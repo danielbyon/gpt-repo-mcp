@@ -38,7 +38,7 @@ export const descriptions = {
   repo_apply_patchset: "Use this when applying a prepared patchset atomically with stale-state guards. A HEAD-bound apply returns first-class rollback guidance.",
   repo_review_patchset: "Use this when reviewing a prepared or applied patchset and its ledger/Git state. It does not mutate files or Git.",
   repo_rollback_patchset: "Use this when the user explicitly approves rollback of an uncommitted, unchanged applied patchset. It requires the expected HEAD.",
-  repo_validate: "Use this when running an allowlisted test, build, lint, typecheck, smoke, or all profile. A declared repo-owned make target takes priority; npm and safe pytest are fallbacks. Output is streamed into a bounded tail without a shell or arbitrary commands.",
+  repo_validate: "Use this when running an allowlisted test, build, lint, typecheck, smoke, or all profile. A declared repo-owned make or just target takes priority; npm and safe pytest are fallbacks. Output is streamed into a bounded tail without a shell or arbitrary commands.",
   repo_start_work_session: "Use this when starting a focused multi-step slice that benefits from content-free local progress state.",
   repo_update_work_session: "Use this when appending decisions, inspected or touched paths, validation refs, risks, status, or next action to a work session.",
   repo_current_work_session: "Use this when resuming repository continuity. Current active or blocked work is full; completed history is compact unless work_session_id is supplied.",

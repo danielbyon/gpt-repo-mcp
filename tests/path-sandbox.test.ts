@@ -1,13 +1,12 @@
 import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { mkdtemp } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import { PathSandbox } from "../src/services/path-sandbox.js";
+import { createTempDir } from "./fixtures/temp-dir.js";
 
 describe("PathSandbox", () => {
   test("rejects absolute model-supplied paths", async () => {
-    const root = await mkdtemp(join(tmpdir(), "repo-reader-"));
+    const root = await createTempDir("repo-reader-");
     const sandbox = new PathSandbox(root);
 
     await expect(sandbox.resolve("/etc/passwd")).rejects.toMatchObject({
@@ -16,7 +15,7 @@ describe("PathSandbox", () => {
   });
 
   test("rejects path traversal", async () => {
-    const root = await mkdtemp(join(tmpdir(), "repo-reader-"));
+    const root = await createTempDir("repo-reader-");
     const sandbox = new PathSandbox(root);
 
     await expect(sandbox.resolve("../outside.txt")).rejects.toMatchObject({
@@ -25,8 +24,8 @@ describe("PathSandbox", () => {
   });
 
   test("rejects symlink escapes", async () => {
-    const root = await mkdtemp(join(tmpdir(), "repo-reader-"));
-    const outside = await mkdtemp(join(tmpdir(), "repo-reader-outside-"));
+    const root = await createTempDir("repo-reader-");
+    const outside = await createTempDir("repo-reader-outside-");
     await writeFile(join(outside, "secret.txt"), "secret");
     await symlink(join(outside, "secret.txt"), join(root, "linked-secret.txt"));
 
@@ -38,7 +37,7 @@ describe("PathSandbox", () => {
   });
 
   test("detects nested repositories without treating them as normal files", async () => {
-    const root = await mkdtemp(join(tmpdir(), "repo-reader-"));
+    const root = await createTempDir("repo-reader-");
     await mkdir(join(root, "vendor", "lib", ".git"), { recursive: true });
 
     const sandbox = new PathSandbox(root);

@@ -1,6 +1,7 @@
 import ignore from "ignore";
 import { posix } from "node:path";
 import { DEFAULT_EXCLUDES } from "../policies/default-excludes.js";
+import { isAdoptionControlArtifact } from "../policies/adoption-artifacts.js";
 import { isDelegationControlArtifact } from "../policies/delegation-control-artifacts.js";
 
 const PUBLIC_ENV_TEMPLATE_PATHS = new Set([".env.example", ".env.sample", ".env.template", "example.env"]);
@@ -40,7 +41,8 @@ export class IgnoreEngine {
   }
 
   isInternalArtifact(repoPath: string): boolean {
-    return isDelegationControlArtifact(normalizeRepoPath(repoPath));
+    const normalized = normalizeRepoPath(repoPath);
+    return isDelegationControlArtifact(normalized) || isAdoptionControlArtifact(normalized);
   }
 }
 

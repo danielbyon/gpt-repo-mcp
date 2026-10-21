@@ -1286,7 +1286,7 @@ describe("MCP contract", () => {
               "openWorldHint": false,
               "readOnlyHint": false,
             },
-            "description": "Use this when running an allowlisted test, build, lint, typecheck, smoke, or all profile. A declared repo-owned make target takes priority; npm and safe pytest are fallbacks. Output is streamed into a bounded tail without a shell or arbitrary commands.",
+            "description": "Use this when running an allowlisted test, build, lint, typecheck, smoke, or all profile. A declared repo-owned make or just target takes priority; npm and safe pytest are fallbacks. Output is streamed into a bounded tail without a shell or arbitrary commands.",
             "inputKeys": [
               "dry_run",
               "profile",

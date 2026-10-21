@@ -7,7 +7,10 @@ export type OperationsPolicyConfig = {
   git_commit_enabled?: boolean;
   validation_enabled?: boolean;
   validation_test_path_globs?: string[];
-  validation_profiles?: Partial<Record<"test" | "build" | "lint" | "typecheck" | "smoke" | "all", { runner: "make"; target: string }>>;
+  validation_profiles?: Partial<Record<
+    "test" | "build" | "lint" | "typecheck" | "smoke" | "all",
+    { runner: "make" | "just"; target: string }
+  >>;
   max_paths_per_operation?: number;
   cleanup_enabled?: boolean;
   cleanup_allowed_globs?: string[];
@@ -19,7 +22,10 @@ export type EffectiveOperationsPolicy = {
   git_commit_enabled: boolean;
   validation_enabled: boolean;
   validation_test_path_globs: string[];
-  validation_profiles: Partial<Record<"test" | "build" | "lint" | "typecheck" | "smoke" | "all", { runner: "make"; target: string }>>;
+  validation_profiles: Partial<Record<
+    "test" | "build" | "lint" | "typecheck" | "smoke" | "all",
+    { runner: "make" | "just"; target: string }
+  >>;
   max_paths_per_operation: number;
   cleanup_enabled: boolean;
   cleanup_allowed_globs: string[];

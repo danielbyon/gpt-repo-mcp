@@ -1,16 +1,21 @@
-import { chmod, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { delimiter, join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { ValidationService } from "../src/services/validation-service.js";
 import { OperationsPolicy } from "../src/services/operations-policy.js";
 import { ValidateInputSchema } from "../src/contracts/validation.contract.js";
 import { descriptions } from "../src/tools/descriptions.js";
 import type { NodeRuntimeResolverOptions } from "../src/services/node-runtime-resolver.js";
+import { createTempDir } from "./fixtures/temp-dir.js";
 
 describe("ValidationService", () => {
+  test("accepts npm banners before validation JSON and rejects malformed final output", () => {
+    expect(lastJsonLine("> smoke\n> fixture\n{\"ok\":true}")).toEqual({ ok: true });
+    expect(() => lastJsonLine("{\"ok\":true}\nmalformed")).toThrow(SyntaxError);
+  });
+
   test("tool and contract describe repo-owned priority plus safe fallbacks without shell execution", async () => {
-    expect(descriptions.repo_validate).toContain("repo-owned make target takes priority");
+    expect(descriptions.repo_validate).toContain("repo-owned make or just target takes priority");
     expect(descriptions.repo_validate).toContain("safe pytest");
     expect(descriptions.repo_validate).toContain("bounded tail without a shell");
     expect(descriptions.repo_validate).not.toContain("allowlisted package.json script profile");
@@ -65,7 +70,7 @@ describe("ValidationService", () => {
     const root = await fixtureRepo({ pythonMarker: true, localPython: "non-executable" });
     expect((await service(root).validate({ repo_id: "fixture", profile: "test", dry_run: true })).commands[0]?.command).toBe("python3 -m pytest");
 
-    const outside = await mkdtemp(join(tmpdir(), "gpt-python-outside-"));
+    const outside = await createTempDir("gpt-python-outside-");
     const outsidePython = join(outside, "python");
     await writeFile(outsidePython, "#!/usr/bin/env node\nprocess.exit(0)\n");
     await chmod(outsidePython, 0o755);
@@ -103,6 +108,141 @@ describe("ValidationService", () => {
     expect(result.commands).toHaveLength(1);
   });
 
+  test("declared just profile takes priority over npm and pytest fallback", async () => {
+    const root = await fixtureRepo({
+      scripts: { test: "echo npm-should-not-run" },
+      pythonMarker: true,
+      localPython: true
+    });
+
+    const result = await service(root, {
+      validation_profiles: { test: { runner: "just", target: "test" } }
+    }).validate({ repo_id: "fixture", profile: "test", dry_run: true });
+
+    expect(result.commands).toEqual([{
+      profile: "test",
+      script: "just:test",
+      command: "just test",
+      status: "skipped"
+    }]);
+  });
+
+  test("executes a declared just profile directly with a single target argument", async () => {
+    const bin = await createTempDir("gpt-just-bin-");
+    const just = join(bin, "just");
+    await writeFile(
+      just,
+      `#!${process.execPath}\nconsole.log("x".repeat(5000));\nconsole.log("args:" + process.argv.slice(2).join("|"));\n`
+    );
+    await chmod(just, 0o755);
+
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ""}`;
+    try {
+      const root = await fixtureRepo({});
+      const result = await service(root, {
+        validation_profiles: { smoke: { runner: "just", target: "smoke" } }
+      }).validate({ repo_id: "fixture", profile: "smoke" });
+
+      expect(result.commands[0]).toMatchObject({
+        script: "just:smoke",
+        command: "just smoke",
+        status: "passed",
+        exit_code: 0
+      });
+      expect(result.commands[0]?.stdout_tail).toContain("smoke");
+      expect(result.commands[0]?.stdout_tail?.length).toBeLessThanOrEqual(4000);
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  });
+
+  test("forwards HOME and XDG_CONFIG_HOME to validation children while keeping the environment allowlisted", async () => {
+    const original = captureEnv(["HOME", "XDG_CONFIG_HOME", "VALIDATION_ENV_LEAK", "CI", "NO_COLOR", "npm_config_color", "PATH"]);
+    const home = "gpt-validation-home-marker";
+    const xdg = "gpt-validation-xdg-marker";
+    process.env.HOME = home;
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.VALIDATION_ENV_LEAK = "must-not-leak";
+    process.env.CI = "0";
+    process.env.NO_COLOR = "0";
+    process.env.npm_config_color = "true";
+    await envProbeJust();
+    const root = await fixtureRepo({});
+    try {
+      const result = await service(root, {
+        validation_profiles: { smoke: { runner: "just", target: "smoke" } }
+      }).validate({ repo_id: "fixture", profile: "smoke" });
+
+      expect(JSON.parse(result.commands[0]?.stdout_tail ?? "{}")).toEqual({
+        HOME: home,
+        XDG_CONFIG_HOME: xdg,
+        CI: "1",
+        NO_COLOR: "1",
+        npm_config_color: "false",
+        VALIDATION_ENV_LEAK: null
+      });
+      expect(result.commands[0]?.stdout_tail).not.toContain("must-not-leak");
+    } finally {
+      restoreEnv(original);
+    }
+  });
+
+  test("does not synthesize HOME or XDG_CONFIG_HOME when the host environment lacks or empties them", async () => {
+    const original = captureEnv(["HOME", "XDG_CONFIG_HOME", "VALIDATION_ENV_LEAK", "PATH"]);
+    const root = await fixtureRepo({});
+    process.env.VALIDATION_ENV_LEAK = "must-not-leak";
+    await envProbeJust();
+    try {
+      delete process.env.HOME;
+      delete process.env.XDG_CONFIG_HOME;
+      let result = await service(root, {
+        validation_profiles: { smoke: { runner: "just", target: "smoke" } }
+      }).validate({ repo_id: "fixture", profile: "smoke" });
+
+      expect(JSON.parse(result.commands[0]?.stdout_tail ?? "{}")).toMatchObject({
+        HOME: null,
+        XDG_CONFIG_HOME: null,
+        CI: "1",
+        NO_COLOR: "1",
+        npm_config_color: "false",
+        VALIDATION_ENV_LEAK: null
+      });
+
+      process.env.HOME = "";
+      process.env.XDG_CONFIG_HOME = "";
+      result = await service(root, {
+        validation_profiles: { smoke: { runner: "just", target: "smoke" } }
+      }).validate({ repo_id: "fixture", profile: "smoke" });
+
+      expect(JSON.parse(result.commands[0]?.stdout_tail ?? "{}")).toMatchObject({
+        HOME: null,
+        XDG_CONFIG_HOME: null
+      });
+    } finally {
+      restoreEnv(original);
+    }
+  });
+
+  test("npm validation chain passes HOME and XDG_CONFIG_HOME to the script child", async () => {
+    const original = captureEnv(["HOME", "XDG_CONFIG_HOME"]);
+    const home = "gpt-validation-home-marker";
+    const xdg = "gpt-validation-xdg-marker";
+    process.env.HOME = home;
+    process.env.XDG_CONFIG_HOME = xdg;
+    const root = await fixtureRepo({
+      scripts: { smoke: `node -e "console.log(JSON.stringify({ home: process.env.HOME ?? null, xdg: process.env.XDG_CONFIG_HOME ?? null }))"` }
+    });
+    try {
+      const result = await service(root).validate({ repo_id: "fixture", profile: "smoke" });
+
+      expect(result.status).toBe("passed");
+      expect(lastJsonLine(result.commands[0]?.stdout_tail)).toEqual({ home, xdg });
+    } finally {
+      restoreEnv(original);
+    }
+  });
+
   test("validation artifact records the pytest runner and display command", async () => {
     const root = await fixtureRepo({ pythonMarker: true, localPython: true });
     const result = await service(root).validate({ repo_id: "fixture", profile: "test" });
@@ -136,22 +276,22 @@ describe("ValidationService", () => {
 
   test("ignores non-exact engines ranges and keeps the host PATH", async () => {
     const root = await fixtureRepo({ scripts: { test: "echo ok" }, enginesNode: ">=24" });
-    const result = await service(root, {}, { home: await mkdtemp(join(tmpdir(), "gpt-empty-runtime-")), env: {} })
+    const result = await service(root, {}, { home: await createTempDir("gpt-empty-runtime-"), env: {} })
       .validate({ repo_id: "fixture", profile: "test", dry_run: true });
     expect(result.commands[0]?.runtime).toBeUndefined();
   });
 
   test("fails safely when an exact requested Node runtime is not installed", async () => {
     const root = await fixtureRepo({ scripts: { test: "echo ok" }, nvmrc: "24.18.0" });
-    await expect(service(root, {}, { home: await mkdtemp(join(tmpdir(), "gpt-empty-runtime-")), env: {} })
+    await expect(service(root, {}, { home: await createTempDir("gpt-empty-runtime-"), env: {} })
       .validate({ repo_id: "fixture", profile: "test", dry_run: true }))
       .rejects.toMatchObject({ code: "VALIDATION_NODE_RUNTIME_UNAVAILABLE" });
   });
 
   test("rejects a runtime symlink that escapes its approved manager root", async () => {
     const root = await fixtureRepo({ scripts: { test: "echo ok" }, nodeVersion: "24.18.0" });
-    const home = await mkdtemp(join(tmpdir(), "gpt-runtime-home-"));
-    const outside = await fakeNodeExecutable(join(await mkdtemp(join(tmpdir(), "gpt-runtime-outside-")), "node"), "24.18.0");
+    const home = await createTempDir("gpt-runtime-home-");
+    const outside = await fakeNodeExecutable(join(await createTempDir("gpt-runtime-outside-"), "node"), "24.18.0");
     const candidate = join(home, ".nvm", "versions", "node", "v24.18.0", "bin", "node");
     await mkdir(join(home, ".nvm", "versions", "node", "v24.18.0", "bin"), { recursive: true });
     await symlink(outside, candidate);
@@ -331,6 +471,23 @@ describe("ValidationService", () => {
       dry_run: true
     })).rejects.toMatchObject({ code: "VALIDATION_TEST_PATH_NOT_ALLOWED" });
   });
+
+  test("rejects focused test paths for a declared just profile", async () => {
+    const root = await fixtureRepo({ scripts: { test: "echo fallback" } });
+
+    await expect(service(root, {
+      validation_test_path_globs: ["tests/**"],
+      validation_profiles: { test: { runner: "just", target: "test" } }
+    }).validate({
+      repo_id: "fixture",
+      profile: "test",
+      test_paths: ["tests/auth.test.ts"],
+      dry_run: true
+    })).rejects.toMatchObject({
+      code: "VALIDATION_TEST_PATHS_DISABLED",
+      message: "Focused test paths are not supported by the declared repository validation profile."
+    });
+  });
 });
 
 function service(
@@ -345,6 +502,41 @@ function service(
   }), runtimeOptions);
 }
 
+async function envProbeJust(): Promise<void> {
+  const bin = await createTempDir("gpt-just-env-probe-");
+  const just = join(bin, "just");
+  await writeFile(
+    just,
+    `#!${process.execPath}\n` +
+      `const keys = ["HOME", "XDG_CONFIG_HOME", "CI", "NO_COLOR", "npm_config_color", "VALIDATION_ENV_LEAK"];\n` +
+      `console.log(JSON.stringify(Object.fromEntries(keys.map((key) => [key, process.env[key] ?? null]))));\n`
+  );
+  await chmod(just, 0o755);
+  process.env.PATH = `${bin}${delimiter}${process.env.PATH ?? ""}`;
+}
+
+function lastJsonLine(stdoutTail: string | undefined): unknown {
+  const finalLine = stdoutTail?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).at(-1);
+  if (!finalLine) {
+    throw new SyntaxError("Validation command produced no JSON output.");
+  }
+  return JSON.parse(finalLine);
+}
+
+function captureEnv(keys: string[]): Record<string, string | undefined> {
+  return Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+}
+
+function restoreEnv(original: Record<string, string | undefined>): void {
+  for (const [key, value] of Object.entries(original)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}
+
 async function fixtureRepo(options: {
   scripts?: Record<string, string>;
   pythonMarker?: boolean;
@@ -354,7 +546,7 @@ async function fixtureRepo(options: {
   voltaNode?: string;
   enginesNode?: string;
 }): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "gpt-repo-validation-"));
+  const root = await createTempDir("gpt-repo-validation-");
   await mkdir(root, { recursive: true });
   if (options.scripts) {
     await writeFile(join(root, "package.json"), JSON.stringify({
@@ -378,7 +570,7 @@ async function fixtureRepo(options: {
 }
 
 async function fakeNvmRuntime(version: string): Promise<{ home: string; options: NodeRuntimeResolverOptions }> {
-  const home = await mkdtemp(join(tmpdir(), "gpt-runtime-home-"));
+  const home = await createTempDir("gpt-runtime-home-");
   await fakeNodeExecutable(join(home, ".nvm", "versions", "node", `v${version}`, "bin", "node"), version);
   return { home, options: { home, env: {} } };
 }

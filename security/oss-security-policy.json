@@ -92,6 +92,30 @@
           "committer"
         ],
         "context": "existing public pull-request provenance"
+      },
+      {
+        "commit": "56d3c3480f618d3d3df97ad34ffbd0826d70d7e2",
+        "roles": [
+          "author",
+          "committer"
+        ],
+        "context": "owner-reviewed public-history provenance from documentation PR #1"
+      },
+      {
+        "commit": "79d26a1993fff99104397afb2f9784de8973c3f5",
+        "roles": [
+          "author",
+          "committer"
+        ],
+        "context": "owner-approved public-history publication"
+      },
+      {
+        "commit": "654ea38324da6f63dd14fbc6a58299c33fb25dc4",
+        "roles": [
+          "author",
+          "committer"
+        ],
+        "context": "owner-approved public-history publication"
       }
     ]
   },

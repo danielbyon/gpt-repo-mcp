@@ -14,7 +14,7 @@ import { GitService } from "./git-service.js";
 import { NodeRuntimeResolver, type NodeRuntimeResolverOptions, type NodeRuntimeSource } from "./node-runtime-resolver.js";
 import { runProcessWithTail } from "./process-exec.js";
 
-const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_TIMEOUT_MS = 900_000;
 const OUTPUT_TAIL_CHARS = 4_000;
 const ALL_PROFILE_ORDER = ["typecheck", "lint", "test", "build", "smoke"] as const;
 const VALIDATION_ROOT = ".chatgpt/validation";
@@ -126,13 +126,13 @@ export class ValidationService {
     const owned = this.policy.config.validation_profiles[profile];
     if (owned) {
       if (testPaths) {
-        throw new RepoReaderError("VALIDATION_TEST_PATHS_DISABLED", "Focused test paths are not supported by the declared make validation profile.");
+        throw new RepoReaderError("VALIDATION_TEST_PATHS_DISABLED", "Focused test paths are not supported by the declared repository validation profile.");
       }
       return [{
         profile,
-        script: `make:${owned.target}`,
-        executable: "make",
-        command: `make ${owned.target}`,
+        script: `${owned.runner}:${owned.target}`,
+        executable: owned.runner,
+        command: `${owned.runner} ${owned.target}`,
         args: [owned.target]
       }];
     }
@@ -185,11 +185,17 @@ export class ValidationService {
       cwd: this.root,
       timeout_ms: timeoutMs,
       tail_bytes: OUTPUT_TAIL_CHARS * 4,
+      // Validation children receive a deliberately allowlisted environment rather than process.env.
+      // HOME and XDG_CONFIG_HOME are forwarded only when the MCP server provides non-empty values
+      // so standard developer tooling can resolve user-level configuration; all other host
+      // environment variables remain excluded.
       env: {
         PATH: command.pathPrefix ? `${command.pathPrefix}${delimiter}${process.env.PATH ?? ""}` : process.env.PATH ?? "",
         CI: "1",
         NO_COLOR: "1",
-        npm_config_color: "false"
+        npm_config_color: "false",
+        ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+        ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {})
       }
     });
     const passed = result.exit_code === 0 && !result.timed_out;
