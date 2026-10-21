@@ -3,6 +3,16 @@ import { spawn, type ChildProcess } from "node:child_process";
 const TERMINATION_GRACE_MS = 250;
 const FORCE_SETTLE_GRACE_MS = 250;
 
+type ProcessTailOptions = {
+  timeout_ms: number;
+  tail_bytes: number;
+};
+
+type PipedChildProcess = ChildProcess & {
+  stdout: NonNullable<ChildProcess["stdout"]>;
+  stderr: NonNullable<ChildProcess["stderr"]>;
+};
+
 export type ProcessTailResult = {
   exit_code?: number;
   signal?: string;
@@ -17,17 +27,35 @@ export async function runProcessWithTail(input: {
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
-  timeout_ms: number;
-  tail_bytes: number;
-}): Promise<ProcessTailResult> {
+} & ProcessTailOptions): Promise<ProcessTailResult> {
   const started = Date.now();
+  const child = spawn(input.executable, input.args, {
+    cwd: input.cwd,
+    env: input.env,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32"
+  });
+  return superviseSpawnedProcessWithTail(child, {
+    timeout_ms: input.timeout_ms,
+    tail_bytes: input.tail_bytes,
+    started_at_ms: started
+  });
+}
+
+/**
+ * Watches an already-spawned child through timeout and process-tree shutdown.
+ *
+ * `runProcessWithTail` calls this immediately after spawning and supplies the
+ * spawn timestamp. Lifecycle tests can wait until a child has installed its
+ * signal handlers before calling this function, then assert the same timeout,
+ * bounded-output, and descendant-cleanup behavior without racing Node startup.
+ */
+export async function superviseSpawnedProcessWithTail(
+  child: PipedChildProcess,
+  input: ProcessTailOptions & { started_at_ms?: number }
+): Promise<ProcessTailResult> {
+  const started = input.started_at_ms ?? Date.now();
   return new Promise((resolve) => {
-    const child = spawn(input.executable, input.args, {
-      cwd: input.cwd,
-      env: input.env,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32"
-    });
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
     const append = (current: Buffer, chunk: Buffer) => {

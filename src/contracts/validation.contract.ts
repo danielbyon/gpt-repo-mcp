@@ -14,7 +14,7 @@ export const ValidateInputSchema = RepoInputSchema.extend({
   profile: ValidationProfileSchema.describe("Allowlisted validation profile resolved first from the repo-owned runner contract, then npm, then the safe pytest test fallback."),
   test_paths: z.array(z.string().min(1)).optional().describe("Optional focused test paths. Only valid for profile test when allowed by repository validation policy."),
   dry_run: z.boolean().optional().describe("When true, resolve runners and verify any requested Node binary without executing project validation scripts."),
-  timeout_ms: z.number().int().positive().max(300_000).optional().describe("Optional per-command timeout in milliseconds, capped at 300000.")
+  timeout_ms: z.number().int().positive().max(900_000).optional().describe("Optional per-command timeout in milliseconds, capped at 900000; defaults to 900000.")
 });
 
 export const ValidateCommandResultSchema = z.object({

@@ -129,7 +129,7 @@ server.
 
 ## Repository-owned validation profiles
 
-A repository can declare canonical allowlisted `make` targets under its `operations` config. Declared profiles take precedence over npm and pytest detection:
+A repository can declare canonical allowlisted `make` or `just` targets under its `operations` config. Declared profiles take precedence over npm and pytest detection:
 
 ```json
 {
@@ -147,7 +147,22 @@ A repository can declare canonical allowlisted `make` targets under its `operati
 }
 ```
 
-Targets are schema-allowlisted and executed directly as `make <target>` without a shell. Output is streamed and only a bounded tail is retained. Existing configs without `validation_profiles` remain valid.
+A `just`-based repository declares the same profile shape with the `just` runner:
+
+```json
+{
+  "operations": {
+    "enabled": true,
+    "validation_enabled": true,
+    "validation_profiles": {
+      "test": { "runner": "just", "target": "test" },
+      "all": { "runner": "just", "target": "verify" }
+    }
+  }
+}
+```
+
+Targets are schema-allowlisted and executed directly as `make <target>` or `just <target>` without a shell. Output is streamed and only a bounded tail is retained. Existing configs without `validation_profiles` remain valid.
 
 ## Doctor
 

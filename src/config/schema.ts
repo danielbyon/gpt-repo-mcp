@@ -19,18 +19,18 @@ export const WritePolicyConfigSchema = z.object({
   max_bytes_per_write: PositiveIntSchema.default(DEFAULT_WRITE_POLICY.max_bytes_per_write)
 }).strict();
 
-const ValidationMakeProfileSchema = z.object({
-  runner: z.literal("make"),
+const ValidationRunnerProfileSchema = z.object({
+  runner: z.enum(["make", "just"]),
   target: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,80}$/)
 }).strict();
 
 const ValidationProfilesSchema = z.object({
-  test: ValidationMakeProfileSchema.optional(),
-  build: ValidationMakeProfileSchema.optional(),
-  lint: ValidationMakeProfileSchema.optional(),
-  typecheck: ValidationMakeProfileSchema.optional(),
-  smoke: ValidationMakeProfileSchema.optional(),
-  all: ValidationMakeProfileSchema.optional()
+  test: ValidationRunnerProfileSchema.optional(),
+  build: ValidationRunnerProfileSchema.optional(),
+  lint: ValidationRunnerProfileSchema.optional(),
+  typecheck: ValidationRunnerProfileSchema.optional(),
+  smoke: ValidationRunnerProfileSchema.optional(),
+  all: ValidationRunnerProfileSchema.optional()
 }).strict();
 
 const OperationsPolicyConfigObjectSchema = z.object({
