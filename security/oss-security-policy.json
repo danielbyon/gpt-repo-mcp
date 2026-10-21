@@ -92,6 +92,14 @@
           "committer"
         ],
         "context": "existing public pull-request provenance"
+      },
+      {
+        "commit": "56d3c3480f618d3d3df97ad34ffbd0826d70d7e2",
+        "roles": [
+          "author",
+          "committer"
+        ],
+        "context": "owner-reviewed public-history provenance from documentation PR #1"
       }
     ]
   },
