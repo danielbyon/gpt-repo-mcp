@@ -14,8 +14,8 @@ The existing human-readable product documentation remains authoritative for prod
 
 Create one file in each target repository:
 
-- `/Users/daniel/Projects/EmuChef/docs/product-contract.json`
-- `/Users/daniel/Projects/Argus-ROM-Toolkit/docs/product-contract.json`
+- EmuChef: `docs/product-contract.json`
+- Argus ROM Toolkit: `docs/product-contract.json`
 
 Each file uses schema version 1 and contains one repository-level product contract with multiple users and jobs where the repository contains more than one product surface.
 
