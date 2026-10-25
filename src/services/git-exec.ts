@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { RepoReaderError } from "../runtime/errors.js";
+import { gitOperationEnv } from "./git-operation-safety.js";
 
 const DEFAULT_STDERR_LIMIT = 128 * 1024;
 
@@ -18,12 +19,16 @@ export async function runGitBounded(input: {
   max_stderr_bytes?: number;
   allow_stdout_truncation?: boolean;
   env?: NodeJS.ProcessEnv;
+  /** Caller-bounded input for Git commands supporting --stdin. */
+  stdin?: string;
 }): Promise<BoundedProcessResult> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", input.args, {
       cwd: input.root,
-      env: input.env ?? { PATH: process.env.PATH ?? "" },
-      stdio: ["ignore", "pipe", "pipe"]
+      // Read-only and mutation candidates must use the same Git ignore context.
+      // Keep HOME/XDG config while excluding ambient Git overrides and secrets.
+      env: input.env ?? gitOperationEnv(),
+      stdio: [input.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"]
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -33,7 +38,11 @@ export async function runGitBounded(input: {
     let stderrTruncated = false;
     const stderrLimit = input.max_stderr_bytes ?? DEFAULT_STDERR_LIMIT;
 
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stdin?.on("error", (error) => reject(new RepoReaderError("GIT_ERROR", `Git input failed: ${error.message}`)));
+    child.stdin?.end(input.stdin);
+
+    // Only stdin varies above; both output streams are always configured as pipes.
+    child.stdout!.on("data", (chunk: Buffer) => {
       const remaining = input.max_stdout_bytes - stdoutBytes;
       if (remaining > 0) {
         const accepted = chunk.subarray(0, remaining);
@@ -42,7 +51,7 @@ export async function runGitBounded(input: {
       }
       if (chunk.length > Math.max(remaining, 0)) stdoutTruncated = true;
     });
-    child.stderr.on("data", (chunk: Buffer) => {
+    child.stderr!.on("data", (chunk: Buffer) => {
       const remaining = stderrLimit - stderrBytes;
       if (remaining > 0) {
         const accepted = chunk.subarray(0, remaining);

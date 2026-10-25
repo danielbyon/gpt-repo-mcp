@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DEFAULT_LIMITS } from "../policies/limits.js";
 import { delegationControlArtifactGitExcludes, isDelegationControlArtifact } from "../policies/delegation-control-artifacts.js";
 import { isNotFoundError } from "../runtime/fs-helpers.js";
+import { RepoReaderError } from "../runtime/errors.js";
 import { validateRepoPath } from "./path-sandbox.js";
 import { runGitBounded } from "./git-exec.js";
 
@@ -118,6 +119,28 @@ export class GitService {
 
   async worktreeFingerprint(): Promise<string> {
     return this.contentFingerprint(await this.changedProjectPaths(true));
+  }
+
+  /** Classify untracked ignores in one query, including absent paths.
+   * NUL framing preserves path boundaries; Git's index keeps tracked files visible.
+   */
+  async ignoredUntrackedPaths(paths: readonly string[]): Promise<string[]> {
+    const selected = [...new Set(paths.map(validateRepoPath))];
+    if (selected.length === 0) return [];
+    try {
+      const result = await runGitBounded({
+        root: this.root,
+        args: ["check-ignore", "--stdin", "-z"],
+        stdin: `${selected.join("\0")}\0`,
+        max_stdout_bytes: STATUS_LIMIT
+      });
+      return result.stdout.split("\0").filter(Boolean);
+    } catch (error) {
+      // check-ignore uses exit 1 for a nonmatch; repository/config errors must
+      // still fail closed. Do not use --no-index, which would hide tracked files.
+      if (error instanceof RepoReaderError && error.code === "GIT_ERROR" && error.diagnostics.exit_code === 1) return [];
+      throw error;
+    }
   }
 
   private async changedProjectPaths(excludeChatgpt: boolean): Promise<string[]> {

@@ -37,7 +37,9 @@ export const DelegationReviewGateSchema = z.object({
 export const DelegationGateRunDecisionSchema = z.object({
   run_id: AgentRunnerRunIdSchema,
   governance_mode: z.enum(["advisory", "enforce"]),
-  applicable_paths: z.array(DelegationRepoPathV3Schema).min(1).max(1_000),
+  // Explicit verification-only runs carry no file authority, including when
+  // their signed review fails and its diagnostics must remain visible.
+  applicable_paths: z.array(DelegationRepoPathV3Schema).max(1_000),
   status: z.enum(["passed", "open", "failed", "stale", "tampered", "missing_gate", "invalid_gate"]),
   review_status: z.enum(["valid", "missing", "stale", "tampered", "unavailable"]),
   product_verdict: z.enum(["passed", "failed", "not_applicable"]).optional(),

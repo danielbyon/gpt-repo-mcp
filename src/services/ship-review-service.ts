@@ -4,7 +4,7 @@ import type { SemanticReviewInput, SemanticReviewResult } from "../contracts/sem
 import type { ShipReviewReason, ShipReviewResult, ShipReviewToolInput } from "../contracts/ship-review.contract.js";
 
 export type ShipReviewDependencies = {
-  gitReview: { review(input: GitReviewInput): Promise<GitReviewResult> };
+  gitReview: { review(input: GitReviewInput, requestedRunId?: string): Promise<GitReviewResult> };
   semanticReview: { review(input: SemanticReviewInput): Promise<SemanticReviewResult> };
   failureDiagnose: { diagnose(input: FailureDiagnoseInput): Promise<FailureDiagnoseResult> };
 };
@@ -32,14 +32,17 @@ export class ShipReviewService {
       ...(input.max_findings ? { max_findings: input.max_findings } : {}),
       ...(input.max_files ? { max_files: input.max_files } : {})
     };
+    const gitInput: GitReviewInput = {
+      repo_id: input.repo_id,
+      mode: "commit_plan",
+      detail,
+      paths: input.paths,
+      max_files: input.max_files
+    };
     const [gitReview, semanticReview] = await Promise.all([
-      this.dependencies.gitReview.review({
-        repo_id: input.repo_id,
-        mode: "commit_plan",
-        detail,
-        paths: input.paths,
-        max_files: input.max_files
-      }),
+      input.run_id
+        ? this.dependencies.gitReview.review(gitInput, input.run_id)
+        : this.dependencies.gitReview.review(gitInput),
       this.dependencies.semanticReview.review(semanticInput)
     ]);
     const validation = gitReview.ship_readiness.validation;
