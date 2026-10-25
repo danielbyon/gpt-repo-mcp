@@ -26,7 +26,7 @@ export class GitReviewService {
     private readonly delegationGate: DelegationGateService = new DelegationGateService(root)
   ) {}
 
-  async review(input: GitReviewInput): Promise<GitReviewResult> {
+  async review(input: GitReviewInput, requestedRunId?: string): Promise<GitReviewResult> {
     const git = new GitService(this.root);
     const detail = input.detail ?? "compact";
     const scopePaths = input.paths ? [...new Set(input.paths.map((path) => validateRepoPath(path)))].sort() : undefined;
@@ -135,6 +135,7 @@ export class GitReviewService {
       repo_id: input.repo_id,
       paths: expectedCommitPaths,
       operation: "review",
+      requested_run_id: requestedRunId,
       head_sha: status.head_sha,
       review_state_fingerprint: reviewStateFingerprint
     });

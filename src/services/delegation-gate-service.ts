@@ -50,11 +50,12 @@ export class DelegationGateService {
     repo_id: string;
     paths: string[];
     operation: DelegationGateOperation;
+    requested_run_id?: string;
     head_sha?: string;
     review_state_fingerprint?: string;
   }): Promise<DelegationGateDecision> {
     const requestedPaths = uniqueSorted(input.paths.filter((path) => path.length > 0 && !path.startsWith(".chatgpt/")));
-    if (requestedPaths.length === 0) return emptyDecision(requestedPaths);
+    if (requestedPaths.length === 0 && !input.requested_run_id) return emptyDecision(requestedPaths);
     const [status, discovered] = await Promise.all([
       input.head_sha ? Promise.resolve({ head_sha: input.head_sha }) : this.git.status(),
       this.discoverRunIds()
@@ -64,6 +65,7 @@ export class DelegationGateService {
       manifest: DelegationRunManifestV3;
       governed_paths: string[];
       claimed_paths: string[];
+      verification_only: boolean;
     }> = [];
     const warnings = [...discovered.warnings];
 
@@ -75,8 +77,16 @@ export class DelegationGateService {
         continue;
       }
       const coverage = await this.pathCoverage(loaded.manifest, requestedPaths);
-      if (coverage.governed_paths.length > 0) {
-        runCandidates.push({ manifest: loaded.manifest, ...coverage });
+      // A clean verification-only run has no changed paths to select it. Only
+      // the explicitly requested run may use this path, and it must pass the
+      // same signed gate/attestation checks as a source-changing run.
+      const verificationOnly = (
+        requestedPaths.length === 0
+        && runId === input.requested_run_id
+        && await this.isCurrentVerificationOnlyRun(loaded.manifest, status.head_sha)
+      );
+      if (coverage.governed_paths.length > 0 || verificationOnly) {
+        runCandidates.push({ manifest: loaded.manifest, ...coverage, verification_only: verificationOnly });
       }
     }
 
@@ -104,7 +114,7 @@ export class DelegationGateService {
         ));
         continue;
       }
-      if (candidate.claimed_paths.length > 0) {
+      if (candidate.claimed_paths.length > 0 || candidate.verification_only) {
         applicableRuns.push(await this.evaluateRun({
           manifest: candidate.manifest,
           applicable_paths: candidate.claimed_paths,
@@ -160,6 +170,33 @@ export class DelegationGateService {
       });
     }
     return decision;
+  }
+
+  private async isCurrentVerificationOnlyRun(manifest: DelegationRunManifestV3, headSha: string): Promise<boolean> {
+    const current = await this.git.status();
+    if (!current.clean || current.head_sha !== headSha || manifest.baseline.head_sha !== headSha) return false;
+    try {
+      const text = await readSafeRunArtifact(this.root, codexRunPaths(manifest.run_id).resultJsonPath, MAX_RESULT_BYTES);
+      if (text === undefined) return false;
+      const result = DelegationResultV3Schema.parse(JSON.parse(text) as unknown);
+      if (
+        result.repo_id !== manifest.repo_id || result.run_id !== manifest.run_id
+        || result.status !== "completed" || result.changed_files.length !== 0 || result.connected_changes.length !== 0
+      ) return false;
+      // Historical baselines may include metadata that the old Git environment
+      // misclassified. Ignore only Git-confirmed untracked ignores; all other
+      // initial paths must still match their recorded state exactly.
+      const ignored = new Set(await this.git.ignoredUntrackedPaths(manifest.baseline.initial_changed_paths));
+      const remaining = manifest.baseline.initial_changed_paths.filter((path) => !ignored.has(path));
+      const baselines = new Map(manifest.baseline.initial_path_states?.map((state) => [state.path, state]));
+      for (const state of await this.git.pathStates(remaining)) {
+        const baseline = baselines.get(state.path);
+        if (!baseline || baseline.exists !== state.exists || baseline.kind !== state.kind || baseline.content_sha256 !== state.content_sha256) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async ensureGate(input: {
