@@ -1,0 +1,50 @@
+tests/git-ignore-provenance.test.ts
+  s_7968de91d99533::t_c44a7d0c274a2a 1-279
+  s_7968de91d99533::t_739c0a2980e776 280-345
+src/services/git-exec.ts
+  s_7968de91d99533::t_db971f216a1836 22-23,31,41-42
+  s_7968de91d99533::t_289e98c43e47e0 3,28-30
+  s_7968de91d99533::t_35674ea3b56e74 44-45,54
+  s_537f13372bbf30::t_56c306057ed241 43
+src/services/git-review-service.ts
+  s_7968de91d99533::t_bca1c4c6d503bf 29,138
+src/services/git-service.ts
+  s_7968de91d99533::t_db971f216a1836 124-129,131-137,141
+  s_7968de91d99533::t_bca1c4c6d503bf 8,130,138-140,142-143
+  s_537f13372bbf30::t_346e81b6ec8c60 144-145
+src/services/ship-review-service.ts
+  s_7968de91d99533::t_c44a7d0c274a2a 36-40
+  s_7968de91d99533::t_bca1c4c6d503bf 7,35,41,43-45
+src/contracts/delegation-gate.contract.ts
+  s_7968de91d99533::t_12360f9f5dd196 40-41
+  s_7968de91d99533::t_ae11a8c517fc6d 42
+src/services/delegation-gate-service.ts
+  s_7968de91d99533::t_db971f216a1836 189-194
+  s_7968de91d99533::t_bca1c4c6d503bf 53,58,80-82,84-86,175-188,195-199
+  s_7968de91d99533::t_12360f9f5dd196 68,83,87-89,117
+  s_537f13372bbf30::t_a0137600eff8db 200-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1f1d5e3cc5ecb82f9800860b6e2dea1d583160df",
+  "prompts": {},
+  "sessions": {
+    "s_537f13372bbf30": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15836-9c35-71e2-891b-d288adcbda2a",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_7968de91d99533": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16f92-cf04-7973-9837-c4d6490963b2",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
