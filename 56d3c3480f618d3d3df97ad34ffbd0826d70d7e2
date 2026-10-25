@@ -1,0 +1,19 @@
+docs/superpowers/specs/2026-08-17-product-contracts-design.md
+  s_4c2a0223845a2c::t_9e88bf9cdede70 17-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "56d3c3480f618d3d3df97ad34ffbd0826d70d7e2",
+  "prompts": {},
+  "sessions": {
+    "s_4c2a0223845a2c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1471c-5568-7362-8ed2-2b5d7d605b21",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <daniel@danielbyon.com>"
+    }
+  }
+}

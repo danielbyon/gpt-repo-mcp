@@ -1,0 +1,19 @@
+security/oss-security-policy.json
+  s_4c2a0223845a2c::t_f45b35a9d50cac 95-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bb71b84cfce458ff2b008dc1dea2dcc672e6a5c2",
+  "prompts": {},
+  "sessions": {
+    "s_4c2a0223845a2c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1471c-5568-7362-8ed2-2b5d7d605b21",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
