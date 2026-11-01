@@ -3,7 +3,7 @@
 import { readFile, realpath, stat } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { basename, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { DEFAULT_OPERATIONS_POLICY, SHIP_VALIDATION_TEST_PATH_GLOBS } from "../policies/operations-defaults.js";
 import { DEFAULT_WRITE_POLICY } from "../policies/write-defaults.js";
 import { isNotFoundError } from "../runtime/fs-helpers.js";
@@ -452,8 +452,11 @@ function defaultIo(): CliIo {
 
 class CliError extends Error {}
 
-const currentModule = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
-if (import.meta.url === currentModule) {
+const invokedPath = process.argv[1];
+if (
+  invokedPath &&
+  await realpath(invokedPath) === await realpath(fileURLToPath(import.meta.url))
+) {
   const code = await runConnectGptCli(process.argv.slice(2));
   process.exitCode = code;
 }

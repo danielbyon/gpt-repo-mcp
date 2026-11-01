@@ -94,12 +94,26 @@ describe("OSS security scan policy", () => {
 
   test("separates production, known development, and unknown advisories", () => {
     const result = classifyAudit({
+      auditReportVersion: 2,
       vulnerabilities: {
         "known-dev": { severity: "high", isDirect: false, fixAvailable: true },
         "unknown-dev": { severity: "low", isDirect: false, fixAvailable: false }
+      },
+      metadata: {
+        vulnerabilities: {
+          info: 0, low: 1, moderate: 0, high: 1, critical: 0, total: 2
+        },
+        dependencies: { total: 2 }
       }
     }, {
-      vulnerabilities: {}
+      auditReportVersion: 2,
+      vulnerabilities: {},
+      metadata: {
+        vulnerabilities: {
+          info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0
+        },
+        dependencies: { total: 1 }
+      }
     }, {
       known_development_advisories: [
         { package: "known-dev", severity: "high", review_by: "2099-01-01" }
@@ -112,5 +126,39 @@ describe("OSS security scan policy", () => {
       { package: "unknown-dev", severity: "low", direct: false, fix_available: false }
     ]);
     expect(result.expired_development).toEqual([]);
+  });
+
+  test("rejects advisory output without complete vulnerability metadata", () => {
+    expect(() => classifyAudit({
+      vulnerabilities: {}
+    }, {
+      vulnerabilities: {}
+    }, {
+      known_development_advisories: []
+    })).toThrow(/complete advisory metadata/i);
+  });
+
+  test("rejects internally inconsistent advisory counts", () => {
+    expect(() => classifyAudit({
+      auditReportVersion: 2,
+      vulnerabilities: {},
+      metadata: {
+        vulnerabilities: {
+          info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 1
+        },
+        dependencies: { total: 1 }
+      }
+    }, {
+      auditReportVersion: 2,
+      vulnerabilities: {},
+      metadata: {
+        vulnerabilities: {
+          info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0
+        },
+        dependencies: { total: 1 }
+      }
+    }, {
+      known_development_advisories: []
+    })).toThrow(/internally inconsistent/i);
   });
 });
