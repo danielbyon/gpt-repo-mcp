@@ -108,7 +108,7 @@ describe("package startup scripts", () => {
     expect(script).toContain("security/");
     expect(script).toContain(".chatgpt/");
     expect(script).toContain("read-only TypeScript MCP server");
-    expect(script).toContain("/Users/");
+  expect(script).toContain("\"/Us\" + \"ers/\"");
   });
 
   test("public hygiene script rejects any tracked .chatgpt artifact", async () => {

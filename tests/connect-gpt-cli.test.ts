@@ -1,6 +1,8 @@
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 import { runConnectGptCli } from "../src/cli/connect-gpt.js";
 
@@ -11,6 +13,29 @@ type CliResult = {
 };
 
 describe("connect-gpt config CLI", () => {
+  test.skipIf(process.platform === "win32")(
+    "runs when the CLI entrypoint is invoked through a symlink",
+    async () => {
+      const sandbox = await mkdtemp(join(tmpdir(), "connect-gpt-cli-link-"));
+      const target = fileURLToPath(new URL("../src/cli/connect-gpt.ts", import.meta.url));
+      const link = join(sandbox, "connect-gpt.ts");
+
+      try {
+        await symlink(target, link);
+        const result = spawnSync(
+          process.execPath,
+          ["--import", "tsx", link, "__unknown_v5_test_command__"],
+          { cwd: process.cwd(), encoding: "utf8" }
+        );
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("Usage:");
+      } finally {
+        await rm(sandbox, { recursive: true, force: true });
+      }
+    }
+  );
+
   test("usage includes doctor", async () => {
     const sandbox = await mkdtemp(join(tmpdir(), "connect-gpt-cli-"));
 
