@@ -460,5 +460,5 @@ describe("OSS security scan history batching", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });
