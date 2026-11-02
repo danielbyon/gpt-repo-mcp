@@ -4,9 +4,10 @@ import { RepoReaderError, toRepoReaderError } from "../runtime/errors.js";
 import { createErrorEnvelope } from "../runtime/result-envelope.js";
 import { audit } from "../runtime/telemetry.js";
 import type { RuntimeContext } from "../runtime/context.js";
+import type { TaskExecutionProviderGuard } from "../services/task-execution-boundary.js";
 import { toolContracts, type ToolName } from "./contracts.js";
 
-export type ToolHandler = (input: unknown, context: RuntimeContext) => Promise<CallToolResult>;
+export type ToolHandler = (input: unknown, context: RuntimeContext, taskExecution?: TaskExecutionProviderGuard) => Promise<CallToolResult>;
 
 export async function safeTool<TInput extends Record<string, unknown>>(
   tool: ToolName,

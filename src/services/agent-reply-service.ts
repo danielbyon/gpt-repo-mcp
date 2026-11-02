@@ -21,7 +21,7 @@ export class AgentReplyService {
     this.agentRuns = new AgentRunsService(root, sandbox, agentRunsOptions);
   }
 
-  async write(rawInput: AgentReplyInput): Promise<AgentReplyResult> {
+  async write(rawInput: AgentReplyInput, beforeWrite?: () => Promise<void>): Promise<AgentReplyResult> {
     const input = AgentReplyInputSchema.parse(rawInput);
     await this.assertRegular(runPaths(input.run_id).manifest_path);
     await this.assertRegular(runPaths(input.run_id).status_path);
@@ -51,6 +51,7 @@ export class AgentReplyService {
       throw new RepoReaderError("RUNNER_REPLY_STALE", "Answers must match every current question_id exactly once.");
     }
 
+    await beforeWrite?.();
     await this.interactions.writeReply({
       repo_id: input.repo_id,
       run_id: input.run_id,

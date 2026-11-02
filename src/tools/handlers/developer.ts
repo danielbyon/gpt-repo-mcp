@@ -117,11 +117,12 @@ export const contextMapHandler: ToolHandler = async (input, context) => safeTool
   return createSuccessEnvelope(result, `Returned context map with ${result.import_edges.length} import edges.`);
 });
 
-export const symbolContextHandler: ToolHandler = async (input, context) => safeTool<SymbolContextInput>("repo_symbol_context", input, async (args) => {
+export const symbolContextHandler: ToolHandler = async (input, context, taskExecution) => safeTool<SymbolContextInput>("repo_symbol_context", input, async (args) => {
+  await taskExecution?.revalidateBeforeProvider();
   const repo = context.registry.get(args.repo_id);
   const native = await new SymbolContextService(repo.root, new PathSandbox(repo.root)).analyze(args);
   const provider = context.codeIntelligence
-    ? await context.codeIntelligence.enrich(repo, args)
+    ? await context.codeIntelligence.enrich(repo, args, taskExecution)
     : { name: "native" as const, status: "native_only" as const, index_available: false, warnings: [] };
   const result = { ...native, provider, warnings: [...new Set([...native.warnings, ...provider.warnings])].sort() };
   audit({ tool: "repo_symbol_context", repo_id: args.repo_id, paths: args.paths, counts: { definitions: result.definitions.length, relations: result.references.length + result.calls.length }, truncated: result.truncated, warnings: result.warnings });

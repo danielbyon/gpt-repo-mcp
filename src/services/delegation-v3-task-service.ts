@@ -41,6 +41,7 @@ import {
   sha256Text,
   type CodexBaseline
 } from "./codex-task-policy.js";
+import { bindTaskPromptIfEnrolled, type TaskExecutionRegistrationBaseline } from "./task-execution-boundary.js";
 
 export type DelegationPreparedResultV3 = z.infer<typeof PreparedSchemaType>;
 
@@ -51,12 +52,19 @@ export class DelegationV3TaskService {
   private readonly lineage: DelegationV3LineageService;
   private readonly gates: DelegationGateService;
   private readonly drift: DelegationDriftService;
-
   constructor(
     private readonly root: string,
     sandbox: PathSandbox,
     private readonly writePolicy: WritePolicy,
-    private readonly now: () => Date = () => new Date()
+    private readonly now: () => Date = () => new Date(),
+    private readonly taskPromptBinder: (
+      prompt: string,
+      repoId: string,
+      runId: string,
+      sourcePaths: readonly string[],
+      env?: NodeJS.ProcessEnv,
+      registrationBaseline?: TaskExecutionRegistrationBaseline
+    ) => Promise<string> = bindTaskPromptIfEnrolled
   ) {
     this.writer = new FileWriter(root, sandbox, writePolicy);
     this.git = new GitService(root);
@@ -77,10 +85,10 @@ export class DelegationV3TaskService {
     const { dry_run: dryRunInput, reason, ...taskInput } = input;
     const parsedTask = DelegationTaskV3ToolInputSchema.parse(taskInput);
     const dryRun = dryRunInput ?? false;
-    const writeTask = () => this.writeTask(parsedTask, dryRun, reason);
-    if (!parsedTask.lineage) return writeTask();
+    const register = () => this.writeTask(parsedTask, dryRun, reason);
+    if (!parsedTask.lineage) return register();
     const rootRunId = await this.lineage.rootRunIdForParent(parsedTask.repo_id, parsedTask.lineage.parent_run_id);
-    return withDelegationV3LineageLock(this.root, rootRunId, writeTask);
+    return withDelegationV3LineageLock(this.root, rootRunId, register);
   }
 
   private async writeTask(
@@ -100,7 +108,18 @@ export class DelegationV3TaskService {
       effectiveForbiddenPaths: effectiveForbidden,
       audit: resolved.audit
     });
-    const prompt = bindPromptToBaseline(promptWithoutBaseline, baseline);
+    const prompt = await this.taskPromptBinder(
+      bindPromptToBaseline(promptWithoutBaseline, baseline),
+      resolved.task.repo_id,
+      resolved.task.run_id!,
+      [...resolved.task.starting_points, ...resolved.task.authorization_scope, ...baseline.initial_changed_paths],
+      undefined,
+      {
+        head_sha: baseline.head_sha,
+        worktree_fingerprint: baseline.worktree_fingerprint,
+        baseline_sha256: delegationBaselineSha256V3(baseline)
+      }
+    );
     const promptSha256 = sha256Text(prompt);
     const manifest = DelegationRunManifestV3Schema.parse({
       schema_version: 3,
