@@ -1,10 +1,11 @@
-import { chmod, mkdtemp, realpath, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { CodeIntelligenceService } from "../src/services/code-intelligence-service.js";
 import { createCodebaseMemoryClientFactory, validateCodebaseMemoryExecutable, type CodebaseMemoryClientFactory } from "../src/services/codebase-memory-client.js";
 import { RootRegistry, type RepoConfig } from "../src/services/root-registry.js";
+import { taskExecutionError } from "../src/services/task-execution-errors.js";
 
 describe("CodeIntelligenceService", () => {
   test("returns native fallback metadata and asks for approval when the exact repo root is not indexed", async () => {
@@ -86,6 +87,34 @@ describe("CodeIntelligenceService", () => {
     expect(indexCalls[0]?.args).toEqual({ repo_path: root, mode: "full", persistence: false });
   });
 
+  test("preserves unenrolled initial status cleanup compatibility", async () => {
+    const root = await mkdtemp(join(tmpdir(), "gpt-code-intelligence-cleanup-compat-"));
+    try {
+      const cleanupError = new Error("provider cleanup failed");
+      let scheduled: (() => Promise<void>) | undefined;
+      const { CodebaseMemoryIndexService } = await import("../src/services/codebase-memory-index-service.js");
+      const service = new CodebaseMemoryIndexService(
+        async () => ({
+          call: async () => ({ projects: [] }),
+          close: async () => { throw cleanupError; }
+        }),
+        100,
+        1_000,
+        {
+          loadBoundary: async () => undefined,
+          scheduleJob: (job) => { scheduled = job; }
+        }
+      );
+
+      const result = await service.index(repo(root), "start");
+
+      expect(result.status).toBe("queued");
+      expect(scheduled).toBeTypeOf("function");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("fails closed when indexing returns an unknown result status", async () => {
     const root = await mkdtemp(join(tmpdir(), "gpt-code-intelligence-"));
     const { factory } = fakeFactory((tool) => tool === "list_projects" ? { projects: [] } : {});
@@ -125,6 +154,37 @@ describe("CodeIntelligenceService", () => {
     const factory: CodebaseMemoryClientFactory = async () => { throw new Error("missing provider"); };
     const result = await new CodeIntelligenceService(factory, 100, 1_000)
       .enrich(repo("/approved/repo"), { repo_id: "fixture", symbols: ["run"] });
+    expect(result).toMatchObject({ status: "provider_unavailable", fallback_used: "native" });
+    expect(result.warnings).toContain("CODEBASE_MEMORY_UNAVAILABLE");
+  });
+
+  test("propagates task boundary rejection before provider setup or native fallback", async () => {
+    const boundaryError = taskExecutionError("repository_registration_changed");
+    const revalidateBeforeProvider = vi.fn(async () => { throw boundaryError; });
+    const factory: CodebaseMemoryClientFactory = vi.fn(async () => { throw new Error("provider must not start"); });
+    const service = new CodeIntelligenceService(factory, 100, 1_000);
+
+    await expect(service.enrich(repo("/approved/repo"), { repo_id: "fixture", symbols: ["run"] }, {
+      revalidateBeforeProvider,
+      bindTaskPrompt: async (prompt) => prompt
+    })).rejects.toBe(boundaryError);
+
+    expect(revalidateBeforeProvider).toHaveBeenCalledOnce();
+    expect(factory).not.toHaveBeenCalled();
+  });
+
+  test("retains native fallback for provider failure after successful task boundary validation", async () => {
+    const revalidateBeforeProvider = vi.fn(async () => undefined);
+    const factory: CodebaseMemoryClientFactory = vi.fn(async () => { throw new Error("provider unavailable"); });
+    const service = new CodeIntelligenceService(factory, 100, 1_000);
+
+    const result = await service.enrich(repo("/approved/repo"), { repo_id: "fixture", symbols: ["run"] }, {
+      revalidateBeforeProvider,
+      bindTaskPrompt: async (prompt) => prompt
+    });
+
+    expect(revalidateBeforeProvider).toHaveBeenCalledOnce();
+    expect(factory).toHaveBeenCalledOnce();
     expect(result).toMatchObject({ status: "provider_unavailable", fallback_used: "native" });
     expect(result.warnings).toContain("CODEBASE_MEMORY_UNAVAILABLE");
   });

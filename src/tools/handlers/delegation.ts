@@ -26,9 +26,15 @@ export const prepareCodexTaskHandler: ToolHandler = async (input, context) => sa
   return createSuccessEnvelope(result, `Prepared Delegation v3 task ${result.run_id}.`, { warnings: result.warnings });
 });
 
-export const writeCodexTaskHandler: ToolHandler = async (input, context) => safeTool<DelegationTaskV3WriteToolInput>("repo_write_codex_task", input, async (args) => {
+export const writeCodexTaskHandler: ToolHandler = async (input, context, taskExecution) => safeTool<DelegationTaskV3WriteToolInput>("repo_write_codex_task", input, async (args) => {
   const repo = context.registry.get(args.repo_id);
-  const result = await new DelegationV3TaskService(repo.root, new PathSandbox(repo.root), new WritePolicy(repo.writes)).write(args);
+  const result = await new DelegationV3TaskService(
+    repo.root,
+    new PathSandbox(repo.root),
+    new WritePolicy(repo.writes),
+    undefined,
+    taskExecution?.bindTaskPrompt
+  ).write(args);
   audit({ tool: "repo_write_codex_task", repo_id: args.repo_id, paths: result.written_paths, warnings: result.warnings });
   return createSuccessEnvelope(result, result.dry_run ? `Dry run checked Delegation v3 task ${result.run_id}.` : `Wrote Delegation v3 task ${result.run_id}.`, { warnings: result.warnings });
 });
@@ -42,11 +48,11 @@ export const agentRunsHandler: ToolHandler = async (input, context) => safeTool<
   return createSuccessEnvelope(result, result.mode === "detail" ? `Read agent run ${result.run?.run_id}.` : `Returned ${result.returned_count} agent runs.`, { warnings: result.warnings, truncated: result.truncated });
 });
 
-export const writeAgentReplyHandler: ToolHandler = async (input, context) => safeTool<AgentReplyInput>("repo_write_agent_reply", input, async (args) => {
+export const writeAgentReplyHandler: ToolHandler = async (input, context, taskExecution) => safeTool<AgentReplyInput>("repo_write_agent_reply", input, async (args) => {
   const repo = context.registry.get(args.repo_id);
   const result = await new AgentReplyService(repo.root, new PathSandbox(repo.root), {
     repository_max_runtime_ms: DEFAULT_AGENT_RUNNER_MAX_RUNTIME_MS
-  }).write(args);
+  }).write(args, taskExecution ? () => taskExecution.revalidateBeforeProvider() : undefined);
   audit({ tool: "repo_write_agent_reply", repo_id: args.repo_id, paths: [result.written_path], counts: { answers: args.answers.length }, warnings: result.warnings });
   return createSuccessEnvelope(result, `Wrote structured reply for agent run ${result.run_id}, turn ${result.turn_index}.`);
 });

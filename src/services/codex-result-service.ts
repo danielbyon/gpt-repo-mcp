@@ -189,7 +189,7 @@ export class CodexResultService {
       detail: "compact",
       ...(modernBinding ? { paths: codexResult.changed_files } : {}),
       ...(input.max_files ? { max_files: input.max_files } : {})
-    });
+    }, input.run_id);
     if (manifest?.schema_version === 2 || manifest?.schema_version === 3) {
       integrity.head_matches_baseline = gitReview.head_sha === manifest.baseline.head_sha;
       if (!integrity.head_matches_baseline) warnings.push("CODEX_BASELINE_HEAD_MISMATCH");

@@ -3,7 +3,8 @@ import type { CodeIndexAction, CodeIndexResult } from "../contracts/code-index.c
 import type { CodeIntelligenceProvider, SymbolContextInput } from "../contracts/symbol-context.contract.js";
 import type { RepoConfig } from "./root-registry.js";
 import { findCodebaseMemoryProject, type CodebaseMemoryClient, type CodebaseMemoryClientFactory } from "./codebase-memory-client.js";
-import { CodebaseMemoryIndexService } from "./codebase-memory-index-service.js";
+import { CodebaseMemoryIndexService, type RegisteredRepoResolver } from "./codebase-memory-index-service.js";
+import type { TaskExecutionProviderGuard } from "./task-execution-boundary.js";
 
 const MAX_GRAPH_DEFINITIONS = 50;
 const MAX_TRACED_SYMBOLS = 8;
@@ -18,13 +19,18 @@ export class CodeIntelligenceService {
     this.indexService = new CodebaseMemoryIndexService(clientFactory, queryTimeoutMs, indexTimeoutMs);
   }
 
-  async enrich(repo: RepoConfig, input: SymbolContextInput): Promise<CodeIntelligenceProvider> {
+  async enrich(
+    repo: RepoConfig,
+    input: SymbolContextInput,
+    taskExecution?: TaskExecutionProviderGuard
+  ): Promise<CodeIntelligenceProvider> {
     if (this.indexService.isRunning(repo.root)) {
       return fallback("indexing", true, "Codebase Memory indexing is in progress.");
     }
 
     let client: CodebaseMemoryClient | undefined;
     const deadline = Date.now() + this.queryTimeoutMs;
+    await taskExecution?.revalidateBeforeProvider();
     try {
       client = await this.clientFactory(repo.root);
       const project = await findCodebaseMemoryProject(client, repo.root, remainingTimeout(deadline));
@@ -52,8 +58,8 @@ export class CodeIntelligenceService {
     }
   }
 
-  async index(repo: RepoConfig, action: CodeIndexAction): Promise<CodeIndexResult> {
-    return this.indexService.index(repo, action);
+  async index(repo: RepoConfig, action: CodeIndexAction, resolveRegisteredRepo?: RegisteredRepoResolver): Promise<CodeIndexResult> {
+    return this.indexService.index(repo, action, resolveRegisteredRepo);
   }
 
   private async searchDefinitions(
