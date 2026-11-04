@@ -396,8 +396,8 @@ describe("runProcessWithTail", () => {
     const invocation = startWindowsLeaderExitTree(root, pidPath, readyPath, "ignore");
     let pids: { leader: number; descendant: number } | undefined;
     try {
-      await waitForWindowsDescendantReady(invocation, readyPath);
-      pids = JSON.parse(await waitForFile(pidPath)) as { leader: number; descendant: number };
+      pids = await waitForWindowsDescendantSpawn(invocation, pidPath);
+      await waitForWindowsDescendantReady(invocation, pids, readyPath);
       await expectProcessGone(pids.leader);
       expect(isProcessAlive(pids.descendant)).toBe(true);
 
@@ -407,9 +407,11 @@ describe("runProcessWithTail", () => {
       expect(result).toMatchObject({ cancelled: true, cleanup_confirmed: true, signal: "SIGKILL" });
       await expectProcessGone(pids.descendant);
     } finally {
-      invocation.controller.abort();
-      await invocation.execution.catch(() => undefined);
-      await rm(root, { recursive: true, force: true });
+      try {
+        await cleanupWindowsInvocation(invocation, pidPath, readyPath, pids);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
     }
   }, 7_000);
 
@@ -420,8 +422,8 @@ describe("runProcessWithTail", () => {
     const invocation = startWindowsLeaderExitTree(root, pidPath, readyPath, "inherit");
     let pids: { leader: number; descendant: number } | undefined;
     try {
-      await waitForWindowsDescendantReady(invocation, readyPath);
-      pids = JSON.parse(await waitForFile(pidPath)) as { leader: number; descendant: number };
+      pids = await waitForWindowsDescendantSpawn(invocation, pidPath);
+      await waitForWindowsDescendantReady(invocation, pids, readyPath);
       await expectProcessGone(pids.leader);
       expect(isProcessAlive(pids.descendant)).toBe(true);
 
@@ -431,9 +433,11 @@ describe("runProcessWithTail", () => {
       expect(result).toMatchObject({ cancelled: true, cleanup_confirmed: true, signal: "SIGKILL" });
       await expectProcessGone(pids.descendant);
     } finally {
-      invocation.controller.abort();
-      await invocation.execution.catch(() => undefined);
-      await rm(root, { recursive: true, force: true });
+      try {
+        await cleanupWindowsInvocation(invocation, pidPath, readyPath, pids);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
     }
   }, 7_000);
 
@@ -444,17 +448,19 @@ describe("runProcessWithTail", () => {
     const invocation = startWindowsLeaderExitTree(root, pidPath, readyPath, "ignore", 1_000);
     let pids: { leader: number; descendant: number } | undefined;
     try {
-      await waitForWindowsDescendantReady(invocation, readyPath);
-      pids = JSON.parse(await waitForFile(pidPath)) as { leader: number; descendant: number };
+      pids = await waitForWindowsDescendantSpawn(invocation, pidPath);
+      await waitForWindowsDescendantReady(invocation, pids, readyPath);
       await expectProcessGone(pids.leader);
       const result = await invocation.execution;
 
       expect(result).toMatchObject({ timed_out: true, cancelled: false, cleanup_confirmed: true, signal: "SIGKILL" });
       await expectProcessGone(pids.descendant);
     } finally {
-      invocation.controller.abort();
-      await invocation.execution.catch(() => undefined);
-      await rm(root, { recursive: true, force: true });
+      try {
+        await cleanupWindowsInvocation(invocation, pidPath, readyPath, pids);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
     }
   }, 5_000);
 
@@ -471,13 +477,14 @@ describe("runProcessWithTail", () => {
     let firstPids: { leader: number; descendant: number } | undefined;
     let secondPids: { leader: number; descendant: number } | undefined;
     let outsiderPid: number | undefined;
+    let cleanupFailure: unknown;
     try {
+      firstPids = await waitForWindowsDescendantSpawn(first, join(root, "first.json"));
+      secondPids = await waitForWindowsDescendantSpawn(second, join(root, "second.json"));
       await Promise.all([
-        waitForWindowsDescendantReady(first, join(root, "first.ready")),
-        waitForWindowsDescendantReady(second, join(root, "second.ready"))
+        waitForWindowsDescendantReady(first, firstPids, join(root, "first.ready")),
+        waitForWindowsDescendantReady(second, secondPids, join(root, "second.ready"))
       ]);
-      firstPids = JSON.parse(await waitForFile(join(root, "first.json"))) as { leader: number; descendant: number };
-      secondPids = JSON.parse(await waitForFile(join(root, "second.json"))) as { leader: number; descendant: number };
       outsiderPid = Number(await waitForFile(outsiderReady));
 
       first.controller.abort();
@@ -493,12 +500,19 @@ describe("runProcessWithTail", () => {
       await expectProcessGone(secondPids.descendant);
       expect(isProcessAlive(outsiderPid)).toBe(true);
     } finally {
-      first.controller.abort();
-      second.controller.abort();
-      if (outsider.pid) outsider.kill("SIGKILL");
-      await Promise.all([first.execution.catch(() => undefined), second.execution.catch(() => undefined)]);
-      await rm(root, { recursive: true, force: true });
+      try {
+        const cleanup = await Promise.allSettled([
+          cleanupWindowsInvocation(first, join(root, "first.json"), join(root, "first.ready"), firstPids),
+          cleanupWindowsInvocation(second, join(root, "second.json"), join(root, "second.ready"), secondPids)
+        ]);
+        if (outsider.pid) outsider.kill("SIGKILL");
+        const failure = cleanup.find((result) => result.status === "rejected");
+        if (failure?.status === "rejected") cleanupFailure = failure.reason;
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
     }
+    if (cleanupFailure) throw cleanupFailure;
   }, 10_000);
 
   windowsTest("fails before command launch when Job initialization fails", async () => {
@@ -551,8 +565,8 @@ describe("runProcessWithTail", () => {
     }, true);
     let pids: { leader: number; descendant: number } | undefined;
     try {
-      await waitForWindowsDescendantReady(invocation, readyPath);
-      pids = JSON.parse(await waitForFile(pidPath)) as { leader: number; descendant: number };
+      pids = await waitForWindowsDescendantSpawn(invocation, pidPath);
+      await waitForWindowsDescendantReady(invocation, pids, readyPath);
       await expectProcessGone(pids.leader);
       invocation.controller.abort();
       const result = await invocation.execution;
@@ -560,9 +574,11 @@ describe("runProcessWithTail", () => {
       expect(result).toMatchObject({ cancelled: true, cleanup_confirmed: false, signal: "SIGKILL" });
       await expectProcessGone(pids.descendant);
     } finally {
-      invocation.controller.abort();
-      await invocation.execution.catch(() => undefined);
-      await rm(root, { recursive: true, force: true });
+      try {
+        await cleanupWindowsInvocation(invocation, pidPath, readyPath, pids);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
     }
   }, 7_000);
 
@@ -631,17 +647,19 @@ function startWindowsLeaderExitTree(
 ): Invocation {
   const controller = new AbortController();
   const descendantScript = [
-    "const { writeFileSync } = require('node:fs');",
+    "const { existsSync, writeFileSync } = require('node:fs');",
     "process.on('SIGTERM', () => {});",
     `writeFileSync(${JSON.stringify(readyPath)}, String(process.pid));`,
-    "setInterval(() => {}, 1_000);"
+    `setInterval(() => { if (existsSync(${JSON.stringify(cleanupPathFor(readyPath))})) { writeFileSync(${JSON.stringify(exitPathFor(readyPath))}, String(process.pid)); process.exit(0); } }, 20);`
   ].join(" ");
   const leaderScript = [
     "const { spawn } = require('node:child_process');",
-    "const { writeFileSync } = require('node:fs');",
+    "const { existsSync, writeFileSync } = require('node:fs');",
+    "let readinessPoll;",
     `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: ${JSON.stringify(stdio)} });`,
-    "descendant.once('error', (error) => { console.error('Descendant spawn failed:', error); process.exitCode = 1; });",
-    `descendant.once('spawn', () => { writeFileSync(${JSON.stringify(pidPath)}, JSON.stringify({ leader: process.pid, descendant: descendant.pid })); descendant.unref(); });`
+    "descendant.once('error', (error) => { if (readinessPoll) clearInterval(readinessPoll); console.error('Descendant spawn failed:', error); process.exitCode = 1; });",
+    `descendant.once('spawn', () => { writeFileSync(${JSON.stringify(pidPath)}, JSON.stringify({ leader: process.pid, descendant: descendant.pid })); readinessPoll = setInterval(() => { if (existsSync(${JSON.stringify(readyPath)}) || existsSync(${JSON.stringify(cleanupPathFor(readyPath))})) { clearInterval(readinessPoll); descendant.unref(); } }, 10); });`,
+    `descendant.once('exit', (code, signal) => { if (!existsSync(${JSON.stringify(readyPath)})) { if (readinessPoll) clearInterval(readinessPoll); console.error('Descendant exited before readiness:', code, signal); process.exitCode = 1; } });`
   ].join(" ");
   const processInput = {
     ...baseInput,
@@ -667,7 +685,49 @@ function testHostLaunch(input: { executable: string; args: string[] }) {
   };
 }
 
-async function waitForWindowsDescendantReady(invocation: Invocation, readyPath: string): Promise<void> {
+async function waitForWindowsDescendantSpawn(
+  invocation: Invocation,
+  pidPath: string
+): Promise<{ leader: number; descendant: number }> {
+  const outcome = await Promise.race([
+    waitForFile(pidPath).then(
+      (value) => ({ type: "spawned" as const, pids: JSON.parse(value) as { leader: number; descendant: number } }),
+      (error: unknown) => ({
+        type: error instanceof Error && error.message === `Timed out waiting for ${pidPath}.`
+          ? "timeout" as const
+          : "read-error" as const,
+        error
+      })
+    ),
+    invocation.execution.then(
+      (result) => ({ type: "completed" as const, result }),
+      (error: unknown) => ({ type: "failed" as const, error })
+    )
+  ]);
+
+  if (outcome.type === "spawned") return outcome.pids;
+  if (outcome.type === "completed") {
+    const pids = await readWindowsDescendantPids(pidPath);
+    if (pids) return pids;
+    throw new Error(`Windows process host completed before descendant spawn: ${JSON.stringify(outcome.result)}`);
+  }
+  if (outcome.type === "failed") {
+    throw new Error(`Windows process host failed before descendant spawn: ${String(outcome.error)}`);
+  }
+  if (outcome.type === "read-error") {
+    throw new Error(`Could not inspect Windows descendant spawn: ${String(outcome.error)}`);
+  }
+
+  invocation.controller.abort();
+  const result = await invocation.execution.catch((error: unknown) => ({ error: String(error) }));
+  throw new Error(`${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)} Host result: ${JSON.stringify(result)}`);
+}
+
+async function waitForWindowsDescendantReady(
+  invocation: Invocation,
+  pids: { leader: number; descendant: number },
+  readyPath: string
+): Promise<void> {
   const readinessController = new AbortController();
   const outcome = await Promise.race([
     waitForFile(readyPath, READY_TIMEOUT_MS, readinessController.signal).then(
@@ -688,7 +748,7 @@ async function waitForWindowsDescendantReady(invocation: Invocation, readyPath: 
 
   if (outcome.type === "ready") return;
   if (outcome.type === "completed") {
-    throw new Error(`Windows process host completed before descendant readiness: ${JSON.stringify(outcome.result)}`);
+    throw new Error(`Windows process host completed before descendant readiness (descendant_alive=${isProcessAlive(pids.descendant)}): ${JSON.stringify(outcome.result)}`);
   }
   if (outcome.type === "failed") {
     throw new Error(`Windows process host failed before descendant readiness: ${String(outcome.error)}`);
@@ -699,7 +759,40 @@ async function waitForWindowsDescendantReady(invocation: Invocation, readyPath: 
 
   invocation.controller.abort();
   const result = await invocation.execution.catch((error: unknown) => ({ error: String(error) }));
-  throw new Error(`${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)} Host result: ${JSON.stringify(result)}`);
+  throw new Error(`${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)} Host result: ${JSON.stringify(result)}, descendant_alive=${isProcessAlive(pids.descendant)}`);
+}
+
+async function cleanupWindowsInvocation(
+  invocation: Invocation,
+  pidPath: string,
+  readyPath: string,
+  knownPids?: { leader: number; descendant: number }
+): Promise<void> {
+  invocation.controller.abort();
+  await invocation.execution.catch(() => undefined);
+  const pids = knownPids ?? await readWindowsDescendantPids(pidPath);
+  if (!pids) return;
+  if (!isProcessAlive(pids.descendant)) return;
+
+  await writeFile(cleanupPathFor(readyPath), "stop");
+  await waitForFile(exitPathFor(readyPath), PROCESS_GONE_TIMEOUT_MS);
+}
+
+function cleanupPathFor(readyPath: string): string {
+  return readyPath.replace(/\.ready$/, ".cleanup");
+}
+
+function exitPathFor(readyPath: string): string {
+  return readyPath.replace(/\.ready$/, ".exit");
+}
+
+async function readWindowsDescendantPids(pidPath: string): Promise<{ leader: number; descendant: number } | undefined> {
+  try {
+    return JSON.parse(await readFile(pidPath, "utf8")) as { leader: number; descendant: number };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
 }
 
 async function waitForFile(path: string, timeoutMs = READY_TIMEOUT_MS, signal?: AbortSignal): Promise<string> {
