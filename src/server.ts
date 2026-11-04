@@ -6,6 +6,7 @@ import { RootRegistry } from "./services/root-registry.js";
 import { CodeIntelligenceService } from "./services/code-intelligence-service.js";
 import { createCodebaseMemoryClientFactory } from "./services/codebase-memory-client.js";
 import { createMcpServer } from "./register.js";
+import { attachMcpRequestCancellation } from "./runtime/mcp-request-cancellation.js";
 import type { RuntimeContext } from "./runtime/context.js";
 import { buildMcpRoutePatterns, isAuthorizedMcpPath, sanitizeMcpRouteForAudit } from "./runtime/mcp-routes.js";
 import { isAllowedBrowserOrigin, resolveServerHost } from "./runtime/network-boundary.js";
@@ -60,7 +61,7 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, name: "gpt-repo-mcp" });
 });
 
-function createMcpRequestContext(req: Request): RequestTelemetryContext {
+function createMcpRequestContext(req: Request, abortSignal?: AbortSignal): RequestTelemetryContext {
   const method = typeof req.body?.method === "string" ? req.body.method : undefined;
   const tool =
     method === "tools/call" && typeof req.body?.params?.name === "string"
@@ -69,6 +70,7 @@ function createMcpRequestContext(req: Request): RequestTelemetryContext {
 
   return {
     request_id: createRequestId(),
+    ...(abortSignal ? { abort_signal: abortSignal } : {}),
     http_method: req.method,
     route: sanitizeMcpRouteForAudit(req.path),
     mcp_session: typeof req.headers["mcp-session-id"] === "string" ? "present" : "missing",
@@ -102,7 +104,7 @@ function rejectUnauthorizedMcpPath(req: Request, res: Response): boolean {
 }
 
 app.post(mcpRoutePatterns, async (req: Request, res: Response) => {
-  const requestContext = createMcpRequestContext(req);
+  const requestContext = createMcpRequestContext(req, attachMcpRequestCancellation(req, res));
   const startedAt = Date.now();
   attachMcpRequestAuditing(res, requestContext, startedAt);
 

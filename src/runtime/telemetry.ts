@@ -4,6 +4,7 @@ import { redactSensitiveText } from "./result-envelope.js";
 
 export type RequestTelemetryContext = {
   request_id: string;
+  abort_signal?: AbortSignal;
   http_method?: string;
   route?: string;
   mcp_session?: "present" | "missing";

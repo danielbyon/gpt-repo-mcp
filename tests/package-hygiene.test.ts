@@ -92,7 +92,8 @@ describe("package boundary hygiene", () => {
       "README.md",
       "LICENSE",
       "dist/server.js",
-      "dist/cli/connect-gpt.js"
+      "dist/cli/connect-gpt.js",
+      "dist/windows-process-host.exe"
     ];
 
     expect(repositoryManifest.private).toBe(true);
@@ -106,6 +107,79 @@ describe("package boundary hygiene", () => {
     expect(inventory.entries).toEqual(expectedPaths);
     expect(inventory.entries).not.toContain("security/oss-security-policy.json");
   });
+
+  test("requires the Windows process host only for Windows package builds", async () => {
+    const files = [
+      "package.json",
+      "README.md",
+      "LICENSE",
+      "dist/server.js",
+      "dist/cli/connect-gpt.js",
+      "dist/windows-process-host.exe"
+    ];
+    const root = await fixturePackage(
+      { "README.md": "Setup guide.\n", "LICENSE": "License text.\n" },
+      { files }
+    );
+    const packedEntries = files.slice(0, -1).map((path) => ({ path }));
+    let packCalls = 0;
+    const packPackage = async () => {
+      packCalls += 1;
+      return { stdout: JSON.stringify([{ files: packedEntries }]) };
+    };
+
+    try {
+      const nonWindows = await checkPackageHygiene({ root, platform: "darwin", packPackage });
+      expect(nonWindows.ok).toBe(true);
+      expect(packCalls).toBe(1);
+
+      const windows = await checkPackageHygiene({ root, platform: "win32", packPackage });
+      expect(windows.ok).toBe(false);
+      expect(windows.blockers.some((blocker) =>
+        blocker.startsWith("package preflight could not inspect dist/windows-process-host.exe: ")
+      )).toBe(true);
+      expect(packCalls).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("checks the parent route before treating an absent Windows host as optional", async () => {
+    const externalRoot = await createTempDirectory("gpt-package-host-external-");
+    const root = await fixturePackage({}, {
+      files: ["dist/windows-process-host.exe"],
+      main: null,
+      bin: null
+    });
+    const hostPath = join(root, "dist", "windows-process-host.exe");
+    const inspectedHostPaths: string[] = [];
+    try {
+      await rm(join(root, "dist"), { recursive: true, force: true });
+      await mkdir(join(externalRoot, "dist"), { recursive: true });
+      await writeFile(join(externalRoot, "dist", "windows-process-host.exe"), "external host");
+      await symlink(externalRoot, join(root, "dist"));
+
+      const result = await checkPackageHygiene({
+        root,
+        platform: "darwin",
+        lstatPath: async (path: string) => {
+          if (path === hostPath) inspectedHostPaths.push(path);
+          return lstat(path);
+        },
+        packPackage: async () => {
+          throw new Error("npm pack must not run after a symlinked parent is found.");
+        }
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.blockers).toContain("symlink in package: dist");
+      expect(inspectedHostPaths).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(externalRoot, { recursive: true, force: true });
+    }
+  });
+
   test("accepts a manifest whose entry points and public resources are packed", () => {
     const result = evaluatePackageBoundary({ entries: cleanEntries, manifest });
     expect(result.ok).toBe(true);

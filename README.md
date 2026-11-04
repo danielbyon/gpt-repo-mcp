@@ -69,6 +69,12 @@ npm run build
 cp config.example.json config.local.json
 ```
 
+On Windows, run the build from a Visual Studio Developer PowerShell or
+Developer Command Prompt with C++ tools that match the installed Node
+architecture. The build creates the process host used by validation. Build on
+Windows before running the service there; builds made on other platforms do not
+include the Windows host.
+
 The copied starter config is valid and empty.
 
 ### 2. Approve a repository
@@ -220,6 +226,7 @@ See [Product principles](docs/PRODUCT.md), [Architecture](docs/ARCHITECTURE.md),
 - Node.js 20 or newer
 - npm
 - Git
+- On Windows, Visual Studio C++ build tools for the installed Node architecture
 - An HTTPS tunnel such as ngrok, or the supported secure tunnel flow
 - ChatGPT with Developer Mode access
 

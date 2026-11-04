@@ -7,6 +7,7 @@ This guide gets a local GPT Repo MCP (`gpt-repo-mcp`) server configured for appr
 - Node.js 20 or newer
 - npm
 - git
+- On Windows, Visual Studio C++ build tools for the installed Node architecture
 - ngrok for the built-in `npm run connect` convenience tunnel, or another HTTPS tunnel for manual setup
 - ChatGPT account with Developer Mode access
 
