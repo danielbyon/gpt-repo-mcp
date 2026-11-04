@@ -14,6 +14,7 @@ const crossSpawn = createRequire(import.meta.url)("cross-spawn") as {
   _parse(command: string, args: string[], options: { env: NodeJS.ProcessEnv }): {
     command: string;
     args: string[];
+    file?: string;
     options: { windowsVerbatimArguments?: boolean };
   };
 };
@@ -59,12 +60,14 @@ export async function runWindowsProcessWithTail(
 }
 
 function windowsHostArgs(input: WindowsProcessHostInput): string[] {
-  // Reuse cross-spawn's Windows quoting for command shims while keeping runner selection upstream.
+  // CreateProcessW treats its explicit application name as a path and does not search PATH.
+  // Use cross-spawn's resolved file for executables and preserve its command and quoting for shell shims.
   const parsed = crossSpawn._parse(input.executable, input.args, { env: input.env });
+  const executable = parsed.command === input.executable && parsed.file ? parsed.file : parsed.command;
   return [
     "--",
     ...(parsed.options.windowsVerbatimArguments ? ["--verbatim"] : []),
-    parsed.command,
+    executable,
     ...parsed.args
   ];
 }
