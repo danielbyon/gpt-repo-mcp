@@ -1,0 +1,19 @@
+.github/workflows/windows-baseline-diagnostic.yml
+  s_43a81d08f445f1::t_124676d7e37abe 1-66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ff308799b66b8d00a1ee55b067bd05cb9fb122dd",
+  "prompts": {},
+  "sessions": {
+    "s_43a81d08f445f1": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a4ed-7769-7680-8e19-f6043caaf6a5",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
