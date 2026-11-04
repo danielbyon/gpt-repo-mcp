@@ -392,8 +392,8 @@ describe("ValidationService", () => {
     }
   });
 
-  test("cancels a Make validation tree without writing a receipt", async () => {
-    const root = await fixtureRepo({});
+  test("cancels an npm validation tree without writing a receipt", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "node fixture.cjs" } });
     const parentPidPath = join(root, "parent.pid");
     const childReadyPath = join(root, "child.ready");
     const cleanupPath = join(root, "cleanup");
@@ -416,15 +416,12 @@ describe("ValidationService", () => {
       `writeFileSync(${JSON.stringify(parentPidPath)}, String(process.pid));`,
       "setInterval(() => {}, 1_000);"
     ].join("\n");
-    await writeFile(join(root, "Makefile"), "all:\n\tnode fixture.cjs\n");
     await writeFile(join(root, "fixture.cjs"), fixtureScript);
 
     const controller = new AbortController();
-    const validationPromise = service(root, {
-      validation_profiles: { all: { runner: "make", target: "all" } }
-    }).validate({
+    const validationPromise = service(root).validate({
       repo_id: "fixture",
-      profile: "all",
+      profile: "smoke",
       timeout_ms: 1_500
     }, { signal: controller.signal });
 
