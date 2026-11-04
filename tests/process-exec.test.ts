@@ -649,14 +649,18 @@ function startWindowsLeaderExitTree(
   const descendantScript = [
     "const { existsSync, writeFileSync } = require('node:fs');",
     "process.on('SIGTERM', () => {});",
-    `writeFileSync(${JSON.stringify(readyPath)}, String(process.pid));`,
-    `setInterval(() => { if (existsSync(${JSON.stringify(cleanupPathFor(readyPath))})) { writeFileSync(${JSON.stringify(exitPathFor(readyPath))}, String(process.pid)); process.exit(0); } }, 20);`
+    `setInterval(() => { if (existsSync(${JSON.stringify(cleanupPathFor(readyPath))})) { writeFileSync(${JSON.stringify(exitPathFor(readyPath))}, String(process.pid)); process.exit(0); } }, 20);`,
+    `writeFileSync(${JSON.stringify(readyPath)}, String(process.pid));`
   ].join(" ");
   const leaderScript = [
     "const { spawn } = require('node:child_process');",
     "const { existsSync, writeFileSync } = require('node:fs');",
     "let readinessPoll;",
-    `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: ${JSON.stringify(stdio)} });`,
+    // Node's non-detached Windows children normally join libuv's
+    // kill-on-close job.
+    // Detaching lets this child outlive the leader without requesting
+    // breakaway from the process-host Job Object.
+    `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: ${JSON.stringify(stdio)}, detached: true });`,
     "descendant.once('error', (error) => { if (readinessPoll) clearInterval(readinessPoll); console.error('Descendant spawn failed:', error); process.exitCode = 1; });",
     `descendant.once('spawn', () => { writeFileSync(${JSON.stringify(pidPath)}, JSON.stringify({ leader: process.pid, descendant: descendant.pid })); readinessPoll = setInterval(() => { if (existsSync(${JSON.stringify(readyPath)}) || existsSync(${JSON.stringify(cleanupPathFor(readyPath))})) { clearInterval(readinessPoll); descendant.unref(); } }, 10); });`,
     `descendant.once('exit', (code, signal) => { if (!existsSync(${JSON.stringify(readyPath)})) { if (readinessPoll) clearInterval(readinessPoll); console.error('Descendant exited before readiness:', code, signal); process.exitCode = 1; } });`
@@ -731,7 +735,12 @@ async function waitForWindowsDescendantReady(
   const readinessController = new AbortController();
   const outcome = await Promise.race([
     waitForFile(readyPath, READY_TIMEOUT_MS, readinessController.signal).then(
-      () => ({ type: "ready" as const }),
+      (readyPid) => Number(readyPid) === pids.descendant
+        ? ({ type: "ready" as const })
+        : ({
+            type: "read-error" as const,
+            error: new Error(`Readiness marker PID ${readyPid} did not match spawned descendant ${pids.descendant}.`)
+          }),
       (error: unknown) => ({
         type: error instanceof Error && error.message === `Timed out waiting for ${readyPath}.`
           ? "timeout" as const
