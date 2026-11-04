@@ -98,6 +98,7 @@ describe("ValidationService", () => {
     const result = await service(root, {
       validation_profiles: { all: { runner: "make", target: "verify" } }
     }).validate({ repo_id: "fixture", profile: "all" });
+    console.log("MAKE_RUNNER_DIAGNOSTIC_RESULT", JSON.stringify(result));
 
     expect(result).toMatchObject({
       status: "passed",

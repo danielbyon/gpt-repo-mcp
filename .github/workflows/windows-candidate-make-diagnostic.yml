@@ -1,0 +1,25 @@
+name: Windows candidate make diagnostic
+
+on:
+  push:
+    branches:
+      - codex/issue-44-windows-candidate-diagnostic
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - run: npm ci
+      - run: npm test -- tests/validation-service.test.ts -t "declared all profile uses canonical make verify"
