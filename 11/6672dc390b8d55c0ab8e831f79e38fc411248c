@@ -1,0 +1,19 @@
+tests/windows-process-host.test.ts
+  s_43a81d08f445f1::t_83f4b56e971f05 4,19-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "116672dc390b8d55c0ab8e831f79e38fc411248c",
+  "prompts": {},
+  "sessions": {
+    "s_43a81d08f445f1": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a4ed-7769-7680-8e19-f6043caaf6a5",
+        "model": "unknown"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
