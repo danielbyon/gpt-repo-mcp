@@ -24,6 +24,8 @@ jobs:
       - id: install
         run: npm ci
       - if: always() && steps.install.outcome == 'success'
+        run: npm test -- tests/server-network-boundary.test.ts
+      - if: always() && steps.install.outcome == 'success'
         run: npm test -- tests/windows-process-host.test.ts -t "PATH-only executable"
       - if: always() && steps.install.outcome == 'success'
         run: npm test -- tests/validation-service.test.ts -t "declared all profile uses canonical make verify"
