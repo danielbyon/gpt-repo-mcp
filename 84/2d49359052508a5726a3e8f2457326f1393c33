@@ -1,0 +1,14 @@
+.github/workflows/windows-candidate-make-diagnostic.yml
+  h_fe6a8a30e51ecc 26-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "842d49359052508a5726a3e8f2457326f1393c33",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
