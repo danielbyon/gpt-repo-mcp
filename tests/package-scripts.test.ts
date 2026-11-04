@@ -77,7 +77,7 @@ describe("package startup scripts", () => {
     expect(script).toContain("REPO_READER_LOG_FORMAT");
     expect(script).toContain("tunnel-client run");
     expect(script).toContain("Open ChatGPT connector settings");
-    expect(script).not.toContain("REPO_READER_PUBLIC_PATH_TOKEN");
+    expect(script).toContain("process.env.GPT_REPO_PUBLIC_PATH_TOKEN ?? process.env.REPO_READER_PUBLIC_PATH_TOKEN");
     expect(script).not.toContain("console.log(process.env.CONTROL_PLANE_API_KEY");
 
     const envExample = await readFile(join(process.cwd(), ".env.example"), "utf8");

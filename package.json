@@ -53,6 +53,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "express": "^5.1.0",
     "ignore": "^7.0.5",
+    "js-yaml": "^4.3.2",
     "typescript": "^5.9.3",
     "zod": "^4.6.6"
   },

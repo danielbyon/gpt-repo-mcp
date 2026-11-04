@@ -21,6 +21,14 @@ describe("server network boundary", () => {
     expect(server.output()).toContain(`http://127.0.0.1:${server.port}/mcp`);
   });
 
+  test("reports the effective port when the operating system assigns one", async () => {
+    const server = await startServer({ PORT: "0" });
+    await waitForHealth(server);
+
+    expect(server.port).toBeGreaterThan(0);
+    expect(server.output()).toContain(`http://127.0.0.1:${server.port}/mcp`);
+  });
+
   test("rejects an external bind unless it is explicitly authorized", async () => {
     const server = await startServer({ GPT_REPO_HOST: "0.0.0.0" });
     const exited = await waitForExit(server.child, 4_000);
@@ -122,7 +130,7 @@ async function initializeSession(port: number): Promise<{ status: number; sessio
 async function startServer(extraEnv: Record<string, string> = {}) {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "gpt-repo-network-boundary-"));
   const configPath = join(fixtureRoot, "config.json");
-  const port = await freePort();
+  const port = extraEnv.PORT === undefined ? await freePort() : Number(extraEnv.PORT);
   await writeFile(configPath, JSON.stringify({ repos: [], limits: {} }), "utf8");
   let output = "";
   const child = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
@@ -154,6 +162,10 @@ async function waitForHealth(server: Awaited<ReturnType<typeof startServer>>): P
   while (Date.now() < deadline) {
     if (server.child.exitCode !== null || server.child.signalCode !== null) {
       throw new Error(`Server exited before becoming healthy.\n${server.output()}`.trim());
+    }
+    if (server.port === 0) {
+      const boundPort = server.output().match(/gpt-repo-mcp listening on http:\/\/[^:]+:(\d+)\//)?.[1];
+      if (boundPort) server.port = Number(boundPort);
     }
     try {
       const response = await fetch(`http://127.0.0.1:${server.port}/health`, {

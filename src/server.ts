@@ -272,7 +272,11 @@ sessionCleanupTimer.unref();
 
 const httpServer = app.listen(port, host, () => {
   const localPath = publicPathToken ? "/t/[token]/mcp" : "/mcp";
-  console.error(`gpt-repo-mcp listening on http://${host}:${port}${localPath}`);
+  const address = httpServer.address();
+  const boundPort = address && typeof address !== "string" ? address.port : port;
+  const urlHost = host.replace(/^\[|\]$/g, "");
+  const urlAuthorityHost = urlHost.includes(":") ? `[${urlHost}]` : urlHost;
+  console.error(`gpt-repo-mcp listening on http://${urlAuthorityHost}:${boundPort}${localPath}`);
 });
 
 let shuttingDown = false;
