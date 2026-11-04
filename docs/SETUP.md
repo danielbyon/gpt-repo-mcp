@@ -200,7 +200,9 @@ You can also use `npm run tunnel` to start only the bundled ngrok command for lo
 
 ## Advanced: OpenAI Secure MCP Tunnel
 
-For longer-lived or private connector setups, and for workspaces that support it, use OpenAI Secure MCP Tunnel. Run `cp .env.example .env`, fill `.env` with your OpenAI Secure MCP Tunnel runtime API key, `tunnel-client` binary path, and profile name, then run `npm run connect:secure`. The profile name in `.env.example` is only a convention; create or configure that profile locally, or replace it with your own configured profile name. See [CONNECTION_OPTIONS.md](CONNECTION_OPTIONS.md) for connection details.
+For a longer-lived or private connector, use OpenAI Secure MCP Tunnel if your workspace supports it. Run `cp .env.example .env`, add your runtime API key, `tunnel-client` binary path, and profile name, then run `npm run connect:secure`. Before starting the tunnel, the launcher verifies MCP initialization and checks that `repo_list_roots` appears in discovery. It then waits for tunnel readiness and a successful control-plane poll.
+
+MCP startup has a `30s` default. Tunnel readiness has a separate `60s` default. Set `MCP_STARTUP_WAIT_TIMEOUT` or `TUNNEL_STARTUP_WAIT_TIMEOUT` to change either timeout. Both accept positive Go durations up to 10 minutes. The profile name in `.env.example` is a convention; create that profile locally or enter a profile you have configured. See [CONNECTION_OPTIONS.md](CONNECTION_OPTIONS.md) for connection details.
 
 ## How To Know It Worked
 
@@ -282,6 +284,8 @@ If a read, write, or cleanup path is unexpectedly blocked, ask ChatGPT to run `r
 - `config.local.json` is missing: run `cp config.example.json config.local.json`.
 - Unknown `repo_id`: run `npm run list`.
 - ChatGPT cannot connect through Secure MCP Tunnel: confirm `npm run connect:secure` is still running, refresh connector metadata, and verify the connector uses Tunnel.
+- Secure startup reports that the MCP port is occupied: stop the process using the configured `PORT`, or choose an unused port and retry.
+- Secure startup rejects a timeout: use a positive Go duration such as `30s` or `1m30s`; values over 10 minutes are rejected.
 - ChatGPT cannot connect through a public tunnel: confirm the URL is public HTTPS and exactly matches the current `/t/<token>/mcp` URL.
 - Tunnel URL changed: update or refresh the ChatGPT connector.
 - Port `8787` is busy: stop the process using it, then rerun `npm run connect`.
