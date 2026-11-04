@@ -396,8 +396,8 @@ describe("runProcessWithTail", () => {
     const invocation = startWindowsLeaderExitTree(root, pidPath, readyPath, "ignore");
     let pids: { leader: number; descendant: number } | undefined;
     try {
+      await waitForWindowsDescendantReady(invocation, readyPath);
       pids = JSON.parse(await waitForFile(pidPath)) as { leader: number; descendant: number };
-      await waitForFile(readyPath);
       await expectProcessGone(pids.leader);
       expect(isProcessAlive(pids.descendant)).toBe(true);
 
@@ -420,8 +420,8 @@ describe("runProcessWithTail", () => {
     const invocation = startWindowsLeaderExitTree(root, pidPath, readyPath, "inherit");
     let pids: { leader: number; descendant: number } | undefined;
     try {
+      await waitForWindowsDescendantReady(invocation, readyPath);
       pids = JSON.parse(await waitForFile(pidPath)) as { leader: number; descendant: number };
-      await waitForFile(readyPath);
       await expectProcessGone(pids.leader);
       expect(isProcessAlive(pids.descendant)).toBe(true);
 
@@ -444,8 +444,8 @@ describe("runProcessWithTail", () => {
     const invocation = startWindowsLeaderExitTree(root, pidPath, readyPath, "ignore", 1_000);
     let pids: { leader: number; descendant: number } | undefined;
     try {
+      await waitForWindowsDescendantReady(invocation, readyPath);
       pids = JSON.parse(await waitForFile(pidPath)) as { leader: number; descendant: number };
-      await waitForFile(readyPath);
       await expectProcessGone(pids.leader);
       const result = await invocation.execution;
 
@@ -472,10 +472,13 @@ describe("runProcessWithTail", () => {
     let secondPids: { leader: number; descendant: number } | undefined;
     let outsiderPid: number | undefined;
     try {
+      await Promise.all([
+        waitForWindowsDescendantReady(first, join(root, "first.ready")),
+        waitForWindowsDescendantReady(second, join(root, "second.ready"))
+      ]);
       firstPids = JSON.parse(await waitForFile(join(root, "first.json"))) as { leader: number; descendant: number };
       secondPids = JSON.parse(await waitForFile(join(root, "second.json"))) as { leader: number; descendant: number };
       outsiderPid = Number(await waitForFile(outsiderReady));
-      await Promise.all([waitForFile(join(root, "first.ready")), waitForFile(join(root, "second.ready"))]);
 
       first.controller.abort();
       const firstResult = await first.execution;
@@ -548,8 +551,8 @@ describe("runProcessWithTail", () => {
     }, true);
     let pids: { leader: number; descendant: number } | undefined;
     try {
+      await waitForWindowsDescendantReady(invocation, readyPath);
       pids = JSON.parse(await waitForFile(pidPath)) as { leader: number; descendant: number };
-      await waitForFile(readyPath);
       await expectProcessGone(pids.leader);
       invocation.controller.abort();
       const result = await invocation.execution;
@@ -637,8 +640,8 @@ function startWindowsLeaderExitTree(
     "const { spawn } = require('node:child_process');",
     "const { writeFileSync } = require('node:fs');",
     `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: ${JSON.stringify(stdio)} });`,
-    `writeFileSync(${JSON.stringify(pidPath)}, JSON.stringify({ leader: process.pid, descendant: descendant.pid }));`,
-    "descendant.unref();"
+    "descendant.once('error', (error) => { console.error('Descendant spawn failed:', error); process.exitCode = 1; });",
+    `descendant.once('spawn', () => { writeFileSync(${JSON.stringify(pidPath)}, JSON.stringify({ leader: process.pid, descendant: descendant.pid })); descendant.unref(); });`
   ].join(" ");
   const processInput = {
     ...baseInput,
@@ -664,14 +667,50 @@ function testHostLaunch(input: { executable: string; args: string[] }) {
   };
 }
 
-async function waitForFile(path: string, timeoutMs = READY_TIMEOUT_MS): Promise<string> {
+async function waitForWindowsDescendantReady(invocation: Invocation, readyPath: string): Promise<void> {
+  const readinessController = new AbortController();
+  const outcome = await Promise.race([
+    waitForFile(readyPath, READY_TIMEOUT_MS, readinessController.signal).then(
+      () => ({ type: "ready" as const }),
+      (error: unknown) => ({
+        type: error instanceof Error && error.message === `Timed out waiting for ${readyPath}.`
+          ? "timeout" as const
+          : "read-error" as const,
+        error
+      })
+    ),
+    invocation.execution.then(
+      (result) => ({ type: "completed" as const, result }),
+      (error: unknown) => ({ type: "failed" as const, error })
+    )
+  ]);
+  readinessController.abort();
+
+  if (outcome.type === "ready") return;
+  if (outcome.type === "completed") {
+    throw new Error(`Windows process host completed before descendant readiness: ${JSON.stringify(outcome.result)}`);
+  }
+  if (outcome.type === "failed") {
+    throw new Error(`Windows process host failed before descendant readiness: ${String(outcome.error)}`);
+  }
+  if (outcome.type === "read-error") {
+    throw new Error(`Could not inspect Windows descendant readiness: ${String(outcome.error)}`);
+  }
+
+  invocation.controller.abort();
+  const result = await invocation.execution.catch((error: unknown) => ({ error: String(error) }));
+  throw new Error(`${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)} Host result: ${JSON.stringify(result)}`);
+}
+
+async function waitForFile(path: string, timeoutMs = READY_TIMEOUT_MS, signal?: AbortSignal): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     try {
       return await readFile(path, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await delay(10);
+      await delay(10, undefined, signal ? { signal } : undefined);
     }
   }
   throw new Error(`Timed out waiting for ${path}.`);
