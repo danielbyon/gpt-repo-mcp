@@ -1,0 +1,66 @@
+name: Issue 44 Windows baseline diagnostic
+
+on:
+  push:
+    branches:
+      - codex/issue-44-windows-baseline-diagnostic
+
+permissions:
+  contents: read
+
+jobs:
+  windows-baseline:
+    name: Windows baseline / Node ${{ matrix.node-version }}
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - 20.x
+          - 22.x
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install dependencies
+        id: install
+        run: npm ci
+
+      - name: Typecheck
+        if: always() && steps.install.outcome == 'success'
+        run: npm run typecheck
+
+      - name: Contract tests
+        if: always() && steps.install.outcome == 'success'
+        run: npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts
+
+      - name: Full test suite
+        if: always() && steps.install.outcome == 'success'
+        run: npm test
+
+      - name: Lint
+        if: always() && steps.install.outcome == 'success'
+        run: npm run lint
+
+      - name: Public hygiene
+        if: always() && steps.install.outcome == 'success'
+        run: npm run check:public
+
+      - name: Build
+        if: always() && steps.install.outcome == 'success'
+        run: npm run build
+
+      - name: Whitespace check
+        if: always() && steps.install.outcome == 'success'
+        run: git diff --check
