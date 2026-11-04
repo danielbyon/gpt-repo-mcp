@@ -1,0 +1,16 @@
+.github/workflows/windows-candidate-make-diagnostic.yml
+  h_fe6a8a30e51ecc 24-29
+tests/windows-process-host.test.ts
+  h_fe6a8a30e51ecc 4,19-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8f3714a2204fd0436cc117b99fc0405ee9d0cbec",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
