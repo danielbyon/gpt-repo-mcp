@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, test, vi } from "vitest";
 import { runWindowsProcessWithTail } from "../src/services/windows-process-host.js";
@@ -16,6 +16,24 @@ const input = {
 };
 
 describe("runWindowsProcessWithTail", () => {
+  test.skipIf(process.platform !== "win32")(
+    "resolves a PATH-only executable before CreateProcess",
+    async () => {
+      const result = await runWindowsProcessWithTail({
+        ...input,
+        executable: "node",
+        args: ["-e", "process.stdout.write('resolved-from-path')"],
+        env: { PATH: dirname(process.execPath) }
+      });
+
+      expect(result).toMatchObject({
+        exit_code: 0,
+        cleanup_confirmed: true,
+        stdout_tail: "resolved-from-path"
+      });
+    }
+  );
+
   test("preserves bounded stdout and stderr plus the completed exit code", async () => {
     const result = await runWindowsProcessWithTail({ ...input, tail_bytes: 5 }, {
       executable: process.execPath,
