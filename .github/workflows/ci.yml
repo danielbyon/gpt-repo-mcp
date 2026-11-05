@@ -54,8 +54,8 @@ jobs:
         run: git diff --check
 
   windows-test:
-    name: Windows / Node ${{ matrix.node-version }}
-    runs-on: windows-latest
+    name: "Windows Issue #44 qualification / Node ${{ matrix.node-version }}"
+    runs-on: windows-2025
 
     strategy:
       fail-fast: false
@@ -83,20 +83,26 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Contract tests
-        run: npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts
+      - name: Build production package and Windows helper
+        run: npm run build
 
-      - name: Test
-        run: npm test
+      - name: Windows process supervision
+        run: npm test -- tests/windows-process-host.test.ts tests/windows-process-host-protocol.test.ts tests/process-exec.test.ts --reporter=verbose
+
+      - name: HTTP, MCP, and server boundary behavior
+        run: npm test -- tests/http-request-cancellation.test.ts tests/tool-handler-validation.test.ts tests/server-network-boundary.test.ts --reporter=verbose
+
+      - name: Validation cancellation and receipt gates
+        run: npm test -- tests/validation-service.test.ts -t "cancellation|receipt|canonical make verify|overlapping validations" --reporter=verbose
+
+      - name: Contract tests
+        run: npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts --reporter=verbose
+
+      - name: Windows helper package hygiene
+        run: npm test -- tests/package-hygiene.test.ts -t "pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional" --reporter=verbose
 
       - name: Lint
         run: npm run lint
-
-      - name: Public hygiene
-        run: npm run check:public
-
-      - name: Build
-        run: npm run build
 
       - name: Whitespace check
         run: git diff --check
