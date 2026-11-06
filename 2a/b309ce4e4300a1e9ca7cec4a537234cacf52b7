@@ -1,0 +1,25 @@
+tests/server-network-boundary.test.ts
+  s_275364cde43d2d::t_3d39bc180494c3 10-20,24,123,126-129,145,161,170,175,181,188-190,201-252,254-278,280,309,332-336,338-354,432-442,613,616-640,667-668,670,676,678
+.github/workflows/ci.yml
+  s_275364cde43d2d::t_3d39bc180494c3 89-91
+scripts/verify-windows-package.mjs
+  s_275364cde43d2d::t_3d39bc180494c3 1-185
+tests/tool-contracts.test.ts
+  s_275364cde43d2d::t_3d39bc180494c3 142-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2ab309ce4e4300a1e9ca7cec4a537234cacf52b7",
+  "prompts": {},
+  "sessions": {
+    "s_275364cde43d2d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a9d5-c835-7700-9cf9-ee249e38fc24",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
