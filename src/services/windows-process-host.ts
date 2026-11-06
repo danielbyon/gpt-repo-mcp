@@ -91,6 +91,7 @@ function superviseWindowsHost(
     let terminalResult: Extract<WindowsHostFrame, { type: "result" }> | undefined;
     let terminalResultAccepted = false;
     let protocolFailure: string | undefined;
+    let hostFailure: string | undefined;
     let spawnFailure: string | undefined;
     let helperSpawned = false;
     let childClosed = false;
@@ -185,6 +186,8 @@ function superviseWindowsHost(
         spawnFailure = `Windows process host could not start the command (error ${frame.error_code}).`;
       } else if (frame.status === "cleanup_unconfirmed") {
         protocolFailure = `Windows process host could not confirm cleanup (error ${frame.error_code}).`;
+      } else if (frame.status === "supervision_failed") {
+        hostFailure = `Windows process host reported a fatal supervision error (error ${frame.error_code}).`;
       } else if ((frame.status === "cancelled_before_start" || frame.status === "cancelled_confirmed") && !stopRequested) {
         cancelled = true;
       }
@@ -254,7 +257,7 @@ function superviseWindowsHost(
         return;
       }
       const cleanupConfirmed = terminalResult.status !== "cleanup_unconfirmed" && !protocolFailure;
-      finish(cleanupConfirmed, protocolFailure ?? spawnFailure);
+      finish(cleanupConfirmed, protocolFailure ?? hostFailure ?? spawnFailure);
     });
 
     input.signal?.addEventListener("abort", abortHandler, { once: true });

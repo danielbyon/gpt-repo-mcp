@@ -96,7 +96,7 @@ npm run add -- /path/to/your/repo --mode ship
 - `write`: read tools plus broad repo-local writes guarded by hard denied paths, secret checks, path sandboxing, and size limits.
 - `ship`: write mode plus local validation, git stage, commit, recover, and cleanup operations.
 
-No mode enables push, pull, reset, checkout, switch, rebase, merge, stash, clean, force, branch deletion, shell execution, or arbitrary command execution.
+No mode enables push, pull, reset, checkout, switch, rebase, merge, stash, clean, force, branch deletion, caller-controlled shell text, or general-purpose commands. Fixed, allowlisted validation profiles may run repository-defined targets, scripts, or recipes; use them only with trusted repository contents.
 
 Permission mode summary:
 
@@ -163,7 +163,7 @@ A `just`-based repository declares the same profile shape with the `just` runner
 }
 ```
 
-Targets are schema-allowlisted and executed directly as `make <target>` or `just <target>` without a shell. Output is streamed and only a bounded tail is retained. Existing configs without `validation_profiles` remain valid.
+Targets are schema-allowlisted and invoked as `make <target>` or `just <target>`. Repository targets may execute recipes or scripts. On Windows, `cmd.exe` may launch selected `.cmd` or `.bat` shims. Output is streamed and only a bounded tail is retained. Existing configs without `validation_profiles` remain valid.
 
 ## Doctor
 

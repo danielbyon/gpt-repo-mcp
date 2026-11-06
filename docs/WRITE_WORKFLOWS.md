@@ -36,7 +36,13 @@ npm run add -- /path/to/repo --mode ship
 
 `write` and `ship` use the same write policy. For clone-based solo-dev setup, that policy allows repo-local paths broadly with `allowed_globs: ["**"]` while the hard deny list still blocks `.env*`, private keys, Git internals, root and nested dependency directories, common generated/cache directories, coverage, test results, and virtual environments. The difference is that `ship` also enables the local operation policy for validation, stage, commit, recover, and cleanup.
 
-No mode adds shell execution or push, pull, reset, checkout, switch, rebase, merge, stash, clean, force, or branch deletion tools.
+`repo_validate` accepts fixed, allowlisted profiles and supported inputs. A
+selected profile may run repository scripts or recipes, which the server does
+not inspect or sandbox; run validation only on content you trust. On Windows,
+`cmd.exe` may serve as the OS-required launch shim for a selected `.cmd` or
+`.bat` runner. No mode accepts caller-supplied shell text, arbitrary executable selection,
+or free-form runner arguments. No mode provides push, pull, reset, checkout,
+switch, rebase, merge, stash, clean, force, or branch deletion tools.
 
 Manual config remains supported. The following is a full policy-shape example for documentation; replace `/absolute/path/to/repo` with a real local repository path before using it:
 

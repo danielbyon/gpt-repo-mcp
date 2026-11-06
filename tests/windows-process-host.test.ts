@@ -1,10 +1,11 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, test, vi } from "vitest";
 import { runWindowsProcessWithTail } from "../src/services/windows-process-host.js";
+import { waitForFile } from "./fixtures/file-event-wait.js";
 
 const input = {
   executable: process.execPath,
@@ -86,6 +87,34 @@ describe("runWindowsProcessWithTail", () => {
     expect(result).toMatchObject({ cleanup_confirmed: false, cancelled: false, timed_out: false });
     expect(result.exit_code).toBeUndefined();
   });
+
+  test("reports a confirmed supervision failure without classifying it as cancellation", async () => {
+    const result = await runWindowsProcessWithTail(input, {
+      executable: process.execPath,
+      args: ["-e", resultHost(5)]
+    });
+
+    expect(result).toMatchObject({ cancelled: false, timed_out: false, cleanup_confirmed: true });
+    expect(result.exit_code).toBeUndefined();
+    expect(result.stderr_tail).toContain("fatal supervision error (error 5)");
+  });
+
+  test.skipIf(process.platform !== "win32")(
+    "reports a native resume failure as a supervision error rather than cancellation",
+    async () => {
+      const result = await runWindowsProcessWithTail({
+        ...input,
+        env: { ...input.env, GPT_REPO_PROCESS_HOST_TEST_FAULT: "resume" }
+      }, {
+        executable: join(process.cwd(), "dist", "windows-process-host.test.exe"),
+        args: ["--", process.execPath]
+      });
+
+      expect(result).toMatchObject({ cancelled: false, timed_out: false, cleanup_confirmed: true });
+      expect(result.exit_code).toBeUndefined();
+      expect(result.stderr_tail).toContain("fatal supervision error (error 5)");
+    }
+  );
 
   test("does not retroactively cancel completion accepted before the abort", async () => {
     const root = await mkdtemp(join(tmpdir(), "gpt-windows-host-completion-race-"));
@@ -221,10 +250,26 @@ function cancellableHost(readyPath: string): string {
 
 function completedHostUntilRelease(releasePath: string): string {
   return [
-    "const { existsSync } = require('node:fs');",
-    "process.stdin.once('data', () => {",
+    "const { existsSync, watch } = require('node:fs');",
+    "const { basename, dirname } = require('node:path');",
+    `const releasePath = ${JSON.stringify(releasePath)};`,
+    "function waitForRelease() {",
+    "return new Promise((resolve, reject) => {",
+    "const releaseName = basename(releasePath);",
+    "const watcher = watch(dirname(releasePath), (_event, filename) => {",
+    "if (filename && filename.toString() !== releaseName) return;",
+    "if (existsSync(releasePath)) { watcher.close(); resolve(); }",
+    "});",
+    "watcher.once('error', error => { watcher.close(); reject(error); });",
+    "if (existsSync(releasePath)) { watcher.close(); resolve(); }",
+    "});",
+    "}",
+    "process.stdin.once('data', async () => {",
+    "const released = waitForRelease();",
     `process.stdout.write(${JSON.stringify(encodeResult(0, 0, 0).toString("base64"))}, 'base64');`,
-    `const poll = setInterval(() => { if (existsSync(${JSON.stringify(releasePath)})) { clearInterval(poll); process.stdin.destroy(); process.stdout.end(); } }, 5);`,
+    "await released;",
+    "process.stdin.destroy();",
+    "process.stdout.end();",
     "});"
   ].join(" ");
 }
@@ -251,16 +296,4 @@ function encodeResult(status: number, exitCode: number, errorCode: number): Buff
   payload.writeUInt32LE(exitCode, 1);
   payload.writeUInt32LE(errorCode, 5);
   return encodeFrame(3, payload);
-}
-
-async function waitForFile(path: string): Promise<string> {
-  for (let attempt = 0; attempt < 100; attempt++) {
-    try {
-      return await readFile(path, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-  throw new Error(`Timed out waiting for ${path}.`);
 }

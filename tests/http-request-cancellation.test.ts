@@ -1,10 +1,9 @@
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { readFile } from "node:fs/promises";
-import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, test } from "vitest";
 import { attachMcpRequestCancellation } from "../src/runtime/mcp-request-cancellation.js";
 import { runProcessWithTail } from "../src/services/process-exec.js";
+import { waitForFile } from "./fixtures/file-event-wait.js";
 import { createTempDir } from "./fixtures/temp-dir.js";
 
 describe("MCP HTTP request cancellation", () => {
@@ -73,7 +72,11 @@ describe("MCP HTTP request cancellation", () => {
           tail_bytes: 1_024,
           signal
         });
-        await waitForFile(childReadyPath);
+        const childPid = Number(await waitForFile(childReadyPath));
+        const parentPid = Number(await waitForFile(parentPidPath));
+        if (!isProcessAlive(parentPid) || !isProcessAlive(childPid)) {
+          throw new Error("The command tree exited before the client disconnected.");
+        }
         res.writeHead(200, { "Content-Type": "text/plain" });
         res.write("command running\n");
         completeExecution(await resultPromise);
@@ -93,32 +96,13 @@ describe("MCP HTTP request cancellation", () => {
 
     try {
       const result = await execution;
-      const parentPid = Number(await readFile(parentPidPath, "utf8"));
-      const childPid = Number(await readFile(childReadyPath, "utf8"));
-
-      expect(result.cancelled).toBe(true);
-      expect(result.timed_out).toBe(false);
-      await Promise.all([expectProcessGone(parentPid), expectProcessGone(childPid)]);
+      expect(result).toMatchObject({ cancelled: true, timed_out: false, cleanup_confirmed: true });
     } finally {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   }, 5_000);
 });
-
-async function waitForFile(path: string): Promise<void> {
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    try {
-      await readFile(path, "utf8");
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await delay(20);
-    }
-  }
-  throw new Error(`Timed out waiting for ${path}.`);
-}
 
 function isProcessAlive(pid: number): boolean {
   try {
@@ -128,10 +112,4 @@ function isProcessAlive(pid: number): boolean {
     if (error instanceof Error && "code" in error && error.code === "ESRCH") return false;
     throw error;
   }
-}
-
-async function expectProcessGone(pid: number): Promise<void> {
-  const deadline = Date.now() + 2_000;
-  while (isProcessAlive(pid) && Date.now() < deadline) await delay(20);
-  expect(isProcessAlive(pid)).toBe(false);
 }

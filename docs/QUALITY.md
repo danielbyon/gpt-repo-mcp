@@ -37,7 +37,9 @@ architecture, clear tool surface, and conservative safety model.
 
 ## Security Rules
 
-- Do not add shell execution or generic command execution.
+- Do not expose caller-supplied shell text, arbitrary executable selection, or free-form runner arguments. Keep validation limited to fixed profiles and their supported inputs.
+- On Windows, cross-spawn may invoke `cmd.exe` as the OS-required launch shim for a selected `.cmd` or `.bat` runner.
+- Validation profiles may execute repository-defined npm scripts, Make/Just recipes, or pytest code. GPT Repo MCP does not inspect or sandbox that code; running validation is the operator's responsibility. Run it only on repository contents you trust.
 - Do not weaken approved-root, path traversal, symlink, secret, denied glob, expected SHA, expected HEAD, or exact staged path checks.
 - Do not expose push, pull, reset, checkout, switch, rebase, merge, stash, clean, force, branch deletion, or arbitrary git command tools.
 - Prefer repo-relative paths in outputs and logs.
@@ -98,7 +100,7 @@ npm test -- tests/file-writer.test.ts tests/git-operations-service.test.ts tests
 2. Use mutating annotations and add the tool to the shared mutating tool list.
 3. Provide `dry_run` where practical.
 4. Require explicit repo-relative paths where paths are applicable.
-5. Do not use shell execution or arbitrary git/command runners.
+5. Do not expose caller-controlled shell text or arbitrary Git/command runners.
 6. Put authorization decisions in a policy or service layer.
 7. Put execution logic in a service, not a handler.
 8. Add focused service tests for policy, safety, dry-run, and mutation behavior.

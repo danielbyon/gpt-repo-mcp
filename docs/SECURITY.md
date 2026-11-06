@@ -16,10 +16,10 @@ control. For reporting a vulnerability, see the repository's
 | Repository access | Only repositories explicitly registered in local configuration are available |
 | File access | Paths are resolved inside the approved root and checked against exclusions and secret-path rules |
 | Writes | Disabled by default and limited by repository policy, path rules, size limits, stale-state checks, and secret scanning |
-| Validation | Limited to repository-approved test, build, lint, type-check, and smoke profiles |
+| Validation | Limited to fixed, allowlisted test, build, lint, type-check, smoke, and all profiles |
 | Git | Review, staging, recovery, and local commits use explicit paths and current-state checks |
 | Network | The server binds locally by default; tunnel URLs must be treated as sensitive temporary access links |
-| Automation | No arbitrary shell, automatic push, automatic deployment, or built-in implementation-agent runner |
+| Automation | No caller-controlled shell commands, automatic push, automatic deployment, or built-in implementation-agent runner |
 
 The model guides the workflow, but the server enforces these boundaries. A
 prompt cannot expand an approved root, enable a disabled capability, bypass a
@@ -110,14 +110,29 @@ notes.
 
 ## Validation Without A General Terminal
 
-ChatGPT can run only validation profiles enabled by the repository. Supported
-profiles cover tests, builds, linting, type checks, smoke checks, or the
-configured complete suite.
+ChatGPT can request only the fixed `test`, `build`, `lint`, `typecheck`,
+`smoke`, and `all` profiles when validation is enabled and the selected profile
+is available. The server resolves each profile to a configured `make` or
+`just` target, a matching `package.json` script, or the detected pytest
+fallback.
 
-The server maps those profiles to known project workflows and executes them
-without a shell. ChatGPT cannot provide a command string, add arbitrary command
-arguments, install a runtime, or invent a new script. Output is bounded and
-redacted before it is returned.
+For `test`, callers may supply `test_paths` only when configured
+`validation_test_path_globs` allow them and the selected runner supports focused
+paths. Each requested path is normalized to a repository-relative form, must match a
+configured `validation_test_path_globs` pattern, and must pass traversal and
+sensitive-path checks. The request is limited to `max_paths_per_operation` paths
+before duplicates are removed. Callers cannot supply command text, choose an
+executable, or pass free-form runner arguments.
+
+On Windows, cross-spawn may invoke `cmd.exe` as the OS-required launch shim for
+a selected `.cmd` or `.bat` runner. Cross-spawn builds and escapes that launch
+invocation. This shim is separate from the shells npm, Make, or Just may use to
+execute repository-defined scripts and recipes.
+
+Profile allowlisting controls runner selection. The selected runner can execute
+code from `package.json` scripts, Makefile or Justfile recipes, or pytest
+tests. GPT Repo MCP does not inspect or sandbox that code. Run validation only
+on repository contents you trust. Output is bounded and redacted.
 
 ## Git Review And Local Commits
 

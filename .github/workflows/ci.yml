@@ -54,7 +54,7 @@ jobs:
         run: git diff --check
 
   windows-test:
-    name: "Windows Issue #44 qualification / Node ${{ matrix.node-version }}"
+    name: "Windows cancellation qualification / Node ${{ matrix.node-version }}"
     runs-on: windows-2025
 
     strategy:

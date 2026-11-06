@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, lstat, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { access, lstat, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { delimiter, isAbsolute, join, relative, sep } from "node:path";
 import ignore from "ignore";
@@ -305,11 +305,12 @@ export class ValidationService {
   }
 
   /**
-   * Prepares a bound receipt while cancellation is allowed, then admits a
-   * non-cancellable publication step that updates the active `latest.json` pointer.
-   * The final abort check and start of the `latest.json` write run synchronously
-   * in one admission function, leaving no asynchronous gap in which cancellation
-   * could be missed.
+   * Writes the validation artifact before updating the active `latest.json`
+   * pointer. Cancellation before the pointer write removes the staged artifact.
+   * Once the pointer write starts, it completes even if the caller cancels.
+   *
+   * The final abort check and the start of the pointer write run synchronously,
+   * so cancellation cannot fall between them.
    */
   private async writeValidationArtifact(result: ValidateResult, signal?: AbortSignal): Promise<string> {
     const validationId = result.validation_id;
@@ -337,7 +338,6 @@ export class ValidationService {
       counts: result.counts,
       warnings: result.warnings
     };
-    await atomicWriteJson(join(this.root, artifactPath), artifact);
     const latestPointer = {
       schema_version: 1,
       validation_id: validationId,
@@ -354,7 +354,15 @@ export class ValidationService {
       signal?.throwIfAborted();
       return atomicWriteJson(join(this.root, VALIDATION_ROOT, "latest.json"), latestPointer);
     };
-    await admitReceiptCommit();
+    try {
+      await atomicWriteJson(join(this.root, artifactPath), artifact);
+      await admitReceiptCommit();
+    } catch (error) {
+      if (signal?.aborted) {
+        await rm(join(this.root, VALIDATION_ROOT, validationId), { recursive: true, force: true });
+      }
+      throw error;
+    }
     return artifactPath;
   }
 

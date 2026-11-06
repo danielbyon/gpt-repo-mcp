@@ -1,5 +1,4 @@
-import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
-import { setTimeout as delay } from "node:timers/promises";
+import { chmod, mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { ValidationService } from "../src/services/validation-service.js";
@@ -9,6 +8,7 @@ import { GitService } from "../src/services/git-service.js";
 import { ValidateInputSchema } from "../src/contracts/validation.contract.js";
 import { descriptions } from "../src/tools/descriptions.js";
 import type { NodeRuntimeResolverOptions } from "../src/services/node-runtime-resolver.js";
+import { waitForFile, waitForFileLineCount } from "./fixtures/file-event-wait.js";
 import { createTempDir } from "./fixtures/temp-dir.js";
 import * as processExec from "../src/services/process-exec.js";
 
@@ -18,12 +18,16 @@ describe("ValidationService", () => {
     expect(() => lastJsonLine("{\"ok\":true}\nmalformed")).toThrow(SyntaxError);
   });
 
-  test("tool and contract describe repo-owned priority plus safe fallbacks without shell execution", async () => {
-    expect(descriptions.repo_validate).toContain("repo-owned make or just target takes priority");
-    expect(descriptions.repo_validate).toContain("safe pytest");
-    expect(descriptions.repo_validate).toContain("bounded tail without a shell");
-    expect(descriptions.repo_validate).not.toContain("allowlisted package.json script profile");
-    expect(ValidateInputSchema.shape.profile.description).toContain("safe pytest");
+  test("tool and contract describe fixed profiles, constrained paths, and Windows launch behavior", async () => {
+    expect(descriptions.repo_validate).toContain("configured make or just target takes priority");
+    expect(descriptions.repo_validate).toContain("detected pytest fallback");
+    expect(descriptions.repo_validate).toContain("test_paths");
+    expect(descriptions.repo_validate).toContain("cmd.exe");
+    expect(descriptions.repo_validate).toContain("does not inspect or sandbox");
+    expect(descriptions.repo_validate).toContain("Callers cannot supply command text");
+    expect(descriptions.repo_validate).not.toContain("without a shell");
+    expect(ValidateInputSchema.shape.profile.description).toContain("detected pytest test fallback");
+    expect(ValidateInputSchema.shape.test_paths.description).toContain("validation_test_path_globs");
     const source = await readFile(join(process.cwd(), "src", "services", "validation-service.ts"), "utf8");
     expect(source).toContain("runProcessWithTail({");
     expect(source).not.toContain("shell: true");
@@ -425,23 +429,22 @@ describe("ValidationService", () => {
       timeout_ms: 1_500
     }, { signal: controller.signal });
 
-    let childPid: number | undefined;
-    let parentPid: number | undefined;
     try {
-      childPid = Number(await waitForFile(childReadyPath));
-      parentPid = Number(await readFile(parentPidPath, "utf8"));
+      const childPid = Number(await waitForFile(childReadyPath));
+      const parentPid = Number(await waitForFile(parentPidPath));
+      expect(isProcessAlive(parentPid)).toBe(true);
+      expect(isProcessAlive(childPid)).toBe(true);
       controller.abort();
 
       await expect(validationPromise).rejects.toMatchObject({ name: "AbortError" });
-      await Promise.all([expectProcessGone(parentPid), expectProcessGone(childPid)]);
+      expect(isProcessAlive(parentPid)).toBe(false);
+      expect(isProcessAlive(childPid)).toBe(false);
       await expect(readFile(join(root, ".chatgpt", "validation", "latest.json"), "utf8"))
         .rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       controller.abort();
       await writeFile(cleanupPath, "stop");
       await validationPromise.catch(() => undefined);
-      const pids = [parentPid, childPid].filter((pid): pid is number => pid !== undefined);
-      await Promise.all(pids.map(expectProcessGone));
     }
   }, 5_000);
 
@@ -503,7 +506,8 @@ describe("ValidationService", () => {
 
   test("cancellation during result staging does not admit receipt publication", async () => {
     const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
-    const latestPath = join(root, ".chatgpt", "validation", "latest.json");
+    const validationDirectory = join(root, ".chatgpt", "validation");
+    const latestPath = join(validationDirectory, "latest.json");
     const previousLatest = "previous-latest-receipt";
     await mkdir(join(root, ".chatgpt", "validation"), { recursive: true });
     await writeFile(latestPath, previousLatest);
@@ -527,6 +531,7 @@ describe("ValidationService", () => {
 
       await expect(validation).rejects.toMatchObject({ name: "AbortError" });
       expect(await readFile(latestPath, "utf8")).toBe(previousLatest);
+      expect((await readdir(validationDirectory)).sort()).toEqual(["latest.json"]);
     } finally {
       controller.abort();
       releaseStaging.resolve();
@@ -757,14 +762,19 @@ describe("ValidationService", () => {
     const startedPath = join(root, "started.txt");
     const releasePath = join(root, "release.txt");
     const runner = [
-      'const { appendFileSync, existsSync } = require("node:fs");',
-      `appendFileSync(${JSON.stringify(startedPath)}, String(process.pid) + "\\n");`,
+      'const { appendFileSync, existsSync, watch } = require("node:fs");',
+      'const { basename, dirname } = require("node:path");',
       `const releasePath = ${JSON.stringify(releasePath)};`,
-      "const gate = new Int32Array(new SharedArrayBuffer(4));",
-      "const deadline = Date.now() + 8_000;",
-      "while (!existsSync(releasePath) && Date.now() < deadline) Atomics.wait(gate, 0, 0, 20);",
-      "if (!existsSync(releasePath)) process.exit(2);",
-      "console.log(JSON.stringify({ pid: process.pid }));"
+      "let release;",
+      "const released = new Promise(resolve => { release = resolve; });",
+      "const releaseName = basename(releasePath);",
+      "const releaseWatcher = watch(dirname(releasePath), (_event, filename) => {",
+      "if (filename && filename.toString() !== releaseName) return;",
+      "if (existsSync(releasePath)) { releaseWatcher.close(); release(); }",
+      "});",
+      "if (existsSync(releasePath)) { releaseWatcher.close(); release(); }",
+      `appendFileSync(${JSON.stringify(startedPath)}, String(process.pid) + "\\n");`,
+      "released.then(() => console.log(JSON.stringify({ pid: process.pid })));"
     ].join("\n");
     await writeFile(join(root, "concurrent-validation.cjs"), runner);
 
@@ -812,33 +822,6 @@ describe("ValidationService", () => {
   });
 });
 
-async function waitForFile(path: string): Promise<string> {
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    try {
-      return await readFile(path, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await delay(20);
-    }
-  }
-  throw new Error(`Timed out waiting for ${path}.`);
-}
-
-async function waitForFileLineCount(path: string, count: number): Promise<string[]> {
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    try {
-      const lines = (await readFile(path, "utf8")).split(/\r?\n/).filter(Boolean);
-      if (lines.length >= count) return lines;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    await delay(20);
-  }
-  throw new Error(`Timed out waiting for ${count} lines in ${path}.`);
-}
-
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -847,12 +830,6 @@ function isProcessAlive(pid: number): boolean {
     if (error instanceof Error && "code" in error && error.code === "ESRCH") return false;
     throw error;
   }
-}
-
-async function expectProcessGone(pid: number): Promise<void> {
-  const deadline = Date.now() + 2_000;
-  while (isProcessAlive(pid) && Date.now() < deadline) await delay(20);
-  expect(isProcessAlive(pid)).toBe(false);
 }
 
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {

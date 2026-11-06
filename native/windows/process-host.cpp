@@ -74,7 +74,8 @@ enum class ResultStatus : BYTE {
   LaunchFailed = 1,
   CleanupUnconfirmed = 2,
   CancelledBeforeStart = 3,
-  CancelledConfirmed = 4
+  CancelledConfirmed = 4,
+  SupervisionFailed = 5
 };
 
 class UniqueHandle {
@@ -136,7 +137,7 @@ struct ReconcileResult {
 };
 
 #ifdef GPT_REPO_PROCESS_HOST_TESTING
-// Test builds recognize job-init, job-query, and job-terminate fault points.
+// Test builds can inject failures in process resume and Job Object operations.
 bool testFault(const wchar_t *name) {
   wchar_t value[64]{};
   const DWORD length =
@@ -650,13 +651,18 @@ int runHost(int argc, wchar_t *argv[]) {
   bool fatal = control.malformed || control.error != ERROR_SUCCESS;
   DWORD fatalError = control.malformed ? ERROR_INVALID_DATA : control.error;
   if (!fatal) {
-    const DWORD resumeCount = ResumeThread(primaryThread.get());
-    if (resumeCount == static_cast<DWORD>(-1)) {
+    if (testFault(L"resume")) {
       fatal = true;
-      fatalError = GetLastError();
-    } else if (resumeCount != 1) {
-      fatal = true;
-      fatalError = ERROR_INVALID_STATE;
+      fatalError = ERROR_ACCESS_DENIED;
+    } else {
+      const DWORD resumeCount = ResumeThread(primaryThread.get());
+      if (resumeCount == static_cast<DWORD>(-1)) {
+        fatal = true;
+        fatalError = GetLastError();
+      } else if (resumeCount != 1) {
+        fatal = true;
+        fatalError = ERROR_INVALID_STATE;
+      }
     }
   }
   primaryThread.reset();
@@ -672,7 +678,7 @@ int runHost(int argc, wchar_t *argv[]) {
     }
     WaitForSingleObject(stdoutReader.get(), INFINITE);
     WaitForSingleObject(stderrReader.get(), INFINITE);
-    writeResult(output, ResultStatus::LaunchFailed, 0, fatalError);
+    writeResult(output, ResultStatus::SupervisionFailed, 0, fatalError);
     return 1;
   }
 
@@ -758,7 +764,7 @@ int runHost(int argc, wchar_t *argv[]) {
   WaitForSingleObject(stdoutReader.get(), INFINITE);
   WaitForSingleObject(stderrReader.get(), INFINITE);
   if (fatal) {
-    writeResult(output, ResultStatus::CancelledConfirmed, ERROR_CANCELLED,
+    writeResult(output, ResultStatus::SupervisionFailed, 0,
                 fatalError == ERROR_SUCCESS ? cleanup.error : fatalError);
     return 1;
   }

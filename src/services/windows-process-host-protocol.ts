@@ -7,7 +7,8 @@ export type WindowsHostResultStatus =
   | "launch_failed"
   | "cleanup_unconfirmed"
   | "cancelled_before_start"
-  | "cancelled_confirmed";
+  | "cancelled_confirmed"
+  | "supervision_failed";
 
 export type WindowsHostFrame =
   | { type: "stdout"; payload: Buffer }
@@ -58,6 +59,7 @@ function resultStatus(value: number): WindowsHostResultStatus {
     case 2: return "cleanup_unconfirmed";
     case 3: return "cancelled_before_start";
     case 4: return "cancelled_confirmed";
+    case 5: return "supervision_failed";
     default: throw new Error(`Windows process host sent unknown result status ${value}.`);
   }
 }
