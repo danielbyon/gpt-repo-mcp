@@ -6,6 +6,7 @@ import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { redactSensitiveText } from "../src/runtime/result-envelope.js";
 
 type StartedServer = {
   child: ChildProcess;
@@ -159,9 +160,10 @@ describe("server network boundary", () => {
           if (latestLog) {
             const debugLog = await readFile(join(logDirectory, latestLog), "utf8");
             npmDebugSummary = debugLog.split(/\r?\n/)
-              .filter((line) => /npm (?:silly lifecycle|verbose (?:run-script|lifecycle|stack|code|exit)|info run|error )/i.test(line))
+              .filter((line) => /(?:silly lifecycle|verbose (?:run-script|lifecycle|stack|code|exit)|info run|error )/i.test(line))
               .slice(-40)
               .join("\n");
+            npmDebugSummary = redactSensitiveText(npmDebugSummary);
           } else {
             npmDebugSummary = `No npm log files captured (directory entries: ${logNames.join(", ") || "empty"}).`;
           }
