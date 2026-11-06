@@ -1,5 +1,5 @@
-import { chmod, mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
-import { delimiter, join } from "node:path";
+import { chmod, mkdir, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
+import { delimiter, dirname, join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { ValidationService } from "../src/services/validation-service.js";
 import { OperationsPolicy } from "../src/services/operations-policy.js";
@@ -18,14 +18,14 @@ describe("ValidationService", () => {
     expect(() => lastJsonLine("{\"ok\":true}\nmalformed")).toThrow(SyntaxError);
   });
 
-  test("tool and contract describe fixed profiles, constrained paths, and Windows launch behavior", async () => {
-    expect(descriptions.repo_validate).toContain("configured make or just target takes priority");
-    expect(descriptions.repo_validate).toContain("detected pytest fallback");
+  test("tool and contract describe fixed profiles, constrained paths, and shell-free Windows supervision", async () => {
+    expect(descriptions.repo_validate).toContain("Fixed Make/Just, npm, pytest profiles");
     expect(descriptions.repo_validate).toContain("test_paths");
-    expect(descriptions.repo_validate).toContain("cmd.exe");
-    expect(descriptions.repo_validate).toContain("does not inspect or sandbox");
-    expect(descriptions.repo_validate).toContain("Callers cannot supply command text");
-    expect(descriptions.repo_validate).not.toContain("without a shell");
+    expect(descriptions.repo_validate).toContain("absolute native paths and argv");
+    expect(descriptions.repo_validate).toContain("can start shells");
+    expect(descriptions.repo_validate).toContain("neither inspects nor sandboxes");
+    expect(descriptions.repo_validate).toContain("Callers cannot choose commands, executables, or args");
+    expect(descriptions.repo_validate).not.toContain("cmd.exe may launch");
     expect(ValidateInputSchema.shape.profile.description).toContain("detected pytest test fallback");
     expect(ValidateInputSchema.shape.test_paths.description).toContain("validation_test_path_globs");
     const source = await readFile(join(process.cwd(), "src", "services", "validation-service.ts"), "utf8");
@@ -60,6 +60,188 @@ describe("ValidationService", () => {
     const root = await fixtureRepo({ scripts: { test: "echo npm" }, pythonMarker: true, localPython: true });
     const result = await service(root).validate({ repo_id: "fixture", profile: "test", dry_run: true });
     expect(result.commands[0]?.command).toBe("npm run test");
+  });
+
+  test.skipIf(process.platform === "win32")("runs Windows npm validation through the pinned node.exe and its adjacent npm-cli.js", async () => {
+    const version = "24.18.0";
+    const root = await fixtureRepo({ scripts: { test: "node -e process.exit(0)" }, nodeVersion: version });
+    const runtime = await fakeWindowsNvmRuntime(version);
+    const npmCli = join(dirname(runtime.node), "node_modules", "npm", "bin", "npm-cli.js");
+    await mkdir(join(npmCli, ".."), { recursive: true });
+    await writeFile(npmCli, "process.exit(0);\n");
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail").mockResolvedValue({
+      exit_code: 0,
+      duration_ms: 1,
+      timed_out: false,
+      cancelled: false,
+      cleanup_confirmed: true,
+      stdout_tail: "",
+      stderr_tail: ""
+    });
+
+    try {
+      const result = await service(root, {}, runtime.options).validate({ repo_id: "fixture", profile: "test" });
+      expect(result.status).toBe("passed");
+      expect(processSpy).toHaveBeenCalledWith(expect.objectContaining({
+        executable: await realpath(runtime.node),
+        args: [await realpath(npmCli), "run", "test"],
+        env: expect.objectContaining({ PATH: `${dirname(await realpath(runtime.node))};${process.env.PATH ?? ""}` })
+      }));
+      expect(processSpy.mock.calls[0]?.[0].executable).not.toMatch(/npm(?:\.cmd)?$/i);
+    } finally {
+      processSpy.mockRestore();
+    }
+  });
+
+  test.skipIf(process.platform === "win32")("does not fall back to npm.cmd when the selected Node runtime lacks npm-cli.js", async () => {
+    const version = "24.18.0";
+    const root = await fixtureRepo({ scripts: { test: "node -e process.exit(0)" }, nodeVersion: version });
+    const runtime = await fakeWindowsNvmRuntime(version);
+    await writeFile(join(runtime.bin, "npm.cmd"), "@echo off\r\n");
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail");
+
+    try {
+      await expect(service(root, {}, runtime.options).validate({ repo_id: "fixture", profile: "test" }))
+        .rejects.toMatchObject({
+          code: "VALIDATION_PROFILE_UNAVAILABLE",
+          diagnostics: { recovery_hint: expect.stringContaining("npm.cmd") }
+        });
+      expect(processSpy).not.toHaveBeenCalled();
+    } finally {
+      processSpy.mockRestore();
+    }
+  });
+
+  test.skipIf(process.platform === "win32")("rejects a bundled npm CLI that resolves outside the selected Node installation", async () => {
+    const version = "24.18.0";
+    const root = await fixtureRepo({ scripts: { test: "node -e process.exit(0)" }, nodeVersion: version });
+    const runtime = await fakeWindowsNvmRuntime(version);
+    const npmDirectory = join(dirname(runtime.node), "node_modules", "npm", "bin");
+    const npmCli = join(npmDirectory, "npm-cli.js");
+    const outside = join(await createTempDir("gpt-untrusted-npm-cli-"), "npm-cli.js");
+    await mkdir(npmDirectory, { recursive: true });
+    await writeFile(outside, "process.exit(0);\n");
+    await symlink(outside, npmCli);
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail");
+
+    try {
+      await expect(service(root, {}, runtime.options).validate({ repo_id: "fixture", profile: "test" }))
+        .rejects.toMatchObject({ code: "VALIDATION_PROFILE_UNAVAILABLE" });
+      expect(processSpy).not.toHaveBeenCalled();
+    } finally {
+      processSpy.mockRestore();
+    }
+  });
+
+  test.skipIf(process.platform !== "win32")("runs Windows npm through the exact running Node and bundled npm CLI", async () => {
+    const version = process.version.slice(1);
+    const root = await fixtureRepo({ scripts: { test: "node -e process.exit(0)" }, nodeVersion: version });
+    const home = await createTempDir("gpt-windows-current-node-");
+    const runtimeOptions: NodeRuntimeResolverOptions = {
+      platform: "win32",
+      home,
+      env: {
+        NVM_HOME: join(home, "nvm"),
+        APPDATA: join(home, "roaming"),
+        LOCALAPPDATA: join(home, "local"),
+        FNM_DIR: join(home, "fnm"),
+        VOLTA_HOME: join(home, "volta"),
+        MISE_INSTALLS_DIR: join(home, "mise-installs"),
+        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {})
+      }
+    };
+    const executable = await realpath(process.execPath);
+    const npmCli = await realpath(join(dirname(executable), "node_modules", "npm", "bin", "npm-cli.js"));
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail").mockResolvedValue({
+      exit_code: 0,
+      duration_ms: 1,
+      timed_out: false,
+      cancelled: false,
+      cleanup_confirmed: true,
+      stdout_tail: "",
+      stderr_tail: ""
+    });
+
+    try {
+      const result = await service(root, {}, runtimeOptions).validate({ repo_id: "fixture", profile: "test" });
+      expect(result.status).toBe("passed");
+      expect(processSpy).toHaveBeenCalledWith(expect.objectContaining({
+        executable,
+        args: [npmCli, "run", "test"],
+        env: expect.objectContaining({ PATH: `${dirname(executable)};${process.env.PATH ?? ""}` })
+      }));
+    } finally {
+      processSpy.mockRestore();
+    }
+  });
+
+  test.each([
+    ["make", "make.exe"],
+    ["just", "just.exe"]
+  ] as const)("resolves the configured Windows %s profile to its native executable", async (runner, fileName) => {
+    const root = await fixtureRepo({});
+    const bin = await createTempDir("gpt native runner bin ");
+    const executable = join(bin, fileName);
+    await writeFile(executable, "MZ-native-test-fixture\n");
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail").mockResolvedValue({
+      exit_code: 0,
+      duration_ms: 1,
+      timed_out: false,
+      cancelled: false,
+      cleanup_confirmed: true,
+      stdout_tail: "",
+      stderr_tail: ""
+    });
+
+    try {
+      const result = await service(root, {
+        validation_profiles: { test: { runner, target: "unit" } }
+      }, { platform: "win32", env: { PATH: bin } }).validate({ repo_id: "fixture", profile: "test" });
+      expect(result.status).toBe("passed");
+      expect(processSpy).toHaveBeenCalledWith(expect.objectContaining({
+        executable: await realpath(executable),
+        args: ["unit"]
+      }));
+    } finally {
+      processSpy.mockRestore();
+    }
+  });
+
+  test.each(["make.cmd", "make.bat", "make.ps1"])("does not resolve Windows command shim %s", async (shim) => {
+    const root = await fixtureRepo({});
+    const bin = await createTempDir("gpt runner shim ");
+    await writeFile(join(bin, shim), "shim\n");
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail");
+
+    try {
+      await expect(service(root, {
+        validation_profiles: { test: { runner: "make", target: "unit" } }
+      }, { platform: "win32", env: { PATH: bin } }).validate({ repo_id: "fixture", profile: "test" }))
+        .rejects.toMatchObject({
+          code: "VALIDATION_PROFILE_UNAVAILABLE",
+          diagnostics: { recovery_hint: expect.stringContaining("native .exe") }
+        });
+      expect(processSpy).not.toHaveBeenCalled();
+    } finally {
+      processSpy.mockRestore();
+    }
+  });
+
+  test("does not select a repository-controlled make.exe from the worktree", async () => {
+    const root = await fixtureRepo({});
+    const executable = join(root, "make.exe");
+    await writeFile(executable, "MZ-repository-fixture\n");
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail");
+
+    try {
+      await expect(service(root, {
+        validation_profiles: { test: { runner: "make", target: "unit" } }
+      }, { platform: "win32", env: { PATH: root } }).validate({ repo_id: "fixture", profile: "test" }))
+        .rejects.toMatchObject({ code: "VALIDATION_PROFILE_UNAVAILABLE" });
+      expect(processSpy).not.toHaveBeenCalled();
+    } finally {
+      processSpy.mockRestore();
+    }
   });
 
   test("does not use pytest fallback for build", async () => {
@@ -466,10 +648,38 @@ describe("ValidationService", () => {
 
     try {
       await expect(service(root).validate({ repo_id: "fixture", profile: "smoke" }))
-        .rejects.toThrow("Validation process cleanup could not be confirmed");
+        .rejects.toMatchObject({ code: "VALIDATION_PROCESS_CLEANUP_UNCONFIRMED" });
       expect(await readFile(latestPath, "utf8")).toBe(previousReceipt);
     } finally {
       processSpy.mockRestore();
+    }
+  });
+
+  test("does not publish a validation receipt after process supervision fails", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
+    const validationDirectory = join(root, ".chatgpt", "validation");
+    const latestPath = join(validationDirectory, "latest.json");
+    const previousReceipt = "previous committed receipt";
+    await mkdir(validationDirectory, { recursive: true });
+    await writeFile(latestPath, previousReceipt);
+    const artifactsBefore = await readdir(validationDirectory);
+    vi.spyOn(processExec, "runProcessWithTail").mockResolvedValue({
+      timed_out: false,
+      cancelled: false,
+      cleanup_confirmed: true,
+      host_failure: "The process anchor could not be started.",
+      duration_ms: 1,
+      stdout_tail: "",
+      stderr_tail: ""
+    } as never);
+
+    try {
+      await expect(service(root).validate({ repo_id: "fixture", profile: "smoke" }))
+        .rejects.toMatchObject({ code: "VALIDATION_PROCESS_SUPERVISION_FAILED" });
+      expect(await readFile(latestPath, "utf8")).toBe(previousReceipt);
+      expect(await readdir(validationDirectory)).toEqual(artifactsBefore);
+    } finally {
+      vi.restoreAllMocks();
     }
   });
 
@@ -593,6 +803,38 @@ describe("ValidationService", () => {
     } finally {
       controller.abort();
       releaseCommit.resolve();
+      writeSpy.mockRestore();
+    }
+  });
+
+  test("preserves the result when an admitted receipt commit errors after publication", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
+    const latestPath = join(root, ".chatgpt", "validation", "latest.json");
+    const controller = new AbortController();
+    const originalWrite = fsHelpers.atomicWriteJson;
+    const writeSpy = vi.spyOn(fsHelpers, "atomicWriteJson").mockImplementation(async (path, value) => {
+      if (path.endsWith("latest.json")) {
+        await originalWrite(path, value);
+        controller.abort();
+        throw new Error("injected post-publication write error");
+      }
+      return originalWrite(path, value);
+    });
+
+    try {
+      await expect(service(root).validate({ repo_id: "fixture", profile: "smoke" }, { signal: controller.signal }))
+        .rejects.toThrow("injected post-publication write error");
+      const latest = JSON.parse(await readFile(latestPath, "utf8")) as {
+        validation_id?: string;
+        artifact_path?: string;
+      };
+      expect(latest.artifact_path).toBe(`.chatgpt/validation/${latest.validation_id}/result.json`);
+      const artifact = JSON.parse(await readFile(join(root, latest.artifact_path!), "utf8")) as {
+        validation_id?: string;
+      };
+      expect(artifact.validation_id).toBe(latest.validation_id);
+    } finally {
+      controller.abort();
       writeSpy.mockRestore();
     }
   });
@@ -921,6 +1163,17 @@ async function fakeNvmRuntime(version: string): Promise<{ home: string; options:
   const home = await createTempDir("gpt-runtime-home-");
   await fakeNodeExecutable(join(home, ".nvm", "versions", "node", `v${version}`, "bin", "node"), version);
   return { home, options: { home, env: {} } };
+}
+
+async function fakeWindowsNvmRuntime(version: string): Promise<{ bin: string; node: string; options: NodeRuntimeResolverOptions }> {
+  const home = await createTempDir("gpt-windows-runtime-home-");
+  const bin = await createTempDir("gpt-windows-runtime-bin-");
+  const node = await fakeNodeExecutable(join(home, "nvm", `v${version}`, "node.exe"), version);
+  return {
+    bin,
+    node,
+    options: { platform: "win32", home, env: { NVM_HOME: join(home, "nvm"), PATH: bin } }
+  };
 }
 
 async function fakeNodeExecutable(path: string, version: string): Promise<string> {

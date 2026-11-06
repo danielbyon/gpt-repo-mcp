@@ -78,6 +78,22 @@ enum class ResultStatus : BYTE {
   SupervisionFailed = 5
 };
 
+bool validTerminalResult(ResultStatus status, DWORD exitCode, DWORD errorCode) {
+  switch (status) {
+  case ResultStatus::Completed:
+    return errorCode == ERROR_SUCCESS;
+  case ResultStatus::LaunchFailed:
+  case ResultStatus::CleanupUnconfirmed:
+  case ResultStatus::SupervisionFailed:
+    return exitCode == 0 && errorCode != ERROR_SUCCESS;
+  case ResultStatus::CancelledBeforeStart:
+    return exitCode == 0 && errorCode == ERROR_SUCCESS;
+  case ResultStatus::CancelledConfirmed:
+    return exitCode == ERROR_CANCELLED && errorCode == ERROR_SUCCESS;
+  }
+  return false;
+}
+
 class UniqueHandle {
 public:
   explicit UniqueHandle(HANDLE handle = nullptr) : handle_(handle) {}
@@ -179,6 +195,8 @@ bool writeFrame(HANDLE output, std::mutex &outputMutex, BYTE type,
 
 bool writeResult(HANDLE output, ResultStatus status, DWORD exitCode,
                  DWORD errorCode) {
+  if (!validTerminalResult(status, exitCode, errorCode))
+    return false;
   BYTE payload[9]{};
   payload[0] = static_cast<BYTE>(status);
   for (unsigned int index = 0; index < 4; ++index) {
@@ -397,16 +415,8 @@ std::wstring quoteWindowsArgument(const wchar_t *argument) {
 }
 
 std::wstring makeCommandLine(const wchar_t *executable, int argc,
-                             wchar_t *argv[], int firstArgument,
-                             bool verbatim) {
+                             wchar_t *argv[], int firstArgument) {
   std::wstring commandLine = quoteWindowsArgument(executable);
-  if (verbatim) {
-    for (int index = firstArgument; index < argc; ++index) {
-      commandLine.push_back(L' ');
-      commandLine.append(argv[index]);
-    }
-    return commandLine;
-  }
   for (int index = firstArgument; index < argc; ++index) {
     commandLine.push_back(L' ');
     commandLine.append(quoteWindowsArgument(argv[index]));
@@ -459,7 +469,7 @@ bool makeChildPipe(UniqueHandle &parentRead, UniqueHandle &childWrite) {
 }
 
 DWORD createCommandProcess(const wchar_t *executable, int argc, wchar_t *argv[],
-                           int firstArgument, bool verbatim, HANDLE job,
+                           int firstArgument, HANDLE job,
                            PROCESS_INFORMATION &processInfo,
                            UniqueHandle &stdoutRead, UniqueHandle &stderrRead,
                            UniqueHandle &stdoutWrite,
@@ -504,7 +514,7 @@ DWORD createCommandProcess(const wchar_t *executable, int argc, wchar_t *argv[],
   startup.lpAttributeList = attributes.get();
 
   std::wstring commandLine =
-      makeCommandLine(executable, argc, argv, firstArgument, verbatim);
+      makeCommandLine(executable, argc, argv, firstArgument);
   if (commandLine.empty() || commandLine.size() >= kMaximumCommandLineChars)
     return ERROR_FILENAME_EXCED_RANGE;
   std::vector<wchar_t> mutableCommandLine(commandLine.begin(),
@@ -552,8 +562,7 @@ int runHost(int argc, wchar_t *argv[]) {
     writeResult(output, ResultStatus::LaunchFailed, 0, ERROR_INVALID_PARAMETER);
     return 1;
   }
-  const bool verbatim = std::wcscmp(argv[2], L"--verbatim") == 0;
-  const int executableIndex = verbatim ? 3 : 2;
+  const int executableIndex = 2;
   if (argc <= executableIndex || argv[executableIndex][0] == L'\0') {
     writeResult(output, ResultStatus::LaunchFailed, 0, ERROR_INVALID_PARAMETER);
     return 1;
@@ -592,7 +601,7 @@ int runHost(int argc, wchar_t *argv[]) {
   UniqueHandle stderrWrite;
   PROCESS_INFORMATION processInfo{};
   const DWORD launchError = createCommandProcess(
-      argv[executableIndex], argc, argv, executableIndex + 1, verbatim,
+      argv[executableIndex], argc, argv, executableIndex + 1,
       job.get(), processInfo, stdoutRead, stderrRead, stdoutWrite, stderrWrite);
   if (launchError != ERROR_SUCCESS) {
     pollControl(input, control, true);

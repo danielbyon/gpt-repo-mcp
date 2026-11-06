@@ -90,7 +90,7 @@ type GroupAnchorMessage = {
   signal?: unknown;
 };
 
-type StopReason = "timeout" | "cancelled";
+type StopReason = "timeout" | "cancelled" | "host_failure";
 type SignalAttempt = "sent" | "gone" | "failed";
 
 export type ProcessTailResult = {
@@ -100,6 +100,8 @@ export type ProcessTailResult = {
   cancelled: boolean;
   /** True when no command started or the managed process group/job is confirmed empty. */
   cleanup_confirmed?: boolean;
+  /** Present when the supervisor itself failed, even if process cleanup was confirmed. */
+  host_failure?: string;
   duration_ms: number;
   stdout_tail: string;
   stderr_tail: string;
@@ -161,12 +163,15 @@ async function superviseSpawnedProcessWithTail(
     let cancelled = false;
     let stopRequested = false;
     let settled = false;
+    let anchorSpawned = false;
     let anchorReady = false;
     let commandStartSent = false;
     let commandCompleted: { exit_code?: number; signal?: string } | undefined;
     let completionCleanup = false;
     let noTaskStarted = false;
     let childClosed = false;
+    let spawnFailure: string | undefined;
+    let hostFailure: string | undefined;
     let closedResult: { exit_code?: number; signal?: string } = {};
     let forced = false;
     let controlBuffer = "";
@@ -209,6 +214,7 @@ async function superviseSpawnedProcessWithTail(
         timed_out: result.timed_out ?? timedOut,
         cancelled: result.cancelled ?? cancelled,
         ...(result.cleanup_confirmed !== undefined ? { cleanup_confirmed: result.cleanup_confirmed } : {}),
+        ...(hostFailure ? { host_failure: hostFailure } : {}),
         duration_ms: Date.now() - started,
         stdout_tail: stdout.toString("utf8"),
         stderr_tail: stderrText
@@ -227,6 +233,7 @@ async function superviseSpawnedProcessWithTail(
     };
 
     const scheduleGroupVerification = (): void => {
+      if (groupPollTimer) clearTimeout(groupPollTimer);
       forceDeadline = Date.now() + FORCE_SETTLE_GRACE_MS;
       const verify = (): void => {
         if (settled) return;
@@ -263,47 +270,52 @@ async function superviseSpawnedProcessWithTail(
       }
     };
 
+    const killAnchor = (): void => {
+      try {
+        if (!child.kill("SIGKILL")) {
+          hostFailure ??= "The process supervisor could not signal its anchor.";
+        }
+      } catch (error) {
+        hostFailure ??= `The process supervisor could not signal its anchor: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    };
+
     const scheduleNoStartCleanup = (): void => {
       if (forceSettleTimer) clearTimeout(forceSettleTimer);
       forceSettleTimer = setTimeout(() => {
         if (settled) return;
         if (childClosed) {
-          finishStopped(true);
+          scheduleGroupVerification();
           return;
         }
-        child.kill("SIGKILL");
-        forceSettleTimer = setTimeout(() => {
-          if (!childClosed) {
-            child.stdout.destroy();
-            child.stderr.destroy();
-            child.stdin?.destroy();
-            child.unref();
-          }
-          finishStopped(childClosed);
-        }, FORCE_SETTLE_GRACE_MS);
+        killAnchor();
+        scheduleGroupVerification();
+      }, TERMINATION_GRACE_MS);
+    };
+
+    const schedulePreReadyCleanup = (): void => {
+      if (preReadyTimer) clearTimeout(preReadyTimer);
+      preReadyTimer = setTimeout(() => {
+        if (settled || anchorReady || childClosed) return;
+        noTaskStarted = true;
+        killAnchor();
+        scheduleGroupVerification();
       }, TERMINATION_GRACE_MS);
     };
 
     const beginTermination = (): void => {
-      if (input.anchored && (!child.pid || child.exitCode !== null || child.signalCode !== null || childClosed)) {
-        if (childClosed) {
-          finishStopped(false);
-        } else {
-          forceSettleTimer = setTimeout(() => {
-            child.stdout.destroy();
-            child.stderr.destroy();
-            child.stdin?.destroy();
-            child.unref();
-            finishStopped(false);
-          }, FORCE_SETTLE_GRACE_MS);
-        }
+      if (input.anchored && (!anchorSpawned || !child.pid || child.exitCode !== null || child.signalCode !== null || childClosed)) {
+        scheduleGroupVerification();
         return;
       }
-      terminateProcessTree(child, "SIGTERM");
+      const gracefulAttempt = terminateProcessTree(child, "SIGTERM");
+      if (gracefulAttempt === "failed") {
+        hostFailure ??= "The process supervisor could not signal the managed process group.";
+      }
       forceTimer = setTimeout(() => {
         if (settled) return;
-        if (childClosed) {
-          finishStopped(false);
+        if (childClosed || child.exitCode !== null || child.signalCode !== null) {
+          scheduleGroupVerification();
           return;
         }
 
@@ -316,9 +328,8 @@ async function superviseSpawnedProcessWithTail(
         forced = true;
         const attempt = terminateProcessTree(child, "SIGKILL");
         if (input.anchored && attempt === "failed") {
-          child.kill("SIGKILL");
-          scheduleGroupVerification();
-          return;
+          hostFailure ??= "The process supervisor could not force-stop the managed process group.";
+          killAnchor();
         }
         scheduleGroupVerification();
       }, TERMINATION_GRACE_MS);
@@ -336,22 +347,9 @@ async function superviseSpawnedProcessWithTail(
         beginTermination();
         return;
       }
+      if (!anchorSpawned) return;
       if (!anchorReady) {
-        preReadyTimer = setTimeout(() => {
-          if (settled || anchorReady) return;
-          noTaskStarted = true;
-          child.kill("SIGKILL");
-          forceSettleTimer = setTimeout(() => {
-            if (childClosed) finishStopped(true);
-            else {
-              child.stdout.destroy();
-              child.stderr.destroy();
-              child.stdin?.destroy();
-              child.unref();
-              finishStopped(false);
-            }
-          }, FORCE_SETTLE_GRACE_MS);
-        }, TERMINATION_GRACE_MS);
+        schedulePreReadyCleanup();
         return;
       }
       if (!commandStartSent) {
@@ -375,7 +373,10 @@ async function superviseSpawnedProcessWithTail(
           scheduleNoStartCleanup();
         } else {
           commandStartSent = sendControl("start");
-          if (!commandStartSent) stop("cancelled");
+          if (!commandStartSent) {
+            hostFailure ??= "The process supervisor could not admit the command to its anchor.";
+            stop("host_failure");
+          }
         }
         return;
       }
@@ -407,7 +408,10 @@ async function superviseSpawnedProcessWithTail(
         controlBuffer += chunk;
         if (controlBuffer.length > 4_096) {
           controlBuffer = "";
-          if (!stopRequested) stop("timeout");
+          if (!stopRequested) {
+            hostFailure ??= "The process supervisor received an oversized control message.";
+            stop("host_failure");
+          }
           return;
         }
         const lines = controlBuffer.split("\n");
@@ -417,23 +421,33 @@ async function superviseSpawnedProcessWithTail(
           try {
             acceptControlMessage(JSON.parse(line) as GroupAnchorMessage);
           } catch {
-            if (!stopRequested) stop("timeout");
+            if (!stopRequested) {
+              hostFailure ??= "The process supervisor received malformed control data.";
+              stop("host_failure");
+            }
           }
         }
       });
     }
 
-    child.stdin?.on("error", () => {
-      if (!completionCleanup && stopRequested && noTaskStarted) scheduleNoStartCleanup();
+    child.stdin?.on("error", (error: Error) => {
+      hostFailure ??= `The process supervisor control channel failed: ${error.message}`;
+      if (!completionCleanup && !stopRequested) stop("host_failure");
+      else if (!completionCleanup && noTaskStarted) scheduleNoStartCleanup();
     });
 
+    child.once("spawn", () => {
+      anchorSpawned = true;
+      if (stopRequested && !anchorReady) schedulePreReadyCleanup();
+    });
     child.once("error", (error) => {
-      finish({
-        timed_out: timedOut,
-        cancelled,
-        ...(input.anchored ? { cleanup_confirmed: !commandStartSent } : { cleanup_confirmed: false }),
-        stderrSuffix: error.message
-      });
+      if (!anchorSpawned) {
+        spawnFailure = error.message;
+        hostFailure = `The process supervisor could not start its anchor: ${error.message}`;
+        return;
+      }
+      hostFailure ??= `The process supervisor reported an error after spawn: ${error.message}`;
+      if (!stopRequested) stop("host_failure");
     });
     child.once("close", (code, signal) => {
       childClosed = true;
@@ -441,19 +455,27 @@ async function superviseSpawnedProcessWithTail(
         ...(typeof code === "number" ? { exit_code: code } : {}),
         ...(signal ? { signal } : {})
       };
+      if (!anchorSpawned) {
+        if (!spawnFailure) hostFailure ??= "The process supervisor closed before spawn was confirmed.";
+        finish({
+          timed_out: timedOut,
+          cancelled,
+          cleanup_confirmed: Boolean(spawnFailure),
+          stderrSuffix: spawnFailure
+        });
+        return;
+      }
       if (completionCleanup) {
         if (forceSettleTimer) clearTimeout(forceSettleTimer);
         scheduleGroupVerification();
+      } else if (!commandStartSent) {
+        hostFailure ??= "The process supervisor exited before command admission.";
+        noTaskStarted = true;
+        scheduleGroupVerification();
       } else if (!stopRequested) {
-        finish({
-          ...closedResult,
-          timed_out: timedOut,
-          cancelled,
-          ...(input.anchored ? { cleanup_confirmed: !commandStartSent } : { cleanup_confirmed: false })
-        });
-      } else if (noTaskStarted) {
-        finishStopped(true);
-      } else if (forced) {
+        hostFailure ??= "The process supervisor exited before reporting command completion.";
+        scheduleGroupVerification();
+      } else if (noTaskStarted || forced || stopRequested) {
         if (forceSettleTimer) clearTimeout(forceSettleTimer);
         scheduleGroupVerification();
       }

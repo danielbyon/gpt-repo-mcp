@@ -122,11 +122,14 @@ For the OpenAI Secure MCP Tunnel, use `npm run connect:secure` and follow the
 
 No mode accepts caller-supplied shell text, arbitrary executable selection, or
 free-form runner arguments. Validation accepts fixed, allowlisted profiles and
-supported inputs; those profiles may run repository scripts or recipes, so run
-validation only on content you trust. On Windows, `cmd.exe` may serve as the
-OS-required launch shim for a selected `.cmd` or `.bat` runner. No mode
-provides push, pull, reset, checkout, switch, rebase, merge, stash, clean,
-force, or branch deletion tools.
+supported inputs. On Windows, the supervisor launches supported native
+executables by absolute path and passes arguments separately. npm runs through
+the selected `node.exe` and its bundled `npm-cli.js`; Make and Just use native
+executables. Command shims and shell fallback are rejected. Repository scripts,
+recipes, and tests may start shells, including `cmd.exe`; GPT Repo MCP does not
+inspect or sandbox those executions. Run validation only on content you trust.
+No mode provides push, pull, reset, checkout, switch, rebase, merge, stash,
+clean, force, or branch deletion tools.
 
 ## Try It In ChatGPT
 

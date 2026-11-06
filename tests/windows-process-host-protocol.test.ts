@@ -35,6 +35,27 @@ describe("decodeWindowsHostFrames", () => {
     expect(() => decodeWindowsHostFrames(frame(3, Buffer.alloc(8)))).toThrow(/result frame/i);
     expect(() => decodeWindowsHostFrames(frame(3, Buffer.from([99, 0, 0, 0, 0, 0, 0, 0, 0])))).toThrow(/result status/i);
   });
+
+  test.each([
+    [0, 0, 5, "completed result with native error"],
+    [1, 0, 0, "launch failure without native error"],
+    [2, 0, 0, "unconfirmed cleanup without native error"],
+    [3, 1, 0, "pre-start cancellation with an exit code"],
+    [4, 0, 0, "confirmed cancellation without the cancellation code"],
+    [5, 0, 0, "supervision failure without native error"]
+  ])("rejects contradictory terminal metadata: %s", (status, exitCode, errorCode) => {
+    expect(() => decodeWindowsHostFrames(resultFrame(status, exitCode, errorCode)))
+      .toThrow(/contradictory terminal result/i);
+  });
+
+  test("keeps normal nonzero command exits as completed results", () => {
+    expect(decodeWindowsHostFrames(resultFrame(0, 7, 0)).frames).toEqual([{
+      type: "result",
+      status: "completed",
+      exit_code: 7,
+      error_code: 0
+    }]);
+  });
 });
 
 function frame(type: number, payload: Buffer): Buffer {
@@ -42,4 +63,12 @@ function frame(type: number, payload: Buffer): Buffer {
   header.writeUInt8(type, 0);
   header.writeUInt32LE(payload.length, 1);
   return Buffer.concat([header, payload]);
+}
+
+function resultFrame(status: number, exitCode: number, errorCode: number): Buffer {
+  const payload = Buffer.alloc(9);
+  payload.writeUInt8(status, 0);
+  payload.writeUInt32LE(exitCode, 1);
+  payload.writeUInt32LE(errorCode, 5);
+  return frame(3, payload);
 }

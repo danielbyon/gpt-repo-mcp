@@ -1,23 +1,27 @@
 import { existsSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { basename, dirname, extname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ProcessTailResult } from "./process-exec.js";
-import { decodeWindowsHostFrames, type WindowsHostFrame } from "./windows-process-host-protocol.js";
+import {
+  assertWindowsHostTerminalResult,
+  decodeWindowsHostFrames,
+  type WindowsHostFrame
+} from "./windows-process-host-protocol.js";
 
 const START_COMMAND = 0x53;
 const CANCEL_COMMAND = 0x43;
 const FORCE_SETTLE_GRACE_MS = 1_000;
 const MAX_PROTOCOL_BUFFER_BYTES = 65_541;
-const crossSpawn = createRequire(import.meta.url)("cross-spawn") as {
-  _parse(command: string, args: string[], options: { env: NodeJS.ProcessEnv }): {
-    command: string;
-    args: string[];
-    file?: string;
-    options: { windowsVerbatimArguments?: boolean };
-  };
-};
+const TRUSTED_VALIDATION_EXECUTABLES = new Set([
+  "node.exe",
+  "make.exe",
+  "gmake.exe",
+  "mingw32-make.exe",
+  "just.exe",
+  "python.exe",
+  "py.exe"
+]);
 
 export type WindowsProcessHostInput = {
   executable: string;
@@ -59,17 +63,15 @@ export async function runWindowsProcessWithTail(
   return superviseWindowsHost(child, input, startedAt);
 }
 
-function windowsHostArgs(input: WindowsProcessHostInput): string[] {
-  // CreateProcessW treats its explicit application name as a path and does not search PATH.
-  // Use cross-spawn's resolved file for executables and preserve its command and quoting for shell shims.
-  const parsed = crossSpawn._parse(input.executable, input.args, { env: input.env });
-  const executable = parsed.command === input.executable && parsed.file ? parsed.file : parsed.command;
-  return [
-    "--",
-    ...(parsed.options.windowsVerbatimArguments ? ["--verbatim"] : []),
-    executable,
-    ...parsed.args
-  ];
+export function windowsHostArgs(input: WindowsProcessHostInput): string[] {
+  if (!isAbsolute(input.executable)) {
+    throw new Error("Windows validation requires an absolute native executable path; PATH lookup is unsupported.");
+  }
+  const executableName = basename(input.executable).toLowerCase();
+  if (extname(input.executable).toLowerCase() !== ".exe" || !TRUSTED_VALIDATION_EXECUTABLES.has(executableName)) {
+    throw new Error("Windows validation permits only trusted native validation executables; command and shell shims are unsupported.");
+  }
+  return ["--", input.executable, ...input.args];
 }
 
 function superviseWindowsHost(
@@ -92,7 +94,8 @@ function superviseWindowsHost(
     let terminalResultAccepted = false;
     let protocolFailure: string | undefined;
     let hostFailure: string | undefined;
-    let spawnFailure: string | undefined;
+    let commandLaunchFailure: string | undefined;
+    let helperSpawnFailure: string | undefined;
     let helperSpawned = false;
     let childClosed = false;
     let childExitCode: number | null = null;
@@ -137,19 +140,33 @@ function superviseWindowsHost(
         duration_ms: Date.now() - startedAt,
         stdout_tail: stdout.toString("utf8"),
         stderr_tail: stderrText,
+        ...(hostFailure ? { host_failure: hostFailure } : {}),
         ...(typeof childExitCode === "number" && !terminalResult && cleanupConfirmed ? { exit_code: childExitCode } : {})
       });
+    };
+
+    const killHost = (): void => {
+      try {
+        if (!child.kill("SIGKILL")) {
+          hostFailure ??= "Windows process host did not accept a termination signal.";
+        }
+      } catch (error) {
+        hostFailure ??= `Windows process host termination failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
     };
 
     const sendCancel = (): void => {
       if (!child.stdin.destroyed && child.stdin.writable) {
         child.stdin.write(Buffer.from([CANCEL_COMMAND]), (error) => {
-          if (error && !protocolFailure) protocolFailure = `Could not signal the Windows process host: ${error.message}`;
+          if (error) {
+            protocolFailure ??= `Could not signal the Windows process host: ${error.message}`;
+            hostFailure ??= protocolFailure;
+          }
         });
       }
       forceTimer = setTimeout(() => {
         if (settled || childClosed) return;
-        child.kill("SIGKILL");
+        killHost();
         settleTimer = setTimeout(() => {
           if (settled || childClosed) return;
           child.stdout.destroy();
@@ -161,7 +178,8 @@ function superviseWindowsHost(
       }, FORCE_SETTLE_GRACE_MS);
     };
 
-    const requestStop = (reason: "cancelled" | "timeout"): void => {
+    const requestStop = (reason: "cancelled" | "timeout" | "host_failure", failure?: string): void => {
+      if (failure) hostFailure ??= failure;
       if (settled || terminalResultAccepted || stopRequested) return;
       stopRequested = true;
       cancelled = reason === "cancelled";
@@ -171,10 +189,20 @@ function superviseWindowsHost(
       sendCancel();
     };
 
+    const recordStartWriteFailure = (error: Error): void => {
+      if (helperSpawnFailure) return;
+      const message = `Could not start the Windows process host: ${error.message}`;
+      protocolFailure ??= message;
+      hostFailure ??= message;
+      if (!stopRequested) requestStop("host_failure", message);
+    };
+
     const acceptResult = (frame: Extract<WindowsHostFrame, { type: "result" }>): void => {
+      assertWindowsHostTerminalResult(frame);
       if (terminalResult) {
         protocolFailure = "Windows process host sent more than one result frame.";
-        requestStop("cancelled");
+        hostFailure ??= protocolFailure;
+        requestStop("host_failure");
         return;
       }
       terminalResult = frame;
@@ -183,7 +211,7 @@ function superviseWindowsHost(
       if (forceTimer) clearTimeout(forceTimer);
       input.signal?.removeEventListener("abort", abortHandler);
       if (frame.status === "launch_failed") {
-        spawnFailure = `Windows process host could not start the command (error ${frame.error_code}).`;
+        commandLaunchFailure = `Windows process host could not start the command (error ${frame.error_code}).`;
       } else if (frame.status === "cleanup_unconfirmed") {
         protocolFailure = `Windows process host could not confirm cleanup (error ${frame.error_code}).`;
       } else if (frame.status === "supervision_failed") {
@@ -193,7 +221,7 @@ function superviseWindowsHost(
       }
       resultTimer = setTimeout(() => {
         if (settled || childClosed) return;
-        child.kill("SIGKILL");
+        killHost();
         settleTimer = setTimeout(() => {
           if (settled || childClosed) return;
           child.stdout.destroy();
@@ -208,7 +236,8 @@ function superviseWindowsHost(
     const handleFrame = (frame: WindowsHostFrame): void => {
       if (terminalResult) {
         protocolFailure = "Windows process host wrote data after its result frame.";
-        requestStop("cancelled");
+        hostFailure ??= protocolFailure;
+        requestStop("host_failure");
         return;
       }
       if (frame.type === "stdout") stdout = appendTail(stdout, frame.payload);
@@ -231,16 +260,21 @@ function superviseWindowsHost(
         for (const frame of decoded.frames) handleFrame(frame);
       } catch (error) {
         protocolFailure = error instanceof Error ? error.message : String(error);
-        requestStop("cancelled");
+        hostFailure ??= protocolFailure;
+        requestStop("host_failure");
       }
     });
     child.stderr.on("data", (chunk: Buffer) => { stderr = appendTail(stderr, chunk); });
+    child.stdin.on("error", recordStartWriteFailure);
     child.once("spawn", () => { helperSpawned = true; });
     child.once("error", (error) => {
       if (helperSpawned) {
         protocolFailure = `Windows process host reported an error after launch: ${error.message}`;
+        hostFailure ??= protocolFailure;
+        requestStop("host_failure");
       } else {
-        spawnFailure = error.message;
+        helperSpawnFailure = error.message;
+        hostFailure = `Windows process host could not be started: ${error.message}`;
       }
     });
     child.once("close", (code, signal) => {
@@ -248,8 +282,8 @@ function superviseWindowsHost(
       childExitCode = typeof code === "number" ? code : null;
       childSignal = signal;
       if (protocolBuffer.length > 0 && !protocolFailure) protocolFailure = "Windows process host closed with a truncated frame.";
-      if (spawnFailure && !terminalResult && !protocolFailure) {
-        finish(true, spawnFailure);
+      if (helperSpawnFailure && !helperSpawned && !terminalResult) {
+        finish(true, helperSpawnFailure);
         return;
       }
       if (!terminalResult) {
@@ -257,17 +291,14 @@ function superviseWindowsHost(
         return;
       }
       const cleanupConfirmed = terminalResult.status !== "cleanup_unconfirmed" && !protocolFailure;
-      finish(cleanupConfirmed, protocolFailure ?? hostFailure ?? spawnFailure);
+      finish(cleanupConfirmed, protocolFailure ?? hostFailure ?? commandLaunchFailure);
     });
 
     input.signal?.addEventListener("abort", abortHandler, { once: true });
     if (input.signal?.aborted) abortHandler();
     if (!stopRequested) {
       child.stdin.write(Buffer.from([START_COMMAND]), (error) => {
-        if (error && !stopRequested) {
-          protocolFailure = `Could not start the Windows process host: ${error.message}`;
-          requestStop("cancelled");
-        }
+        if (error) recordStartWriteFailure(error);
       });
     }
   });

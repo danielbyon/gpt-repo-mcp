@@ -38,8 +38,9 @@ architecture, clear tool surface, and conservative safety model.
 ## Security Rules
 
 - Do not expose caller-supplied shell text, arbitrary executable selection, or free-form runner arguments. Keep validation limited to fixed profiles and their supported inputs.
-- On Windows, cross-spawn may invoke `cmd.exe` as the OS-required launch shim for a selected `.cmd` or `.bat` runner.
+- On Windows, the supervisor starts only absolute paths to supported native executables and passes arguments separately. npm runs through the selected `node.exe` and its bundled `npm-cli.js`; Make and Just resolve to native executables. The supervisor rejects command shims and does not fall back to shell dispatch.
 - Validation profiles may execute repository-defined npm scripts, Make/Just recipes, or pytest code. GPT Repo MCP does not inspect or sandbox that code; running validation is the operator's responsibility. Run it only on repository contents you trust.
+- Repository-defined scripts, recipes, and tests can start shells, including `cmd.exe`, or other programs. Those executions are outside the supervisor dispatch boundary.
 - Do not weaken approved-root, path traversal, symlink, secret, denied glob, expected SHA, expected HEAD, or exact staged path checks.
 - Do not expose push, pull, reset, checkout, switch, rebase, merge, stash, clean, force, branch deletion, or arbitrary git command tools.
 - Prefer repo-relative paths in outputs and logs.
