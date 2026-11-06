@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { access, lstat, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, sep, win32 } from "node:path";
 import ignore from "ignore";
 import { ValidateInputSchema, type ValidateInput, type ValidateResult, type ValidationProfile } from "../contracts/validation.contract.js";
 import { RepoReaderError } from "../runtime/errors.js";
@@ -27,6 +27,7 @@ type CommandPlan = {
   command: string;
   args: string[];
   pathPrefix?: string;
+  windowsNpmLifecycle?: true;
   runtime?: { name: "node"; version: string; source: NodeRuntimeSource };
 };
 
@@ -181,7 +182,8 @@ export class ValidationService {
         : testPaths && candidate === "test" ? ["run", candidate, "--", ...testPaths] : ["run", candidate],
       ...((selectedNode || windowsNodeExecutable)
         ? { pathPrefix: selectedNode?.bin_directory ?? dirname(windowsNodeExecutable!), ...(runtime ? { runtime } : {}) }
-        : {})
+        : {}),
+      ...(windowsNodeExecutable ? { windowsNpmLifecycle: true as const } : {})
     }));
     const needsPytest = !("test" in scripts) && (profile === "test" || profile === "all") && await this.hasPythonTestSuite();
     if (needsPytest) {
@@ -211,6 +213,7 @@ export class ValidationService {
   }
 
   private async runCommand(command: CommandPlan, timeoutMs: number, signal?: AbortSignal): Promise<ValidateResult["commands"][number]> {
+    const npmComSpec = command.windowsNpmLifecycle ? await resolveWindowsNpmComSpec() : undefined;
     const result = await runProcessWithTail({
       executable: command.executable,
       args: command.args,
@@ -229,6 +232,7 @@ export class ValidationService {
         CI: "1",
         NO_COLOR: "1",
         npm_config_color: "false",
+        ...(npmComSpec ? { ComSpec: npmComSpec } : {}),
         ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
         ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {})
       }
@@ -446,6 +450,28 @@ function createValidationId(): string {
 function isWithinRoot(root: string, candidate: string): boolean {
   const pathFromRoot = relative(root, candidate);
   return pathFromRoot === "" || (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot));
+}
+
+async function resolveWindowsNpmComSpec(): Promise<string> {
+  const systemRoot = process.env.SystemRoot;
+  const recoveryHint = "Start the MCP server from a standard Windows environment with SystemRoot set to the Windows installation directory and cmd.exe available under System32.";
+  if (!systemRoot || !win32.isAbsolute(systemRoot)) {
+    throw new RepoReaderError("VALIDATION_PROFILE_UNAVAILABLE", "Windows npm validation requires the system command processor.", {
+      diagnostics: { recovery_hint: recoveryHint }
+    });
+  }
+
+  const comSpec = win32.join(systemRoot, "System32", "cmd.exe");
+  if (process.platform === "win32") {
+    try {
+      if (!(await stat(comSpec)).isFile()) throw new Error("System command processor is not a file.");
+    } catch {
+      throw new RepoReaderError("VALIDATION_PROFILE_UNAVAILABLE", "Windows npm validation requires the system command processor.", {
+        diagnostics: { recovery_hint: recoveryHint }
+      });
+    }
+  }
+  return comSpec;
 }
 
 async function isExecutableOnPath(name: "python3", platform: NodeJS.Platform, pathValue: string | undefined): Promise<boolean> {

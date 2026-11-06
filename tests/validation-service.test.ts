@@ -69,6 +69,9 @@ describe("ValidationService", () => {
     const npmCli = join(dirname(runtime.node), "node_modules", "npm", "bin", "npm-cli.js");
     await mkdir(join(npmCli, ".."), { recursive: true });
     await writeFile(npmCli, "process.exit(0);\n");
+    const originalSystemEnvironment = { SystemRoot: process.env.SystemRoot, ComSpec: process.env.ComSpec };
+    process.env.SystemRoot = "C:\\Windows";
+    process.env.ComSpec = "C:\\Tools\\powershell.exe";
     const processSpy = vi.spyOn(processExec, "runProcessWithTail").mockResolvedValue({
       exit_code: 0,
       duration_ms: 1,
@@ -85,11 +88,78 @@ describe("ValidationService", () => {
       expect(processSpy).toHaveBeenCalledWith(expect.objectContaining({
         executable: await realpath(runtime.node),
         args: [await realpath(npmCli), "run", "test"],
-        env: expect.objectContaining({ PATH: `${dirname(await realpath(runtime.node))};${process.env.PATH ?? ""}` })
+        env: expect.objectContaining({
+          PATH: `${dirname(await realpath(runtime.node))};${process.env.PATH ?? ""}`,
+          ComSpec: "C:\\Windows\\System32\\cmd.exe"
+        })
       }));
       expect(processSpy.mock.calls[0]?.[0].executable).not.toMatch(/npm(?:\.cmd)?$/i);
     } finally {
       processSpy.mockRestore();
+      restoreEnv(originalSystemEnvironment);
+    }
+  });
+
+  test.skipIf(process.platform === "win32").each([
+    ["missing", undefined],
+    ["relative", "Windows"]
+  ] as const)("does not start Windows npm validation with %s SystemRoot", async (_case, systemRoot) => {
+    const root = await fixtureRepo({ scripts: { test: "node -e process.exit(0)" }, nodeVersion: "24.18.0" });
+    const runtime = await fakeWindowsNvmRuntime("24.18.0");
+    const npmCli = join(dirname(runtime.node), "node_modules", "npm", "bin", "npm-cli.js");
+    await mkdir(join(npmCli, ".."), { recursive: true });
+    await writeFile(npmCli, "process.exit(0);\n");
+    const originalSystemEnvironment = { SystemRoot: process.env.SystemRoot, ComSpec: process.env.ComSpec };
+    if (systemRoot) process.env.SystemRoot = systemRoot;
+    else delete process.env.SystemRoot;
+    process.env.ComSpec = "C:\\Tools\\cmd.exe";
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail");
+
+    try {
+      await expect(service(root, {}, runtime.options).validate({ repo_id: "fixture", profile: "test" }))
+        .rejects.toMatchObject({
+          code: "VALIDATION_PROFILE_UNAVAILABLE",
+          diagnostics: { recovery_hint: expect.stringContaining("SystemRoot") }
+        });
+      expect(processSpy).not.toHaveBeenCalled();
+    } finally {
+      processSpy.mockRestore();
+      restoreEnv(originalSystemEnvironment);
+    }
+  });
+
+  test.skipIf(process.platform !== "win32")("does not start Windows npm validation when System32/cmd.exe is unavailable", async () => {
+    const version = process.version.slice(1);
+    const root = await fixtureRepo({ scripts: { test: "node -e process.exit(0)" }, nodeVersion: version });
+    const home = await createTempDir("gpt-windows-missing-shell-");
+    const runtimeOptions: NodeRuntimeResolverOptions = {
+      platform: "win32",
+      home,
+      env: {
+        NVM_HOME: join(home, "nvm"),
+        APPDATA: join(home, "roaming"),
+        LOCALAPPDATA: join(home, "local"),
+        FNM_DIR: join(home, "fnm"),
+        VOLTA_HOME: join(home, "volta"),
+        MISE_INSTALLS_DIR: join(home, "mise-installs"),
+        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {})
+      }
+    };
+    const invalidSystemRoot = await createTempDir("gpt-missing-system-shell-");
+    const originalSystemEnvironment = { SystemRoot: process.env.SystemRoot, ComSpec: process.env.ComSpec };
+    process.env.SystemRoot = invalidSystemRoot;
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail");
+
+    try {
+      await expect(service(root, {}, runtimeOptions).validate({ repo_id: "fixture", profile: "test" }))
+        .rejects.toMatchObject({
+          code: "VALIDATION_PROFILE_UNAVAILABLE",
+          diagnostics: { recovery_hint: expect.stringContaining("cmd.exe") }
+        });
+      expect(processSpy).not.toHaveBeenCalled();
+    } finally {
+      processSpy.mockRestore();
+      restoreEnv(originalSystemEnvironment);
     }
   });
 
@@ -202,6 +272,7 @@ describe("ValidationService", () => {
         executable: await realpath(executable),
         args: ["unit"]
       }));
+      expect(processSpy.mock.calls[0]?.[0].env).not.toHaveProperty("ComSpec");
     } finally {
       processSpy.mockRestore();
     }
