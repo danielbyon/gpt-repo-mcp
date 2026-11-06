@@ -7,11 +7,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
-const children = new Set<ChildProcess>();
+type StartedServer = {
+  child: ChildProcess;
+  closed: Promise<void>;
+  output: () => string;
+  outputEvents: EventEmitter;
+  port: number;
+};
+
+type RequestOutcome<T> = { value: T } | { error: unknown };
+
+const children = new Set<StartedServer>();
 
 describe("server network boundary", () => {
   afterEach(async () => {
-    await Promise.all([...children].map((child) => stopChild(child)));
+    await Promise.all([...children].map((server) => stopChild(server)));
   });
 
   test("defaults to an explicit loopback binding", async () => {
@@ -110,10 +120,13 @@ describe("server network boundary", () => {
     const validationDirectory = join(repoRoot, ".chatgpt", "validation");
     const latestPath = join(validationDirectory, "latest.json");
     const processControl = await startProcessControl();
+    let server: StartedServer | undefined;
     let cancelController: AbortController | undefined;
     let independentController: AbortController | undefined;
-    let cancelRequest: Promise<unknown> | undefined;
-    let independentRequest: Promise<unknown> | undefined;
+    let cancelRequest: Promise<RequestOutcome<ValidationToolResult>> | undefined;
+    let independentRequest: Promise<RequestOutcome<ValidationToolResult>> | undefined;
+    let testFailed = false;
+    let testError: unknown;
 
     try {
       await mkdir(repoRoot, { recursive: true });
@@ -129,7 +142,7 @@ describe("server network boundary", () => {
         limits: {}
       }), "utf8");
 
-      const server = await startServer({ GPT_REPO_CONFIG: configPath, PORT: "0" });
+      server = await startServer({ GPT_REPO_CONFIG: configPath, PORT: "0" });
       await waitForHealth(server);
 
       const cancelSession = await initializeSession(server.port);
@@ -145,8 +158,7 @@ describe("server network boundary", () => {
       await writeFile(modePath, "hold\n");
 
       cancelController = new AbortController();
-      cancelRequest = callRepoValidate(server.port, cancelSession.sessionId!, 3, cancelController.signal)
-        .then(() => new Error("The disconnected validation unexpectedly returned a response."), (error) => error);
+      cancelRequest = settleRequest(callRepoValidate(server.port, cancelSession.sessionId!, 3, cancelController.signal));
       const cancelledProcesses = await processControl.waitForConnections(2);
       expect(new Set(cancelledProcesses.map(({ pid }) => pid)).size).toBe(2);
 
@@ -155,25 +167,27 @@ describe("server network boundary", () => {
       expect(independentSession.sessionId).toEqual(expect.any(String));
       await initializeClient(server.port, independentSession.sessionId!);
       independentController = new AbortController();
-      independentRequest = callRepoValidate(
+      independentRequest = settleRequest(callRepoValidate(
         server.port,
         independentSession.sessionId!,
         2,
         independentController.signal
-      );
+      ));
       const independentProcesses = (await processControl.waitForConnections(4)).slice(2);
       expect(new Set(independentProcesses.map(({ pid }) => pid)).size).toBe(2);
 
       cancelController.abort();
       const disconnect = await cancelRequest;
-      expect(disconnect).toMatchObject({ name: "AbortError" });
+      expect(disconnect).toMatchObject({ error: { name: "AbortError" } });
       await processControl.waitForClosed(cancelledProcesses);
       expect(independentProcesses.every(({ socket }) => !socket.destroyed)).toBe(true);
       expect(await readFile(latestPath, "utf8")).toBe(seededLatest);
       expect((await readdir(validationDirectory)).sort()).toEqual(artifactsBeforeCancel);
 
       await writeFile(releasePath, "release\n");
-      const independentResult = await independentRequest as ValidationToolResult;
+      const independentOutcome = await independentRequest;
+      if ("error" in independentOutcome) throw independentOutcome.error;
+      const independentResult = independentOutcome.value;
       expect(independentResult.status).toBe("passed");
       expect(independentResult.validation_id).toEqual(expect.any(String));
       expect(independentResult.commands).toHaveLength(1);
@@ -184,15 +198,86 @@ describe("server network boundary", () => {
       expect(latest).toMatchObject({ validation_id: independentResult.validation_id, status: "passed" });
       expect(artifact).toMatchObject({ validation_id: independentResult.validation_id, status: "passed" });
       await processControl.waitForClosed(independentProcesses);
-    } finally {
-      cancelController?.abort();
-      independentController?.abort();
-      await writeFile(releasePath, "release\n").catch(() => undefined);
-      await Promise.allSettled([cancelRequest, independentRequest].filter((task): task is Promise<unknown> => task !== undefined));
-      await processControl.waitForClosed(processControl.connections()).catch(() => undefined);
-      await processControl.close();
-      await rm(fixtureRoot, { recursive: true, force: true });
+    } catch (error) {
+      testFailed = true;
+      testError = error;
     }
+
+    cancelController?.abort();
+    independentController?.abort();
+    const cleanupErrors: unknown[] = [];
+    let canRemoveFixture = true;
+
+    try {
+      await mkdir(repoRoot, { recursive: true });
+      await writeFile(releasePath, "release\n");
+    } catch (error) {
+      cleanupErrors.push(error);
+      canRemoveFixture = false;
+    }
+
+    const outstandingRequests = [cancelRequest, independentRequest]
+      .filter((task) => task !== undefined);
+    const requestSettlements = await Promise.allSettled(outstandingRequests);
+    for (const settlement of requestSettlements) {
+      if (settlement.status === "rejected") {
+        cleanupErrors.push(settlement.reason);
+        canRemoveFixture = false;
+      }
+    }
+
+    const cancelOutcome = cancelRequest ? await cancelRequest : undefined;
+    if (cancelOutcome && "error" in cancelOutcome) {
+      if (!(cancelController?.signal.aborted && isAbortError(cancelOutcome.error))) {
+        cleanupErrors.push(cancelOutcome.error);
+      }
+    } else if (cancelOutcome) {
+      cleanupErrors.push(new Error("The disconnected validation unexpectedly returned a response."));
+    }
+
+    const independentOutcome = independentRequest ? await independentRequest : undefined;
+    if (independentOutcome && "error" in independentOutcome) {
+      if (!(independentController?.signal.aborted && isAbortError(independentOutcome.error))) {
+        cleanupErrors.push(independentOutcome.error);
+      }
+    }
+
+    try {
+      await processControl.waitForClosed(processControl.connections());
+    } catch (error) {
+      cleanupErrors.push(error);
+      canRemoveFixture = false;
+    }
+
+    try {
+      await processControl.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+      canRemoveFixture = false;
+    }
+
+    try {
+      if (server) await stopChild(server);
+    } catch (error) {
+      cleanupErrors.push(error);
+      canRemoveFixture = false;
+    }
+
+    if (canRemoveFixture) {
+      try {
+        await rm(fixtureRoot, { recursive: true, force: true });
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        testFailed ? [testError, ...cleanupErrors] : cleanupErrors,
+        "HTTP cancellation fixture cleanup failed."
+      );
+    }
+    if (testFailed) throw testError;
   }, 20_000);
 });
 
@@ -221,7 +306,7 @@ async function initializeSession(port: number): Promise<{ status: number; sessio
   };
 }
 
-async function startServer(extraEnv: Record<string, string> = {}) {
+async function startServer(extraEnv: Record<string, string> = {}): Promise<StartedServer> {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "gpt-repo-network-boundary-"));
   const configPath = join(fixtureRoot, "config.json");
   const port = extraEnv.PORT === undefined ? await freePort() : Number(extraEnv.PORT);
@@ -238,19 +323,35 @@ async function startServer(extraEnv: Record<string, string> = {}) {
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
-  children.add(child);
   const recordOutput = (chunk: Buffer): void => {
     output += chunk.toString();
     outputEvents.emit("change");
   };
   child.stdout.on("data", recordOutput);
   child.stderr.on("data", recordOutput);
-  child.once("exit", () => {
-    children.delete(child);
-    void rm(fixtureRoot, { recursive: true, force: true });
-    outputEvents.emit("change");
+  let resolveClosed!: () => void;
+  let rejectClosed!: (error: unknown) => void;
+  const closed = new Promise<void>((resolve, reject) => {
+    resolveClosed = resolve;
+    rejectClosed = reject;
   });
-  return { child, output: () => output, outputEvents, port };
+  const server: StartedServer = { child, closed, output: () => output, outputEvents, port };
+  children.add(server);
+  child.once("exit", () => outputEvents.emit("change"));
+  child.once("close", () => {
+    void rm(fixtureRoot, { recursive: true, force: true }).then(
+      () => {
+        children.delete(server);
+        outputEvents.emit("change");
+        resolveClosed();
+      },
+      (error: unknown) => {
+        children.delete(server);
+        rejectClosed(error);
+      }
+    );
+  });
+  return server;
 }
 
 async function waitForHealth(server: Awaited<ReturnType<typeof startServer>>): Promise<void> {
@@ -327,6 +428,17 @@ type ValidationToolResult = {
   validation_artifact: { path: string };
   commands: Array<{ status: string }>;
 };
+
+function settleRequest<T>(request: Promise<T>): Promise<RequestOutcome<T>> {
+  return request.then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error })
+  );
+}
+
+function isAbortError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "name" in error && error.name === "AbortError";
+}
 
 type ProcessConnection = { role: string; pid: number; socket: Socket };
 
@@ -498,10 +610,34 @@ async function startProcessControl(): Promise<{
     },
     async waitForClosed(closedConnections, timeoutMs = 3_000) {
       await Promise.all(closedConnections.map(async ({ pid, socket }) => {
-        if (socket.destroyed) return;
+        if (socket.closed) return;
         const signal = AbortSignal.timeout(timeoutMs);
         try {
-          await once(socket, "close", { signal });
+          await new Promise<void>((resolve, reject) => {
+            const cleanup = (): void => {
+              socket.removeListener("close", onClose);
+              socket.removeListener("error", onError);
+              signal.removeEventListener("abort", onAbort);
+            };
+            const onClose = (): void => {
+              cleanup();
+              resolve();
+            };
+            const onError = (error: Error): void => {
+              if ("code" in error && error.code === "ECONNRESET") return;
+              cleanup();
+              reject(error);
+            };
+            const onAbort = (): void => {
+              cleanup();
+              reject(signal.reason);
+            };
+
+            socket.once("close", onClose);
+            socket.on("error", onError);
+            signal.addEventListener("abort", onAbort, { once: true });
+            if (socket.closed) onClose();
+          });
         } catch (error) {
           if (!signal.aborted) throw error;
           throw new Error(`Validation process ${pid} kept its control socket open.`, { cause: error });
@@ -528,13 +664,16 @@ async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<bool
   ]);
 }
 
-async function stopChild(child: ChildProcess): Promise<void> {
+async function stopChild(server: StartedServer): Promise<void> {
+  const { child } = server;
   if (child.exitCode !== null || child.signalCode !== null) {
+    await server.closed;
     return;
   }
   child.kill("SIGTERM");
   if (!await waitForExit(child, 1_000)) {
     child.kill("SIGKILL");
-    await once(child, "exit");
+    if (child.exitCode === null && child.signalCode === null) await once(child, "exit");
   }
+  await server.closed;
 }

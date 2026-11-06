@@ -86,6 +86,9 @@ jobs:
       - name: Build production package and Windows helper
         run: npm run build
 
+      - name: Verify packed Windows package artifact
+        run: node scripts/verify-windows-package.mjs
+
       - name: Windows process supervision
         run: npm test -- tests/windows-process-host.test.ts tests/windows-process-host-protocol.test.ts tests/process-exec.test.ts --reporter=verbose
 

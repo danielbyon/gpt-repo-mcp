@@ -139,8 +139,10 @@ describe("tool catalog contracts", () => {
   });
 
   test("connector metadata stays materially smaller and contrastive", () => {
-    const instructionSourceBytes = readFileSync("src/instructions.ts").byteLength;
-    const descriptionSourceBytes = readFileSync("src/tools/descriptions.ts").byteLength;
+    const sourceByteLength = (path: string): number =>
+      Buffer.byteLength(readFileSync(path, "utf8").replace(/\r\n/g, "\n"), "utf8");
+    const instructionSourceBytes = sourceByteLength("src/instructions.ts");
+    const descriptionSourceBytes = sourceByteLength("src/tools/descriptions.ts");
     const descriptionPayloadBytes = Buffer.byteLength(toolCatalog.map((tool) => tool.description).join(" "), "utf8");
 
     expect(instructionSourceBytes).toBeLessThan(6_000);
