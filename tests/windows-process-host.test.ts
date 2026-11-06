@@ -45,11 +45,8 @@ describe("runWindowsProcessWithTail", () => {
         args: ["-e", "console.log(JSON.stringify(process.argv.slice(1)))", ...values]
       });
 
-      expect(result).toMatchObject({
-        exit_code: 0,
-        cleanup_confirmed: true,
-        stdout_tail: JSON.stringify(values)
-      });
+      expect(result).toMatchObject({ exit_code: 0, cleanup_confirmed: true });
+      expect(JSON.parse(result.stdout_tail)).toEqual(values);
     }
   );
 

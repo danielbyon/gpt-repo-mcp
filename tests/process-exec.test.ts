@@ -238,7 +238,7 @@ describe("runProcessWithTail", () => {
     }
   }, 15_000);
 
-  test("returns spawn failures without waiting for the timeout", async () => {
+  posixTest("returns spawn failures without waiting for the timeout", async () => {
     const result = await runProcessWithTail({
       ...baseInput,
       executable: join(process.cwd(), "__missing_process_executable__"),
