@@ -150,7 +150,16 @@ describe("server network boundary", () => {
       expect(cancelSession.sessionId).toEqual(expect.any(String));
       await initializeClient(server.port, cancelSession.sessionId!);
       const seed = await callRepoValidate(server.port, cancelSession.sessionId!, 2);
-      expect(seed.status).toBe("passed");
+  const seedCommands = seed.commands.map(({ profile, command, status, exit_code, duration_ms, stdout_tail, stderr_tail }) => ({
+    profile,
+    command,
+    status,
+    exit_code,
+    duration_ms,
+    stdout_tail,
+    stderr_tail
+  }));
+  expect(seed.status, `Seed validation command result:\n${JSON.stringify(seedCommands, null, 2)}`).toBe("passed");
       expect(seed.validation_id).toEqual(expect.any(String));
 
       const seededLatest = await readFile(latestPath, "utf8");
@@ -426,7 +435,15 @@ type ValidationToolResult = {
   status: string;
   validation_id: string;
   validation_artifact: { path: string };
-  commands: Array<{ status: string }>;
+  commands: Array<{
+    profile?: string;
+    command?: string;
+    status: string;
+    exit_code?: number;
+    duration_ms?: number;
+    stdout_tail?: string;
+    stderr_tail?: string;
+  }>;
 };
 
 function settleRequest<T>(request: Promise<T>): Promise<RequestOutcome<T>> {
