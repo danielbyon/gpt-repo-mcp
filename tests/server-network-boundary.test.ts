@@ -154,7 +154,7 @@ describe("server network boundary", () => {
       if (process.platform === "win32" && seed.status !== "passed") {
         try {
           const logDirectory = join(repoRoot, ".npm-cache", "_logs");
-          const logNames = (await readdir(logDirectory)).filter((name) => name.endsWith("-debug-0.log")).sort();
+          const logNames = (await readdir(logDirectory)).filter((name) => name.endsWith(".log")).sort();
           const latestLog = logNames.at(-1);
           if (latestLog) {
             const debugLog = await readFile(join(logDirectory, latestLog), "utf8");
@@ -162,6 +162,8 @@ describe("server network boundary", () => {
               .filter((line) => /npm (?:silly lifecycle|verbose (?:run-script|lifecycle|stack|code|exit)|info run|error )/i.test(line))
               .slice(-40)
               .join("\n");
+          } else {
+            npmDebugSummary = `No npm log files captured (directory entries: ${logNames.join(", ") || "empty"}).`;
           }
         } catch {
           npmDebugSummary = "NPM debug log unavailable.";
@@ -590,8 +592,8 @@ async function writeValidationFixture(
     scripts: { smoke: "node runner.cjs" }
   }), "utf8");
   if (process.platform === "win32") {
-      const npmCachePath = join(repoRoot, ".npm-cache").replaceAll("\\", "/");
-      await writeFile(join(repoRoot, ".npmrc"), `cache=${npmCachePath}\nloglevel=verbose\n`, "utf8");
+      const npmLogDirectory = join(repoRoot, ".npm-cache", "_logs").replaceAll("\\", "/");
+      await writeFile(join(repoRoot, ".npmrc"), `logs-dir=${npmLogDirectory}\nloglevel=verbose\n`, "utf8");
   }
   await writeFile(runnerPath, runner, "utf8");
 }
