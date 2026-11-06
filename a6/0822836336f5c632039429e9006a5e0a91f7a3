@@ -1,0 +1,19 @@
+tests/server-network-boundary.test.ts
+  s_76759ca7815121::t_e4596e7f9ca513 153-162,438-446
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a60822836336f5c632039429e9006a5e0a91f7a3",
+  "prompts": {},
+  "sessions": {
+    "s_76759ca7815121": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b048-1149-77f2-84a8-7221586ce369",
+        "model": "unknown"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
