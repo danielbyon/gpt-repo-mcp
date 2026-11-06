@@ -1,0 +1,95 @@
+docs/WRITE_WORKFLOWS.md
+  s_275364cde43d2d::t_9ae7a9287b719f 42
+  s_275364cde43d2d::t_ecd2b076b782f0 43-44
+  s_275364cde43d2d::t_79c5062693fbef 39-41,45
+tests/windows-process-host.test.ts
+  s_275364cde43d2d::t_aa42635400cd67 1,8,253-268,270-272
+  s_275364cde43d2d::t_af61d332a11ab4 91-118
+native/windows/process-host.cpp
+  s_275364cde43d2d::t_ddee6fcafac805 681
+  s_275364cde43d2d::t_cfec93776e0819 77-78,140,654,656-665,767
+tests/fixtures/file-event-wait.ts
+  s_275364cde43d2d::t_fe6a8788c8dc57 1-61
+tests/server-network-boundary.test.ts
+  s_275364cde43d2d::t_f18e4eb21a754d 339,359
+  s_275364cde43d2d::t_48a1bddfef11b5 2-3,5,103-196,230,242,244-247,251,253,257-260,262-263,271-279,281
+  s_275364cde43d2d::t_7502592ac6358f 415
+  s_275364cde43d2d::t_7100c44c804ae4 446,460
+  s_275364cde43d2d::t_a10dc35575083a 268-269,324-338,340-358,360-414,416-445,447-459,461-519
+  s_a9443de43ad0db::t_1f6654565ed6cb 520
+src/services/windows-process-host-protocol.ts
+  s_275364cde43d2d::t_cfec93776e0819 10-11,62
+docs/SECURITY.md
+  s_cdbeffa262693c::t_8ddf158bb91578 121-124
+  s_cdbeffa262693c::t_f93af1177c5341 19,22,113-120,125-135
+tests/validation-service.test.ts
+  s_275364cde43d2d::t_65c2a8d326ca48 11,21-30,433,435-436,765-766,768-777
+  s_275364cde43d2d::t_a6d8a299ffeae5 1
+  s_275364cde43d2d::t_5169e2ee29328e 509-510,534
+  s_275364cde43d2d::t_4c264354925a95 434,440-441
+src/services/validation-service.ts
+  s_275364cde43d2d::t_b53af91b94a15c 2,308-313,357-365
+src/services/windows-process-host.ts
+  s_275364cde43d2d::t_cfec93776e0819 94,189-190,260
+README.md
+  s_275364cde43d2d::t_9ae7a9287b719f 126-127
+  s_275364cde43d2d::t_ecd2b076b782f0 128-129
+  s_275364cde43d2d::t_79c5062693fbef 123-125
+  s_275364cde43d2d::t_a2e435f61e555c 57
+docs/QUALITY.md
+  s_275364cde43d2d::t_923f149da8805f 41
+  s_275364cde43d2d::t_546758aeb77dcd 40,42,103
+tests/http-request-cancellation.test.ts
+  s_275364cde43d2d::t_4c264354925a95 76
+  s_275364cde43d2d::t_a0ae79d50d1b86 6,75,77-79,99
+src/services/policy-explain-service.ts
+  s_275364cde43d2d::t_923f149da8805f 163
+.github/workflows/ci.yml
+  s_275364cde43d2d::t_a4a81844a4b819 57
+CONTRIBUTING.md
+  s_275364cde43d2d::t_9bac7271efd621 25
+SECURITY.md
+  s_275364cde43d2d::t_f40ae573d7824b 25-30
+docs/SETUP.md
+  s_275364cde43d2d::t_049a5d1954e33b 99,166
+src/contracts/validation.contract.ts
+  s_275364cde43d2d::t_70ab4743a25d91 14-15
+src/tools/descriptions.ts
+  s_275364cde43d2d::t_88921f18819f7b 41
+tests/mcp-contract.test.ts
+  s_275364cde43d2d::t_7a4c4217957a53 1289
+tests/tool-contracts.test.ts
+  s_275364cde43d2d::t_f96e479789fccc 2356
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c1997a99f776a5fce792eb89c01818cc24e0836b",
+  "prompts": {},
+  "sessions": {
+    "s_275364cde43d2d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a9d5-c835-7700-9cf9-ee249e38fc24",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_a9443de43ad0db": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ad36-3c21-7883-b04f-4152c2e9d467",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_cdbeffa262693c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a9f9-02fe-7481-bc2a-74702747bc2a",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
