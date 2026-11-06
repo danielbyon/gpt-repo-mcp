@@ -569,6 +569,9 @@ async function writeValidationFixture(
     private: true,
     scripts: { smoke: "node runner.cjs" }
   }), "utf8");
+  if (process.platform === "win32") {
+    await writeFile(join(repoRoot, ".npmrc"), "loglevel=verbose\n", "utf8");
+  }
   await writeFile(runnerPath, runner, "utf8");
 }
 
