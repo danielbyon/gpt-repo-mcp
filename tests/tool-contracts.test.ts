@@ -139,8 +139,10 @@ describe("tool catalog contracts", () => {
   });
 
   test("connector metadata stays materially smaller and contrastive", () => {
-    const instructionSourceBytes = readFileSync("src/instructions.ts").byteLength;
-    const descriptionSourceBytes = readFileSync("src/tools/descriptions.ts").byteLength;
+    const sourceByteLength = (path: string): number =>
+      Buffer.byteLength(readFileSync(path, "utf8").replace(/\r\n/g, "\n"), "utf8");
+    const instructionSourceBytes = sourceByteLength("src/instructions.ts");
+    const descriptionSourceBytes = sourceByteLength("src/tools/descriptions.ts");
     const descriptionPayloadBytes = Buffer.byteLength(toolCatalog.map((tool) => tool.description).join(" "), "utf8");
 
     expect(instructionSourceBytes).toBeLessThan(6_000);
@@ -2353,7 +2355,7 @@ describe("tool catalog contracts", () => {
             "openWorldHint": false,
             "readOnlyHint": false,
           },
-          "description": "Use this when running an allowlisted test, build, lint, typecheck, smoke, or all profile. A declared repo-owned make or just target takes priority; npm and safe pytest are fallbacks. Output is streamed into a bounded tail without a shell or arbitrary commands.",
+          "description": "Use this when running fixed allowlisted profiles. A configured make or just target takes priority, then npm or detected pytest fallback. test_paths use configured globs/path/count checks. Callers cannot supply command text, executables, or arbitrary args. Windows cmd.exe may launch .cmd/.bat shims. Profiles run repo scripts; trust their contents. Server does not inspect or sandbox it. Bounded output.",
           "inputKeys": [
             "dry_run",
             "profile",

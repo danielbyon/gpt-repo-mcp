@@ -1,12 +1,16 @@
-import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { ValidationService } from "../src/services/validation-service.js";
 import { OperationsPolicy } from "../src/services/operations-policy.js";
+import * as fsHelpers from "../src/runtime/fs-helpers.js";
+import { GitService } from "../src/services/git-service.js";
 import { ValidateInputSchema } from "../src/contracts/validation.contract.js";
 import { descriptions } from "../src/tools/descriptions.js";
 import type { NodeRuntimeResolverOptions } from "../src/services/node-runtime-resolver.js";
+import { waitForFile, waitForFileLineCount } from "./fixtures/file-event-wait.js";
 import { createTempDir } from "./fixtures/temp-dir.js";
+import * as processExec from "../src/services/process-exec.js";
 
 describe("ValidationService", () => {
   test("accepts npm banners before validation JSON and rejects malformed final output", () => {
@@ -14,12 +18,16 @@ describe("ValidationService", () => {
     expect(() => lastJsonLine("{\"ok\":true}\nmalformed")).toThrow(SyntaxError);
   });
 
-  test("tool and contract describe repo-owned priority plus safe fallbacks without shell execution", async () => {
-    expect(descriptions.repo_validate).toContain("repo-owned make or just target takes priority");
-    expect(descriptions.repo_validate).toContain("safe pytest");
-    expect(descriptions.repo_validate).toContain("bounded tail without a shell");
-    expect(descriptions.repo_validate).not.toContain("allowlisted package.json script profile");
-    expect(ValidateInputSchema.shape.profile.description).toContain("safe pytest");
+  test("tool and contract describe fixed profiles, constrained paths, and Windows launch behavior", async () => {
+    expect(descriptions.repo_validate).toContain("configured make or just target takes priority");
+    expect(descriptions.repo_validate).toContain("detected pytest fallback");
+    expect(descriptions.repo_validate).toContain("test_paths");
+    expect(descriptions.repo_validate).toContain("cmd.exe");
+    expect(descriptions.repo_validate).toContain("does not inspect or sandbox");
+    expect(descriptions.repo_validate).toContain("Callers cannot supply command text");
+    expect(descriptions.repo_validate).not.toContain("without a shell");
+    expect(ValidateInputSchema.shape.profile.description).toContain("detected pytest test fallback");
+    expect(ValidateInputSchema.shape.test_paths.description).toContain("validation_test_path_globs");
     const source = await readFile(join(process.cwd(), "src", "services", "validation-service.ts"), "utf8");
     expect(source).toContain("runProcessWithTail({");
     expect(source).not.toContain("shell: true");
@@ -360,6 +368,266 @@ describe("ValidationService", () => {
     expect(result.commands[0]?.stdout_tail?.length).toBeLessThanOrEqual(4000);
   });
 
+  test("cancellation during command planning prevents a dry-run result", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "echo should-not-run" } });
+    const planningStarted = deferred<void>();
+    const releasePlanning = deferred<void>();
+    const internals = ValidationService.prototype as unknown as {
+      readScripts(this: ValidationService): Promise<Record<string, string>>;
+    };
+    const originalReadScripts = internals.readScripts;
+    const readSpy = vi.spyOn(internals, "readScripts").mockImplementation(async function (this: ValidationService) {
+      planningStarted.resolve();
+      await releasePlanning.promise;
+      return originalReadScripts.call(this);
+    });
+    const controller = new AbortController();
+    try {
+      const validation = service(root).validate({ repo_id: "fixture", profile: "smoke", dry_run: true }, { signal: controller.signal });
+      await planningStarted.promise;
+      controller.abort();
+      releasePlanning.resolve();
+
+      await expect(validation).rejects.toMatchObject({ name: "AbortError" });
+    } finally {
+      controller.abort();
+      releasePlanning.resolve();
+      readSpy.mockRestore();
+    }
+  });
+
+  test("cancels an npm validation tree without writing a receipt", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "node fixture.cjs" } });
+    const parentPidPath = join(root, "parent.pid");
+    const childReadyPath = join(root, "child.ready");
+    const cleanupPath = join(root, "cleanup");
+    await writeFile(cleanupPath, "wait");
+    const childScript = [
+      "const { readFileSync, watch, writeFileSync } = require('node:fs');",
+      `const cleanupWatcher = watch(${JSON.stringify(cleanupPath)}, () => { cleanupWatcher.close(); process.exit(0); });`,
+      `if (readFileSync(${JSON.stringify(cleanupPath)}, 'utf8') === 'stop') process.exit(0);`,
+      "process.on('SIGTERM', () => {});",
+      `writeFileSync(${JSON.stringify(childReadyPath)}, String(process.pid));`,
+      "setInterval(() => {}, 1_000);"
+    ].join("\n");
+    const fixtureScript = [
+      "const { spawn } = require('node:child_process');",
+      "const { readFileSync, watch, writeFileSync } = require('node:fs');",
+      `const cleanupWatcher = watch(${JSON.stringify(cleanupPath)}, () => { cleanupWatcher.close(); process.exit(0); });`,
+      `if (readFileSync(${JSON.stringify(cleanupPath)}, 'utf8') === 'stop') process.exit(0);`,
+      "process.on('SIGTERM', () => {});",
+      `spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' });`,
+      `writeFileSync(${JSON.stringify(parentPidPath)}, String(process.pid));`,
+      "setInterval(() => {}, 1_000);"
+    ].join("\n");
+    await writeFile(join(root, "fixture.cjs"), fixtureScript);
+
+    const controller = new AbortController();
+    const validationPromise = service(root).validate({
+      repo_id: "fixture",
+      profile: "smoke",
+      timeout_ms: 1_500
+    }, { signal: controller.signal });
+
+    try {
+      const childPid = Number(await waitForFile(childReadyPath));
+      const parentPid = Number(await waitForFile(parentPidPath));
+      expect(isProcessAlive(parentPid)).toBe(true);
+      expect(isProcessAlive(childPid)).toBe(true);
+      controller.abort();
+
+      await expect(validationPromise).rejects.toMatchObject({ name: "AbortError" });
+      expect(isProcessAlive(parentPid)).toBe(false);
+      expect(isProcessAlive(childPid)).toBe(false);
+      await expect(readFile(join(root, ".chatgpt", "validation", "latest.json"), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      controller.abort();
+      await writeFile(cleanupPath, "stop");
+      await validationPromise.catch(() => undefined);
+    }
+  }, 5_000);
+
+  test("preserves the latest receipt when Windows cleanup is unconfirmed", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
+    const validationDirectory = join(root, ".chatgpt", "validation");
+    const latestPath = join(validationDirectory, "latest.json");
+    const previousReceipt = "previous committed receipt";
+    await mkdir(validationDirectory, { recursive: true });
+    await writeFile(latestPath, previousReceipt);
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail").mockResolvedValue({
+      timed_out: false,
+      cancelled: true,
+      cleanup_confirmed: false,
+      duration_ms: 1,
+      stdout_tail: "",
+      stderr_tail: ""
+    });
+
+    try {
+      await expect(service(root).validate({ repo_id: "fixture", profile: "smoke" }))
+        .rejects.toThrow("Validation process cleanup could not be confirmed");
+      expect(await readFile(latestPath, "utf8")).toBe(previousReceipt);
+    } finally {
+      processSpy.mockRestore();
+    }
+  });
+
+  test("cancellation during identity capture preserves the existing latest receipt", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
+    const latestPath = join(root, ".chatgpt", "validation", "latest.json");
+    const previousLatest = "previous-latest-receipt";
+    await mkdir(join(root, ".chatgpt", "validation"), { recursive: true });
+    await writeFile(latestPath, previousLatest);
+
+    const identityStarted = deferred<void>();
+    const releaseIdentity = deferred<void>();
+    const originalFingerprint = GitService.prototype.worktreeFingerprint;
+    const fingerprintSpy = vi.spyOn(GitService.prototype, "worktreeFingerprint").mockImplementation(async function (this: GitService) {
+      identityStarted.resolve();
+      await releaseIdentity.promise;
+      return originalFingerprint.call(this);
+    });
+    const controller = new AbortController();
+    try {
+      const validation = service(root).validate({ repo_id: "fixture", profile: "smoke" }, { signal: controller.signal });
+      await identityStarted.promise;
+      controller.abort();
+      releaseIdentity.resolve();
+
+      await expect(validation).rejects.toMatchObject({ name: "AbortError" });
+      expect(await readFile(latestPath, "utf8")).toBe(previousLatest);
+    } finally {
+      controller.abort();
+      releaseIdentity.resolve();
+      fingerprintSpy.mockRestore();
+    }
+  });
+
+  test("cancellation during result staging does not admit receipt publication", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
+    const validationDirectory = join(root, ".chatgpt", "validation");
+    const latestPath = join(validationDirectory, "latest.json");
+    const previousLatest = "previous-latest-receipt";
+    await mkdir(join(root, ".chatgpt", "validation"), { recursive: true });
+    await writeFile(latestPath, previousLatest);
+
+    const stagingStarted = deferred<void>();
+    const releaseStaging = deferred<void>();
+    const originalWrite = fsHelpers.atomicWriteJson;
+    const writeSpy = vi.spyOn(fsHelpers, "atomicWriteJson").mockImplementation(async (path, value) => {
+      if (path.endsWith("result.json")) {
+        stagingStarted.resolve();
+        await releaseStaging.promise;
+      }
+      return originalWrite(path, value);
+    });
+    const controller = new AbortController();
+    try {
+      const validation = service(root).validate({ repo_id: "fixture", profile: "smoke" }, { signal: controller.signal });
+      await stagingStarted.promise;
+      controller.abort();
+      releaseStaging.resolve();
+
+      await expect(validation).rejects.toMatchObject({ name: "AbortError" });
+      expect(await readFile(latestPath, "utf8")).toBe(previousLatest);
+      expect((await readdir(validationDirectory)).sort()).toEqual(["latest.json"]);
+    } finally {
+      controller.abort();
+      releaseStaging.resolve();
+      writeSpy.mockRestore();
+    }
+  });
+
+  test("cancellation immediately before commit admission preserves latest", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
+    const latestPath = join(root, ".chatgpt", "validation", "latest.json");
+    const previousLatest = "previous-latest-receipt";
+    await mkdir(join(root, ".chatgpt", "validation"), { recursive: true });
+    await writeFile(latestPath, previousLatest);
+
+    const controller = new AbortController();
+    const originalWrite = fsHelpers.atomicWriteJson;
+    const writeSpy = vi.spyOn(fsHelpers, "atomicWriteJson").mockImplementation(async (path, value) => {
+      const result = await originalWrite(path, value);
+      if (path.endsWith("result.json")) controller.abort();
+      return result;
+    });
+    try {
+      await expect(service(root).validate({ repo_id: "fixture", profile: "smoke" }, { signal: controller.signal }))
+        .rejects.toMatchObject({ name: "AbortError" });
+      expect(await readFile(latestPath, "utf8")).toBe(previousLatest);
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  test("commit admission makes receipt publication non-cancellable", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
+    const latestPath = join(root, ".chatgpt", "validation", "latest.json");
+    const previousLatest = "previous-latest-receipt";
+    await mkdir(join(root, ".chatgpt", "validation"), { recursive: true });
+    await writeFile(latestPath, previousLatest);
+
+    const commitStarted = deferred<void>();
+    const releaseCommit = deferred<void>();
+    const controller = new AbortController();
+    const originalWrite = fsHelpers.atomicWriteJson;
+    const writeSpy = vi.spyOn(fsHelpers, "atomicWriteJson").mockImplementation(async (path, value) => {
+      if (path.endsWith("latest.json")) {
+        commitStarted.resolve();
+        await releaseCommit.promise;
+      }
+      return originalWrite(path, value);
+    });
+    try {
+      const validation = service(root).validate({ repo_id: "fixture", profile: "smoke" }, { signal: controller.signal });
+      await commitStarted.promise;
+      controller.abort();
+      releaseCommit.resolve();
+
+      const result = await validation;
+      const latest = JSON.parse(await readFile(latestPath, "utf8")) as { validation_id?: string };
+      expect(result.status).toBe("passed");
+      expect(latest.validation_id).toBe(result.validation_id);
+    } finally {
+      controller.abort();
+      releaseCommit.resolve();
+      writeSpy.mockRestore();
+    }
+  });
+
+  test("latest replacement failure rejects and preserves the previous receipt", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
+    const latestPath = join(root, ".chatgpt", "validation", "latest.json");
+    const previousLatest = "previous-latest-receipt";
+    await mkdir(join(root, ".chatgpt", "validation"), { recursive: true });
+    await writeFile(latestPath, previousLatest);
+
+    const originalWrite = fsHelpers.atomicWriteJson;
+    const writeSpy = vi.spyOn(fsHelpers, "atomicWriteJson").mockImplementation(async (path, value) => {
+      if (path.endsWith("latest.json")) throw new Error("injected latest replacement failure");
+      return originalWrite(path, value);
+    });
+    try {
+      await expect(service(root).validate({ repo_id: "fixture", profile: "smoke" }))
+        .rejects.toThrow("injected latest replacement failure");
+      expect(await readFile(latestPath, "utf8")).toBe(previousLatest);
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  test("does not report validation success when receipt persistence fails", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
+    const receiptPath = join(root, ".chatgpt");
+    await writeFile(receiptPath, "preserve-existing-file");
+
+    await expect(service(root).validate({ repo_id: "fixture", profile: "smoke" }))
+      .rejects.toMatchObject({ code: "ENOTDIR" });
+    expect(await readFile(receiptPath, "utf8")).toBe("preserve-existing-file");
+  });
+
   test("reports validation failure as a structured result instead of a tool error", async () => {
     const root = await fixtureRepo({
       scripts: { test: "node -e \"console.error('failed safely'); process.exit(3)\"" }
@@ -488,7 +756,87 @@ describe("ValidationService", () => {
       message: "Focused test paths are not supported by the declared repository validation profile."
     });
   });
+
+  test("allows overlapping validations and preserves each receipt", async () => {
+    const root = await fixtureRepo({ scripts: { smoke: "node concurrent-validation.cjs" } });
+    const startedPath = join(root, "started.txt");
+    const releasePath = join(root, "release.txt");
+    const runner = [
+      'const { appendFileSync, existsSync, watch } = require("node:fs");',
+      'const { basename, dirname } = require("node:path");',
+      `const releasePath = ${JSON.stringify(releasePath)};`,
+      "let release;",
+      "const released = new Promise(resolve => { release = resolve; });",
+      "const releaseName = basename(releasePath);",
+      "const releaseWatcher = watch(dirname(releasePath), (_event, filename) => {",
+      "if (filename && filename.toString() !== releaseName) return;",
+      "if (existsSync(releasePath)) { releaseWatcher.close(); release(); }",
+      "});",
+      "if (existsSync(releasePath)) { releaseWatcher.close(); release(); }",
+      `appendFileSync(${JSON.stringify(startedPath)}, String(process.pid) + "\\n");`,
+      "released.then(() => console.log(JSON.stringify({ pid: process.pid })));"
+    ].join("\n");
+    await writeFile(join(root, "concurrent-validation.cjs"), runner);
+
+    const validator = service(root);
+    const runs = [
+      validator.validate({ repo_id: "fixture", profile: "smoke" }),
+      validator.validate({ repo_id: "fixture", profile: "smoke" })
+    ];
+    let started: string[] | undefined;
+    let startError: unknown;
+    try {
+      started = await waitForFileLineCount(startedPath, 2);
+    } catch (error) {
+      startError = error;
+    } finally {
+      await writeFile(releasePath, "release\n");
+    }
+
+    const settled = await Promise.allSettled(runs);
+    if (startError) throw startError;
+    expect(started).toHaveLength(2);
+    expect(new Set(started).size).toBe(2);
+    expect(settled.every((result) => result.status === "fulfilled")).toBe(true);
+    const results = settled.map((result) => {
+      if (result.status === "rejected") throw result.reason;
+      return result.value;
+    });
+    expect(results.map((result) => result.status)).toEqual(["passed", "passed"]);
+    const validationIds = results.map((result) => result.validation_id);
+    expect(new Set(validationIds).size).toBe(2);
+
+    const latest = JSON.parse(await readFile(join(root, ".chatgpt", "validation", "latest.json"), "utf8")) as {
+      validation_id?: string;
+      artifact_path?: string;
+    };
+    const latestResult = results.find((result) => result.validation_id === latest.validation_id);
+    expect(latestResult).toBeDefined();
+    expect(latest.artifact_path).toBe(latestResult?.validation_artifact?.path);
+    for (const result of results) {
+      const artifact = JSON.parse(await readFile(join(root, result.validation_artifact!.path), "utf8")) as {
+        validation_id?: string;
+      };
+      expect(artifact.validation_id).toBe(result.validation_id);
+    }
+  });
 });
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => { resolve = complete; });
+  return { promise, resolve };
+}
 
 function service(
   root: string,

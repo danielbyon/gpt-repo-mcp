@@ -28,6 +28,7 @@ const FORBIDDEN_PREFIXES = new Set([
 ]);
 const FORBIDDEN_PATTERNS = [/(?:^|\/)[^/]*\.local\.[^/]*$/i];
 const ENVIRONMENT_TEMPLATE = ".env.example";
+const WINDOWS_PROCESS_HOST_PATH = "dist/windows-process-host.exe";
 const WINDOWS_DRIVE_PATH = /^[A-Za-z]:/;
 const WINDOWS_UNC_PATH = /^\/\//;
 // Account roots are assembled from parts because the public hygiene gate
@@ -452,10 +453,14 @@ async function preflightPackagePaths(root, files, {
       blockers.push(parentBlocker);
       continue;
     }
+    // A non-Windows build cannot produce this native runtime artifact.
+    const optionalWindowsHost = platform !== "win32" &&
+      relativePath === WINDOWS_PROCESS_HOST_PATH;
     let info;
     try {
       info = await lstatPath(join(root, relativePath));
     } catch (error) {
+      if (optionalWindowsHost && error?.code === "ENOENT") continue;
       if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
         blockers.push(
           `package preflight could not inspect ${relativePath}: ` +

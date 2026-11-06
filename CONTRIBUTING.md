@@ -22,7 +22,7 @@ Use targeted tests for the area you changed before broad validation.
 
 ## Safety Rules
 
-- Do not add shell execution or arbitrary command-runner tools.
+- Do not expose caller-supplied shell text, arbitrary executable selection, or free-form runner arguments. Keep validation limited to fixed, allowlisted profiles and their supported inputs.
 - Do not weaken sandbox, secret, path, write, git, or cleanup policies.
 - Keep tool changes contract-first: contracts -> tool registry -> handlers -> services.
 - Keep tool definitions metadata-only and handlers thin.

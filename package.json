@@ -40,17 +40,20 @@
     "list": "node dist/cli/connect-gpt.js list",
     "check:config": "node dist/cli/connect-gpt.js check",
     "doctor": "npm run build && node dist/cli/connect-gpt.js doctor",
-    "build": "tsup src/server.ts --format esm --dts --clean --external typescript && tsup src/cli/connect-gpt.ts --format esm --out-dir dist/cli --external typescript",
+    "build": "tsup src/server.ts --format esm --dts --clean --external typescript && tsup src/cli/connect-gpt.ts --format esm --out-dir dist/cli --external typescript && node scripts/build-windows-process-host.mjs",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "check:public": "node scripts/check-public.mjs",
     "security:scan": "node scripts/oss-security-scan.mjs",
     "test": "vitest run",
-    "verify:dist": "npm run build && node scripts/smoke-dist-server.mjs"
+    "verify:dist": "npm run build && node scripts/smoke-dist-server.mjs",
+    "predev": "node scripts/build-windows-process-host.mjs",
+    "pretest": "node scripts/build-windows-process-host.mjs && node scripts/build-windows-process-host.mjs --test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "cross-spawn": "7.0.6",
     "express": "^5.1.0",
     "ignore": "^7.0.5",
     "js-yaml": "^4.3.2",
@@ -72,6 +75,7 @@
     "README.md",
     "LICENSE",
     "dist/server.js",
-    "dist/cli/connect-gpt.js"
+    "dist/cli/connect-gpt.js",
+    "dist/windows-process-host.exe"
   ]
 }

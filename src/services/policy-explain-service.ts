@@ -160,7 +160,7 @@ export class PolicyExplainService {
       ]);
     }
     return allowed("GENERAL_VALIDATION_POLICY", "Validation is enabled for allowlisted project runner profiles.", [], [
-      "repo_validate prioritizes matching npm scripts, safely selects an exact repo-declared Node.js version when already installed, and may use pytest fallback for detected Python tests; it never installs runtimes, accepts command strings, or uses a shell."
+      "repo_validate selects fixed allowlisted profiles through configured make or just targets, matching npm scripts, or detected pytest fallback. Callers cannot supply command text, choose executables, or pass free-form runner arguments. test_paths are accepted only for profile test when configured globs and path checks allow them and the selected runner supports focused paths. On Windows, cross-spawn may invoke `cmd.exe` as the OS-required launch shim for a selected `.cmd` or `.bat` runner; npm, Make, and Just may use their own shells for repository scripts and recipes. The server does not inspect or sandbox that code; run validation only on repository contents you trust. It never installs runtimes."
     ]);
   }
 }

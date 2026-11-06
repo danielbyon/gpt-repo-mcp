@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, lstat, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { access, lstat, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { delimiter, isAbsolute, join, relative, sep } from "node:path";
 import ignore from "ignore";
@@ -43,12 +43,15 @@ export class ValidationService {
     private readonly nodeRuntimeOptions: NodeRuntimeResolverOptions = {}
   ) {}
 
-  async validate(input: ValidateInput): Promise<ValidateResult> {
+  async validate(input: ValidateInput, options: { signal?: AbortSignal } = {}): Promise<ValidateResult> {
+    options.signal?.throwIfAborted();
     const args = ValidateInputSchema.parse(input);
     this.policy.assertValidationAllowed();
     const scripts = await this.readScripts();
+    options.signal?.throwIfAborted();
     const testPaths = args.test_paths ? this.validateFocusedTestPaths(args.profile, args.test_paths) : undefined;
     const commands = await this.resolveCommands(args.profile, scripts, testPaths);
+    options.signal?.throwIfAborted();
 
     if (args.dry_run === true) {
       return {
@@ -72,8 +75,10 @@ export class ValidationService {
 
     const results = [];
     for (const command of commands) {
-      results.push(await this.runCommand(command, args.timeout_ms ?? DEFAULT_TIMEOUT_MS));
+      options.signal?.throwIfAborted();
+      results.push(await this.runCommand(command, args.timeout_ms ?? DEFAULT_TIMEOUT_MS, options.signal));
     }
+    options.signal?.throwIfAborted();
     const failed = results.filter((result) => result.status === "failed").length;
     const passed = results.filter((result) => result.status === "passed").length;
     const validationId = createValidationId();
@@ -89,7 +94,8 @@ export class ValidationService {
       counts: { total: results.length, passed, failed, skipped: 0 },
       warnings: []
     };
-    const artifactPath = await this.writeValidationArtifact(result);
+    options.signal?.throwIfAborted();
+    const artifactPath = await this.writeValidationArtifact(result, options.signal);
 
     return {
       ...result,
@@ -178,13 +184,14 @@ export class ValidationService {
     return plans;
   }
 
-  private async runCommand(command: CommandPlan, timeoutMs: number): Promise<ValidateResult["commands"][number]> {
+  private async runCommand(command: CommandPlan, timeoutMs: number, signal?: AbortSignal): Promise<ValidateResult["commands"][number]> {
     const result = await runProcessWithTail({
       executable: command.executable,
       args: command.args,
       cwd: this.root,
       timeout_ms: timeoutMs,
       tail_bytes: OUTPUT_TAIL_CHARS * 4,
+      signal,
       // Validation children receive a deliberately allowlisted environment rather than process.env.
       // HOME and XDG_CONFIG_HOME are forwarded only when the MCP server provides non-empty values
       // so standard developer tooling can resolve user-level configuration; all other host
@@ -198,6 +205,13 @@ export class ValidationService {
         ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {})
       }
     });
+    if (result.cleanup_confirmed === false) {
+      throw new Error("Validation process cleanup could not be confirmed; no receipt was published.");
+    }
+    if (result.cancelled) {
+      signal?.throwIfAborted();
+      throw new DOMException("Validation was cancelled before completion.", "AbortError");
+    }
     const passed = result.exit_code === 0 && !result.timed_out;
     return {
       profile: command.profile,
@@ -290,15 +304,25 @@ export class ValidationService {
     });
   }
 
-  private async writeValidationArtifact(result: ValidateResult): Promise<string> {
+  /**
+   * Writes the validation artifact before updating the active `latest.json`
+   * pointer. Cancellation before the pointer write removes the staged artifact.
+   * Once the pointer write starts, it completes even if the caller cancels.
+   *
+   * The final abort check and the start of the pointer write run synchronously,
+   * so cancellation cannot fall between them.
+   */
+  private async writeValidationArtifact(result: ValidateResult, signal?: AbortSignal): Promise<string> {
     const validationId = result.validation_id;
     if (!validationId) {
       throw new RepoReaderError("VALIDATION_ARTIFACT_WRITE_FAILED", "Validation id missing before artifact write.");
     }
+    signal?.throwIfAborted();
     const [headSha, worktreeFingerprint] = await Promise.all([
       this.currentHeadSha(),
       this.currentWorktreeFingerprint()
     ]);
+    signal?.throwIfAborted();
     const artifactPath = `${VALIDATION_ROOT}/${validationId}/result.json`;
     const artifact = {
       schema_version: 1,
@@ -314,8 +338,7 @@ export class ValidationService {
       counts: result.counts,
       warnings: result.warnings
     };
-    await atomicWriteJson(join(this.root, artifactPath), artifact);
-    await atomicWriteJson(join(this.root, VALIDATION_ROOT, "latest.json"), {
+    const latestPointer = {
       schema_version: 1,
       validation_id: validationId,
       repo_id: result.repo_id,
@@ -326,7 +349,20 @@ export class ValidationService {
       worktree_fingerprint: worktreeFingerprint,
       artifact_path: artifactPath,
       timestamp: artifact.timestamp
-    });
+    };
+    const admitReceiptCommit = (): Promise<void> => {
+      signal?.throwIfAborted();
+      return atomicWriteJson(join(this.root, VALIDATION_ROOT, "latest.json"), latestPointer);
+    };
+    try {
+      await atomicWriteJson(join(this.root, artifactPath), artifact);
+      await admitReceiptCommit();
+    } catch (error) {
+      if (signal?.aborted) {
+        await rm(join(this.root, VALIDATION_ROOT, validationId), { recursive: true, force: true });
+      }
+      throw error;
+    }
     return artifactPath;
   }
 

@@ -195,9 +195,9 @@ export const changePlanHandler: ToolHandler = async (input, context) => safeTool
   return createSuccessEnvelope(result, `Returned change plan with ${result.proposed_steps.length} steps.`);
 });
 
-export const validateHandler: ToolHandler = async (input, context) => safeTool<ValidateInput>("repo_validate", input, async (args) => {
+export const validateHandler: ToolHandler = async (input, context, _taskExecution, signal) => safeTool<ValidateInput>("repo_validate", input, async (args) => {
   const repo = context.registry.get(args.repo_id);
-  const result = await new ValidationService(repo.root, new OperationsPolicy(repo.operations)).validate(args);
+  const result = await new ValidationService(repo.root, new OperationsPolicy(repo.operations)).validate(args, { signal });
   audit({ tool: "repo_validate", repo_id: args.repo_id, counts: result.counts, warnings: result.warnings });
   return createSuccessEnvelope(result, result.dry_run ? `Dry run resolved ${result.commands.length} validation commands.` : `Validation ${result.status}: ${result.counts.passed}/${result.counts.total} commands passed.`, { warnings: result.warnings });
 });

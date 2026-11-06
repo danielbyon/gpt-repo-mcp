@@ -54,7 +54,7 @@ preparation. ChatGPT receives tool descriptions, schemas, safety annotations,
 and structured results that help it select the next appropriate action.
 
 The model guides the work; the server enforces the boundary. No prompt can turn
-the server into unrestricted filesystem access, arbitrary shell execution,
+the server into unrestricted filesystem access, caller-controlled arbitrary shell execution,
 automatic push, or automatic deployment.
 
 ## Quickstart
@@ -68,6 +68,12 @@ npm install
 npm run build
 cp config.example.json config.local.json
 ```
+
+On Windows, run the build from a Visual Studio Developer PowerShell or
+Developer Command Prompt with C++ tools that match the installed Node
+architecture. The build creates the process host used by validation. Build on
+Windows before running the service there; builds made on other platforms do not
+include the Windows host.
 
 The copied starter config is valid and empty.
 
@@ -114,8 +120,13 @@ For the OpenAI Secure MCP Tunnel, use `npm run connect:secure` and follow the
 | `write` | Daily implementation | Read capabilities plus policy-checked single- and multi-file edits |
 | `ship` | Reviewed local completion | Write capabilities plus approved validation, recovery, staging, and local commits |
 
-No mode enables push, pull, reset, checkout, switch, rebase, merge, stash,
-force operations, branch deletion, shell execution, or arbitrary commands.
+No mode accepts caller-supplied shell text, arbitrary executable selection, or
+free-form runner arguments. Validation accepts fixed, allowlisted profiles and
+supported inputs; those profiles may run repository scripts or recipes, so run
+validation only on content you trust. On Windows, `cmd.exe` may serve as the
+OS-required launch shim for a selected `.cmd` or `.bat` runner. No mode
+provides push, pull, reset, checkout, switch, rebase, merge, stash, clean,
+force, or branch deletion tools.
 
 ## Try It In ChatGPT
 
@@ -220,6 +231,7 @@ See [Product principles](docs/PRODUCT.md), [Architecture](docs/ARCHITECTURE.md),
 - Node.js 20 or newer
 - npm
 - Git
+- On Windows, Visual Studio C++ build tools for the installed Node architecture
 - An HTTPS tunnel such as ngrok, or the supported secure tunnel flow
 - ChatGPT with Developer Mode access
 

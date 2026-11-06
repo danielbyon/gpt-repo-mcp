@@ -7,7 +7,7 @@ import type { RuntimeContext } from "../runtime/context.js";
 import type { TaskExecutionProviderGuard } from "../services/task-execution-boundary.js";
 import { toolContracts, type ToolName } from "./contracts.js";
 
-export type ToolHandler = (input: unknown, context: RuntimeContext, taskExecution?: TaskExecutionProviderGuard) => Promise<CallToolResult>;
+export type ToolHandler = (input: unknown, context: RuntimeContext, taskExecution?: TaskExecutionProviderGuard, signal?: AbortSignal) => Promise<CallToolResult>;
 
 export async function safeTool<TInput extends Record<string, unknown>>(
   tool: ToolName,
