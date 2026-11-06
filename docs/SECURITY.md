@@ -124,15 +124,18 @@ sensitive-path checks. The request is limited to `max_paths_per_operation` paths
 before duplicates are removed. Callers cannot supply command text, choose an
 executable, or pass free-form runner arguments.
 
-On Windows, cross-spawn may invoke `cmd.exe` as the OS-required launch shim for
-a selected `.cmd` or `.bat` runner. Cross-spawn builds and escapes that launch
-invocation. This shim is separate from the shells npm, Make, or Just may use to
-execute repository-defined scripts and recipes.
+On Windows, the validation supervisor starts supported native executables by
+absolute path and passes arguments as separate values. npm runs through the
+selected `node.exe` and that installation's `node_modules/npm/bin/npm-cli.js`.
+Make and Just resolve to native executables. The supervisor rejects `.cmd`,
+`.bat`, `.ps1`, PATH-only commands, and unsupported executables. It fails closed
+when a supported native runner or the bundled npm CLI cannot be resolved.
 
-Profile allowlisting controls runner selection. The selected runner can execute
-code from `package.json` scripts, Makefile or Justfile recipes, or pytest
-tests. GPT Repo MCP does not inspect or sandbox that code. Run validation only
-on repository contents you trust. Output is bounded and redacted.
+Profile allowlisting controls runner selection. Repository-defined npm scripts,
+Makefile or Justfile recipes, and pytest tests can start shells, including
+`cmd.exe`, and other programs. Those executions are outside supervisor dispatch
+and are not sandboxed. Run validation only on repository contents you trust.
+Output is bounded and redacted.
 
 ## Git Review And Local Commits
 

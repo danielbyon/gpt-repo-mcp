@@ -6,6 +6,7 @@ import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { redactSensitiveText } from "../src/runtime/result-envelope.js";
 
 type StartedServer = {
   child: ChildProcess;
@@ -150,7 +151,39 @@ describe("server network boundary", () => {
       expect(cancelSession.sessionId).toEqual(expect.any(String));
       await initializeClient(server.port, cancelSession.sessionId!);
       const seed = await callRepoValidate(server.port, cancelSession.sessionId!, 2);
-      expect(seed.status).toBe("passed");
+      let npmDebugSummary = "";
+      if (process.platform === "win32" && seed.status !== "passed") {
+        try {
+          const logDirectory = join(repoRoot, ".npm-cache", "_logs");
+          const logNames = (await readdir(logDirectory)).filter((name) => name.endsWith(".log")).sort();
+          const latestLog = logNames.at(-1);
+          if (latestLog) {
+            const debugLog = await readFile(join(logDirectory, latestLog), "utf8");
+            npmDebugSummary = debugLog.split(/\r?\n/)
+              .filter((line) => /(?:silly lifecycle|verbose (?:run-script|lifecycle|stack|code|exit)|info run|error )/i.test(line))
+              .slice(-40)
+              .join("\n");
+            npmDebugSummary = redactSensitiveText(npmDebugSummary);
+          } else {
+            npmDebugSummary = `No npm log files captured (directory entries: ${logNames.join(", ") || "empty"}).`;
+          }
+        } catch {
+          npmDebugSummary = "NPM debug log unavailable.";
+        }
+      }
+      const seedCommands = seed.commands.map(({ profile, command, status, exit_code, duration_ms, stdout_tail, stderr_tail }) => ({
+        profile,
+        command,
+        status,
+        exit_code,
+        duration_ms,
+        stdout_tail,
+        stderr_tail
+      }));
+      expect(seed.status, [
+        `Seed validation command result:\n${JSON.stringify(seedCommands, null, 2)}`,
+        npmDebugSummary && `NPM debug summary:\n${npmDebugSummary}`
+      ].filter(Boolean).join("\n\n")).toBe("passed");
       expect(seed.validation_id).toEqual(expect.any(String));
 
       const seededLatest = await readFile(latestPath, "utf8");
@@ -426,7 +459,15 @@ type ValidationToolResult = {
   status: string;
   validation_id: string;
   validation_artifact: { path: string };
-  commands: Array<{ status: string }>;
+  commands: Array<{
+    profile?: string;
+    command?: string;
+    status: string;
+    exit_code?: number;
+    duration_ms?: number;
+    stdout_tail?: string;
+    stderr_tail?: string;
+  }>;
 };
 
 function settleRequest<T>(request: Promise<T>): Promise<RequestOutcome<T>> {
@@ -552,6 +593,10 @@ async function writeValidationFixture(
     private: true,
     scripts: { smoke: "node runner.cjs" }
   }), "utf8");
+  if (process.platform === "win32") {
+      const npmLogDirectory = join(repoRoot, ".npm-cache", "_logs").replaceAll("\\", "/");
+      await writeFile(join(repoRoot, ".npmrc"), `logs-dir=${npmLogDirectory}\nloglevel=verbose\n`, "utf8");
+  }
   await writeFile(runnerPath, runner, "utf8");
 }
 

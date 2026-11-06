@@ -1286,7 +1286,7 @@ describe("MCP contract", () => {
               "openWorldHint": false,
               "readOnlyHint": false,
             },
-            "description": "Use this when running fixed allowlisted profiles. A configured make or just target takes priority, then npm or detected pytest fallback. test_paths use configured globs/path/count checks. Callers cannot supply command text, executables, or arbitrary args. Windows cmd.exe may launch .cmd/.bat shims. Profiles run repo scripts; trust their contents. Server does not inspect or sandbox it. Bounded output.",
+            "description": "Use this when validating. Fixed Make/Just, npm, pytest profiles. Callers cannot choose commands, executables, or args. Windows uses absolute native paths and argv; npm uses selected node.exe plus bundled npm-cli.js. Shell executables and shims fail closed. test_paths are policy-checked. Repository scripts can start shells; the server neither inspects nor sandboxes them. Output is bounded.",
             "inputKeys": [
               "dry_run",
               "profile",

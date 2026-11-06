@@ -163,7 +163,7 @@ A `just`-based repository declares the same profile shape with the `just` runner
 }
 ```
 
-Targets are schema-allowlisted and invoked as `make <target>` or `just <target>`. Repository targets may execute recipes or scripts. On Windows, `cmd.exe` may launch selected `.cmd` or `.bat` shims. Output is streamed and only a bounded tail is retained. Existing configs without `validation_profiles` remain valid.
+Targets are schema-allowlisted and invoked with separate arguments. On Windows, the supervisor resolves Make and Just to native executables and rejects command shims. Repository targets may execute recipes or scripts, including shell commands; the supervisor does not inspect or sandbox them. Output is streamed and only a bounded tail is retained. Existing configs without `validation_profiles` remain valid.
 
 ## Doctor
 

@@ -1,6 +1,7 @@
 const FRAME_HEADER_BYTES = 5;
 const MAX_FRAME_BYTES = 65_536;
 const RESULT_PAYLOAD_BYTES = 9;
+const WINDOWS_ERROR_CANCELLED = 1_223;
 
 export type WindowsHostResultStatus =
   | "completed"
@@ -37,12 +38,14 @@ export function decodeWindowsHostFrames(buffer: Buffer): { frames: WindowsHostFr
         throw new Error(`Windows process host result frame must be ${RESULT_PAYLOAD_BYTES} bytes.`);
       }
       const status = resultStatus(payload.readUInt8(0));
-      frames.push({
+      const result: WindowsHostFrame = {
         type: "result",
         status,
         exit_code: payload.readUInt32LE(1),
         error_code: payload.readUInt32LE(5)
-      });
+      };
+      assertWindowsHostTerminalResult(result);
+      frames.push(result);
     } else {
       throw new Error(`Windows process host sent unknown frame type ${frameType}.`);
     }
@@ -50,6 +53,28 @@ export function decodeWindowsHostFrames(buffer: Buffer): { frames: WindowsHostFr
   }
 
   return { frames, remainder: buffer.subarray(offset) };
+}
+
+/** Checks the status-specific exit and native error fields before a result can affect validation. */
+export function assertWindowsHostTerminalResult(frame: WindowsHostFrame): void {
+  if (frame.type !== "result") return;
+  const valid = (() => {
+    switch (frame.status) {
+      case "completed":
+        return frame.error_code === 0;
+      case "launch_failed":
+      case "cleanup_unconfirmed":
+      case "supervision_failed":
+        return frame.exit_code === 0 && frame.error_code !== 0;
+      case "cancelled_before_start":
+        return frame.exit_code === 0 && frame.error_code === 0;
+      case "cancelled_confirmed":
+        return frame.exit_code === WINDOWS_ERROR_CANCELLED && frame.error_code === 0;
+    }
+  })();
+  if (!valid) {
+    throw new Error("Windows process host sent contradictory terminal result metadata.");
+  }
 }
 
 function resultStatus(value: number): WindowsHostResultStatus {

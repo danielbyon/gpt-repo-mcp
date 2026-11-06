@@ -2,9 +2,9 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { describe, expect, test, vi } from "vitest";
-import { runWindowsProcessWithTail } from "../src/services/windows-process-host.js";
+import { runWindowsProcessWithTail, windowsHostArgs } from "../src/services/windows-process-host.js";
 import { waitForFile } from "./fixtures/file-event-wait.js";
 
 const input = {
@@ -18,22 +18,55 @@ const input = {
 
 describe("runWindowsProcessWithTail", () => {
   test.skipIf(process.platform !== "win32")(
-    "resolves a PATH-only executable before CreateProcess",
+    "rejects a PATH-only executable instead of searching command shims",
     async () => {
-      const result = await runWindowsProcessWithTail({
+      await expect(runWindowsProcessWithTail({
         ...input,
         executable: "node",
-        args: ["-e", "process.stdout.write('resolved-from-path')"],
+        args: ["-e", "process.stdout.write('must-not-run')"],
         env: { PATH: dirname(process.execPath) }
-      });
-
-      expect(result).toMatchObject({
-        exit_code: 0,
-        cleanup_confirmed: true,
-        stdout_tail: "resolved-from-path"
-      });
+      })).rejects.toThrow(/absolute native executable path/);
     }
   );
+
+  test("passes spaces and shell metacharacters as literal argument values", () => {
+    const executable = join(tmpdir(), "trusted tools bin", "node.exe");
+    const args = ["path with spaces/file.js", "& | < > ^ %PATH%", "quote\"and\\slash"];
+    expect(windowsHostArgs({ ...input, executable, args })).toEqual(["--", executable, ...args]);
+  });
+
+  test.skipIf(process.platform !== "win32")(
+    "passes spaces and shell metacharacters literally through the production native helper",
+    async () => {
+      const values = ["path with spaces", "& | < > ^ %PATH%", "quote\"and\\slash"];
+      const result = await runWindowsProcessWithTail({
+        ...input,
+        executable: process.execPath,
+        args: ["-e", "console.log(JSON.stringify(process.argv.slice(1)))", ...values]
+      });
+
+      expect(result).toMatchObject({ exit_code: 0, cleanup_confirmed: true });
+      expect(JSON.parse(result.stdout_tail)).toEqual(values);
+    }
+  );
+
+  test.each([
+    "cmd",
+    "cmd.exe",
+    "npm.cmd",
+    "make.bat",
+    "script.ps1",
+    "powershell.exe",
+    "pwsh.exe",
+    "bash.exe",
+    "sh.exe",
+    "cscript.exe",
+    "wscript.exe",
+    "unknown.exe"
+  ])("rejects unsupported Windows command or shell shim %s without fallback", (name) => {
+    const executable = name === "cmd" ? name : join(tmpdir(), name);
+    expect(() => windowsHostArgs({ ...input, executable, args: ["must-not-run"] })).toThrow();
+  });
 
   test("preserves bounded stdout and stderr plus the completed exit code", async () => {
     const result = await runWindowsProcessWithTail({ ...input, tail_bytes: 5 }, {
@@ -49,6 +82,42 @@ describe("runWindowsProcessWithTail", () => {
       stdout_tail: "after",
       stderr_tail: "rning"
     });
+  });
+
+  test("rejects duplicate terminal result frames as unconfirmed supervision", async () => {
+    const frames = Buffer.concat([encodeResult(0, 0, 0), encodeResult(0, 0, 0)]);
+    const script = [
+      "process.stdin.once('data', () => {",
+      "process.stdin.destroy();",
+      `process.stdout.end(${JSON.stringify(frames.toString("base64"))}, 'base64');`,
+      "});"
+    ].join(" ");
+    const result = await runWindowsProcessWithTail(input, {
+      executable: process.execPath,
+      args: ["-e", script]
+    });
+
+    expect(result).toMatchObject({ cleanup_confirmed: false, cancelled: false, timed_out: false });
+    expect(result).toHaveProperty("host_failure");
+    expect(result.host_failure).toMatch(/more than one result frame|wrote data after its result frame/i);
+  });
+
+  test("fails closed when a completed frame carries a native error", async () => {
+    const frame = encodeResult(0, 0, 5);
+    const script = [
+      "process.stdin.once('data', () => {",
+      "process.stdin.destroy();",
+      `process.stdout.end(${JSON.stringify(frame.toString("base64"))}, 'base64');`,
+      "});"
+    ].join(" ");
+    const result = await runWindowsProcessWithTail(input, {
+      executable: process.execPath,
+      args: ["-e", script]
+    });
+
+    expect(result).toMatchObject({ cleanup_confirmed: false, cancelled: false, timed_out: false });
+    expect(result).toHaveProperty("host_failure");
+    expect(result.host_failure).toMatch(/contradictory terminal result/i);
   });
 
   test("sends cancellation to only the active host and waits for its cleanup result", async () => {
@@ -95,6 +164,7 @@ describe("runWindowsProcessWithTail", () => {
     });
 
     expect(result).toMatchObject({ cancelled: false, timed_out: false, cleanup_confirmed: true });
+    expect(result).toHaveProperty("host_failure");
     expect(result.exit_code).toBeUndefined();
     expect(result.stderr_tail).toContain("fatal supervision error (error 5)");
   });
@@ -220,6 +290,47 @@ describe("runWindowsProcessWithTail", () => {
       vi.resetModules();
     }
   });
+
+  test("keeps ENOENT primary when the initial START write also reports EPIPE", async () => {
+    const writeError = Object.assign(new Error("broken pipe"), { code: "EPIPE" });
+    let startWriteCompleted!: () => void;
+    const startWrite = new Promise<void>((resolve) => { startWriteCompleted = resolve; });
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        process.nextTick(() => {
+          callback(writeError);
+          startWriteCompleted();
+        });
+      }
+    });
+    const child = Object.assign(new EventEmitter(), {
+      stdin,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      pid: undefined,
+      kill: vi.fn(() => false),
+      unref: vi.fn()
+    });
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({ spawn: () => child }));
+
+    try {
+      const { runWindowsProcessWithTail: runWithFakeHost } = await import("../src/services/windows-process-host.js");
+      const resultPromise = runWithFakeHost(input, { executable: "test-host", args: [] });
+      child.emit("error", Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }));
+      await startWrite;
+      child.emit("close", null, null);
+
+      const result = await resultPromise;
+      expect(result).toMatchObject({ cleanup_confirmed: true, cancelled: false, timed_out: false });
+      expect(result).toHaveProperty("host_failure");
+      expect(result.stderr_tail).toContain("spawn ENOENT");
+      expect(result.stderr_tail).not.toContain("broken pipe");
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
 });
 
 function completedHost(stdout: string, stderr: string, exitCode: number): string {
@@ -242,7 +353,7 @@ function cancellableHost(readyPath: string): string {
     `writeFileSync(${JSON.stringify(readyPath)}, 'ready');`,
     "process.stdin.once('data', () => {",
     "process.stdin.destroy();",
-    `process.stdout.end(${JSON.stringify(encodeResult(4, 0, 0).toString("base64"))}, 'base64');`,
+    `process.stdout.end(${JSON.stringify(encodeResult(4, 1_223, 0).toString("base64"))}, 'base64');`,
     "});",
     "});"
   ].join(" ");

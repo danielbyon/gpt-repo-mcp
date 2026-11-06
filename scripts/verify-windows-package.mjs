@@ -1,56 +1,76 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { createRequire } from "node:module";
+import { execFile } from "node:child_process";
+import { lstat, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import process from "node:process";
-import { basename, join, resolve } from "node:path";
-import { fileURLToPath, URL } from "node:url";
+import { basename, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL, URL } from "node:url";
+import { promisify } from "node:util";
 import { gunzipSync } from "node:zlib";
 
-const require = createRequire(import.meta.url);
-const { sync: spawnSync } = require("cross-spawn");
-
-const expectedFiles = [
+const execFileAsync = promisify(execFile);
+const COMMAND_TIMEOUT_MS = 120_000;
+const OUTPUT_LIMIT_BYTES = 1_048_576;
+const COMMON_ENTRIES = [
   "package/LICENSE",
   "package/README.md",
   "package/dist/cli/connect-gpt.js",
   "package/dist/server.js",
-  "package/dist/windows-process-host.exe",
   "package/package.json"
 ];
-const windowsHostPath = "package/dist/windows-process-host.exe";
+const WINDOWS_HELPER_ENTRY = "package/dist/windows-process-host.exe";
 const projectRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 
-try {
-  await verifyWindowsPackage();
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-  process.exitCode = 1;
+export function verifyPackageArchiveInventory(entries, platform = process.platform) {
+  const expected = [...COMMON_ENTRIES, ...(platform === "win32" ? [WINDOWS_HELPER_ENTRY] : [])].sort();
+  const expectedSet = new Set(expected);
+  const actual = [...entries].sort();
+  const seen = new Set();
+  const missing = expected.filter((entry) => !actual.includes(entry));
+  const unexpected = [];
+  const duplicates = [];
+
+  for (const entry of actual) {
+    if (!expectedSet.has(entry)) unexpected.push(entry);
+    if (seen.has(entry)) duplicates.push(entry);
+    seen.add(entry);
+  }
+
+  if (missing.length || unexpected.length || duplicates.length) {
+    throw new Error([
+      missing.length ? `Missing package entries: ${missing.join(", ")}.` : "",
+      unexpected.length ? `Unexpected package entries: ${unexpected.join(", ")}.` : "",
+      duplicates.length ? `Duplicate package entries: ${duplicates.join(", ")}.` : ""
+    ].filter(Boolean).join(" "));
+  }
 }
 
-async function verifyWindowsPackage() {
-  const buildHostPath = join(projectRoot, "dist", "windows-process-host.exe");
-  const buildHost = await readFile(buildHostPath);
-  if (buildHost.byteLength === 0) {
-    throw new Error("The built Windows process host is empty.");
+async function verifyPackageArchive() {
+  const npmCliPath = process.env.npm_execpath;
+  if (!npmCliPath || !isAbsolute(npmCliPath) || basename(npmCliPath).toLowerCase() !== "npm-cli.js") {
+    throw new Error("Run this check as an npm script so it can use the active Node executable and npm CLI.");
   }
-  const buildHostSha256 = sha256(buildHost);
-  const packageDirectory = await mkdtemp(join(tmpdir(), "gpt-repo-mcp-windows-package-"));
+
+  const packageDirectory = await mkdtemp(join(tmpdir(), "gpt-repo-mcp-package-"));
   let verificationError;
 
   try {
-    const packResult = spawnSync(
-      "npm",
-      ["pack", "--json", "--pack-destination", packageDirectory],
-      { cwd: projectRoot, encoding: "utf8", windowsHide: true }
-    );
-    if (packResult.error) throw packResult.error;
-    if (packResult.status !== 0) {
-      throw new Error(
-        `npm pack --json failed with status ${String(packResult.status)}: ${packResult.stderr.trim()}`
-      );
+    const npmCliInfo = await lstat(npmCliPath);
+    if (!npmCliInfo.isFile() || npmCliInfo.isSymbolicLink()) {
+      throw new Error("The active npm CLI must be a regular, non-symlink file.");
     }
 
+    const packResult = await execFileAsync(
+      process.execPath,
+      [npmCliPath, "pack", "--json", "--pack-destination", packageDirectory],
+      {
+        cwd: projectRoot,
+        encoding: "utf8",
+        timeout: COMMAND_TIMEOUT_MS,
+        maxBuffer: OUTPUT_LIMIT_BYTES,
+        windowsHide: true
+      }
+    );
     let packMetadata;
     try {
       packMetadata = JSON.parse(packResult.stdout);
@@ -70,28 +90,46 @@ async function verifyWindowsPackage() {
       throw new Error("npm pack --json returned an unsafe archive filename.");
     }
 
-    const archivePath = join(packageDirectory, packageMetadata.filename);
-    const archive = await readFile(archivePath);
-    const entries = readTarGzip(archive);
-    assertExpectedInventory(entries);
-
-    const packedHost = entries.find(({ path }) => path === windowsHostPath)?.contents;
-    if (!packedHost || packedHost.byteLength === 0) {
-      throw new Error(`${windowsHostPath} is missing or empty in the npm archive.`);
+    const archivePath = resolve(packageDirectory, packageMetadata.filename);
+    if (!archivePath.startsWith(`${resolve(packageDirectory)}${process.platform === "win32" ? "\\" : "/"}`)) {
+      throw new Error("npm pack returned an archive outside its temporary directory.");
+    }
+    const archiveInfo = await lstat(archivePath);
+    if (!archiveInfo.isFile() || archiveInfo.isSymbolicLink() || archiveInfo.nlink !== 1) {
+      throw new Error("npm pack did not create a singly linked regular archive file.");
     }
 
-    const packedHostSha256 = sha256(packedHost);
-    if (packedHostSha256 !== buildHostSha256) {
-      throw new Error(
-        `Packaged Windows process host hash mismatch: built=${buildHostSha256}, packed=${packedHostSha256}.`
-      );
+    const archive = await readFile(archivePath);
+    const entries = readTarGzip(archive);
+    verifyPackageArchiveInventory(entries.map(({ path }) => path));
+
+    let helperDigest;
+    if (process.platform === "win32") {
+      const buildHostPath = join(projectRoot, "dist", "windows-process-host.exe");
+      const buildHost = await readFile(buildHostPath);
+      if (buildHost.byteLength === 0) {
+        throw new Error("The built Windows process host is empty.");
+      }
+
+      const packedHost = entries.find(({ path }) => path === WINDOWS_HELPER_ENTRY)?.contents;
+      if (!packedHost || packedHost.byteLength === 0) {
+        throw new Error(`${WINDOWS_HELPER_ENTRY} is missing or empty in the npm archive.`);
+      }
+
+      const buildHostSha256 = sha256(buildHost);
+      helperDigest = sha256(packedHost);
+      if (helperDigest !== buildHostSha256) {
+        throw new Error(
+          `Packaged Windows process host hash mismatch: built=${buildHostSha256}, packed=${helperDigest}.`
+        );
+      }
     }
 
     const packageFiles = entries.map(({ path }) => path.slice("package/".length)).sort();
     process.stdout.write([
       `Verified ${packageMetadata.name}@${packageMetadata.version}:`,
       `  files: ${packageFiles.join(", ")}`,
-      `  Windows process host: ${packedHost.byteLength} bytes SHA-256 ${packedHostSha256}`
+      ...(helperDigest ? [`  Windows process host: SHA-256 ${helperDigest}`] : [])
     ].join("\n") + "\n");
   } catch (error) {
     verificationError = error;
@@ -162,24 +200,13 @@ function readTarString(header, start, length) {
   return field.subarray(0, end === -1 ? field.byteLength : end).toString("utf8");
 }
 
-function assertExpectedInventory(entries) {
-  const actualFiles = entries.map(({ path }) => path).sort();
-  const expected = [...expectedFiles].sort();
-  const expectedSet = new Set(expected);
-  const seen = new Set();
-  const missing = expected.filter((path) => !actualFiles.includes(path));
-  const extra = [];
-  for (const path of actualFiles) {
-    if (!expectedSet.has(path) || seen.has(path)) extra.push(path);
-    seen.add(path);
-  }
-  if (missing.length > 0 || extra.length > 0 || actualFiles.length !== expected.length) {
-    throw new Error(
-      `npm archive inventory mismatch; missing=[${missing.join(", ")}], extra=[${extra.join(", ")}].`
-    );
-  }
-}
-
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  await verifyPackageArchive().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
 }

@@ -86,8 +86,15 @@ jobs:
       - name: Build production package and Windows helper
         run: npm run build
 
-      - name: Verify packed Windows package artifact
-        run: node scripts/verify-windows-package.mjs
+      - name: Verify actual Windows npm package archive
+        run: npm run verify:package-archive
+      - name: Windows package archive inventory regression
+        run: npm test -- tests/package-archive-verification.test.ts --reporter=verbose
+
+      - name: Windows exact Node runtime and shell-free npm dispatch
+        run: |
+          npm test -- tests/node-runtime-resolver.test.ts --reporter=verbose
+          npm test -- tests/validation-service.test.ts -t "Windows npm|configured Windows|Windows command shim|repository-controlled make.exe" --reporter=verbose
 
       - name: Windows process supervision
         run: npm test -- tests/windows-process-host.test.ts tests/windows-process-host-protocol.test.ts tests/process-exec.test.ts --reporter=verbose
@@ -96,7 +103,7 @@ jobs:
         run: npm test -- tests/http-request-cancellation.test.ts tests/tool-handler-validation.test.ts tests/server-network-boundary.test.ts --reporter=verbose
 
       - name: Validation cancellation and receipt gates
-        run: npm test -- tests/validation-service.test.ts -t "cancellation|receipt|canonical make verify|overlapping validations" --reporter=verbose
+        run: npm test -- tests/validation-service.test.ts -t "cancellation|receipt|supervision|canonical make verify|overlapping validations" --reporter=verbose
 
       - name: Contract tests
         run: npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts --reporter=verbose

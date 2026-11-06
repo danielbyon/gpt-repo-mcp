@@ -42,6 +42,19 @@ describe("runProcessWithTail", () => {
     });
   });
 
+  posixTest("reports a nonzero command exit after confirmed process-group cleanup", async () => {
+    const result = await runProcessWithTail({
+      ...baseInput,
+      executable: process.execPath,
+      args: ["-e", "process.exit(3)"],
+      cwd: process.cwd(),
+      timeout_ms: 2_000
+    });
+
+    expect(result).toMatchObject({ exit_code: 3, cleanup_confirmed: true, cancelled: false, timed_out: false });
+    expect(result).not.toHaveProperty("host_failure");
+  });
+
   test("preserves argument boundaries for spaces, quotes, backslashes, and Unicode", async () => {
     const argumentsWithSpecialCharacters = ["two words", "quote\"inside", "C:\\work path\\tail\\", "snowman ☃"];
     const result = await runProcessWithTail({
@@ -56,23 +69,15 @@ describe("runProcessWithTail", () => {
     expect(JSON.parse(result.stdout_tail)).toEqual(argumentsWithSpecialCharacters);
   });
 
-  windowsTest("runs the npm command shim through the managed host", async () => {
-    const result = await runProcessWithTail({
+  windowsTest("rejects a bare npm command instead of searching for a shell shim", async () => {
+    await expect(runProcessWithTail({
       ...baseInput,
       executable: "npm",
       args: ["--version"],
       cwd: process.cwd(),
       timeout_ms: 5_000
-    });
-
-    expect(result).toMatchObject({
-      timed_out: false,
-      cancelled: false,
-      cleanup_confirmed: true
-    });
-    expect(result.exit_code).toBe(0);
-    expect(result.stdout_tail.trim()).toMatch(/^\d+\.\d+\.\d+/);
-  }, 7_000);
+    })).rejects.toThrow(/absolute native executable path/);
+  });
 
   windowsTest("keeps completed command status when abort arrives after the host result", async () => {
     const controller = new AbortController();
@@ -233,7 +238,7 @@ describe("runProcessWithTail", () => {
     }
   }, 15_000);
 
-  test("returns spawn failures without waiting for the timeout", async () => {
+  posixTest("returns spawn failures without waiting for the timeout", async () => {
     const result = await runProcessWithTail({
       ...baseInput,
       executable: join(process.cwd(), "__missing_process_executable__"),

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { access, lstat, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { delimiter, isAbsolute, join, relative, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, sep, win32 } from "node:path";
 import ignore from "ignore";
 import { ValidateInputSchema, type ValidateInput, type ValidateResult, type ValidationProfile } from "../contracts/validation.contract.js";
 import { RepoReaderError } from "../runtime/errors.js";
@@ -27,6 +27,7 @@ type CommandPlan = {
   command: string;
   args: string[];
   pathPrefix?: string;
+  windowsNpmLifecycle?: true;
   runtime?: { name: "node"; version: string; source: NodeRuntimeSource };
 };
 
@@ -42,6 +43,14 @@ export class ValidationService {
     private readonly policy: OperationsPolicy,
     private readonly nodeRuntimeOptions: NodeRuntimeResolverOptions = {}
   ) {}
+
+  private get platform(): NodeJS.Platform {
+    return this.nodeRuntimeOptions.platform ?? process.platform;
+  }
+
+  private get validationEnvironment(): NodeJS.ProcessEnv {
+    return this.nodeRuntimeOptions.env ?? process.env;
+  }
 
   async validate(input: ValidateInput, options: { signal?: AbortSignal } = {}): Promise<ValidateResult> {
     options.signal?.throwIfAborted();
@@ -134,10 +143,18 @@ export class ValidationService {
       if (testPaths) {
         throw new RepoReaderError("VALIDATION_TEST_PATHS_DISABLED", "Focused test paths are not supported by the declared repository validation profile.");
       }
+      const executable = this.platform === "win32"
+        ? await resolveWindowsNativeExecutable(owned.runner, this.root, this.validationEnvironment.PATH ?? "")
+        : owned.runner;
+      if (!executable) {
+        throw new RepoReaderError("VALIDATION_PROFILE_UNAVAILABLE", `The configured ${owned.runner} profile requires a native Windows executable.`, {
+          diagnostics: { recovery_hint: `Install ${owned.runner} as a native .exe outside the repository and add its directory to the server PATH. Command shims are not supported.` }
+        });
+      }
       return [{
         profile,
         script: `${owned.runner}:${owned.target}`,
-        executable: owned.runner,
+        executable,
         command: `${owned.runner} ${owned.target}`,
         args: [owned.target]
       }];
@@ -146,16 +163,27 @@ export class ValidationService {
     const selectedNode = npmProfiles.length > 0
       ? await new NodeRuntimeResolver(this.root, this.nodeRuntimeOptions).resolve()
       : undefined;
+    const windowsNodeExecutable = this.platform === "win32" && npmProfiles.length > 0
+      ? selectedNode?.executable ?? process.execPath
+      : undefined;
+    const npmCli = windowsNodeExecutable
+      ? await resolveTrustedWindowsNpmCli(windowsNodeExecutable, this.root)
+      : undefined;
     const runtime = selectedNode
       ? { name: selectedNode.name, version: selectedNode.version, source: selectedNode.source }
       : undefined;
     const plans: CommandPlan[] = npmProfiles.map((candidate) => ({
       profile: candidate,
       script: candidate,
-      executable: "npm",
+      executable: windowsNodeExecutable ?? "npm",
       command: testPaths && candidate === "test" ? `npm run test -- ${testPaths.join(" ")}` : `npm run ${candidate}`,
-      args: testPaths && candidate === "test" ? ["run", candidate, "--", ...testPaths] : ["run", candidate],
-      ...(selectedNode ? { pathPrefix: selectedNode.bin_directory, runtime } : {})
+      args: windowsNodeExecutable
+        ? [npmCli!, ...(testPaths && candidate === "test" ? ["run", candidate, "--", ...testPaths] : ["run", candidate])]
+        : testPaths && candidate === "test" ? ["run", candidate, "--", ...testPaths] : ["run", candidate],
+      ...((selectedNode || windowsNodeExecutable)
+        ? { pathPrefix: selectedNode?.bin_directory ?? dirname(windowsNodeExecutable!), ...(runtime ? { runtime } : {}) }
+        : {}),
+      ...(windowsNodeExecutable ? { windowsNpmLifecycle: true as const } : {})
     }));
     const needsPytest = !("test" in scripts) && (profile === "test" || profile === "all") && await this.hasPythonTestSuite();
     if (needsPytest) {
@@ -185,6 +213,7 @@ export class ValidationService {
   }
 
   private async runCommand(command: CommandPlan, timeoutMs: number, signal?: AbortSignal): Promise<ValidateResult["commands"][number]> {
+    const npmComSpec = command.windowsNpmLifecycle ? await resolveWindowsNpmComSpec() : undefined;
     const result = await runProcessWithTail({
       executable: command.executable,
       args: command.args,
@@ -197,16 +226,28 @@ export class ValidationService {
       // so standard developer tooling can resolve user-level configuration; all other host
       // environment variables remain excluded.
       env: {
-        PATH: command.pathPrefix ? `${command.pathPrefix}${delimiter}${process.env.PATH ?? ""}` : process.env.PATH ?? "",
+        PATH: command.pathPrefix
+          ? `${command.pathPrefix}${this.platform === "win32" ? ";" : delimiter}${process.env.PATH ?? ""}`
+          : process.env.PATH ?? "",
         CI: "1",
         NO_COLOR: "1",
         npm_config_color: "false",
+        ...(npmComSpec ? { ComSpec: npmComSpec } : {}),
         ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
         ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {})
       }
     });
-    if (result.cleanup_confirmed === false) {
-      throw new Error("Validation process cleanup could not be confirmed; no receipt was published.");
+    if (result.cleanup_confirmed !== true) {
+      throw new RepoReaderError(
+        "VALIDATION_PROCESS_CLEANUP_UNCONFIRMED",
+        "Validation process cleanup could not be confirmed; no receipt was published."
+      );
+    }
+    if (result.host_failure) {
+      throw new RepoReaderError(
+        "VALIDATION_PROCESS_SUPERVISION_FAILED",
+        "Validation process supervision failed; no receipt was published."
+      );
     }
     if (result.cancelled) {
       signal?.throwIfAborted();
@@ -248,7 +289,7 @@ export class ValidationService {
   }
 
   private async selectPython(): Promise<{ executable: string; prefixArgs: string[]; display: string }> {
-    const localCandidates = process.platform === "win32"
+    const localCandidates = this.platform === "win32"
       ? [[".venv", "Scripts", "python.exe"], ["venv", "Scripts", "python.exe"]]
       : [[".venv", "bin", "python"], ["venv", "bin", "python"]];
     for (const parts of localCandidates) {
@@ -257,11 +298,16 @@ export class ValidationService {
         return { executable: candidate, prefixArgs: [], display: parts.join("/") };
       }
     }
-    if (process.platform === "win32") {
-      if (await isExecutableOnPath("py")) return { executable: "py", prefixArgs: ["-3"], display: "py -3" };
-      return { executable: "python", prefixArgs: [], display: "python" };
+    if (this.platform === "win32") {
+      const py = await resolveWindowsNativeExecutable("py", this.root, this.validationEnvironment.PATH ?? "");
+      if (py) return { executable: py, prefixArgs: ["-3"], display: "py -3" };
+      const python = await resolveWindowsNativeExecutable("python", this.root, this.validationEnvironment.PATH ?? "");
+      if (python) return { executable: python, prefixArgs: [], display: "python" };
+      throw new RepoReaderError("VALIDATION_PROFILE_UNAVAILABLE", "No supported native Windows Python executable was found.", {
+        diagnostics: { recovery_hint: "Add python.exe or py.exe to the server PATH, or provide an executable .venv/Scripts/python.exe. Command shims are not supported." }
+      });
     }
-    if (await isExecutableOnPath("python3")) return { executable: "python3", prefixArgs: [], display: "python3" };
+    if (await isExecutableOnPath("python3", this.platform, this.validationEnvironment.PATH)) return { executable: "python3", prefixArgs: [], display: "python3" };
     return { executable: "python", prefixArgs: [], display: "python" };
   }
 
@@ -272,7 +318,7 @@ export class ValidationService {
       if (!linkInfo.isFile() && !linkInfo.isSymbolicLink()) return false;
       const [resolvedRoot, resolved] = await Promise.all([realpath(this.root), realpath(candidate)]);
       if (!isWithinRoot(resolvedRoot, resolved) || !(await stat(resolved)).isFile()) return false;
-      await access(resolved, fsConstants.X_OK);
+      if (this.platform !== "win32") await access(resolved, fsConstants.X_OK);
       return true;
     } catch {
       return false;
@@ -350,15 +396,18 @@ export class ValidationService {
       artifact_path: artifactPath,
       timestamp: artifact.timestamp
     };
+    let receiptCommitAdmitted = false;
     const admitReceiptCommit = (): Promise<void> => {
       signal?.throwIfAborted();
+      receiptCommitAdmitted = true;
       return atomicWriteJson(join(this.root, VALIDATION_ROOT, "latest.json"), latestPointer);
     };
     try {
       await atomicWriteJson(join(this.root, artifactPath), artifact);
       await admitReceiptCommit();
     } catch (error) {
-      if (signal?.aborted) {
+      // An admitted pointer write may have committed before it reported an error.
+      if (signal?.aborted && !receiptCommitAdmitted) {
         await rm(join(this.root, VALIDATION_ROOT, validationId), { recursive: true, force: true });
       }
       throw error;
@@ -403,13 +452,96 @@ function isWithinRoot(root: string, candidate: string): boolean {
   return pathFromRoot === "" || (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot));
 }
 
-async function isExecutableOnPath(name: "python3" | "py"): Promise<boolean> {
-  for (const directory of (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":").filter(Boolean)) {
-    const candidate = join(directory, process.platform === "win32" && name === "py" ? "py.exe" : name);
+async function resolveWindowsNpmComSpec(): Promise<string> {
+  const systemRoot = process.env.SystemRoot;
+  const recoveryHint = "Start the MCP server from a standard Windows environment with SystemRoot set to the Windows installation directory and cmd.exe available under System32.";
+  if (!systemRoot || !win32.isAbsolute(systemRoot)) {
+    throw new RepoReaderError("VALIDATION_PROFILE_UNAVAILABLE", "Windows npm validation requires the system command processor.", {
+      diagnostics: { recovery_hint: recoveryHint }
+    });
+  }
+
+  const comSpec = win32.join(systemRoot, "System32", "cmd.exe");
+  if (process.platform === "win32") {
+    try {
+      if (!(await stat(comSpec)).isFile()) throw new Error("System command processor is not a file.");
+    } catch {
+      throw new RepoReaderError("VALIDATION_PROFILE_UNAVAILABLE", "Windows npm validation requires the system command processor.", {
+        diagnostics: { recovery_hint: recoveryHint }
+      });
+    }
+  }
+  return comSpec;
+}
+
+async function isExecutableOnPath(name: "python3", platform: NodeJS.Platform, pathValue: string | undefined): Promise<boolean> {
+  for (const directory of (pathValue ?? "").split(platform === "win32" ? ";" : delimiter).filter(Boolean)) {
+    const candidate = join(directory, name);
     try {
       await access(candidate, fsConstants.X_OK);
       if ((await stat(candidate)).isFile()) return true;
     } catch { /* try the next fixed PATH entry */ }
   }
   return false;
+}
+
+async function resolveWindowsNativeExecutable(
+  runner: "make" | "just" | "python" | "py",
+  repositoryRoot: string,
+  pathValue: string
+): Promise<string | undefined> {
+  const executableNames = {
+    make: ["make.exe", "gmake.exe", "mingw32-make.exe"],
+    just: ["just.exe"],
+    python: ["python.exe"],
+    py: ["py.exe"]
+  }[runner];
+  let canonicalRepositoryRoot: string;
+  try {
+    canonicalRepositoryRoot = await realpath(repositoryRoot);
+  } catch {
+    return undefined;
+  }
+
+  for (const directory of pathValue.split(";").filter(Boolean)) {
+    if (!isAbsolute(directory)) continue;
+    try {
+      const canonicalDirectory = await realpath(directory);
+      if (isWithinRoot(canonicalRepositoryRoot, canonicalDirectory)) continue;
+      for (const executableName of executableNames) {
+        const candidate = join(canonicalDirectory, executableName);
+        const metadata = await lstat(candidate);
+        if (!metadata.isFile() || metadata.isSymbolicLink()) continue;
+        const resolved = await realpath(candidate);
+        if (!isWithinRoot(canonicalDirectory, resolved) || isWithinRoot(canonicalRepositoryRoot, resolved)) continue;
+        return resolved;
+      }
+    } catch {
+      // Inaccessible PATH entries are skipped; absence of a native runner fails closed.
+    }
+  }
+  return undefined;
+}
+
+async function resolveTrustedWindowsNpmCli(nodeExecutable: string, repositoryRoot: string): Promise<string> {
+  const fail = (): never => {
+    throw new RepoReaderError("VALIDATION_PROFILE_UNAVAILABLE", "The selected Node runtime has no trusted bundled npm CLI.", {
+      diagnostics: { recovery_hint: "Install npm with the selected Node runtime. Validation does not invoke npm.cmd or substitute another Node installation." }
+    });
+  };
+  try {
+    if (!isAbsolute(nodeExecutable) || nodeExecutable.split(/[\\/]/).at(-1)?.toLowerCase() !== "node.exe") return fail();
+    const canonicalRoot = await realpath(repositoryRoot);
+    const canonicalNode = await realpath(nodeExecutable);
+    if (isWithinRoot(canonicalRoot, canonicalNode) || !(await stat(canonicalNode)).isFile()) return fail();
+    const runtimeRoot = dirname(canonicalNode);
+    const candidate = join(runtimeRoot, "node_modules", "npm", "bin", "npm-cli.js");
+    const metadata = await stat(candidate);
+    if (!metadata.isFile()) return fail();
+    const canonicalCli = await realpath(candidate);
+    if (!isWithinRoot(runtimeRoot, canonicalCli) || isWithinRoot(canonicalRoot, canonicalCli)) return fail();
+    return canonicalCli;
+  } catch {
+    return fail();
+  }
 }

@@ -16,12 +16,14 @@ export type NodeRuntimeSelection = {
   name: "node";
   version: string;
   source: NodeRuntimeSource;
+  executable: string;
   bin_directory: string;
 };
 
 export type NodeRuntimeResolverOptions = {
   home?: string;
   env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
 };
 
 type VersionRequest = { version: string; source: NodeRuntimeSource };
@@ -29,10 +31,12 @@ type VersionRequest = { version: string; source: NodeRuntimeSource };
 export class NodeRuntimeResolver {
   private readonly home: string;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly platform: NodeJS.Platform;
 
   constructor(private readonly root: string, options: NodeRuntimeResolverOptions = {}) {
     this.home = options.home ?? homedir();
     this.env = options.env ?? process.env;
+    this.platform = options.platform ?? process.platform;
   }
 
   async resolve(): Promise<NodeRuntimeSelection | undefined> {
@@ -41,14 +45,17 @@ export class NodeRuntimeResolver {
 
     for (const candidate of this.runtimeCandidates(request.version)) {
       if (await this.isSafeRuntimeExecutable(candidate.executable, candidate.runtimeRoot, request.version)) {
-        return { name: "node", version: request.version, source: request.source, bin_directory: dirname(candidate.executable) };
+        const executable = await realpath(candidate.executable);
+        return { name: "node", version: request.version, source: request.source, executable, bin_directory: dirname(executable) };
       }
     }
 
     throw new RepoReaderError(
       "VALIDATION_NODE_RUNTIME_UNAVAILABLE",
       `Repository requires Node.js ${request.version}, but no safe installed runtime was found.`,
-      { diagnostics: { recovery_hint: `Install Node.js ${request.version} with nvm, mise, fnm, Volta, or asdf, then retry validation.` } }
+      { diagnostics: { recovery_hint: this.platform === "win32"
+        ? `Install Node.js ${request.version} with nvm-windows, mise, fnm, or Volta, then retry validation.`
+        : `Install Node.js ${request.version} with nvm, mise, fnm, Volta, or asdf, then retry validation.` } }
     );
   }
 
@@ -91,6 +98,26 @@ export class NodeRuntimeResolver {
   }
 
   private runtimeCandidates(version: string): Array<{ executable: string; runtimeRoot: string }> {
+    if (this.platform === "win32") {
+      const nvmRoot = this.env.NVM_HOME ?? join(this.home, "AppData", "Roaming", "nvm");
+      const localAppData = this.env.LOCALAPPDATA ?? join(this.home, "AppData", "Local");
+      const appData = this.env.APPDATA ?? join(this.home, "AppData", "Roaming");
+      const fnmRoot = this.env.FNM_DIR ?? join(appData, "fnm");
+      const voltaRoot = this.env.VOLTA_HOME ?? join(localAppData, "Volta");
+      const miseDataRoot = this.env.MISE_DATA_DIR ?? join(localAppData, "mise");
+      const miseInstallsRoot = this.env.MISE_INSTALLS_DIR ?? join(miseDataRoot, "installs");
+      const windowsCandidates = [
+        { runtimeRoot: join(nvmRoot, `v${version}`), executable: join(nvmRoot, `v${version}`, "node.exe") },
+        { runtimeRoot: join(voltaRoot, "tools", "image", "node", version), executable: join(voltaRoot, "tools", "image", "node", version, "node.exe") },
+        { runtimeRoot: join(miseInstallsRoot, "node", version), executable: join(miseInstallsRoot, "node", version, "node.exe") },
+        { runtimeRoot: join(fnmRoot, "node-versions", `v${version}`, "installation"), executable: join(fnmRoot, "node-versions", `v${version}`, "installation", "node.exe") }
+      ];
+      if (exactVersion(process.version) === version && isAbsolute(process.execPath)) {
+        windowsCandidates.push({ runtimeRoot: dirname(process.execPath), executable: process.execPath });
+      }
+      return windowsCandidates;
+    }
+
     const nvmRoot = this.env.NVM_DIR ? join(this.env.NVM_DIR, "versions", "node") : join(this.home, ".nvm", "versions", "node");
     return [
       { runtimeRoot: nvmRoot, executable: join(nvmRoot, `v${version}`, "bin", "node") },
@@ -107,13 +134,16 @@ export class NodeRuntimeResolver {
       if (!isWithin(resolvedRoot, resolvedExecutable)) return false;
       const info = await stat(resolvedExecutable);
       if (!info.isFile()) return false;
-      await access(resolvedExecutable, fsConstants.X_OK);
+      if (this.platform !== "win32") await access(resolvedExecutable, fsConstants.X_OK);
       const checked = await execFileAsync(resolvedExecutable, ["--version"], {
         timeout: VERSION_CHECK_TIMEOUT_MS,
         maxBuffer: 256,
-        env: { PATH: dirname(resolvedExecutable) }
+        env: {
+          PATH: dirname(resolvedExecutable),
+          ...(this.platform === "win32" && this.env.SystemRoot ? { SystemRoot: this.env.SystemRoot } : {})
+        }
       });
-      return exactVersion(checked.stdout.trim()) === version;
+      return exactVersion(checked.stdout.trim()) === version && !isWithin(await realpath(this.root), resolvedExecutable);
     } catch {
       return false;
     }

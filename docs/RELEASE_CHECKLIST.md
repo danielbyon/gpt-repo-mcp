@@ -73,6 +73,8 @@ Review any full-audit development advisory against
 - Treat npm publication as a separate explicit decision.
 - Verify package name, version, license, repository metadata, files, and
   executable entries in the `npm pack --dry-run` output.
+- On Windows after the production build, run `npm run verify:package-archive` to
+  inspect an actual archive and confirm the helper and runtime file inventory.
 - Confirm the package privacy setting is intentional before publishing.
 - Install the packed archive in a temporary directory and verify the CLI,
   build output, and server health check.
