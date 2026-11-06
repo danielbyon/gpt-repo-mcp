@@ -150,16 +150,36 @@ describe("server network boundary", () => {
       expect(cancelSession.sessionId).toEqual(expect.any(String));
       await initializeClient(server.port, cancelSession.sessionId!);
       const seed = await callRepoValidate(server.port, cancelSession.sessionId!, 2);
-  const seedCommands = seed.commands.map(({ profile, command, status, exit_code, duration_ms, stdout_tail, stderr_tail }) => ({
-    profile,
-    command,
-    status,
-    exit_code,
-    duration_ms,
-    stdout_tail,
-    stderr_tail
-  }));
-  expect(seed.status, `Seed validation command result:\n${JSON.stringify(seedCommands, null, 2)}`).toBe("passed");
+      let npmDebugSummary = "";
+      if (process.platform === "win32" && seed.status !== "passed") {
+        try {
+          const logDirectory = join(repoRoot, ".npm-cache", "_logs");
+          const logNames = (await readdir(logDirectory)).filter((name) => name.endsWith("-debug-0.log")).sort();
+          const latestLog = logNames.at(-1);
+          if (latestLog) {
+            const debugLog = await readFile(join(logDirectory, latestLog), "utf8");
+            npmDebugSummary = debugLog.split(/\r?\n/)
+              .filter((line) => /npm (?:silly lifecycle|verbose (?:run-script|lifecycle|stack|code|exit)|info run|error )/i.test(line))
+              .slice(-40)
+              .join("\n");
+          }
+        } catch {
+          npmDebugSummary = "NPM debug log unavailable.";
+        }
+      }
+      const seedCommands = seed.commands.map(({ profile, command, status, exit_code, duration_ms, stdout_tail, stderr_tail }) => ({
+        profile,
+        command,
+        status,
+        exit_code,
+        duration_ms,
+        stdout_tail,
+        stderr_tail
+      }));
+      expect(seed.status, [
+        `Seed validation command result:\n${JSON.stringify(seedCommands, null, 2)}`,
+        npmDebugSummary && `NPM debug summary:\n${npmDebugSummary}`
+      ].filter(Boolean).join("\n\n")).toBe("passed");
       expect(seed.validation_id).toEqual(expect.any(String));
 
       const seededLatest = await readFile(latestPath, "utf8");
@@ -570,7 +590,8 @@ async function writeValidationFixture(
     scripts: { smoke: "node runner.cjs" }
   }), "utf8");
   if (process.platform === "win32") {
-    await writeFile(join(repoRoot, ".npmrc"), "loglevel=verbose\n", "utf8");
+      const npmCachePath = join(repoRoot, ".npm-cache").replaceAll("\\", "/");
+      await writeFile(join(repoRoot, ".npmrc"), `cache=${npmCachePath}\nloglevel=verbose\n`, "utf8");
   }
   await writeFile(runnerPath, runner, "utf8");
 }
