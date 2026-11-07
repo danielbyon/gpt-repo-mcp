@@ -184,7 +184,7 @@ export function collectWindowsTestTitles(filename, source) {
   const titles = [];
   const visit = (node, disabled = false) => {
     if (ts.isPropertyAccessExpression(node) && node.name.text === "only" &&
-        /\\b(?:test|it|describe)\\b/.test(node.expression.getText(file))) {
+        /\b(?:test|it|describe)\b/.test(node.expression.getText(file))) {
       throw new Error("Exclusive Vitest test selection is unaudited.");
     }
     const disabledDescribe = ts.isCallExpression(node) &&
