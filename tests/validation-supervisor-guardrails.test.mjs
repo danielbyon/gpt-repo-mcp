@@ -47,6 +47,33 @@ describe("validation supervisor direct-execution guard", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
   });
 
+  test.each([
+    ["computed double-quoted shell", "spawn('node.exe', [], { [\"shell\"]: true });"],
+    ["computed single-quoted shell", "spawn('node.exe', [], { ['shell']: false });"],
+    ["computed template shell", "spawn('node.exe', [], { [\`shell\`]: true });"],
+    ["aliased spawn", "import { spawn as runNative } from 'node:child_process'; runNative('node.exe', [], { ['shell']: true });"],
+    ["aliased execFile", "import { execFile as runNative } from 'node:child_process'; runNative('node.exe', [], { ['shell']: true });"],
+    ["unknown computed option", "spawn('node.exe', [], { [optionName]: true });"],
+    ["unknown computed expression", "spawn('node.exe', [], { ['sh' + 'ell']: true });"],
+    ["opaque option object", "const opts = { stdio: 'pipe' }; spawn('node.exe', [], opts);"],
+    ["spread process options", "spawn('node.exe', [], { ...runtimeOptions });"]
+  ])("52-D rejects shell-capable or unverifiable native launch options: %s", (_name, code) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", code))
+      .not.toEqual([]);
+  });
+
+  test("52-D accepts native execution and unrelated computed objects", () => {
+    const source = [
+      "import { spawn as runNative, execFile as execNative } from 'node:child_process';",
+      "const metadata = { ['shell']: 'not a launch option', [variable]: 1 };",
+      "runNative('node.exe', [], { cwd: '.', stdio: 'pipe' });",
+      "execNative('node.exe', ['--version'], { windowsHide: true });",
+      "spawn('node.exe', ['--version']);"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .toEqual([]);
+  });
+
   test("audits the embedded POSIX launcher and rejects shell dispatch inside it", () => {
     const valid = "const POSIX_GROUP_LAUNCHER = String.raw`" +
       "const { spawn } = require('node:child_process'); spawn('node', []);" + "`;";

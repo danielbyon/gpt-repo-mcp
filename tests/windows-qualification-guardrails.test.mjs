@@ -103,6 +103,78 @@ describe("Windows qualification scope guard", () => {
     expect(findings.some((f) => f.includes("Could not parse mandatory Vitest declarations"))).toBe(true);
   });
 
+  test.each([
+    ["disabled plain suite", "describe.skip('suite', () => { test('required', () => {}); });"],
+    ["todo suite", "describe.todo('suite', () => { test('required', () => {}); });"],
+    ["disabled skipIf suite", "describe.skipIf(true)('suite', () => { test('required', () => {}); });"],
+    ["disabled runIf suite", "describe.runIf(false)('suite', () => { test('required', () => {}); });"],
+    ["nested disabled suite", "describe('outer', () => { describe.skipIf(true)('inner', () => { test('required', () => {}); }); });"],
+    ["unresolved suite predicate", "describe.skipIf(isDisabled)('suite', () => { test('required', () => {}); });"],
+    ["false conditional", "if (false) { test('required', () => {}); }"],
+    ["non-Windows conditional", "if (process.platform !== 'win32') { test('required', () => {}); }"],
+    ["unknown conditional", "if (runtimeFlag) { test('required', () => {}); }"]
+  ])("52-E does not count a required regression in %s", (_name, source) => {
+    expect(collectWindowsTestTitles("fixture.ts", source))
+      .toEqual([{ title: "required", enabled: false }]);
+  });
+
+  test.each([
+    ["Windows-only skipIf", "describe.skipIf(process.platform !== 'win32')('suite', () => { test('required', () => {}); });"],
+    ["Windows-only runIf", "describe.runIf(process.platform === 'win32')('suite', () => { test('required', () => {}); });"],
+    ["enabled skipIf", "describe.skipIf(false)('suite', () => { test('required', () => {}); });"],
+    ["enabled runIf", "describe.runIf(true)('suite', () => { test('required', () => {}); });"],
+    ["nested enabled suite", "describe('outer', () => { describe.runIf(true)('inner', () => { test('required', () => {}); }); });"],
+    ["true conditional", "if (true) { test('required', () => {}); }"],
+    ["Windows branch", "if (process.platform === 'win32') { test('required', () => {}); }"],
+    ["Windows else", "if (process.platform !== 'win32') {} else { test('required', () => {}); }"]
+  ])("52-E permits a proven Windows-executable regression in %s", (_name, source) => {
+    expect(collectWindowsTestTitles("fixture.ts", source))
+      .toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test("52-E tracks both statically decidable branches", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "if (false) { test('off', () => {}); } else { test('on', () => {}); }"))
+      .toEqual([{ title: "off", enabled: false }, { title: "on", enabled: true }]);
+  });
+
+  test("52-E rejects a mandatory regression hidden in a disabled parent suite", () => {
+    const workflow = load();
+    const findings = inspectQualificationWorkflow(workflow, (path) =>
+      path === "tests/package-hygiene.test.ts"
+        ? "describe.skipIf(true)('disabled', () => { test('pins the repository package inventory to its runtime files', () => {}); });"
+        : readFileSync(join(root, path), "utf8"));
+    expect(findings.some((f) => f.includes("missing or disabling mandatory regression"))).toBe(true);
+  });
+
+  test.each([
+    ["test.only", "test.only('extra', () => {});"],
+    ["test bracket", "test['only']('extra', () => {});"],
+    ["it bracket", "it[\"only\"]('extra', () => {});"],
+    ["describe bracket", "describe['only']('suite', () => {});"],
+    ["dynamic test selector", "test[modifier]('extra', () => {});"],
+    ["dynamic describe selector", "describe[modifier]('suite', () => {});"]
+  ])("52-F rejects exclusive or unverifiable Vitest execution: %s", (_name, source) => {
+    expect(() => collectWindowsTestTitles("fixture.ts", source +
+      " test('required', () => {});"))
+      .toThrow(/Exclusive or dynamically selected Vitest/);
+  });
+
+  test("52-F accepts unrelated element access without exclusive Vitest selection", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "const flags = { ['only']: false }; test('required', () => {});"))
+      .toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test("52-F rejects bracket-exclusive tests at the workflow evidence boundary", () => {
+    const workflow = load();
+    const findings = inspectQualificationWorkflow(workflow, (path) =>
+      path === "tests/package-hygiene.test.ts"
+        ? "test['only']('extra', () => {}); test('pins the repository package inventory to its runtime files', () => {});"
+        : readFileSync(join(root, path), "utf8"));
+    expect(findings.some((f) => f.includes("Could not parse mandatory Vitest declarations"))).toBe(true);
+  });
+
   test("expands parameterized test.each native executable cases", () => {
     const declarations = collectWindowsTestTitles("fixture.ts",
       "test.each([['make','make.exe'],['just','just.exe']])('Windows %s runner', () => {});");

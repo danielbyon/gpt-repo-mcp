@@ -23,6 +23,14 @@ const nameOf = (node) => ts.isIdentifier(node) ? node.text : undefined;
 const callName = (node) => nameOf(node) ||
   (ts.isPropertyAccessExpression(node) ? node.name.text : undefined);
 const propertyName = (node, file) => node.name?.getText(file).replace(/^["']|["']$/g, "");
+const launchOptionName = (name) => {
+  if (name && (ts.isIdentifier(name) || ts.isStringLiteralLike(name) ||
+      ts.isNumericLiteral(name))) return name.text;
+  if (name && ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)) {
+    return name.expression.text;
+  }
+  return undefined;
+};
 
 function inspectJavaScript(filename, source, isLauncher = false) {
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true,
@@ -70,6 +78,30 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     }
   };
 
+  const inspectLaunchOptions = (call, runner) => {
+    const second = call.arguments[1];
+    const third = call.arguments[2];
+    const options = second && ts.isObjectLiteralExpression(second) ? second : third;
+    if (!options || (runner === "execFile" && (
+        ts.isFunctionExpression(options) || ts.isArrowFunction(options)))) return;
+    if (!ts.isObjectLiteralExpression(options)) {
+      add(options, "unresolved process-launch options cannot prove shell-free dispatch");
+      return;
+    }
+    for (const property of options.properties) {
+      if (!("name" in property)) {
+        add(property, "spread process-launch options cannot prove shell-free dispatch");
+        continue;
+      }
+      const name = launchOptionName(property.name);
+      if (name === undefined) {
+        add(property, "unresolved computed process-launch option");
+      } else if (name === "shell") {
+        add(property, "shell dispatch option is forbidden");
+      }
+    }
+  };
+
   const visit = (node) => {
     if (ts.isImportDeclaration(node)) {
       const module = moduleLiteral(node.moduleSpecifier);
@@ -107,6 +139,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       const direct = ts.isIdentifier(node.expression)
         ? processFunctions.get(node.expression.text) ?? node.expression.text
         : undefined;
+      if (SAFE_PROCESS_EXPORTS.has(direct)) inspectLaunchOptions(node, direct);
       if (SAFE_PROCESS_EXPORTS.has(direct) && moduleLiteral(node.arguments[0]) &&
           (DISALLOWED_PROGRAMS.test(moduleLiteral(node.arguments[0])) ||
            DISALLOWED_SHIMS.test(moduleLiteral(node.arguments[0])))) {

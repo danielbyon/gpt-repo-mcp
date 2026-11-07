@@ -147,30 +147,70 @@ function eachValues(node) {
   }).filter((value) => value !== undefined);
 }
 
-function callKind(expression) {
-  if (ts.isIdentifier(expression) && ["test", "it"].includes(expression.text)) {
+function access(node) {
+  if (ts.isPropertyAccessExpression(node)) {
+    return { receiver: node.expression, method: node.name.text };
+  }
+  if (ts.isElementAccessExpression(node)) {
+    return { receiver: node.expression, method: literal(node.argumentExpression) };
+  }
+  return undefined;
+}
+
+/** A deliberately small Windows-only predicate evaluator; unknown means unproven. */
+function conditionOnWindows(node) {
+  if (!node) return undefined;
+  node = unwrap(node);
+  if (node.kind === ts.SyntaxKind.TrueKeyword) return true;
+  if (node.kind === ts.SyntaxKind.FalseKeyword) return false;
+  if (ts.isPrefixUnaryExpression(node) &&
+      node.operator === ts.SyntaxKind.ExclamationToken) {
+    const value = conditionOnWindows(node.operand);
+    return value === undefined ? undefined : !value;
+  }
+  if (ts.isBinaryExpression(node)) {
+    const op = node.operatorToken.kind;
+    const equal = op === ts.SyntaxKind.EqualsEqualsEqualsToken ||
+      op === ts.SyntaxKind.EqualsEqualsToken;
+    const unequal = op === ts.SyntaxKind.ExclamationEqualsEqualsToken ||
+      op === ts.SyntaxKind.ExclamationEqualsToken;
+    if (!equal && !unequal) return undefined;
+    const left = node.left.getText().replace(/\s+/g, "");
+    const right = node.right.getText().replace(/\s+/g, "");
+    const value = left === "process.platform" ? literal(node.right) :
+      right === "process.platform" ? literal(node.left) : undefined;
+    if (value !== undefined) {
+      const matches = value === "win32";
+      return equal ? matches : !matches;
+    }
+  }
+  return undefined;
+}
+
+function invocationKind(expression, names) {
+  if (ts.isIdentifier(expression) && names.includes(expression.text)) {
     return { enabled: true };
   }
-  if (ts.isPropertyAccessExpression(expression) &&
-      ["skip", "todo"].includes(expression.name.text) &&
-      ts.isIdentifier(expression.expression) &&
-      ["test", "it"].includes(expression.expression.text)) return { enabled: false };
-  if (!ts.isCallExpression(expression) || !ts.isPropertyAccessExpression(expression.expression)) {
-    return undefined;
+  const member = access(expression);
+  if (member && ts.isIdentifier(member.receiver) &&
+      names.includes(member.receiver.text) &&
+      ["skip", "todo"].includes(member.method)) {
+    return { enabled: false };
   }
-  const inner = callKind(expression.expression.expression);
+  if (!ts.isCallExpression(expression)) return undefined;
+  const decorator = access(expression.expression);
+  if (!decorator) return undefined;
+  const inner = invocationKind(decorator.receiver, names);
   if (!inner) return undefined;
-  const method = expression.expression.name.text;
-  if (method === "skipIf") {
-    const condition = expression.arguments[0]?.getText().replace(/\s+/g, "");
-    const safe = /^process\.platform(?:!==|!=)['"]win32['"]$/.test(condition ?? "");
-    return { ...inner, enabled: inner.enabled && safe };
-  }
-  if (method === "runIf") {
+  if (decorator.method === "skipIf") {
     return { ...inner, enabled: inner.enabled &&
-      expression.arguments[0]?.kind === ts.SyntaxKind.TrueKeyword };
+      conditionOnWindows(expression.arguments[0]) === false };
   }
-  if (method === "each") {
+  if (decorator.method === "runIf") {
+    return { ...inner, enabled: inner.enabled &&
+      conditionOnWindows(expression.arguments[0]) === true };
+  }
+  if (decorator.method === "each") {
     const values = eachValues(expression.arguments[0]);
     return { ...inner, enabled: inner.enabled && values.length > 0, values };
   }
@@ -183,27 +223,44 @@ export function collectWindowsTestTitles(filename, source) {
   if (file.parseDiagnostics.length) throw new Error("Cannot parse Vitest declarations");
   const titles = [];
   const visit = (node, disabled = false) => {
-    if (ts.isPropertyAccessExpression(node) && node.name.text === "only" &&
-        /\b(?:test|it|describe)\b/.test(node.expression.getText(file))) {
-      throw new Error("Exclusive Vitest test selection is unaudited.");
+    const member = access(node);
+    if (member && ts.isIdentifier(member.receiver) &&
+        ["test", "it", "describe"].includes(member.receiver.text) &&
+        (member.method === undefined || member.method === "only")) {
+      throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
     }
-    const disabledDescribe = ts.isCallExpression(node) &&
-      ts.isPropertyAccessExpression(node.expression) &&
-      node.expression.expression.getText(file) === "describe" &&
-      ["skip", "skipIf", "runIf"].includes(node.expression.name.text);
-    const scopedDisabled = disabled || disabledDescribe;
-    if (ts.isCallExpression(node) && literal(node.arguments[0]) !== undefined) {
-      const call = callKind(node.expression);
-      if (call) {
-        const template = literal(node.arguments[0]);
+    if (ts.isIfStatement(node)) {
+      const outcome = conditionOnWindows(node.expression);
+      visit(node.expression, disabled);
+      visit(node.thenStatement, disabled || outcome !== true);
+      if (node.elseStatement) visit(node.elseStatement, disabled || outcome !== false);
+      return;
+    }
+    if (ts.isConditionalExpression(node)) {
+      const outcome = conditionOnWindows(node.condition);
+      visit(node.condition, disabled);
+      visit(node.whenTrue, disabled || outcome !== true);
+      visit(node.whenFalse, disabled || outcome !== false);
+      return;
+    }
+    if (ts.isCallExpression(node)) {
+      const suite = invocationKind(node.expression, ["describe"]);
+      if (suite) {
+        visit(node.expression, disabled);
+        for (const arg of node.arguments) visit(arg, disabled || !suite.enabled);
+        return;
+      }
+      const template = literal(node.arguments[0]);
+      const call = invocationKind(node.expression, ["test", "it"]);
+      if (call && template !== undefined) {
         const expanded = call.values ? call.values.map((value, i) =>
           template.replace(/%s|%d|%i/, (p) => p === "%i" ? String(i) : String(value))) : [template];
         for (const title of expanded) titles.push({
-          title, enabled: call.enabled && !scopedDisabled
+          title, enabled: call.enabled && !disabled
         });
       }
     }
-    ts.forEachChild(node, (child) => visit(child, scopedDisabled));
+    ts.forEachChild(node, (child) => visit(child, disabled));
   };
   visit(file);
   return titles;
