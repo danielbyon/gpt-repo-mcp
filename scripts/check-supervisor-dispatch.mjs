@@ -137,7 +137,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         add(node, "embedded POSIX launcher must be a static String.raw template");
       } else {
         findings.push(...inspectJavaScript(filename + "#POSIX_GROUP_LAUNCHER",
-          value.template.text, true));
+          value.template.rawText ?? value.template.text, true));
       }
     }
     ts.forEachChild(node, visit);
