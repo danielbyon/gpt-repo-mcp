@@ -11,6 +11,11 @@ const MAX_PATCH_BYTES = 16 * 1024 * 1024;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_UNTRACKED_FILES = 256;
 const MAX_UNTRACKED_BYTES = 16 * 1024 * 1024;
+const MAX_ENUMERATED_PATHS = 8_192;
+const IGNORED_INVENTORY_ROOTS = Object.freeze([
+  "src/", "tests/", "scripts/", "docs/", "native/", ".github/workflows/",
+  "Makefile", "Justfile", "package.json", "Cargo.toml"
+]);
 const READ_FLAGS = constants.O_RDONLY |
   (typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0);
 const DEFAULT_REFERENCES = [
@@ -136,8 +141,45 @@ function changedPaths(root, baseSha) {
   return nulPaths(git(root, ["diff", "--name-only", "-z", baseSha, "--"]));
 }
 
+function boundedPaths(bytes) {
+  const entries = nulPaths(bytes);
+  if (entries.length > MAX_ENUMERATED_PATHS) {
+    throw new Error("Review-bundle candidate inventory exceeds the path-count limit.");
+  }
+  return entries;
+}
+
 function untrackedPaths(root) {
-  return nulPaths(git(root, ["ls-files", "--others", "--exclude-standard", "-z", "--"]));
+  return boundedPaths(git(root, ["ls-files", "--others", "--exclude-standard", "-z", "--"],
+    { maxBuffer: 1024 * 1024 }));
+}
+
+/**
+ * Ignore-aware inventory is intentionally confined to source/test/docs roots.
+ * --directory collapses ignored trees, preventing descent into caches and
+ * dependencies. A relevant ignored directory is ambiguous and fails closed.
+ */
+function ignoredPaths(root) {
+  return boundedPaths(git(root, [
+    "ls-files", "--others", "--ignored", "--exclude-standard", "--directory",
+    "-z", "--", ...IGNORED_INVENTORY_ROOTS
+  ], { maxBuffer: 1024 * 1024 }));
+}
+
+function relevantIgnoredSource(path) {
+  if (path.endsWith("/")) return !restricted(path.slice(0, -1));
+  return eligibleUntracked(path);
+}
+
+function assertIgnoredInventory(paths) {
+  for (const path of paths) {
+    if (!isSafeRelative(path.endsWith("/") ? path.slice(0, -1) : path)) {
+      throw new Error("Unsafe path in scoped ignored-source inventory.");
+    }
+    if (relevantIgnoredSource(path)) {
+      throw new Error("Relevant ignored source cannot be omitted from review evidence: " + path);
+    }
+  }
 }
 
 async function validateSnapshot(root, baseSha, snapshot) {
@@ -146,7 +188,8 @@ async function validateSnapshot(root, baseSha, snapshot) {
   }
   if (sha256(trackedDiff(root, baseSha)) !== snapshot.tracked_patch.sha256 ||
       JSON.stringify(changedPaths(root, baseSha)) !== JSON.stringify(snapshot.tracked_changed_paths) ||
-      JSON.stringify(untrackedPaths(root)) !== JSON.stringify(snapshot.all_untracked_paths)) {
+      JSON.stringify(untrackedPaths(root)) !== JSON.stringify(snapshot.all_untracked_paths) ||
+      JSON.stringify(ignoredPaths(root)) !== JSON.stringify(snapshot.all_ignored_paths)) {
     throw new Error("Git worktree changed during review-bundle capture.");
   }
   for (const entry of [...snapshot.untracked_files, ...snapshot.references]) {
@@ -163,7 +206,9 @@ async function validateSnapshot(root, baseSha, snapshot) {
  * restores identical bytes between observations.
  */
 export async function createReviewBundle({
-  cwd = process.cwd(), base, output, references = [], issues = []
+  cwd = process.cwd(), base, output, references = [], issues = [],
+  beforeFinalSnapshot
+
 } = {}) {
   if (typeof base !== "string" || !/^[A-Za-z0-9._/-]{1,120}$/.test(base)) {
     throw new Error("Provide a safe base commit or ref using --base.");
@@ -193,6 +238,11 @@ export async function createReviewBundle({
   for (const path of allUntracked) {
     if (!isSafeRelative(path)) throw new Error("Git worktree contains unsafe untracked path syntax.");
   }
+  const allIgnored = ignoredPaths(root);
+  assertIgnoredInventory(allIgnored);
+  const excludedIgnored = allIgnored.filter((path) =>
+    !restricted(path.endsWith("/") ? path.slice(0, -1) : path));
+  const redactedIgnoredCount = allIgnored.length - excludedIgnored.length;
   const selectedUntracked = allUntracked.filter(eligibleUntracked);
   if (selectedUntracked.length > MAX_UNTRACKED_FILES) {
     throw new Error("Review bundle exceeds the untracked-source file count limit.");
@@ -220,7 +270,7 @@ export async function createReviewBundle({
   try {
     await writeBundleFile(outputDirectory, "tracked.patch", patch);
     const manifest = {
-      schema_version: 1,
+      schema_version: 2,
       base_sha: baseSha,
       head_sha: headSha,
       tracked_changed_paths: paths,
@@ -228,6 +278,9 @@ export async function createReviewBundle({
       untracked_files: [],
       references: [],
       excluded_untracked_paths: allUntracked.filter((path) => !eligibleUntracked(path)),
+      ignored_inventory_roots: [...IGNORED_INVENTORY_ROOTS],
+      excluded_ignored_paths: excludedIgnored,
+      redacted_ignored_count: redactedIgnoredCount,
       issue_references: issueReferences
     };
     let untrackedBytes = 0;
@@ -254,8 +307,9 @@ export async function createReviewBundle({
       });
     }
 
+    if (beforeFinalSnapshot) await beforeFinalSnapshot(root);
     await validateSnapshot(root, baseSha, {
-      ...manifest, all_untracked_paths: allUntracked
+      ...manifest, all_untracked_paths: allUntracked, all_ignored_paths: allIgnored
     });
     const contentDigest = sha256(JSON.stringify(manifest));
     const encoded = Buffer.from(JSON.stringify({
@@ -270,7 +324,9 @@ export async function createReviewBundle({
       content_digest_sha256: contentDigest,
       tracked_path_count: paths.length,
       untracked_path_count: selectedUntracked.length,
-      excluded_untracked_count: manifest.excluded_untracked_paths.length
+      excluded_untracked_count: manifest.excluded_untracked_paths.length,
+      excluded_ignored_count: excludedIgnored.length,
+      redacted_ignored_count: redactedIgnoredCount
     };
   } catch (error) {
     await rm(outputDirectory, { recursive: true, force: true });
@@ -306,15 +362,44 @@ export async function verifyReviewBundle(directory, expectedManifestSha256) {
     throw new Error("Review bundle manifest digest mismatch.");
   }
   const manifest = JSON.parse(manifestBytes.toString("utf8"));
-  if (manifest.schema_version !== 1 || !Array.isArray(manifest.tracked_changed_paths) ||
-      !Array.isArray(manifest.untracked_files) || !Array.isArray(manifest.references)) {
+  if (manifest.schema_version !== 2 || !Array.isArray(manifest.tracked_changed_paths) ||
+      !Array.isArray(manifest.untracked_files) || !Array.isArray(manifest.references) ||
+      !Array.isArray(manifest.excluded_untracked_paths) ||
+      !Array.isArray(manifest.excluded_ignored_paths) ||
+      JSON.stringify(manifest.ignored_inventory_roots) !==
+        JSON.stringify(IGNORED_INVENTORY_ROOTS) ||
+      !Number.isSafeInteger(manifest.redacted_ignored_count) ||
+      manifest.redacted_ignored_count < 0) {
     throw new Error("Unsupported review-bundle manifest.");
   }
   const { content_digest_sha256: digest, ...unsigned } = manifest;
   if (sha256(JSON.stringify(unsigned)) !== digest) {
     throw new Error("Review bundle content manifest digest mismatch.");
   }
+  if (new Set(manifest.tracked_changed_paths).size !== manifest.tracked_changed_paths.length ||
+      manifest.tracked_changed_paths.some(restricted) ||
+      new Set(manifest.excluded_untracked_paths).size !== manifest.excluded_untracked_paths.length ||
+      new Set(manifest.excluded_ignored_paths).size !== manifest.excluded_ignored_paths.length ||
+      manifest.excluded_ignored_paths.some((path) =>
+        restricted(path.endsWith("/") ? path.slice(0, -1) : path))) {
+    throw new Error("Review-bundle inventory is inconsistent or includes restricted paths.");
+  }
   const expected = ["manifest.json"];
+  if (manifest.tracked_patch?.path !== "tracked.patch") {
+    throw new Error("Review-bundle tracked patch path is inconsistent.");
+  }
+  for (const entry of manifest.untracked_files) {
+    if (!eligibleUntracked(entry?.source_path) ||
+        entry.path !== "untracked/" + entry.source_path) {
+      throw new Error("Review-bundle untracked entry is inconsistent.");
+    }
+  }
+  for (const entry of manifest.references) {
+    if (restricted(entry?.source_path) || !/\.(?:md|txt)$/i.test(entry.source_path) ||
+        entry.path !== "references/" + entry.source_path) {
+      throw new Error("Review-bundle reference entry is inconsistent.");
+    }
+  }
   const entries = [manifest.tracked_patch, ...manifest.untracked_files, ...manifest.references];
   for (const entry of entries) {
     if (!entry || !isSafeRelative(entry.path) || restricted(entry.path) ||
