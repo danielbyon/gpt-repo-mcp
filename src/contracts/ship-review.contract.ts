@@ -17,6 +17,7 @@ export const ShipReviewReasonSchema = z.enum([
   "VALIDATION_FAILED",
   "VALIDATION_MISSING",
   "VALIDATION_STALE",
+  "VALIDATION_UNVERIFIED",
   "VALIDATION_FOCUSED",
   "GIT_REVIEW_HIGH_RISK",
   "GIT_CANONICAL_SHIP_PAYLOAD_UNAVAILABLE",
@@ -60,7 +61,7 @@ export const ShipReviewResultSchema = z.object({
   ship_readiness: z.object({
     status: z.enum(["ready", "review_required"]),
     reasons: z.array(ShipReviewReasonSchema),
-    validation_status: z.enum(["missing", "passed", "failed", "stale"]),
+      validation_status: z.enum(["missing", "passed", "failed", "stale", "unverified"]),
     blocking_finding_ids: z.array(z.string()),
     diagnosis_included: z.boolean()
   }),

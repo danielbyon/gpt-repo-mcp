@@ -71,9 +71,9 @@ export function evaluateCodexTechnicalReadiness(input: {
     };
   }
 
-  const validationRequested = input.manifest.schema_version === 3
-    ? Boolean(input.manifest.task.validation)
-    : Boolean(input.manifest.validation);
+  const validationRequest = input.manifest.schema_version === 3
+    ? input.manifest.task.validation
+    : input.manifest.validation;
   const checks: CodexTechnicalReadiness["checks"] = {
     integrity: input.integrity.manifest_bound ? "passed" : "failed",
     baseline: input.integrity.head_matches_baseline === true
@@ -100,7 +100,7 @@ export function evaluateCodexTechnicalReadiness(input: {
       ? !input.resultFound ? "incomplete" : input.connectedChangesComplete ? "passed" : "failed"
       : "not_applicable",
     technical_acceptance: technicalAcceptanceStatus(input.technicalAcceptance, input.resultFound),
-    validation: validationStatus(validationRequested, input.gitReview)
+    validation: validationStatus(validationRequest, input.gitReview)
   };
   const blockingReasons = reasonCodes(checks, "failed");
   const incompleteReasons = reasonCodes(checks, "incomplete");
@@ -142,12 +142,21 @@ function technicalAcceptanceStatus(
   return evidence.all_passed ? "passed" : "incomplete";
 }
 
-function validationStatus(validationRequested: boolean, gitReview: GitReview | undefined): CheckStatus {
-  if (!validationRequested) return "not_applicable";
+function validationStatus(
+  validationRequest: { profile: string; test_paths: string[] } | undefined,
+  gitReview: GitReview | undefined
+): CheckStatus {
+  if (!validationRequest) return "not_applicable";
   if (!gitReview) return "incomplete";
-  const status = gitReview.ship_readiness.validation.status;
-  if (status === "passed") return "passed";
-  if (status === "failed") return "failed";
+  const validation = gitReview.ship_readiness.validation;
+  if (validation.validation_status === "failed") return "failed";
+  const requestPaths = [...validationRequest.test_paths].sort();
+  const receiptPaths = [...(validation.test_paths ?? [])].sort();
+  if (validation.status === "passed"
+      && validation.eligibility === "eligible"
+      && validation.profile === validationRequest.profile
+      && requestPaths.length === receiptPaths.length
+      && requestPaths.every((path, index) => path === receiptPaths[index])) return "passed";
   return "incomplete";
 }
 

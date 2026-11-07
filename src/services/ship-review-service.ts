@@ -114,6 +114,7 @@ function readinessReasons(
   if (validation.status === "failed") reasons.add("VALIDATION_FAILED");
   if (validation.status === "missing") reasons.add("VALIDATION_MISSING");
   if (validation.status === "stale") reasons.add("VALIDATION_STALE");
+  if (validation.status === "unverified") reasons.add("VALIDATION_UNVERIFIED");
   if (validation.focused) reasons.add("VALIDATION_FOCUSED");
   if (gitReview.recommendation.risk_level === "high") reasons.add("GIT_REVIEW_HIGH_RISK");
   if (

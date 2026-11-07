@@ -743,12 +743,30 @@ describe("GitReviewService", () => {
     const result = await new GitReviewService(fixture.root).review({ repo_id: "fixture" });
 
     expect(result.ship_readiness.validation).toMatchObject({
-      status: "passed",
+      status: "unverified",
+      eligibility: "unverified",
+      evidence_contract_version: 1,
+      validation_status: "passed",
       validation_id: "validation-focused",
       focused: true,
       test_paths: ["tests/auth.test.ts"]
     });
     expect(result.recommendation.warnings).toContain("VALIDATION_FOCUSED");
+  });
+
+  test("does not report an unknown validation schema as readable V1 evidence", async () => {
+    const fixture = await createGitFixture();
+    await mkdir(join(fixture.root, ".chatgpt", "validation"), { recursive: true });
+    await writeFile(join(fixture.root, ".chatgpt", "validation", "latest.json"), JSON.stringify({
+      schema_version: 99,
+      status: "passed",
+      validation_id: "validation-future"
+    }));
+
+    const result = await new GitReviewService(fixture.root).review({ repo_id: "fixture" });
+
+    expect(result.ship_readiness.validation).toMatchObject({ status: "unverified", eligibility: "unverified" });
+    expect(result.ship_readiness.validation).not.toHaveProperty("evidence_contract_version");
   });
 });
 

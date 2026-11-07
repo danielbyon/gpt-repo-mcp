@@ -212,6 +212,36 @@ contents or diffs.
 type-check, smoke, or complete validation profiles. ChatGPT cannot supply an
 arbitrary command string or use it as a terminal.
 
+Rust checks use an explicitly configured `make` or `just` profile. The selected
+Cargo and Rustc tools must match the repository's pin; the Makefile or Just
+recipe remains the command entry point. There is no direct Cargo runner. A pin
+or recipe mismatch, unresolved toolchain, or unsupported environment override
+stops eligibility before execution. Bounded discovery includes Make helpers,
+Just imports and modules, and referenced helper files in source evidence even
+when Git ignores them. Unsupported or ambiguous Just sources fail closed.
+Existing repository settings, including `RUST_TEST_THREADS=1` where defined,
+remain in effect.
+
+Validation receipts use V2 evidence to separate command outcome from
+eligibility. A successful exit does not establish eligibility by itself.
+Detected source or policy drift makes the evidence ineligible, while missing
+proof leaves it unverified. V1 receipts remain readable but cannot be promoted
+to V2 eligibility. Review also checks pointer identity, artifact containment
+and contents, effective policy, current candidate state, and requested profile
+and test paths. When no structured validation request exists, readiness remains
+`not_applicable`.
+
+When Rustup selects the Rust tools, V2 runtime evidence binds its path
+identity, reported version, and executable contents. Rustup is optional when
+direct Cargo and Rustc selection satisfies the pin checks. Source snapshots
+exclude untracked generated Delegation control artifacts such as
+`RESULT.json`; tracked files at those paths remain covered.
+
+The source comparison uses bounded snapshots before and after execution. It
+does not reliably detect a change that is reverted between snapshots. Slice A
+does not bind selected worktrees or isolated instances; that work remains with
+Issue #25.
+
 ### `repo_failure_diagnose`
 
 **Read-only.** Interprets saved validation evidence, related Git state, and

@@ -110,7 +110,10 @@ export const GitReviewResultSchema = z.object({
   delegation_gate: DelegationGateDecisionSchema,
   ship_readiness: z.object({
     validation: z.object({
-      status: z.enum(["missing", "passed", "failed", "stale"]),
+      status: z.enum(["missing", "passed", "failed", "stale", "unverified"]),
+      eligibility: z.enum(["eligible", "ineligible", "unverified"]).optional(),
+      evidence_contract_version: z.number().int().positive().optional(),
+      receipt_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
       validation_id: z.string().optional(),
       validation_status: z.enum(["passed", "failed", "skipped"]).optional(),
       profile: z.string().optional(),
