@@ -94,6 +94,15 @@ describe("Windows qualification scope guard", () => {
     expect(problems.some((p) => p.includes("missing or disabling mandatory regression"))).toBe(true);
   });
 
+  test("rejects an exclusive test that would prevent unrelated mandatory cases from running", () => {
+    const workflow = load();
+    const findings = inspectQualificationWorkflow(workflow, (path) =>
+      path === "tests/package-hygiene.test.ts"
+        ? "test.only('extra', () => {}); test('pins the repository package inventory to its runtime files', () => {});"
+        : readFileSync(join(root, path), "utf8"));
+    expect(findings.some((f) => f.includes("Could not parse mandatory Vitest declarations"))).toBe(true);
+  });
+
   test("expands parameterized test.each native executable cases", () => {
     const declarations = collectWindowsTestTitles("fixture.ts",
       "test.each([['make','make.exe'],['just','just.exe']])('Windows %s runner', () => {});");

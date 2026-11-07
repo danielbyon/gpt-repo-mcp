@@ -183,6 +183,10 @@ export function collectWindowsTestTitles(filename, source) {
   if (file.parseDiagnostics.length) throw new Error("Cannot parse Vitest declarations");
   const titles = [];
   const visit = (node, disabled = false) => {
+    if (ts.isPropertyAccessExpression(node) && node.name.text === "only" &&
+        /\\b(?:test|it|describe)\\b/.test(node.expression.getText(file))) {
+      throw new Error("Exclusive Vitest test selection is unaudited.");
+    }
     const disabledDescribe = ts.isCallExpression(node) &&
       ts.isPropertyAccessExpression(node.expression) &&
       node.expression.expression.getText(file) === "describe" &&
