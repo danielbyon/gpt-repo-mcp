@@ -163,7 +163,7 @@ describe("POSIX process anchor lifecycle", () => {
   posixTest("does not confirm cleanup when process-group inspection is denied", async () => {
     vi.useFakeTimers();
     const child = fakeAnchor(42_429);
-    const processKill = vi.spyOn(process, "kill").mockImplementation(((_pid, _signal) => {
+    const processKill = vi.spyOn(process, "kill").mockImplementation((() => {
       throw Object.assign(new Error("group inspection denied"), { code: "EPERM" });
     }) as typeof process.kill);
     const run = await loadRunner(child);
