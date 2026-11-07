@@ -1652,6 +1652,30 @@ describe("ValidationService", () => {
       })).review({ repo_id: "fixture" });
       expect(contradictoryReview.ship_readiness.validation).toMatchObject({ status: "unverified", eligibility: "unverified" });
 
+      const inconsistentFocusUnsigned = { ...unsignedReceipt, focused: true, test_paths: [] };
+      const inconsistentFocusSha256 = canonicalSha256(inconsistentFocusUnsigned);
+      const inconsistentFocusReceipt = {
+        ...inconsistentFocusUnsigned,
+        receipt_sha256: inconsistentFocusSha256
+      };
+      const inconsistentFocusPointer = {
+        ...pointer,
+        focused: true,
+        test_paths: [],
+        receipt_sha256: inconsistentFocusSha256
+      };
+      expect(ValidationReceiptV2Schema.safeParse(inconsistentFocusReceipt).success).toBe(false);
+      expect(ValidationLatestPointerV2Schema.safeParse(inconsistentFocusPointer).success).toBe(false);
+      await writeFile(receiptPath, JSON.stringify(inconsistentFocusReceipt, null, 2));
+      await writeFile(latestPath, JSON.stringify(inconsistentFocusPointer, null, 2));
+      const inconsistentFocusReview = await new GitReviewService(root, new OperationsPolicy({
+        enabled: true,
+        validation_enabled: true,
+        ...operations
+      })).review({ repo_id: "fixture" });
+      expect(inconsistentFocusReview.ship_readiness.validation)
+        .toMatchObject({ status: "unverified", eligibility: "unverified" });
+
       const inconsistentCountsUnsigned = {
         ...unsignedReceipt,
         counts: { ...receipt.counts, passed: 0, failed: receipt.counts.total }

@@ -167,6 +167,13 @@ export const ValidationReceiptV2BaseSchema = z.object({
   receipt_sha256: z.string().regex(/^[a-f0-9]{64}$/)
 }).strict();
 export const ValidationReceiptV2Schema = ValidationReceiptV2BaseSchema.superRefine((receipt, context) => {
+  if (receipt.focused !== (receipt.test_paths.length > 0)) {
+    context.addIssue({
+      code: "custom",
+      path: ["focused"],
+      message: "Focused validation receipts must include the requested test paths."
+    });
+  }
   const commandCounts = {
     total: receipt.commands.length,
     passed: receipt.commands.filter((command) => command.status === "passed").length,
@@ -218,7 +225,15 @@ export const ValidationLatestPointerV2Schema = z.object({
   artifact_path: z.string().min(1),
   timestamp: z.string().datetime({ offset: true }),
   receipt_sha256: z.string().regex(/^[a-f0-9]{64}$/)
-}).strict();
+}).strict().superRefine((pointer, context) => {
+  if (pointer.focused !== (pointer.test_paths.length > 0)) {
+    context.addIssue({
+      code: "custom",
+      path: ["focused"],
+      message: "Focused validation pointers must include the requested test paths."
+    });
+  }
+});
 
 function requireCargoConfigIdentity(
   runtime: z.infer<typeof RustValidationRuntimeSchema>,
