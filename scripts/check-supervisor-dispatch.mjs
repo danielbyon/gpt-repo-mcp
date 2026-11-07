@@ -99,6 +99,63 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   };
   collectBindings(file);
 
+  const enclosingFunction = (node, expected) => {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+      if (ts.isFunctionDeclaration(parent)) {
+        return parent.name?.text === expected ? parent : undefined;
+      }
+    }
+    return undefined;
+  };
+  const stringArrayMember = (type, field) => {
+    if (!type) return false;
+    if (ts.isIntersectionTypeNode(type)) {
+      return type.types.some((member) => stringArrayMember(member, field));
+    }
+    return ts.isTypeLiteralNode(type) && type.members.some((member) =>
+      ts.isPropertySignature(member) && member.name?.getText(file) === field &&
+      member.type && ts.isArrayTypeNode(member.type) &&
+      member.type.elementType.kind === ts.SyntaxKind.StringKeyword);
+  };
+  const sourceContractArray = (node) => {
+    const field = node.getText(file).replace(/\s+/g, "");
+    if (filename === "src/services/process-exec.ts" && field === "input.args") {
+      const owner = enclosingFunction(node, "runProcessWithTail");
+      return !!owner && stringArrayMember(
+        owner.parameters.find((parameter) => nameOf(parameter.name) === "input")?.type, "args");
+    }
+    if (filename === "src/services/windows-process-host.ts" && field === "launch?.args") {
+      const owner = enclosingFunction(node, "runWindowsProcessWithTail");
+      const parameter = owner?.parameters.find((item) => nameOf(item.name) === "launch");
+      const alias = file.statements.find((item) => ts.isTypeAliasDeclaration(item) &&
+        item.name.text === "WindowsProcessHostLaunch");
+      return !!parameter && ts.isTypeReferenceNode(parameter.type) &&
+        parameter.type.typeName.getText(file) === "WindowsProcessHostLaunch" &&
+        !!alias && stringArrayMember(alias.type, "args");
+    }
+    return false;
+  };
+  const provenArrayProducer = (node) => {
+    const target = node.expression.getText(file).replace(/\s+/g, "");
+    if (target === "process.argv.slice") return true;
+    if (filename !== "src/services/windows-process-host.ts" ||
+        target !== "windowsHostArgs" ||
+        !enclosingFunction(node, "runWindowsProcessWithTail")) return false;
+    const producer = file.statements.find((item) => ts.isFunctionDeclaration(item) &&
+      item.name?.text === "windowsHostArgs");
+    if (!producer?.body || !producer.type || !ts.isArrayTypeNode(producer.type) ||
+        producer.type.elementType.kind !== ts.SyntaxKind.StringKeyword) return false;
+    const returns = [];
+    const inspectReturns = (child) => {
+      if (child !== producer.body && ts.isFunctionLike(child)) return;
+      if (ts.isReturnStatement(child)) returns.push(unwrap(child.expression));
+      ts.forEachChild(child, inspectReturns);
+    };
+    inspectReturns(producer.body);
+    return returns.length > 0 && returns.every((result) =>
+      result && ts.isArrayLiteralExpression(result));
+  };
+
   const isArrayArguments = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
@@ -111,14 +168,8 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken) {
       return isArrayArguments(node.left, seen) && isArrayArguments(node.right, seen);
     }
-    if (ts.isPropertyAccessExpression(node)) {
-      // These expressions have array-valued contracts in the audited modules.
-      return ["input.args", "launch?.args"].includes(node.getText(file).replace(/\s+/g, ""));
-    }
-    if (ts.isCallExpression(node)) {
-      const target = node.expression.getText(file).replace(/\s+/g, "");
-      return target === "process.argv.slice" || target === "windowsHostArgs";
-    }
+    if (ts.isPropertyAccessExpression(node)) return sourceContractArray(node);
+    if (ts.isCallExpression(node)) return provenArrayProducer(node);
     if (ts.isIdentifier(node) && !seen.has(node.text)) {
       const bindings = arrayBindings.get(node.text);
       if (bindings?.length === 1) {

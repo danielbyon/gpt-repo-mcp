@@ -85,7 +85,10 @@ describe("validation supervisor direct-execution guard", () => {
     ["opaque execFile options", "execFile('node.exe', getOptions(), () => {});"],
     ["opaque execFileSync options", "execFileSync('node.exe', getOptions());"],
     ["aliased execFile second options", "import { execFile as native } from 'node:child_process'; native('node.exe', getOptions());"],
-    ["aliased synchronous third options", "import { spawnSync as native } from 'node:child_process'; native('node.exe', ['--version'], getOptions());"]
+    ["aliased synchronous third options", "import { spawnSync as native } from 'node:child_process'; native('node.exe', ['--version'], getOptions());"],
+    ["spoofed input.args", "const input = { args: getOptions() }; spawn('node.exe', input.args, { stdio: 'pipe' });"],
+    ["spoofed windowsHostArgs", "function windowsHostArgs() { return getOptions(); } spawn('node.exe', windowsHostArgs(), { stdio: 'pipe' });"],
+    ["spoofed helperArgs", "const launch = { args: getOptions() }; const helperArgs = launch?.args ?? getOptions(); spawn('node.exe', helperArgs, { stdio: 'pipe' });"]
   ])("52-G rejects unproven process-launch overload: %s", (_name, code) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", code)).not.toEqual([]);
   });
