@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { link, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import process from "node:process";
 import { join } from "node:path";
@@ -99,4 +100,117 @@ describe("content-addressed worktree review bundles", () => {
       cwd: f.root, base: f.base, output: f.output, references: [".serena/state.yml"]
     })).rejects.toThrow(/safe text document/);
   });
+
+  test("fails closed for a Git-ignored source test in the scoped inventory", async () => {
+    const f = await fixture();
+    await writeFile(join(f.root, ".gitignore"), "tests/hidden.test.ts\n");
+    await writeFile(join(f.root, "tests", "hidden.test.ts"), "test('hidden', () => {});\n");
+    const before = runGit(f.root, ["status", "--porcelain"]);
+    await expect(createReviewBundle({ cwd: f.root, base: f.base, output: f.output }))
+      .rejects.toThrow(/Relevant ignored source/);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+  });
+
+  test("records only the bounded ignored-directory exclusion without descending into generated trees", async () => {
+    const f = await fixture();
+    await mkdir(join(f.root, "src", "build"), { recursive: true });
+    await writeFile(join(f.root, ".gitignore"), "src/build/\n");
+    await writeFile(join(f.root, "src", "build", "generated.js"), "generated\n");
+    const result = await createReviewBundle({ cwd: f.root, base: f.base, output: f.output });
+    const manifest = JSON.parse(await readFile(join(f.output, "manifest.json"), "utf8"));
+    expect(manifest.schema_version).toBe(2);
+    expect(manifest.ignored_inventory_roots).toContain("src/");
+    expect(manifest.redacted_ignored_count).toBe(1);
+    expect(manifest.excluded_ignored_paths).toEqual([]);
+    expect(result.redacted_ignored_count).toBe(1);
+  });
+
+  test("detects HEAD advancement during capture and deletes the partial output", async () => {
+    const f = await fixture();
+    await expect(createReviewBundle({
+      cwd: f.root, base: f.base, output: f.output,
+      beforeFinalSnapshot: () => runGit(f.root, ["commit", "--allow-empty", "-qm", "advance"])
+    })).rejects.toThrow(/HEAD changed/);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("detects source drift after capture and deletes the partial output", async () => {
+    const f = await fixture();
+    await expect(createReviewBundle({
+      cwd: f.root, base: f.base, output: f.output,
+      beforeFinalSnapshot: () => writeFile(join(f.root, "tests", "new.test.ts"), "changed\n")
+    })).rejects.toThrow(/Source changed/);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("rejects restricted tracked modifications before output mutation", async () => {
+    const f = await fixture();
+    await writeFile(join(f.root, ".env"), "secret=not-a-real-secret\n");
+    runGit(f.root, ["add", "-f", ".env"]);
+    runGit(f.root, ["commit", "-qm", "add tracked restricted fixture"]);
+    await writeFile(join(f.root, ".env"), "secret=changed\n");
+    await expect(createReviewBundle({ cwd: f.root, base: f.base, output: f.output }))
+      .rejects.toThrow(/Tracked change crosses/);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("rejects multiply linked review source and cleans incomplete output", async () => {
+    const f = await fixture();
+    await link(join(f.root, "tests", "new.test.ts"), join(f.root, "tests", "link.test.ts"));
+    const before = runGit(f.root, ["status", "--porcelain"]);
+    await expect(createReviewBundle({ cwd: f.root, base: f.base, output: f.output }))
+      .rejects.toThrow(/singly linked regular file/);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+  });
+
+  test("detects duplicate and inconsistent manifest entries even with a recomputed digest", async () => {
+    const f = await fixture();
+    const result = await createReviewBundle({ cwd: f.root, base: f.base, output: f.output });
+    const path = join(f.output, "manifest.json");
+    const manifest = JSON.parse(await readFile(path, "utf8"));
+    manifest.untracked_files.push({ ...manifest.untracked_files[0] });
+    const { content_digest_sha256: ignored, ...unsigned } = manifest;
+    expect(ignored).toBeTruthy();
+    manifest.content_digest_sha256 = createHash("sha256")
+      .update(JSON.stringify(unsigned)).digest("hex");
+    const bytes = JSON.stringify(manifest, null, 2) + "\n";
+    await writeFile(path, bytes);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    await expect(verifyReviewBundle(f.output, hash)).rejects.toThrow(/duplicate|unexpected/);
+    expect(result.manifest_sha256).not.toBe(hash);
+  });
+
+  test("rejects unexpected payload files", async () => {
+    const f = await fixture();
+    const result = await createReviewBundle({ cwd: f.root, base: f.base, output: f.output });
+    await writeFile(join(f.output, "unexpected.txt"), "not declared\n");
+    await expect(verifyReviewBundle(f.output, result.manifest_sha256))
+      .rejects.toThrow(/unexpected files/);
+  });
+
+  test("bounds the untracked file count before copying source", async () => {
+    const f = await fixture();
+    for (let i = 0; i < 257; i++) {
+      await writeFile(join(f.root, "tests", "extra-" + i + ".test.ts"), "export {};\n");
+    }
+    await expect(createReviewBundle({ cwd: f.root, base: f.base, output: f.output }))
+      .rejects.toThrow(/file count limit/);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("bounds cumulative included source bytes and removes the incomplete output", async () => {
+    const f = await fixture();
+    const payload = "x".repeat(1_900_000);
+    for (let i = 0; i < 9; i++) {
+      await writeFile(join(f.root, "tests", "large-" + i + ".test.ts"), payload);
+    }
+    const before = runGit(f.root, ["status", "--porcelain"]);
+    await expect(createReviewBundle({ cwd: f.root, base: f.base, output: f.output }))
+      .rejects.toThrow(/total untracked-source byte limit/);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+  });
+
 });
