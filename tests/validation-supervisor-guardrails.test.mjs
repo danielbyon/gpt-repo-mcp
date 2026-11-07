@@ -74,6 +74,37 @@ describe("validation supervisor direct-execution guard", () => {
       .toEqual([]);
   });
 
+
+  test.each([
+    ["opaque second-argument options", "spawn('node.exe', getOptions());"],
+    ["opaque second with explicit third options", "spawn('node.exe', getOptions(), { stdio: 'pipe' });"],
+    ["parenthesized type assertion", "spawn('node.exe', ({ ['shell']: true } as any));"],
+    ["angle-bracket type assertion", "spawn('node.exe', <any>({ shell: true }));"],
+    ["satisfies options", "spawn('node.exe', ({ shell: true } satisfies object));"],
+    ["opaque synchronous options", "spawnSync('node.exe', getOptions());"],
+    ["opaque execFile options", "execFile('node.exe', getOptions(), () => {});"],
+    ["opaque execFileSync options", "execFileSync('node.exe', getOptions());"],
+    ["aliased execFile second options", "import { execFile as native } from 'node:child_process'; native('node.exe', getOptions());"],
+    ["aliased synchronous third options", "import { spawnSync as native } from 'node:child_process'; native('node.exe', ['--version'], getOptions());"]
+  ])("52-G rejects unproven process-launch overload: %s", (_name, code) => {
+    expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", code)).not.toEqual([]);
+  });
+
+  test.each([
+    ["literal array", "spawn('node.exe', ['--version']);"],
+    ["literal array and options", "spawnSync('node.exe', (['--version'] as string[]), ({ stdio: 'ignore' } satisfies object));"],
+    ["options in second position", "spawn('node.exe', ({ stdio: 'pipe' } as object));"],
+    ["callback alone", "execFile('node.exe', () => {});"],
+    ["args and callback", "execFile('node.exe', ['--version'], () => {});"],
+    ["options and callback", "execFile('node.exe', ({ timeout: 100 } as object), () => {});"],
+    ["args, options, callback", "execFile('node.exe', ['--version'], { windowsHide: true }, () => {});"],
+    ["sync arguments and options", "execFileSync('node.exe', ['--version'], ({ windowsHide: true } satisfies object));"],
+    ["safe argv identifier", "const args = ['--version']; spawn('node.exe', args, { stdio: 'pipe' });"],
+    ["safe native argv slice", "spawn('node.exe', process.argv.slice(2), { stdio: 'pipe' });"]
+  ])("52-G accepts provably native overload: %s", (_name, code) => {
+    expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", code)).toEqual([]);
+  });
+
   test("audits the embedded POSIX launcher and rejects shell dispatch inside it", () => {
     const valid = "const POSIX_GROUP_LAUNCHER = String.raw`" +
       "const { spawn } = require('node:child_process'); spawn('node', []);" + "`;";

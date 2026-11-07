@@ -217,52 +217,73 @@ function invocationKind(expression, names) {
   return undefined;
 }
 
-/** Parse executable Vitest declarations, excluding comments and disabled tests. */
+/**
+ * Prove Vitest registration only in top-level statements and callbacks of
+ * enabled describe suites. Uninvoked functions and deferred callbacks are
+ * not registration contexts, even when they contain matching test strings.
+ */
 export function collectWindowsTestTitles(filename, source) {
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   if (file.parseDiagnostics.length) throw new Error("Cannot parse Vitest declarations");
   const titles = [];
-  const visit = (node, disabled = false) => {
+
+  // Exclusive declarations anywhere in the file remain fail-closed, including
+  // element access and unknown dynamic member selectors.
+  const checkExclusive = (node) => {
     const member = access(node);
     if (member && ts.isIdentifier(member.receiver) &&
         ["test", "it", "describe"].includes(member.receiver.text) &&
         (member.method === undefined || member.method === "only")) {
       throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
     }
+    ts.forEachChild(node, checkExclusive);
+  };
+  checkExclusive(file);
+
+  const register = (node, disabled = false) => {
+    if (ts.isSourceFile(node) || ts.isBlock(node)) {
+      for (const statement of node.statements) register(statement, disabled);
+      return;
+    }
     if (ts.isIfStatement(node)) {
       const outcome = conditionOnWindows(node.expression);
-      visit(node.expression, disabled);
-      visit(node.thenStatement, disabled || outcome !== true);
-      if (node.elseStatement) visit(node.elseStatement, disabled || outcome !== false);
+      register(node.thenStatement, disabled || outcome !== true);
+      if (node.elseStatement) register(node.elseStatement, disabled || outcome !== false);
       return;
     }
+    if (ts.isExpressionStatement(node)) {
+      register(node.expression, disabled);
+      return;
+    }
+    node = unwrap(node);
     if (ts.isConditionalExpression(node)) {
       const outcome = conditionOnWindows(node.condition);
-      visit(node.condition, disabled);
-      visit(node.whenTrue, disabled || outcome !== true);
-      visit(node.whenFalse, disabled || outcome !== false);
+      register(node.whenTrue, disabled || outcome !== true);
+      register(node.whenFalse, disabled || outcome !== false);
       return;
     }
-    if (ts.isCallExpression(node)) {
-      const suite = invocationKind(node.expression, ["describe"]);
-      if (suite) {
-        visit(node.expression, disabled);
-        for (const arg of node.arguments) visit(arg, disabled || !suite.enabled);
-        return;
+    if (!ts.isCallExpression(node)) return;
+
+    const suite = invocationKind(node.expression, ["describe"]);
+    if (suite) {
+      const callback = unwrap(node.arguments[1]);
+      if (callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) {
+        register(callback.body, disabled || !suite.enabled);
       }
-      const template = literal(node.arguments[0]);
-      const call = invocationKind(node.expression, ["test", "it"]);
-      if (call && template !== undefined) {
-        const expanded = call.values ? call.values.map((value, i) =>
-          template.replace(/%s|%d|%i/, (p) => p === "%i" ? String(i) : String(value))) : [template];
-        for (const title of expanded) titles.push({
-          title, enabled: call.enabled && !disabled
-        });
-      }
+      // Unresolved suite callbacks are not proven to register tests.
+      return;
     }
-    ts.forEachChild(node, (child) => visit(child, disabled));
+    const title = literal(node.arguments[0]);
+    const call = invocationKind(node.expression, ["test", "it"]);
+    if (call && title !== undefined) {
+      const expanded = call.values ? call.values.map((value, i) =>
+        title.replace(/%s|%d|%i/, (p) => p === "%i" ? String(i) : String(value))) : [title];
+      for (const name of expanded) titles.push({ title: name, enabled: call.enabled && !disabled });
+    }
+    // Other calls (setTimeout, .then, IIFEs, fixtures) are not Vitest
+    // registration contexts; never descend through their callbacks.
   };
-  visit(file);
+  register(file);
   return titles;
 }
 

@@ -78,17 +78,64 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     }
   };
 
-  const inspectLaunchOptions = (call, runner) => {
-    const second = call.arguments[1];
-    const third = call.arguments[2];
-    const options = second && ts.isObjectLiteralExpression(second) ? second : third;
-    if (!options || (runner === "execFile" && (
-        ts.isFunctionExpression(options) || ts.isArrowFunction(options)))) return;
-    if (!ts.isObjectLiteralExpression(options)) {
-      add(options, "unresolved process-launch options cannot prove shell-free dispatch");
+  const unwrap = (node) => {
+    while (node && (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) ||
+           ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node) ||
+           ts.isNonNullExpression(node))) node = node.expression;
+    return node;
+  };
+  const isCallback = (node) => ts.isFunctionExpression(node) || ts.isArrowFunction(node);
+
+  // A second argument must be provably an argv array: Node treats a non-array
+  // object there as its options, even when a third argument is supplied.
+  const arrayBindings = new Map();
+  const collectBindings = (node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      const entries = arrayBindings.get(node.name.text) ?? [];
+      entries.push(node.initializer);
+      arrayBindings.set(node.name.text, entries);
+    }
+    ts.forEachChild(node, collectBindings);
+  };
+  collectBindings(file);
+
+  const isArrayArguments = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (ts.isArrayLiteralExpression(node)) return true;
+    if (ts.isConditionalExpression(node)) {
+      return isArrayArguments(node.whenTrue, seen) &&
+        isArrayArguments(node.whenFalse, seen);
+    }
+    if (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken) {
+      return isArrayArguments(node.left, seen) && isArrayArguments(node.right, seen);
+    }
+    if (ts.isPropertyAccessExpression(node)) {
+      // These expressions have array-valued contracts in the audited modules.
+      return ["input.args", "launch?.args"].includes(node.getText(file).replace(/\s+/g, ""));
+    }
+    if (ts.isCallExpression(node)) {
+      const target = node.expression.getText(file).replace(/\s+/g, "");
+      return target === "process.argv.slice" || target === "windowsHostArgs";
+    }
+    if (ts.isIdentifier(node) && !seen.has(node.text)) {
+      const bindings = arrayBindings.get(node.text);
+      if (bindings?.length === 1) {
+        const next = new Set(seen);
+        next.add(node.text);
+        return isArrayArguments(bindings[0], next);
+      }
+    }
+    return false;
+  };
+
+  const inspectOptionObject = (node) => {
+    if (!ts.isObjectLiteralExpression(node)) {
+      add(node, "unresolved process-launch options cannot prove shell-free dispatch");
       return;
     }
-    for (const property of options.properties) {
+    for (const property of node.properties) {
       if (!("name" in property)) {
         add(property, "spread process-launch options cannot prove shell-free dispatch");
         continue;
@@ -99,6 +146,40 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       } else if (name === "shell") {
         add(property, "shell dispatch option is forbidden");
       }
+    }
+  };
+
+  const inspectLaunchOptions = (call, runner) => {
+    const second = unwrap(call.arguments[1]);
+    const third = unwrap(call.arguments[2]);
+    const fourth = unwrap(call.arguments[3]);
+    const callbackRunner = runner === "execFile";
+
+    if (!second) {
+      if (third || fourth) add(call, "unsupported process-launch overload");
+      return;
+    }
+    if (callbackRunner && isCallback(second)) {
+      if (third || fourth) add(call, "unsupported execFile callback overload");
+      return;
+    }
+    if (ts.isObjectLiteralExpression(second)) {
+      inspectOptionObject(second);
+      if (third && !(callbackRunner && isCallback(third) && !fourth)) {
+        add(third, "unsupported process-launch overload after options");
+      }
+      if (fourth) add(fourth, "unsupported process-launch callback position");
+      return;
+    }
+
+    if (!isArrayArguments(second)) {
+      add(second, "unresolved process-launch argv may be options");
+    }
+    if (third && !(callbackRunner && isCallback(third))) {
+      inspectOptionObject(third);
+    }
+    if (fourth && !(callbackRunner && third && !isCallback(third) && isCallback(fourth))) {
+      add(fourth, "unsupported process-launch callback position");
     }
   };
 

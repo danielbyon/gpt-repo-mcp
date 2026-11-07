@@ -175,6 +175,46 @@ describe("Windows qualification scope guard", () => {
     expect(findings.some((f) => f.includes("Could not parse mandatory Vitest declarations"))).toBe(true);
   });
 
+
+  test.each([
+    ["unused function", "function unused() { test('required', () => {}); }"],
+    ["uninvoked closure", "const deferred = () => { test('required', () => {}); };"],
+    ["deferred timeout callback", "setTimeout(() => { test('required', () => {}); }, 0);"],
+    ["promise callback", "Promise.resolve().then(() => test('required', () => {}));"],
+    ["uninvoked IIFE-like closure", "(() => { test('required', () => {}); });"],
+    ["nested unused suite callback", "describe('suite', () => { function later() { test('required', () => {}); } });"],
+    ["uninvoked nested closure", "describe('suite', () => { const later = () => test('required', () => {}); });"],
+    ["deferred nested callback", "describe('suite', () => { setTimeout(() => test('required', () => {}), 0); });"]
+  ])("52-H excludes mandatory text in %s", (_name, code) => {
+    expect(collectWindowsTestTitles("fixture.ts", code)).toEqual([]);
+  });
+
+  test.each([
+    ["top-level registration", "test('required', () => {});"],
+    ["enabled describe callback", "describe('suite', () => { test('required', () => {}); });"],
+    ["nested enabled describe", "describe('outer', () => { describe('inner', () => { test('required', () => {}); }); });"],
+    ["Windows-only describe", "describe.skipIf(process.platform !== 'win32')('suite', () => { test('required', () => {}); });"],
+    ["Windows conditional", "if (process.platform === 'win32') { test('required', () => {}); }"],
+    ["table-driven test", "test.each(['required'])('%s', () => {});"]
+  ])("52-H retains proven registration in %s", (_name, code) => {
+    expect(collectWindowsTestTitles("fixture.ts", code)).toEqual([
+      { title: "required", enabled: true }
+    ]);
+  });
+
+  test.each([
+    ["unused function", "function unused() { test('pins the repository package inventory to its runtime files', () => {}); }"],
+    ["deferred callback", "setTimeout(() => test('pins the repository package inventory to its runtime files', () => {}), 0);"],
+    ["unused closure", "const later = () => test('pins the repository package inventory to its runtime files', () => {});"],
+    ["unused describe callback", "describe('outer', () => { const later = () => test('pins the repository package inventory to its runtime files', () => {}); });"]
+  ])("52-H rejects missing mandatory Windows coverage inside %s", (_name, code) => {
+    const workflow = load();
+    const findings = inspectQualificationWorkflow(workflow, (path) =>
+      path === "tests/package-hygiene.test.ts" ? code :
+        readFileSync(join(root, path), "utf8"));
+    expect(findings.some((item) => item.includes("missing or disabling mandatory regression"))).toBe(true);
+  });
+
   test("expands parameterized test.each native executable cases", () => {
     const declarations = collectWindowsTestTitles("fixture.ts",
       "test.each([['make','make.exe'],['just','just.exe']])('Windows %s runner', () => {});");
