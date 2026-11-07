@@ -33,6 +33,34 @@ describe("validation supervisor direct-execution guard", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source).length).toBeGreaterThan(0);
   });
 
+
+  test.each([
+    ["alias across local declarations", "import { execFile as safe } from 'node:child_process'; const runner = safe; runner('cmd.exe', []);"],
+    ["dynamic import", "const p = import('node:child_process');"],
+    ["dynamic require", "const p = require(moduleName);"],
+    ["require with computed member", "const p = require('node:child_process'); p['exec']('echo nope');"],
+    ["namespace import", "import * as cp from 'node:child_process'; cp.exec('echo nope');"],
+    ["function evaluation", "new Function('return require(\\\"node:child_process\\\")')();"]
+  ])("rejects an unaudited loading route: %s", (_case, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
+  });
+
+  test("audits the embedded POSIX launcher and rejects shell dispatch inside it", () => {
+    const valid = "const POSIX_GROUP_LAUNCHER = String.raw\`" +
+      "const { spawn } = require('node:child_process'); spawn('node', []);" + "\`;";
+    const invalid = valid.replace("spawn('node', [])", "spawn('cmd.exe', ['/c'])");
+    expect(inspectSupervisorSource("src/services/process-exec.ts", valid)).toEqual([]);
+    expect(inspectSupervisorSource("src/services/process-exec.ts", invalid))
+      .toEqual([expect.stringContaining("direct interpreter")]);
+  });
+
+  test("rejects a nonliteral or missing POSIX launcher", () => {
+    expect(inspectSupervisorSource("src/services/process-exec.ts",
+      "const POSIX_GROUP_LAUNCHER = buildLauncher();")).not.toEqual([]);
+    expect(inspectSupervisorSource("src/services/process-exec.ts",
+      "const unrelated = 1;")).not.toEqual([]);
+  });
+
   test("ignores shell names in documentation and npm lifecycle environment strings", () => {
     const source = "const recoveryHint = 'npm may require cmd.exe for repository scripts';" +
       "const env = { ComSpec: 'C:\\\\Windows\\\\System32\\\\cmd.exe' };";
