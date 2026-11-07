@@ -123,7 +123,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       add(node, "shell dispatch option is forbidden");
     }
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) &&
-        ts.isIdentifier(node.initializer) && processFunctions.has(node.initializer.text)) {
+        node.initializer && ts.isIdentifier(node.initializer) && processFunctions.has(node.initializer.text)) {
       processFunctions.set(node.name.text, processFunctions.get(node.initializer.text));
     }
 
