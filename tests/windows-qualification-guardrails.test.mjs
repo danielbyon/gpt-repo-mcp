@@ -113,7 +113,7 @@ describe("Windows qualification scope guard", () => {
     windowsStep(workflow, "Windows exact Node runtime and shell-free npm dispatch").run =
       "npm test -- tests/validation-service.test.ts -t \"canonical make verify\"";
     expect(inspect(workflow).some((message) =>
-      message.includes("does not select mandatory regression: does not resolve Windows command shim %s"))).toBe(true);
+      message.includes("does not select mandatory regression: does not resolve Windows command shim make.cmd"))).toBe(true);
   });
 
   test("rejects a required test that was renamed without updating the scope", () => {
@@ -121,7 +121,7 @@ describe("Windows qualification scope guard", () => {
     const findings = inspectQualificationWorkflow(workflow, (path) =>
       path === "tests/package-hygiene.test.ts" ? "test('renamed', () => {});" :
         readFileSync(join(root, path), "utf8"));
-    expect(findings.some((message) => message.includes("is missing mandatory regression:"))).toBe(true);
+    expect(findings.some((message) => message.includes("is missing or disabling mandatory regression:"))).toBe(true);
   });
 
   test("rejects optional Windows gates and loss of the full Linux suite", () => {
@@ -138,6 +138,6 @@ describe("Windows qualification scope guard", () => {
     const workflow = load();
     windowsStep(workflow, "Validation security and CI coverage guardrails").run = "npm run lint";
     expect(inspect(workflow)).toContain(
-      "Windows CI must run required non-optional step: Validation security and CI coverage guardrails");
+      "Windows must run mandatory validation guardrails");
   });
 });
