@@ -129,7 +129,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       const parameter = owner?.parameters.find((item) => nameOf(item.name) === "launch");
       const alias = file.statements.find((item) => ts.isTypeAliasDeclaration(item) &&
         item.name.text === "WindowsProcessHostLaunch");
-      return !!parameter && ts.isTypeReferenceNode(parameter.type) &&
+      return !!parameter?.type && ts.isTypeReferenceNode(parameter.type) &&
         parameter.type.typeName.getText(file) === "WindowsProcessHostLaunch" &&
         !!alias && stringArrayMember(alias.type, "args");
     }
