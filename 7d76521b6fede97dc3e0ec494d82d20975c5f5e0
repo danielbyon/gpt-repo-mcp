@@ -1,0 +1,14 @@
+tests/validation-service.test.ts
+  h_fe6a8a30e51ecc 395-396,422,424
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7d76521b6fede97dc3e0ec494d82d20975c5f5e0",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}

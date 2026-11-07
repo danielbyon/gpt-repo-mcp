@@ -1,0 +1,21 @@
+.github/workflows/windows-candidate-make-diagnostic.yml
+  s_c4c26be2fc295a::t_a86ceb5c9e9ae0 1-25
+tests/validation-service.test.ts
+  s_c4c26be2fc295a::t_db618d1a3157d9 101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "53a727ffaaf8c4eb3c845ff15e942b8f3ecc8f3a",
+  "prompts": {},
+  "sessions": {
+    "s_c4c26be2fc295a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a04c-f768-77a2-b0d8-9e14583300b0",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}

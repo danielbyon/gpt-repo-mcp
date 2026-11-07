@@ -1,0 +1,14 @@
+tests/process-exec.test.ts
+  h_fe6a8a30e51ecc 652-653,659-663,738-743
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "eae858eab6fd52ed03800a63d1b151e4884f6116",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
