@@ -1,0 +1,22 @@
+tests/validation-service.test.ts
+  s_76759ca7815121::t_89a308313e1de7 418
+  s_76759ca7815121::t_2c4a8c73af22ff 401-407,409-412,414-417,419-425,1878-1896
+tests/git-ignore-provenance.test.ts
+  s_76759ca7815121::t_c92f1fb508e587 161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5cf8f762d0f3dded5fc4ef32aa4aabffa6fb4288",
+  "prompts": {},
+  "sessions": {
+    "s_76759ca7815121": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b048-1149-77f2-84a8-7221586ce369",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
