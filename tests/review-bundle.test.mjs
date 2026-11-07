@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import process from "node:process";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { createReviewBundle, verifyReviewBundle } from "../scripts/create-review-bundle.mjs";
