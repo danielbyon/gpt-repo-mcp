@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import process from "node:process";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
 
