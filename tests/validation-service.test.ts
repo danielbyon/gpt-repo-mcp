@@ -398,17 +398,31 @@ describe("ValidationService", () => {
       localPython: true
     });
     await writeFile(join(root, "justfile"), "test:\n    @echo just-test\n");
+    const bin = await createTempDir("gpt-just-dry-run-bin-");
+    const just = join(bin, "just");
+    await writeFile(just, `#!${process.execPath}\nthrow new Error("dry-run must not execute just");\n`);
+    await chmod(just, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ""}`;
+    const processSpy = vi.spyOn(processExec, "runProcessWithTail");
 
-    const result = await service(root, {
-      validation_profiles: { test: { runner: "just", target: "test" } }
-    }).validate({ repo_id: "fixture", profile: "test", dry_run: true });
+    try {
+      const result = await service(root, {
+        validation_profiles: { test: { runner: "just", target: "test" } }
+      }).validate({ repo_id: "fixture", profile: "test", dry_run: true });
 
-    expect(result.commands).toMatchObject([{
-      profile: "test",
-      script: "just:test",
-      command: "just test",
-      status: "skipped"
-    }]);
+      expect(result.commands).toMatchObject([{
+        profile: "test",
+        script: "just:test",
+        command: "just test",
+        executable: "just",
+        status: "skipped"
+      }]);
+      expect(processSpy).not.toHaveBeenCalled();
+    } finally {
+      processSpy.mockRestore();
+      restoreEnv({ PATH: previousPath });
+    }
   });
 
   test("executes a declared just profile directly with a single target argument", async () => {
@@ -1861,7 +1875,25 @@ describe("ValidationService", () => {
     if (startError) throw startError;
     expect(started).toHaveLength(2);
     expect(new Set(started).size).toBe(2);
-    expect(settled.every((result) => result.status === "fulfilled")).toBe(true);
+    const safeSettledSummary = settled.map((result) => {
+      if (result.status === "fulfilled") {
+        return {
+          status: result.status,
+          validation_status: result.value.status,
+          validation_id: result.value.validation_id
+        };
+      }
+      const reason = result.reason as { code?: unknown; name?: unknown } | null;
+      return {
+        status: result.status,
+        error_name: reason && typeof reason.name === "string" ? reason.name : "unknown",
+        error_code: reason && typeof reason.code === "string" ? reason.code : "UNCLASSIFIED_ERROR"
+      };
+    });
+    expect(safeSettledSummary).toEqual([
+      expect.objectContaining({ status: "fulfilled", validation_status: "passed" }),
+      expect.objectContaining({ status: "fulfilled", validation_status: "passed" })
+    ]);
     const results = settled.map((result) => {
       if (result.status === "rejected") throw result.reason;
       return result.value;

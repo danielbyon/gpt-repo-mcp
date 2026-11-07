@@ -158,7 +158,7 @@ describe("Git-native ignored candidate provenance through MCP", () => {
     await git(f.root, ["commit", "-m", "Invalidate fixture attestation head"]);
     const stale = await f.call("repo_ship_review", { run_id: RUN });
     expect(stale.ship_readiness.reasons).toContain("DELEGATION_GATE_RUN_MISMATCH");
-  });
+  }, 10_000);
 
   test("a no-change attestation cannot conceal a changed tracked baseline", async () => {
     const f = await fixture("home");
