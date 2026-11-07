@@ -29,8 +29,7 @@ const FILTERED_CASES = Object.freeze([
     titles: [
       "runs Windows npm through the exact running Node and bundled npm CLI",
       "does not start Windows npm validation when System32/cmd.exe is unavailable",
-      "resolves the configured Windows make profile to its native executable",
-      "resolves the configured Windows just profile to its native executable",
+      "resolves the configured Windows %s profile to its native executable",
       "does not resolve Windows command shim %s",
       "does not select a repository-controlled make.exe from the worktree"
     ]
@@ -128,6 +127,11 @@ export function inspectQualificationWorkflow(workflow, readTest = (path) =>
     } catch {
       findings.push("Required Windows test source unavailable: " + scope.file);
       continue;
+    }
+    if (scope.step === "Windows exact Node runtime and shell-free npm dispatch" &&
+        (!source.includes('["make", "make.exe"]') ||
+          !source.includes('["just", "just.exe"]'))) {
+      findings.push("Windows native-runner table must cover both make.exe and just.exe.");
     }
     for (const title of scope.titles) {
       if (!source.includes(JSON.stringify(title)) && !source.includes("'" + title + "'")) {
