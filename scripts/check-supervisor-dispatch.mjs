@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, URL } from "node:url";
 import ts from "typescript";
 
 const ROOT = resolve(fileURLToPath(new URL("../", import.meta.url)));
