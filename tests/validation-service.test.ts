@@ -1837,8 +1837,9 @@ describe("ValidationService", () => {
 
   test("allows overlapping validations and preserves each receipt", async () => {
     const root = await fixtureRepo({ scripts: { smoke: "node concurrent-validation.cjs" } });
-    const startedPath = join(root, "started.txt");
-    const releasePath = join(root, "release.txt");
+    const coordinationDir = await createTempDir("gpt-validation-overlap-control-");
+    const startedPath = join(coordinationDir, "started.txt");
+    const releasePath = join(coordinationDir, "release.txt");
     const runner = [
       'const { appendFileSync, existsSync, watch } = require("node:fs");',
       'const { basename, dirname } = require("node:path");',
