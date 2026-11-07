@@ -76,6 +76,36 @@ Git recovery is separate from write tools. `repo_write_file` and `repo_write_cha
 
 The preferred high-level mutation flow is `repo_git_review` followed by the review-provided `repo_write_stage_commit` or `repo_write_recover` payload through the host approval UI. Granular tools remain available for specific requested operations, staged-only commits, troubleshooting, or cases where composite payloads are absent.
 
+## Validation Evidence
+
+`repo_validate` keeps the command result separate from evidence eligibility.
+The V2 receipt binds the configured repository identity, selected profile and
+recipe, runner and Rust toolchain, effective validation policy, and bounded
+source-state inventories captured before and after execution. Those
+inventories include the Git reference, logical index entries, tracked content,
+staged content, relevant untracked content, file modes, and symlink identities.
+Inventory limits fail closed when the required state cannot be captured.
+Untracked generated Delegation control artifacts such as `RESULT.json` are
+excluded; tracked content under those paths remains in the inventory. When
+Rustup selects the toolchain, its executable identity is also bound to the
+receipt.
+Configured Make and Just profiles also discover a bounded recipe source graph.
+Included recipes, Just imports and modules, and referenced helper files enter
+the snapshot even when Git ignores a helper. Unsupported paths and ambiguous
+Just module sources leave the evidence unverified.
+
+A successful command can still produce ineligible evidence. Observed source or
+policy drift makes the receipt ineligible; missing proof leaves it unverified.
+Review checks the receipt pointer, contained artifact path and digest, receipt
+contents, effective policy, current candidate state, and any task-requested
+profile and test paths. V1 receipts remain readable for compatibility, but
+they cannot establish V2 eligibility.
+
+The source inventories are endpoint snapshots. They do not continuously watch
+the repository, so a transient change that is reverted between snapshots may
+not be detected. Slice A also validates the configured checkout only. Selected
+worktree and per-instance receipt binding remain deferred to Issue #25.
+
 ## Canonical Development Workflow
 
 The normal direct-development path is intentionally linear:

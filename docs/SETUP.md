@@ -165,6 +165,23 @@ A `just`-based repository declares the same profile shape with the `just` runner
 
 Targets are schema-allowlisted and invoked with separate arguments. On Windows, the supervisor resolves Make and Just to native executables and rejects command shims. Repository targets may execute recipes or scripts, including shell commands; the supervisor does not inspect or sandbox them. Output is streamed and only a bounded tail is retained. Existing configs without `validation_profiles` remain valid.
 
+## Rust validation setup
+
+Declare a profile such as `test` or `all` with the `make` or `just` runner and
+the repository-owned target that already performs the check. The recipe may
+invoke Cargo, but Cargo is not a separate runner. Keep the pin in
+`rust-toolchain.toml` aligned with the Makefile or Just recipe. NSCB specifies
+Rust `1.98.1` in both its toolchain file and Makefile. The selected Cargo and
+Rustc tools must report the pinned version. Missing or inconsistent pins,
+unsupported Cargo overrides, and untrusted runner configuration fail before
+the recipe runs. Bounded source discovery follows Make includes, Just imports
+and modules, and referenced helper files. Those files enter validation
+evidence even when Git ignores them; unresolved or ambiguous Just sources fail
+closed. Repository-defined settings such as `RUST_TEST_THREADS=1` remain in
+effect. When Rustup selects the toolchain, receipts bind its path identity,
+reported version, and executable contents. Rustup remains optional when direct
+Cargo and Rustc selection satisfies the same pin checks.
+
 ## Doctor
 
 Run `npm run doctor`. The doctor command checks config validation, package scripts, ngrok availability, tunnel state, port `8787`, and git status without dumping raw config or secrets. Run it after adding a repository for full green status. Before adding a repository, the empty starter config still validates and doctor may report `WARN config has no repositories`.
