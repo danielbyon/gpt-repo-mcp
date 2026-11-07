@@ -48,8 +48,8 @@ describe("validation supervisor direct-execution guard", () => {
   });
 
   test("audits the embedded POSIX launcher and rejects shell dispatch inside it", () => {
-    const valid = "const POSIX_GROUP_LAUNCHER = String.raw\`" +
-      "const { spawn } = require('node:child_process'); spawn('node', []);" + "\`;";
+    const valid = "const POSIX_GROUP_LAUNCHER = String.raw`" +
+      "const { spawn } = require('node:child_process'); spawn('node', []);" + "`;";
     const invalid = valid.replace("spawn('node', [])", "spawn('cmd.exe', ['/c'])");
     expect(inspectSupervisorSource("src/services/process-exec.ts", valid)).toEqual([]);
     expect(inspectSupervisorSource("src/services/process-exec.ts", invalid))
