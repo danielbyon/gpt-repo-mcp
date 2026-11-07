@@ -50,7 +50,7 @@ describe("validation supervisor direct-execution guard", () => {
   test.each([
     ["computed double-quoted shell", "spawn('node.exe', [], { [\"shell\"]: true });"],
     ["computed single-quoted shell", "spawn('node.exe', [], { ['shell']: false });"],
-    ["computed template shell", "spawn('node.exe', [], { [\`shell\`]: true });"],
+    ["computed template shell", "spawn('node.exe', [], { [`shell`]: true });"],
     ["aliased spawn", "import { spawn as runNative } from 'node:child_process'; runNative('node.exe', [], { ['shell']: true });"],
     ["aliased execFile", "import { execFile as runNative } from 'node:child_process'; runNative('node.exe', [], { ['shell']: true });"],
     ["unknown computed option", "spawn('node.exe', [], { [optionName]: true });"],
