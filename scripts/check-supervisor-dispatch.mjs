@@ -113,6 +113,14 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         add(node, "direct interpreter or command-shim dispatch is forbidden");
       }
     }
+    if (ts.isVariableDeclaration(node) &&
+        node.initializer && ts.isIdentifier(node.initializer) &&
+        node.initializer.text === "require") {
+      add(node, "aliasing require to bypass import inspection is forbidden");
+    }
+    if (ts.isCallExpression(node) && callName(node.expression) === "Function") {
+      add(node, "dynamic function construction is unaudited");
+    }
     if (ts.isNewExpression(node) && nameOf(node.expression) === "Function") {
       add(node, "dynamic function construction is unaudited");
     }

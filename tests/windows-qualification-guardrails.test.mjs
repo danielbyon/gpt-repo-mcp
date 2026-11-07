@@ -29,6 +29,18 @@ describe("Windows qualification scope guard", () => {
     expect(inspect(workflow).some((f) => f.includes("conditional or optional"))).toBe(true);
   });
 
+  test("rejects a conditionally skipped Windows lint stage", () => {
+    const workflow = load();
+    windowsStep(workflow, "Lint").if = "false";
+    expect(inspect(workflow).some((f) => f.includes("conditional or optional"))).toBe(true);
+  });
+
+  test("rejects a missing Linux typecheck", () => {
+    const workflow = load();
+    workflow.jobs.test.steps.find((s) => s.name === "Typecheck").run = "echo skipped";
+    expect(inspect(workflow).some((f) => f.includes("must execute required command"))).toBe(true);
+  });
+
   test("rejects conditional Linux qualification", () => {
     const workflow = load();
     workflow.jobs.test.if = false;
@@ -49,6 +61,7 @@ describe("Windows qualification scope guard", () => {
 
   test.each([
     "--passWithNoTests",
+    "-t Windows|echo skipped",
     '--exclude tests/validation-service.test.ts',
     '-t "Windows npm" --testNamePattern="Windows command shim"',
     '--testNamePattern="["'

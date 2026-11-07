@@ -38,6 +38,8 @@ describe("validation supervisor direct-execution guard", () => {
     ["alias across local declarations", "import { execFile as safe } from 'node:child_process'; const runner = safe; runner('cmd.exe', []);"],
     ["dynamic import", "const p = import('node:child_process');"],
     ["dynamic require", "const p = require(moduleName);"],
+    ["aliased require", "const loader = require; const cp = loader(\"node:child_process\");"],
+    ["function constructor", "const create = Function(\"return 1\");"],
     ["require with computed member", "const p = require('node:child_process'); p['exec']('echo nope');"],
     ["namespace import", "import * as cp from 'node:child_process'; cp.exec('echo nope');"],
     ["function evaluation", "new Function('return require(\\\"node:child_process\\\")')();"]

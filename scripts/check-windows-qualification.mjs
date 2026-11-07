@@ -75,6 +75,7 @@ function tokenize(line) {
       part = "";
       open = false;
     } else {
+      if (/[|;&<>`]/.test(char)) throw new Error("unquoted shell control character");
       part += char;
       open = true;
     }
@@ -256,6 +257,28 @@ export function inspectQualificationWorkflow(workflow, readTest = (path) =>
     const guard = mandatoryStep(steps, "Validation security and CI coverage guardrails", findings, platform);
     if (guard?.run?.trim() !== "npm run check:validation-guardrails") {
       findings.push(platform + " must run mandatory validation guardrails");
+    }
+  }
+  for (const [steps, platform, required] of [
+    [linux, "Linux", [
+      ["Typecheck", "npm run typecheck"],
+      ["Lint", "npm run lint"],
+      ["Public hygiene", "npm run check:public"],
+      ["Build", "npm run build"],
+      ["Whitespace check", "git diff --check"]
+    ]],
+    [windows, "Windows", [
+      ["Typecheck", "npm run typecheck"],
+      ["Build production package and Windows helper", "npm run build"],
+      ["Lint", "npm run lint"],
+      ["Whitespace check", "git diff --check"]
+    ]]
+  ]) {
+    for (const [name, command] of required) {
+      const requiredStep = mandatoryStep(steps, name, findings, platform);
+      if (requiredStep?.run?.trim() !== command) {
+        findings.push(platform + " must execute required command: " + name);
+      }
     }
   }
   const linuxSuite = mandatoryStep(linux, "Test", findings, "Linux");
