@@ -21,6 +21,8 @@ describe("validation supervisor direct-execution guard", () => {
     ["shell option from a variable", "spawn('node.exe', [], { shell });"],
     ["shell string execution", "import { exec } from 'node:child_process'; exec('node -v');"],
     ["shell string sync execution", "import { execSync } from 'node:child_process'; execSync('node -v');"],
+    ["aliased shell execution", "import { exec as runCommand } from 'node:child_process'; runCommand('node -v');"],
+    ["CommonJS execution alias", "const cp = require('node:child_process'); cp.exec('node -v');"],
     ["direct command interpreter", "spawn('cmd.exe', ['/c', 'dir']);"],
     ["PowerShell interpreter", "spawn('powershell.exe', ['-Command', 'Get-ChildItem']);"],
     ["batch wrapper", "spawn('C:\\\\Tools\\\\npm.cmd', ['test']);"],

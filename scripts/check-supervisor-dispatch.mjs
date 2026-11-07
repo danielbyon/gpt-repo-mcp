@@ -41,6 +41,17 @@ export function inspectSupervisorSource(filename, source) {
       add(node, "shell-capable runner imports are not allowed in validation supervision");
     }
 
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) &&
+        ["node:child_process", "child_process"].includes(node.moduleSpecifier.text)) {
+      const bindings = node.importClause?.namedBindings;
+      if (!bindings || !ts.isNamedImports(bindings)) {
+        add(node, "process execution imports must use explicitly audited named exports");
+      } else if (bindings.elements.some((item) =>
+        ["exec", "execSync"].includes(item.propertyName?.text ?? item.name.text))) {
+        add(node, "shell-string child_process APIs cannot be imported by the supervisor");
+      }
+    }
+
     if (ts.isCallExpression(node)) {
       const callee = nameOf(node.expression);
       if ((callee === "exec" || callee === "execSync") &&
@@ -52,6 +63,11 @@ export function inspectSupervisorSource(filename, source) {
       }
       if (callee === "_parse") {
         add(node, "private command/shim parsing is forbidden in validation supervision");
+      }
+      if (callee === "require" && node.arguments.length > 0 &&
+          ts.isStringLiteral(node.arguments[0]) &&
+          ["node:child_process", "child_process"].includes(node.arguments[0].text)) {
+        add(node, "CommonJS child_process loading is not allowed in supervisor source");
       }
       if ((callee === "require" || node.expression.kind === ts.SyntaxKind.ImportKeyword) &&
           node.arguments.length > 0 && ts.isStringLiteral(node.arguments[0]) &&
