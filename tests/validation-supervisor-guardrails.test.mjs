@@ -37,6 +37,11 @@ describe("validation supervisor direct-execution guard", () => {
     expect(inspectSupervisorSource("src/services/validation-service.ts", source)).toEqual([]);
   });
 
+  test("allows RegExp.exec while blocking shell command execution", () => {
+    expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts",
+      "const parsed = /v([0-9]+)/.exec(version);")).toEqual([]);
+  });
+
   test("does not mistake safe execFile and direct spawn for a shell", () => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts",
       "import { execFile } from 'node:child_process'; execFile('node.exe', ['--version']);" +

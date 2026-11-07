@@ -42,7 +42,11 @@ export function inspectSupervisorSource(filename, source) {
 
     if (ts.isCallExpression(node)) {
       const callee = nameOf(node.expression);
-      if (callee === "exec" || callee === "execSync") {
+      if ((callee === "exec" || callee === "execSync") &&
+          (ts.isIdentifier(node.expression) ||
+            (ts.isPropertyAccessExpression(node.expression) &&
+              ts.isIdentifier(node.expression.expression) &&
+              node.expression.expression.text === "childProcess"))) {
         add(node, "shell-string process execution is forbidden in validation supervision");
       }
       if (callee === "_parse") {
