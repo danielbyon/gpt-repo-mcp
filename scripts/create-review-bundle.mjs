@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import process from "node:process";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { constants, existsSync } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -155,15 +155,37 @@ function untrackedPaths(root) {
 }
 
 /**
- * Ignore-aware inventory is intentionally confined to source/test/docs roots.
- * --directory collapses ignored trees, preventing descent into caches and
- * dependencies. A relevant ignored directory is ambiguous and fails closed.
+ * Git's --directory inventory can include traversal ancestors that are not
+ * themselves ignored. Classify its bounded candidates with Git check-ignore;
+ * only genuinely ignored paths may affect exclusions or fail-closed checks.
+ * Neither command descends into collapsed ignored build/dependency trees.
  */
 function ignoredPaths(root) {
-  return boundedPaths(git(root, [
+  const candidates = boundedPaths(git(root, [
     "ls-files", "--others", "--ignored", "--exclude-standard", "--directory",
     "-z", "--", ...IGNORED_INVENTORY_ROOTS
   ], { maxBuffer: 1024 * 1024 }));
+  if (candidates.length === 0) return [];
+
+  const input = Buffer.from(candidates.join("\0") + "\0", "utf8");
+  if (input.byteLength > 1024 * 1024) {
+    throw new Error("Review-bundle ignored-source inventory exceeds its byte limit.");
+  }
+  const checked = spawnSync("git", ["check-ignore", "-z", "--stdin"], {
+    cwd: root, windowsHide: true, input, timeout: 30_000, maxBuffer: 1024 * 1024,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  if (checked.error) throw checked.error;
+  if (checked.signal || (checked.status !== 0 && checked.status !== 1)) {
+    throw new Error("Git ignored-source classification failed.");
+  }
+  const ignored = boundedPaths(checked.stdout);
+  const candidateSet = new Set(candidates);
+  if ((checked.status === 1 && ignored.length !== 0) ||
+      ignored.some((path) => !candidateSet.has(path))) {
+    throw new Error("Git ignored-source classification returned inconsistent paths.");
+  }
+  return ignored;
 }
 
 function relevantIgnoredSource(path) {

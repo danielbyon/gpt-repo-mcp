@@ -43,9 +43,13 @@ The inventory has explicit boundaries:
   paths appear under `excluded_untracked_paths`.
 - Ignored source: a separate bounded Git-ignored inventory covers
   `src/`, `tests/`, `scripts/`, `docs/`, `native/`,
-  `.github/workflows/`, and the named build definitions. An ignored
-  reviewable source path or an ambiguous ignored directory in these roots
-  **fails closed**, including ignored test files. It cannot silently disappear.
+  `.github/workflows/`, and the named build definitions. Git can emit
+  synthetic traversal ancestors alongside actual ignored directories; each
+  candidate is classified by `git check-ignore --stdin` before counting or
+  applying the fail-closed rule. A synthetic, nonignored parent does not
+  cause a failure or appear as an ignored exclusion. An actually ignored
+  reviewable source path or directory still **fails closed**, including
+  ignored test files. It cannot silently disappear.
 - Other ignored artifacts: ignored generated/blocked directories are collapsed
   by Git's directory enumeration and not recursively scanned. Nonrestricted
   exclusions appear under `excluded_ignored_paths`; restricted path names

@@ -213,4 +213,72 @@ describe("content-addressed worktree review bundles", () => {
     expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
   });
 
+
+  test("53-D: skips synthetic Git directory ancestors of excluded generated content", async () => {
+    const f = await fixture();
+    await mkdir(join(f.root, "src", "feature", "build"), { recursive: true });
+    await writeFile(join(f.root, ".gitignore"), "src/feature/build/\n");
+    await writeFile(join(f.root, "src", "feature", "build", "generated.js"), "generated\n");
+    const output = runGit(f.root, [
+      "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--", "src/"
+    ]).split("\n");
+    expect(output).toContain("src/feature/");
+    expect(output).toContain("src/feature/build/");
+    const before = runGit(f.root, ["status", "--porcelain"]);
+    const result = await createReviewBundle({ cwd: f.root, base: f.base, output: f.output });
+    const manifest = JSON.parse(await readFile(join(f.output, "manifest.json"), "utf8"));
+    expect(manifest.excluded_ignored_paths).toEqual([]);
+    expect(manifest.redacted_ignored_count).toBe(1);
+    expect(result.redacted_ignored_count).toBe(1);
+    expect(await verifyReviewBundle(f.output, result.manifest_sha256)).toMatchObject({ verified: true });
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+  });
+
+  test("53-D: rejects an actually ignored source subtree", async () => {
+    const f = await fixture();
+    await mkdir(join(f.root, "src", "feature"), { recursive: true });
+    await writeFile(join(f.root, ".gitignore"), "src/feature/\n");
+    await writeFile(join(f.root, "src", "feature", "hidden.ts"), "export {};\n");
+    const before = runGit(f.root, ["status", "--porcelain"]);
+    await expect(createReviewBundle({ cwd: f.root, base: f.base, output: f.output }))
+      .rejects.toThrow(/Relevant ignored source.*src\/feature\//);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+  });
+
+  test("53-D: preserves visible untracked source beside an ignored generated subtree", async () => {
+    const f = await fixture();
+    await mkdir(join(f.root, "src", "feature", "build"), { recursive: true });
+    await writeFile(join(f.root, ".gitignore"), "src/feature/build/\n");
+    await writeFile(join(f.root, "src", "feature", "new.ts"), "export const feature = 1;\n");
+    await writeFile(join(f.root, "src", "feature", "build", "generated.js"), "generated\n");
+    const before = runGit(f.root, ["status", "--porcelain"]);
+    const result = await createReviewBundle({ cwd: f.root, base: f.base, output: f.output });
+    const manifest = JSON.parse(await readFile(join(f.output, "manifest.json"), "utf8"));
+    expect(manifest.untracked_files.map((entry) => entry.source_path))
+      .toEqual(["src/feature/new.ts", "tests/new.test.ts"]);
+    expect(manifest.redacted_ignored_count).toBe(1);
+    expect(await readFile(join(f.output, "untracked", "src", "feature", "new.ts"), "utf8"))
+      .toBe("export const feature = 1;\n");
+    await expect(stat(join(f.output, "untracked", "src", "feature", "build", "generated.js")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    expect(result.untracked_path_count).toBe(2);
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+  });
+
+  test("53-D: fails closed if a relevant ignored source appears during capture", async () => {
+    const f = await fixture();
+    await writeFile(join(f.root, ".gitignore"), "tests/late.test.ts\n");
+    const before = runGit(f.root, ["status", "--porcelain"]);
+    await expect(createReviewBundle({
+      cwd: f.root, base: f.base, output: f.output,
+      beforeFinalSnapshot: () =>
+        writeFile(join(f.root, "tests", "late.test.ts"), "test('late', () => {});\n")
+    })).rejects.toThrow(/Git worktree changed during review-bundle capture/);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+    // Only the deliberately inserted test differs from the original checkout.
+    expect(runGit(f.root, ["status", "--porcelain"])).toContain("?? .gitignore");
+    expect(before).toContain("?? .gitignore");
+  });
+
 });
