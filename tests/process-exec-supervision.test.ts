@@ -159,6 +159,78 @@ describe("POSIX process anchor lifecycle", () => {
     expect(result).toMatchObject({ cleanup_confirmed: false });
     expect(result).toHaveProperty("host_failure");
   });
+
+  posixTest("does not confirm cleanup when process-group inspection is denied", async () => {
+    vi.useFakeTimers();
+    const child = fakeAnchor(42_429);
+    const processKill = vi.spyOn(process, "kill").mockImplementation(((_pid, _signal) => {
+      throw Object.assign(new Error("group inspection denied"), { code: "EPERM" });
+    }) as typeof process.kill);
+    const run = await loadRunner(child);
+    const execution = run();
+
+    child.emit("spawn");
+    child.exitCode = 1;
+    child.emit("close", 1, null);
+    await vi.runAllTimersAsync();
+
+    const result = await execution;
+    expect(processKill).toHaveBeenCalledWith(-42_429, 0);
+    expect(result).toMatchObject({
+      cleanup_confirmed: false, cancelled: false, timed_out: false
+    });
+    expect(result).toHaveProperty("host_failure");
+  });
+
+  posixTest("treats malformed anchor control after READY as supervision failure", async () => {
+    const child = fakeAnchor(42_430);
+    const processKill = vi.spyOn(process, "kill").mockImplementation(((_pid, signal) => {
+      if (signal === 0) throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+      return true;
+    }) as typeof process.kill);
+    const run = await loadRunner(child);
+    const execution = run();
+
+    child.emit("spawn");
+    child.stdio[3]!.write('{"type":"ready"}\n');
+    child.stdio[3]!.write("{malformed-control}\n");
+    child.exitCode = 1;
+    child.emit("close", 1, null);
+
+    const result = await execution;
+    expect(processKill).toHaveBeenCalledWith(-42_430, "SIGTERM");
+    expect(processKill).toHaveBeenCalledWith(-42_430, 0);
+    expect(result).toMatchObject({
+      cleanup_confirmed: true, cancelled: false, timed_out: false
+    });
+    expect(result.host_failure).toMatch(/malformed control data/i);
+  });
+
+  posixTest("classifies failure to dispatch START as supervisor failure", async () => {
+    vi.useFakeTimers();
+    const child = fakeAnchor(42_431);
+    const processKill = vi.spyOn(process, "kill").mockImplementation(((_pid, signal) => {
+      if (signal === 0) throw Object.assign(new Error("group exited"), { code: "ESRCH" });
+      return true;
+    }) as typeof process.kill);
+    const run = await loadRunner(child);
+    const execution = run();
+
+    child.stdin.destroy();
+    child.emit("spawn");
+    child.stdio[3]!.write('{"type":"ready"}\n');
+    await vi.advanceTimersToNextTimerAsync();
+    child.exitCode = 1;
+    child.emit("close", 1, null);
+
+    const result = await execution;
+    expect(processKill).toHaveBeenCalledWith(-42_431, 0);
+    expect(result).toMatchObject({
+      cleanup_confirmed: true, cancelled: false, timed_out: false
+    });
+    expect(result.host_failure).toMatch(/could not admit the command/i);
+  });
+
 });
 
 function fakeAnchor(pid: number | undefined) {
