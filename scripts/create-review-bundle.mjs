@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { constants, existsSync } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, URL } from "node:url";
 
 const MAX_PATCH_BYTES = 16 * 1024 * 1024;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
