@@ -130,7 +130,7 @@ describe("Windows qualification scope guard", () => {
     workflow.jobs.test.steps.find((step) => step.name === "Test").run =
       "npm test -- tests/process-exec.test.ts";
     const findings = inspect(workflow);
-    expect(findings.some((message) => message.includes("allowed to fail"))).toBe(true);
+    expect(findings.some((message) => message.includes("conditional or optional"))).toBe(true);
     expect(findings.some((message) => message.includes("unfiltered full suite"))).toBe(true);
   });
 
