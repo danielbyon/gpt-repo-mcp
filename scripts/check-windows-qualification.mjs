@@ -225,7 +225,7 @@ function invocationKind(expression, names, isProcessPlatform, testRunnerOf) {
   }
   const member = access(expression);
   if (member && testRunnerOf(member.receiver, names) &&
-      ["concurrent", "sequential"].includes(member.method)) {
+      ["concurrent", "fails", "sequential"].includes(member.method)) {
     return { enabled: true };
   }
   if (member && testRunnerOf(member.receiver, names) &&
@@ -875,7 +875,7 @@ const recordResolvedAssignments = (target, source) => {
             continue;
           }
         }
-        if (["concurrent", "sequential"].includes(key)) {
+        if (["concurrent", "fails", "sequential"].includes(key)) {
           const runner = testRunnerOf(source, ["test", "it", "describe"]);
           const binding = resolveBinding(targetValue);
           if (runner && binding?.kind === "variable") {
@@ -951,6 +951,61 @@ collectResolvedAssignments(file);
     return Boolean(member && names.includes(member.method) &&
       globalObjectOf(member.receiver, seen));
   }
+  const intrinsicMethodAliasNames = new Set();
+  const intrinsicMethodContainerNames = new Set();
+  const globalIntrinsicMethodOf = (input, receiverNames, methods, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (!ts.isIdentifier(node)) {
+      if (seen.has(node)) return false;
+      const next = new Set(seen);
+      next.add(node);
+      const member = access(node);
+      if (!member) return false;
+      if (methods.includes(member.method) &&
+          globalIntrinsicOf(member.receiver, receiverNames, next)) return true;
+      let container = unwrap(member.receiver);
+      const namedContainer = ts.isIdentifier(container) &&
+        intrinsicMethodContainerNames.has(container.text);
+      if (ts.isIdentifier(container)) {
+        const receiverBinding = resolveBinding(container);
+        const initializer = receiverBinding?.node &&
+          (ts.isVariableDeclaration(receiverBinding.node) ||
+           ts.isParameter(receiverBinding.node))
+          ? receiverBinding.node.initializer : undefined;
+        container = initializer ? unwrap(initializer) : container;
+      }
+      if (!ts.isArrayLiteralExpression(container) &&
+          !ts.isObjectLiteralExpression(container) && !namedContainer) return false;
+      return objectPropertyValuesOf(container, member.method, next)
+        .some((value) => globalIntrinsicMethodOf(
+          value, receiverNames, methods, next));
+    }
+    if (!intrinsicMethodAliasNames.has(node.text)) return false;
+    const binding = resolveBinding(node);
+    if (!binding?.node || seen.has(binding.node)) return false;
+    if (binding.kind !== "variable" &&
+        !(binding.kind === "opaque" && ts.isVariableDeclaration(binding.node))) {
+      return false;
+    }
+    const next = new Set(seen);
+    next.add(binding.node);
+    const declaration = binding.node;
+    const values = [declaration.initializer,
+      ...(assignmentsByBinding.get(declaration) ?? [])];
+    if (values.some((value) => value && globalIntrinsicMethodOf(
+      value, receiverNames, methods, next))) return true;
+    if (ts.isIdentifier(declaration.name)) return false;
+    const source = declaration.initializer ? unwrap(declaration.initializer) : undefined;
+    if (source && (ts.isArrayLiteralExpression(source) ||
+        ts.isObjectLiteralExpression(source)) &&
+        destructuredValuesOf(declaration, node.text).some((value) =>
+          globalIntrinsicMethodOf(value, receiverNames, methods, next))) return true;
+    return Boolean(declaration.initializer &&
+      globalIntrinsicOf(declaration.initializer, receiverNames, next) &&
+      methods.some((method) => patternSelectsProperty(
+        declaration.name, node.text, method)));
+  };
   function patternSelectsProperty(pattern, targetName, property) {
     if (ts.isObjectBindingPattern(pattern)) {
       return pattern.elements.some((element) => {
@@ -1054,7 +1109,7 @@ collectResolvedAssignments(file);
     if (!node) return undefined;
     if (!ts.isIdentifier(node)) {
       const member = access(node);
-      if (member && ["concurrent", "sequential"].includes(member.method)) {
+      if (member && ["concurrent", "fails", "sequential"].includes(member.method)) {
         return testRunnerOf(member.receiver, names, seen);
       }
       return member && names.includes(member.method) && vitestNamespaceOf(member.receiver)
@@ -1096,7 +1151,7 @@ collectResolvedAssignments(file);
               (vitestNamespaceOf(value) || possibleVitestNamespaceOf(value))) {
             return { runner: key };
           }
-          if (key && ["concurrent", "sequential"].includes(key)) {
+          if (key && ["concurrent", "fails", "sequential"].includes(key)) {
             const runner = possibleTestRunnerOf(value, names);
             if (runner) return { runner };
           }
@@ -1203,7 +1258,7 @@ return undefined;
   }
   if (!ts.isIdentifier(node)) {
     const member = access(node);
-    if (member && ["concurrent", "sequential"].includes(member.method)) {
+    if (member && ["concurrent", "fails", "sequential"].includes(member.method)) {
       return possibleTestRunnerOf(member.receiver, names, seen);
     }
     if (member && names.includes(member.method) &&
@@ -1288,15 +1343,17 @@ if (candidate) return candidate;
     if (globalIntrinsicOf(node, ["Proxy"])) return true;
     if (names.some((name) => objectPropertyValuesOf(node, name, seen)
       .some((value) => possibleTestRunnerOf(value, names, seen)))) return true;
+    const member = access(node);
+    if (member && (member.method === "value" || names.includes(member.method) ||
+        /^\d+$/.test(member.method ?? "")) &&
+        testRunnerContainerOf(member.receiver, names, seen)) return true;
     if (!ts.isCallExpression(node)) return false;
     if (globalIntrinsicOf(node.expression, ["Proxy"])) {
       return Boolean(node.arguments[0]) &&
         testRunnerContainerOf(node.arguments[0], names, seen);
     }
     const factory = access(unwrap(node.expression));
-    if (!factory) return false;
-    if (factory.method === "get" &&
-        globalIntrinsicOf(factory.receiver, ["Reflect"])) {
+    if (globalIntrinsicMethodOf(node.expression, ["Reflect"], ["get"], seen)) {
       const property = literal(node.arguments[1]);
       if (property === undefined) {
         return possibleTestRunnerOf(node.arguments[0], names, seen) ||
@@ -1309,18 +1366,120 @@ if (candidate) return candidate;
         (possibleVitestNamespaceOf(node.arguments[0]) ||
          testRunnerContainerOf(node.arguments[0], names, seen));
     }
-    if (factory.method === "assign" &&
+    if (factory?.method === "assign" &&
         globalIntrinsicOf(factory.receiver, ["Object"])) {
       return node.arguments.some((argument) =>
         testRunnerContainerOf(argument, names, seen));
     }
-    if (factory.method === "create" &&
+    if (factory?.method === "create" &&
         globalIntrinsicOf(factory.receiver, ["Object"])) {
       return Boolean(node.arguments[0]) &&
         testRunnerContainerOf(node.arguments[0], names, seen);
     }
+    if (globalIntrinsicMethodOf(node.expression, ["Object"], [
+      "getOwnPropertyDescriptor"
+    ], seen)) {
+      const property = literal(node.arguments[1]);
+      return Boolean(node.arguments[0]) &&
+        (property === undefined || names.includes(property)) &&
+        testRunnerContainerOf(node.arguments[0], names, seen);
+    }
+    if (globalIntrinsicMethodOf(node.expression, ["Object"], [
+      "entries", "fromEntries", "getOwnPropertyDescriptors", "values"
+    ], seen)) {
+      return node.arguments.some((argument) =>
+        testRunnerContainerOf(argument, names, seen));
+    }
     return false;
   };
+  const collectBoundNames = (pattern, names = []) => {
+    for (const element of pattern.elements) {
+      if (!ts.isBindingElement(element)) continue;
+      if (ts.isIdentifier(element.name)) names.push(element.name.text);
+      else collectBoundNames(element.name, names);
+    }
+    return names;
+  };
+  const visitIntrinsicAliases = (node) => {
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      if (ts.isIdentifier(node.name)) {
+        if (globalIntrinsicMethodOf(node.initializer, ["Reflect"], ["get"]) ||
+            globalIntrinsicMethodOf(node.initializer, ["Object"], [
+              "entries", "fromEntries", "getOwnPropertyDescriptor",
+              "getOwnPropertyDescriptors", "values"
+            ])) intrinsicMethodAliasNames.add(node.name.text);
+        if (ts.isObjectLiteralExpression(unwrap(node.initializer)) &&
+            unwrap(node.initializer).properties.some((property) => {
+              if (ts.isSpreadAssignment(property)) return false;
+              const value = ts.isPropertyAssignment(property) ? property.initializer
+                : ts.isShorthandPropertyAssignment(property) ? property.name : undefined;
+              return Boolean(value &&
+                (globalIntrinsicMethodOf(value, ["Reflect"], ["get"]) ||
+                 globalIntrinsicMethodOf(value, ["Object"], [
+                   "entries", "fromEntries", "getOwnPropertyDescriptor",
+                   "getOwnPropertyDescriptors", "values"
+                 ])));
+            })) intrinsicMethodContainerNames.add(node.name.text);
+      } else if (ts.isObjectBindingPattern(node.name) ||
+          ts.isArrayBindingPattern(node.name)) {
+        for (const name of collectBoundNames(node.name)) {
+          const selected = destructuredValuesOf(node, name);
+          if (selected.some((value) =>
+            globalIntrinsicMethodOf(value, ["Reflect"], ["get"]) ||
+            globalIntrinsicMethodOf(value, ["Object"], [
+              "entries", "fromEntries", "getOwnPropertyDescriptor",
+              "getOwnPropertyDescriptors", "values"
+            ]))) {
+            intrinsicMethodAliasNames.add(name);
+          } else if (globalIntrinsicOf(node.initializer, ["Reflect"]) &&
+              patternSelectsProperty(node.name, name, "get")) {
+            intrinsicMethodAliasNames.add(name);
+          } else if (globalIntrinsicOf(node.initializer, ["Object"]) &&
+              ["entries", "fromEntries", "getOwnPropertyDescriptor",
+                "getOwnPropertyDescriptors", "values"].some((method) =>
+                patternSelectsProperty(node.name, name, method))) {
+            intrinsicMethodAliasNames.add(name);
+          }
+        }
+      }
+    }
+    if (ts.isBinaryExpression(node) && aliasAssignmentKinds.has(node.operatorToken.kind) &&
+        ts.isIdentifier(unwrap(node.left)) &&
+        (globalIntrinsicMethodOf(node.right, ["Reflect"], ["get"]) ||
+         globalIntrinsicMethodOf(node.right, ["Object"], [
+           "entries", "fromEntries", "getOwnPropertyDescriptor",
+           "getOwnPropertyDescriptors", "values"
+         ]))) intrinsicMethodAliasNames.add(unwrap(node.left).text);
+    ts.forEachChild(node, visitIntrinsicAliases);
+  };
+  visitIntrinsicAliases(file);
+  let expandedAlias = true;
+  while (expandedAlias) {
+    expandedAlias = false;
+    const visitAliasChains = (node) => {
+      let target;
+      let value;
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) &&
+          node.initializer) {
+        target = node.name;
+        value = node.initializer;
+      } else if (ts.isBinaryExpression(node) &&
+          aliasAssignmentKinds.has(node.operatorToken.kind) &&
+          ts.isIdentifier(unwrap(node.left))) {
+        target = unwrap(node.left);
+        value = node.right;
+      }
+      value = unwrap(value);
+      if (target && ts.isIdentifier(value) &&
+          intrinsicMethodAliasNames.has(value.text) &&
+          !intrinsicMethodAliasNames.has(target.text)) {
+        intrinsicMethodAliasNames.add(target.text);
+        expandedAlias = true;
+      }
+      ts.forEachChild(node, visitAliasChains);
+    };
+    visitAliasChains(file);
+  }
   return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
     possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
     resolveBinding };
@@ -1394,8 +1553,8 @@ export function collectWindowsTestTitles(filename, source) {
       throw new Error("Exclusive or dynamically selected Vitest tests unaudited.");
     }
     const member = access(node);
-    if (member && testRunnerContainerOf(member.receiver, ["test", "it", "describe"]) &&
-        (member.method === undefined || member.method === "only")) {
+    if (member && (member.method === undefined || member.method === "only") &&
+        testRunnerContainerOf(member.receiver, ["test", "it", "describe"])) {
       throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
     }
     if (ts.isCallExpression(node)) {

@@ -1077,19 +1077,38 @@ const reflectiveReadOf = (input, seen = new Set()) => {
     const next = new Set(seen);
     next.add(binding.node);
     if (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) {
-      const values = ts.isIdentifier(binding.node.name)
-        ? [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
-        : [];
-      return values.filter(Boolean).some((value) => reflectiveReadOf(value, next));
+      if (ts.isIdentifier(binding.node.name)) {
+        return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+          .filter(Boolean).some((value) => reflectiveReadOf(value, next));
+      }
+      const values = [
+        ...(binding.node.initializer ? bindingPatternValuesOf(
+          binding.node.name,
+          binding.node.initializer,
+          node.text,
+          next
+        ) : []),
+        ...(destructuredAssignmentsByBinding.get(
+          `${binding.node.pos}:${node.text}`) ?? [])
+      ];
+      if (values.some((value) => reflectiveReadOf(value, next))) return true;
+      return Boolean(binding.node.initializer &&
+        globalPrototypeObjectOf(binding.node.initializer, next) &&
+        ["entries", "get", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors"]
+          .some((property) => destructuresConstructor(binding.node.name, node.text, property)));
     }
     return false;
   }
   const member = memberAccess(node);
-  return Boolean(member &&
-    ((member.property === "get" && globalReflectOf(member.receiver, seen)) ||
-     (["entries", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors"].includes(
-       member.property) &&
-      globalPrototypeObjectOf(member.receiver, seen))));
+  if (!member) return false;
+  if ((member.property === "get" && globalReflectOf(member.receiver, seen)) ||
+      (["entries", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors"].includes(
+        member.property) && globalPrototypeObjectOf(member.receiver, seen))) return true;
+  if (seen.has(node)) return false;
+  const next = new Set(seen);
+  next.add(node);
+  return memberValueCandidatesOf(member.receiver, member.property, next)
+    .some((value) => reflectiveReadOf(value, next));
 };
   const destructuringEntries = (target) => {
     if (ts.isObjectBindingPattern(target)) {
@@ -1864,7 +1883,11 @@ const reflectiveReadOf = (input, seen = new Set()) => {
       if (called === "createRequire" || called === "_parse") {
         add(node, "indirect process loading, eval, or private shim parsing is forbidden");
       }
-      if (reflectiveReadOf(node.expression)) {
+      const indirectReflective = invoked && ["apply", "bind", "call"].includes(
+        invoked.property) && reflectiveReadOf(invoked.receiver);
+      if (indirectReflective) {
+        add(node, "reflective access to dynamic execution or process capabilities forbidden");
+      } else if (reflectiveReadOf(node.expression)) {
         const receiver = node.arguments[0];
         const property = staticStringOf(node.arguments[1]);
         const globalCapabilityReceiver = globalObjectOf(receiver) ||

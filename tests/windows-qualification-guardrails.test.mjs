@@ -548,6 +548,18 @@ describe("Windows qualification scope guard", () => {
   test.each([
     ["reflected test.only", "import { test } from 'vitest'; Reflect.get(test, 'only')('focused', () => {});"],
     ["reflected runner held by object", "import { test } from 'vitest'; const holder: any = { test }; Reflect.get(holder, 'test').only('focused', () => {});"],
+    ["aliased Reflect.get", "import { test } from 'vitest'; const read = Reflect.get; const holder: any = { test }; read(holder, 'test').only('focused', () => {});"],
+    ["forward Reflect.get alias", "import { test } from 'vitest'; const readAgain = read; const read = Reflect.get; const holder: any = { test }; readAgain(holder, 'test').only('focused', () => {});"],
+    ["property-held Reflect.get", "import { test } from 'vitest'; const tools = { read: Reflect.get }; const holder: any = { test }; tools.read(holder, 'test').only('focused', () => {});"],
+    ["destructured Reflect.get", "import { test } from 'vitest'; const { get: read } = Reflect; const holder: any = { test }; read(holder, 'test').only('focused', () => {});"],
+    ["object-destructured Reflect.get", "import { test } from 'vitest'; const { read } = { read: Reflect.get }; const holder: any = { test }; read(holder, 'test').only('focused', () => {});"],
+    ["descriptor value", "import { test } from 'vitest'; const holder: any = { test }; Object.getOwnPropertyDescriptor(holder, 'test').value.only('focused', () => {});"],
+    ["descriptor bag value", "import { test } from 'vitest'; const holder: any = { test }; Object.getOwnPropertyDescriptors(holder).test.value.only('focused', () => {});"],
+    ["values array", "import { test } from 'vitest'; const holder: any = { test }; Object.values(holder)[0].only('focused', () => {});"],
+    ["entries array", "import { test } from 'vitest'; const holder: any = { test }; Object.entries(holder)[0][1].only('focused', () => {});"],
+    ["entries round trip", "import { test } from 'vitest'; const holder: any = { test }; Object.fromEntries(Object.entries(holder)).test.only('focused', () => {});"],
+    ["aliased fromEntries", "import { test } from 'vitest'; const rebuild = Object.fromEntries; const holder: any = { test }; rebuild(Object.entries(holder)).test.only('focused', () => {});"],
+    ["fails chain", "import { test } from 'vitest'; test.fails.only('focused', () => {});"],
     ["option-only test", "import { test } from 'vitest'; test('focused', { only: true }, () => {});"],
     ["option-only suite", "import { describe } from 'vitest'; describe('suite', { only: true }, () => {});"],
     ["created test runner", "import { test } from 'vitest'; Object.create(test).only('focused', () => {});"],
@@ -564,6 +576,13 @@ describe("Windows qualification scope guard", () => {
       "import { test } from 'vitest';",
       "const holder: any = { test: true };",
       "Reflect.get(holder, 'test');",
+      "Object.getOwnPropertyDescriptor(holder, 'test').value;",
+      "Object.getOwnPropertyDescriptors(holder).test.value;",
+      "Object.values(holder)[0];",
+      "Object.entries(holder)[0][1];",
+      "Object.fromEntries(Object.entries(holder)).test;",
+      "const { read } = { read: Reflect.get };",
+      "read({ value: 1 }, 'value');",
       "test('required', () => {});"
     ].join("\n"))).toEqual([{ title: "required", enabled: true }]);
   });
