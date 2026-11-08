@@ -546,7 +546,9 @@ describe("Windows qualification scope guard", () => {
   });
 
   test.each([
-    ["reflected test.only", "import { test } from 'vitest'; Reflect.get(test, 'only')('focused', () => {});"],
+["reflected test.only", "import { test } from 'vitest'; Reflect.get(test, 'only')('focused', () => {});"],
+["constant Reflect.get property", "import { test } from 'vitest'; const key = 'only'; Reflect.get(test, key)('focused', () => {});"],
+["comma-selected Reflect.get property", "import { test } from 'vitest'; Reflect.get(test, (0, 'only'))('focused', () => {});"],
     ["reflected runner held by object", "import { test } from 'vitest'; const holder: any = { test }; Reflect.get(holder, 'test').only('focused', () => {});"],
     ["aliased Reflect.get", "import { test } from 'vitest'; const read = Reflect.get; const holder: any = { test }; read(holder, 'test').only('focused', () => {});"],
     ["forward Reflect.get alias", "import { test } from 'vitest'; const readAgain = read; const read = Reflect.get; const holder: any = { test }; readAgain(holder, 'test').only('focused', () => {});"],
@@ -571,9 +573,18 @@ describe("Windows qualification scope guard", () => {
     ["stored entries value", "import { test } from 'vitest'; const holder: any = { test }; const entries = Object.entries(holder); const entry = entries[0]; const value = entry[1]; value.only('focused', () => {});"],
     ["stored entries round trip", "import { test } from 'vitest'; const holder: any = { test }; const entries = Object.entries(holder); const rebuilt = Object.fromEntries(entries); const runner = rebuilt.test; runner.only('focused', () => {});"],
     ["destructured descriptor value", "import { test } from 'vitest'; const holder: any = { test }; const { value } = Object.getOwnPropertyDescriptor(holder, 'test'); value.only('focused', () => {});"],
+    ["renamed destructured descriptor value", "import { test } from 'vitest'; const holder: any = { test }; const { value: runner } = Object.getOwnPropertyDescriptor(holder, 'test'); runner.only('focused', () => {});"],
+    ["renamed descriptor bag value", "import { test } from 'vitest'; const holder: any = { test }; const { test: runner } = Object.getOwnPropertyDescriptors(holder); runner.value.only('focused', () => {});"],
+    ["destructured values result", "import { test } from 'vitest'; const holder: any = { test }; const [runner] = Object.values(holder); runner.only('focused', () => {});"],
+    ["destructured entries value", "import { test } from 'vitest'; const holder: any = { test }; const [, runner] = Object.entries(holder)[0]; runner.only('focused', () => {});"],
     ["reflective descriptor call", "import { test } from 'vitest'; const holder: any = { test }; const read = Object.getOwnPropertyDescriptor; const descriptor = read.call(Object, holder, 'test'); descriptor.value.only('focused', () => {});"],
+    ["bound descriptor call", "import { test } from 'vitest'; const holder: any = { test }; const read = Object.getOwnPropertyDescriptor.bind(Object); const descriptor = read(holder, 'test'); descriptor.value.only('focused', () => {});"],
     ["Object.assign-held descriptor method", "import { test } from 'vitest'; const tools = Object.assign({}, { read: Object.getOwnPropertyDescriptors }); const holder: any = { test }; const descriptors = tools.read(holder); const value = descriptors.test.value; value.only('focused', () => {});"],
+    ["spread Object.assign descriptor method", "import { test } from 'vitest'; const tools = Object.assign({}, ...[{ read: Object.getOwnPropertyDescriptors }]); const holder: any = { test }; const value = tools.read(holder).test.value; value.only('focused', () => {});"],
     ["computed descriptor method", "import { test } from 'vitest'; const key = 'read'; const tools = { [key]: Object.getOwnPropertyDescriptors }; const holder: any = { test }; const value = tools.read(holder).test.value; value.only('focused', () => {});"],
+    ["computed descriptor access", "import { test } from 'vitest'; const key = 'read'; const tools = { [key]: Object.getOwnPropertyDescriptors }; const holder: any = { test }; const value = tools[key](holder).test.value; value.only('focused', () => {});"],
+["numeric computed runner assignment", "import { test } from 'vitest'; const holder: any = {}; holder[1 + 2] = test; holder[3].only('focused', () => {});"],
+["comma computed runner assignment", "import { test } from 'vitest'; const holder: any = {}; holder[(0, 1)] = test; holder[1].only('focused', () => {});"],
     ["computed dynamic namespace", "const V = await import('vi' + 'test'); V.test.only('focused', () => {});"]
   ])("rejects exclusive registration through %s", (_name, source) => {
     expect(() => collectWindowsTestTitles("fixture.ts", source))
@@ -594,6 +605,11 @@ describe("Windows qualification scope guard", () => {
       "read({ value: 1 }, 'value');",
       "const key = 'test'; const computedHolder: any = { [key]: true };",
       "const { value: ordinaryValue } = Object.getOwnPropertyDescriptor(holder, 'test');",
+      "const { value: renamedDescriptorValue } = Object.getOwnPropertyDescriptor(holder, 'test');",
+      "const safeTools = Object.assign({}, { read: Object.getOwnPropertyDescriptors });",
+      "const safeCycle = Object.assign(safeCycle, { helper: true });",
+"const reflectedLength = Reflect.get(test, 'length');",
+"const numericMetadata: any = {}; numericMetadata[1 + 2] = true;",
       "test('required', () => {});"
     ].join("\n"))).toEqual([{ title: "required", enabled: true }]);
   });

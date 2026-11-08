@@ -124,6 +124,8 @@ describe("validation supervisor direct-execution guard", () => {
   ["conditional process object alias", "const runtime = enabled ? process : {}; runtime.getBuiltinModule('node:child_process');"],
   ["comma process object alias", "const runtime = (0, process); runtime.getBuiltinModule('node:child_process');"],
   ["object-property process value", "const holder = { runtime: process }; holder.runtime.getBuiltinModule('node:child_process');"],
+["numeric computed process object access", "const holder = { 0: process }; holder[0 + 0].getBuiltinModule('node:child_process').exec('cmd.exe');"],
+["comma computed process object access", "const holder = { 0: process }; holder[(0, 0)].getBuiltinModule('node:child_process').exec('cmd.exe');"],
     ["object-destructured process value", "const { runtime } = { runtime: process }; runtime.getBuiltinModule('node:child_process');"],
   ["nested object process destructuring", "const { nested: { getBuiltinModule } } = { nested: process }; getBuiltinModule('node:child_process');"],
   ["identifier-backed process destructuring", "const source = { runtime: process }; const { runtime } = source; runtime.getBuiltinModule('node:child_process');"],
@@ -135,6 +137,8 @@ describe("validation supervisor direct-execution guard", () => {
     ["process object assigned by nullish assignment", "let runtime; runtime ??= process; runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["process object assigned to an object property", "const holder = {}; holder.runtime = process; holder.runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["process object nullish-assigned to an object property", "const holder = {}; holder.runtime ??= process; holder.runtime.getBuiltinModule('node:child_process').exec('node -v');"],
+    ["numeric computed process assignment", "const holder = {}; holder[1 + 2] = process; holder[3].getBuiltinModule('node:child_process').exec('cmd.exe');"],
+    ["named numeric computed process assignment", "const one = 1, two = 2; const holder = {}; holder[one + two] = process; holder[3].getBuiltinModule('node:child_process').exec('cmd.exe');"],
       ["process object destructured into an object property", "const holder = {}; ({ runtime: holder.runtime } = { runtime: process }); holder.runtime.getBuiltinModule('node:child_process').exec('node -v');"],
       ["process object returned by a local function", "const runtime = () => process; runtime().getBuiltinModule('node:child_process').exec('node -v');"],
       ["process object returned by a block-bodied function", "const runtime = () => { return process; }; runtime().getBuiltinModule('node:child_process').exec('node -v');"],
@@ -206,6 +210,15 @@ test.each([
   test("terminates local function-return cycles without inventing process capability", () => {
     const source = "const runtime = () => runtime(); runtime().getBuiltinModule('node:child_process');";
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
+  });
+
+  test("terminates reflective container cycles without overflowing", () => {
+    const source = [
+      "const tools = Object.assign(tools, { read: Object.getOwnPropertyDescriptors });",
+      "const methods = [methods];"
+    ].join("\n");
+    expect(() => inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .not.toThrow();
   });
 
   test.each([
@@ -327,12 +340,20 @@ test.each([
      "const tools = { read: Object.getOwnPropertyDescriptors }; tools.read(globalThis).eval.value('process');"],
     ["Object.assign-held descriptor method",
      "const tools = Object.assign({}, { read: Object.getOwnPropertyDescriptors }); tools.read(globalThis).eval.value('process');"],
+    ["spread Object.assign descriptor method",
+     "const tools = Object.assign({}, ...[{ read: Object.getOwnPropertyDescriptors }]); const descriptors = tools.read.call(Object, globalThis); descriptors.eval.value('process');"],
     ["computed descriptor method",
      "const key = 'read'; const tools = { [key]: Object.getOwnPropertyDescriptors }; tools.read(globalThis).eval.value('process');"],
+    ["deterministic comma computed descriptor method",
+     "const key = (0, 'read'); const tools = { [key]: Object.getOwnPropertyDescriptors }; tools[key](globalThis).eval.value('process');"],
     ["computed descriptor destructuring",
      "const key = 'getOwnPropertyDescriptors'; const { [key]: read } = Object; read(globalThis).eval.value('process');"],
     ["Object.assign-held reflective call",
      "const tools = Object.assign({}, { read: Object.getOwnPropertyDescriptors }); const descriptors = tools.read.call(Object, globalThis); descriptors.eval.value('process');"],
+    ["array-held descriptor method",
+     "const methods = [Object.getOwnPropertyDescriptors]; const read = methods[0]; read.call(Object, globalThis).eval.value('process');"],
+    ["factory-returned descriptor method",
+     "const make = () => Object.getOwnPropertyDescriptors; const read = make(); read.call(Object, globalThis).eval.value('process');"],
     ["destructured Reflect get",
      "const { get: reflectGet } = Reflect; reflectGet(globalThis, 'Function')('return process')();"],
     ["destructured process entries",
@@ -547,7 +568,10 @@ test.each([
   ["object-held require", "const holder = { load: require }; const cp = holder.load('node:child_process'); cp.exec('id');"],
   ["shorthand-held require", "const holder = { require }; const cp = holder.require('node:child_process'); cp.exec('id');"],
   ["array-held require", "const holder = [require]; const cp = holder[0]('node:child_process'); cp.exec('id');"],
-  ["assigned member require", "const holder = {}; holder.load = require; const cp = holder.load('node:child_process'); cp.exec('id');"]
+  ["assigned member require", "const holder = {}; holder.load = require; const cp = holder.load('node:child_process'); cp.exec('id');"],
+  ["computed assigned member require", "const key = 'load'; const holder = {}; holder[key] = require; holder.load('node:child_process').exec('id');"],
+  ["conditional assigned member require", "const holder = {}; holder.load = true ? require : () => {}; holder.load('node:child_process').exec('id');"],
+  ["factory-returned require", "const holder = { load: () => require }; const cp = holder.load()('node:child_process'); cp.exec('id');"]
 ])("rejects indirect require through %s inside POSIX_GROUP_LAUNCHER", (_name, body) => {
   const quoted = "const POSIX_GROUP_LAUNCHER = String.raw" + String.fromCharCode(96) +
     body + String.fromCharCode(96) + ";";

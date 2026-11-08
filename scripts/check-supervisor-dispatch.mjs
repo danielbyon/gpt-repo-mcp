@@ -106,6 +106,9 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     return ["call", "apply", "bind"].includes(property) &&
       requireReferenceOf(node.expression);
   }
+  if (ts.isConditionalExpression(node)) {
+    return requireReferenceOf(node.whenTrue) || requireReferenceOf(node.whenFalse);
+  }
     if (!ts.isBinaryExpression(node)) return false;
     const operator = node.operatorToken.kind;
     if (operator === ts.SyntaxKind.CommaToken) {
@@ -141,6 +144,11 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     if (ts.isConditionalExpression(node)) {
       return requireReferenceInContainerOf(node.whenTrue, seen) ||
         requireReferenceInContainerOf(node.whenFalse, seen);
+    }
+    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node) ||
+        ts.isFunctionDeclaration(node)) {
+      return functionReturnExpressionsOf(node)
+        .some((value) => requireReferenceInContainerOf(value, seen));
     }
     if (ts.isBinaryExpression(node) && [
       ts.SyntaxKind.AmpersandAmpersandToken,
@@ -287,6 +295,63 @@ const matches = declarations(scopeStatements);
     ts.SyntaxKind.BarBarEqualsToken,
     ts.SyntaxKind.AmpersandAmpersandEqualsToken
   ]);
+const staticNumericNameOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return undefined;
+  if (ts.isNumericLiteral(node)) {
+    const value = Number(node.text);
+    return Number.isFinite(value) ? value : undefined;
+  }
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = staticNumericNameOf(node.left, seen);
+    const right = staticNumericNameOf(node.right, seen);
+    return left !== undefined && right !== undefined ? left + right : undefined;
+  }
+  if (!ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (binding?.kind !== "variable" || !binding.constant ||
+      !binding.node.initializer || seen.has(binding.node)) return undefined;
+  const next = new Set(seen);
+  next.add(binding.node);
+  return staticNumericNameOf(binding.node.initializer, next);
+};
+const staticAssignmentNameOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return undefined;
+  if (ts.isStringLiteralLike(node)) return node.text;
+  if (ts.isNumericLiteral(node)) {
+    const value = Number(node.text);
+    return Number.isFinite(value) ? String(value) : undefined;
+  }
+  if (ts.isConditionalExpression(node)) {
+    const left = staticAssignmentNameOf(node.whenTrue, seen);
+    const right = staticAssignmentNameOf(node.whenFalse, seen);
+    return left !== undefined && left === right ? left : undefined;
+  }
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return staticAssignmentNameOf(node.right, seen);
+  }
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const numericLeft = staticNumericNameOf(node.left, seen);
+    const numericRight = staticNumericNameOf(node.right, seen);
+    if (numericLeft !== undefined && numericRight !== undefined) {
+      return String(numericLeft + numericRight);
+    }
+    const left = staticAssignmentNameOf(node.left, seen);
+    const right = staticAssignmentNameOf(node.right, seen);
+    return left !== undefined && right !== undefined ? left + right : undefined;
+  }
+  if (!ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (binding?.kind !== "variable" || !binding.constant ||
+      !binding.node.initializer || seen.has(binding.node)) return undefined;
+  const next = new Set(seen);
+  next.add(binding.node);
+  return staticAssignmentNameOf(binding.node.initializer, next);
+};
   const assignmentsByBinding = new Map();
   const destructuredAssignmentsByBinding = new Map();
   const assignmentPropertyName = (name) => {
@@ -308,10 +373,8 @@ const assignmentMemberAccess = (node) => {
     return { receiver: node.expression, property: node.name.text };
   }
   if (ts.isElementAccessExpression(node)) {
-    const argument = unwrap(node.argumentExpression);
-    if (ts.isStringLiteralLike(argument) || ts.isNoSubstitutionTemplateLiteral(argument)) {
-      return { receiver: node.expression, property: argument.text };
-    }
+    const property = staticAssignmentNameOf(node.argumentExpression);
+    if (property !== undefined) return { receiver: node.expression, property };
   }
   return undefined;
 };
@@ -520,8 +583,26 @@ const assignmentMemberPathKey = (receiver, property) => {
   const staticStringOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return undefined;
-    if (ts.isStringLiteralLike(node)) return node.text;
+  if (ts.isStringLiteralLike(node)) return node.text;
+  if (ts.isNumericLiteral(node)) {
+    const value = Number(node.text);
+    return Number.isFinite(value) ? String(value) : undefined;
+  }
+  if (ts.isConditionalExpression(node)) {
+    const left = staticStringOf(node.whenTrue, seen);
+    const right = staticStringOf(node.whenFalse, seen);
+    return left !== undefined && left === right ? left : undefined;
+  }
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return staticStringOf(node.right, seen);
+  }
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const numericLeft = staticNumericNameOf(node.left, seen);
+    const numericRight = staticNumericNameOf(node.right, seen);
+    if (numericLeft !== undefined && numericRight !== undefined) {
+      return String(numericLeft + numericRight);
+    }
       const left = staticStringOf(node.left, seen);
       const right = staticStringOf(node.right, seen);
       return left !== undefined && right !== undefined ? left + right : undefined;
@@ -684,9 +765,30 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     return [node];
   };
+  const expandedSpreadValuesOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return [];
+    const next = new Set(seen);
+    next.add(node);
+    if (ts.isSpreadElement(node)) return expandedSpreadValuesOf(node.expression, next);
+    const values = [];
+    for (const value of resolvedValuesOf(node, next)) {
+      if (ts.isArrayLiteralExpression(value)) {
+        values.push(...value.elements.flatMap((element) =>
+          ts.isOmittedExpression(element) ? [] : expandedSpreadValuesOf(element, next)));
+      } else {
+        values.push(value);
+      }
+    }
+    return values;
+  };
   const objectValueCandidatesOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return [];
+    const next = new Set(seen);
+    next.add(node);
     const objects = [];
-    for (const value of resolvedValuesOf(input, seen)) {
+    for (const value of resolvedValuesOf(node, next)) {
       if (ts.isObjectLiteralExpression(value)) {
         objects.push(value);
         continue;
@@ -694,10 +796,10 @@ const assignmentMemberPathKey = (receiver, property) => {
       if (ts.isCallExpression(value)) {
         const factory = memberAccess(unwrap(value.expression));
         if (factory?.property === "assign" &&
-            globalPrototypeObjectOf(factory.receiver, seen)) {
+            globalPrototypeObjectOf(factory.receiver, next)) {
           for (const argument of value.arguments) {
-            if (!ts.isSpreadElement(argument)) {
-              objects.push(...objectValueCandidatesOf(argument, seen));
+            for (const expanded of expandedSpreadValuesOf(argument, next)) {
+              objects.push(...objectValueCandidatesOf(expanded, next));
             }
           }
         }
@@ -708,19 +810,23 @@ const assignmentMemberPathKey = (receiver, property) => {
       for (const candidate of memberValueCandidatesOf(
         member.receiver,
         member.property,
-        seen
+        next
       )) {
-        objects.push(...objectValueCandidatesOf(candidate, seen));
+        objects.push(...objectValueCandidatesOf(candidate, next));
       }
     }
     return objects;
   };
   const memberValueCandidatesOf = (input, property, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return [];
+    const next = new Set(seen);
+    next.add(node);
     const values = [];
-    for (const object of objectValueCandidatesOf(input, seen)) {
+    for (const object of objectValueCandidatesOf(node, seen)) {
       for (const candidate of object.properties) {
         if (ts.isSpreadAssignment(candidate)) {
-          values.push(...memberValueCandidatesOf(candidate.expression, property, seen));
+          values.push(...memberValueCandidatesOf(candidate.expression, property, next));
           continue;
         }
         if (!("name" in candidate)) continue;
@@ -731,14 +837,14 @@ const assignmentMemberPathKey = (receiver, property) => {
       if (ts.isMethodDeclaration(candidate)) values.push(candidate);
       }
     }
-    for (const value of resolvedValuesOf(input, seen)) {
+    for (const value of resolvedValuesOf(node, next)) {
       if (!ts.isArrayLiteralExpression(value) || !/^\d+$/.test(property)) continue;
       const indexed = value.elements[Number(property)];
       if (indexed && !ts.isOmittedExpression(indexed) && !ts.isSpreadElement(indexed)) {
         values.push(indexed);
       }
     }
-  const key = assignmentMemberPathKey(input, property);
+    const key = assignmentMemberPathKey(node, property);
   if (key !== undefined) {
     values.push(...(assignmentsByMemberPath.get(key) ?? []));
   }
@@ -1142,6 +1248,13 @@ const reflectiveReadOf = (input, seen = new Set()) => {
           .some((property) => destructuresConstructor(binding.node.name, node.text, property)));
     }
     return false;
+  }
+  if (ts.isCallExpression(node)) {
+    if (seen.has(node)) return false;
+    const next = new Set(seen);
+    next.add(node);
+    return functionReturnExpressionsOf(node.expression, next)
+      .some((value) => reflectiveReadOf(value, next));
   }
   const member = memberAccess(node);
   if (!member) return false;

@@ -429,9 +429,22 @@ function createWindowsTestBindingResolver(file) {
   const staticStringOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return undefined;
-    if (ts.isStringLiteralLike(node) || ts.isNumericLiteral(node)) return node.text;
+    if (ts.isStringLiteralLike(node)) return node.text;
+    if (ts.isNumericLiteral(node)) {
+      const value = Number(node.text);
+      return Number.isFinite(value) ? String(value) : undefined;
+    }
+    if (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+      return staticStringOf(node.right, seen);
+    }
     if (ts.isBinaryExpression(node) &&
         node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const numericLeft = staticNumericStringOf(node.left, seen);
+      const numericRight = staticNumericStringOf(node.right, seen);
+      if (numericLeft !== undefined && numericRight !== undefined) {
+        return String(numericLeft + numericRight);
+      }
       const left = staticStringOf(node.left, seen);
       const right = staticStringOf(node.right, seen);
       return left !== undefined && right !== undefined ? left + right : undefined;
@@ -451,6 +464,38 @@ function createWindowsTestBindingResolver(file) {
     next.add(binding.node);
     return staticStringOf(binding.node.initializer, next);
   };
+  const staticNumericStringOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return undefined;
+    if (ts.isNumericLiteral(node)) {
+      const value = Number(node.text);
+      return Number.isFinite(value) ? value : undefined;
+    }
+    if (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = staticNumericStringOf(node.left, seen);
+      const right = staticNumericStringOf(node.right, seen);
+      return left !== undefined && right !== undefined ? left + right : undefined;
+    }
+    if (!ts.isIdentifier(node)) return undefined;
+    const binding = resolveBinding(node);
+    if (binding?.kind !== "variable" || !binding.constant ||
+        !binding.node.initializer || seen.has(binding.node)) return undefined;
+    const next = new Set(seen);
+    next.add(binding.node);
+    return staticNumericStringOf(binding.node.initializer, next);
+  };
+  const resolvedAccess = (input) => {
+    const node = unwrap(input);
+    if (!node) return undefined;
+    if (ts.isPropertyAccessExpression(node)) {
+      return { receiver: node.expression, method: node.name.text };
+    }
+    if (ts.isElementAccessExpression(node)) {
+      return { receiver: node.expression, method: staticStringOf(node.argumentExpression) };
+    }
+    return undefined;
+  };
   const aliasAssignmentKinds = new Set([
     ts.SyntaxKind.EqualsToken,
     ts.SyntaxKind.QuestionQuestionEqualsToken,
@@ -467,10 +512,8 @@ const assignmentMemberAccess = (node) => {
     return { receiver: node.expression, property: node.name.text };
   }
   if (ts.isElementAccessExpression(node)) {
-    const argument = unwrap(node.argumentExpression);
-    if (ts.isStringLiteralLike(argument) || ts.isNoSubstitutionTemplateLiteral(argument)) {
-      return { receiver: node.expression, property: argument.text };
-    }
+    const property = staticStringOf(node.argumentExpression);
+    if (property !== undefined) return { receiver: node.expression, property };
   }
   return undefined;
 };
@@ -669,7 +712,7 @@ const possibleVitestNamespaceOf = (input, seen = new Set()) => {
       ts.isSpreadAssignment(property) && possibleVitestNamespaceOf(property.expression, seen));
   }
   if (!ts.isIdentifier(node)) {
-    const member = access(node);
+    const member = resolvedAccess(node);
     return Boolean(member && member.method !== undefined &&
       objectPropertyValuesOf(member.receiver, member.method, seen).some((value) =>
         possibleVitestNamespaceOf(value, seen)));
@@ -753,24 +796,31 @@ const expandedArgumentValuesOf = (input, seen = new Set()) => {
   return values;
 };
 const containerValuesOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return [];
+    const next = new Set(seen);
+    next.add(node);
   const values = [];
-  for (const value of expressionValuesOf(input, seen)) {
+    for (const value of expressionValuesOf(node, next)) {
     if (ts.isObjectLiteralExpression(value) || ts.isArrayLiteralExpression(value)) {
       values.push(value);
       continue;
     }
       if (objectAssignCall(value)) {
         for (const argument of value.arguments) {
-          if (!ts.isSpreadElement(argument)) {
-            values.push(...containerValuesOf(argument, seen));
+          const expanded = ts.isSpreadElement(argument)
+            ? expandedArgumentValuesOf(argument.expression, next)
+            : [argument];
+          for (const source of expanded) {
+            values.push(...containerValuesOf(source, next));
           }
         }
         continue;
       }
-    const member = access(value);
+    const member = resolvedAccess(value);
     if (!member || member.method === undefined) continue;
-    for (const candidate of objectPropertyValuesOf(member.receiver, member.method, seen)) {
-      values.push(...containerValuesOf(candidate, seen));
+      for (const candidate of objectPropertyValuesOf(member.receiver, member.method, next)) {
+        values.push(...containerValuesOf(candidate, next));
     }
   }
   return values;
@@ -949,7 +999,7 @@ collectResolvedAssignments(file);
       next.add(binding.node);
       return globalObjectOf(binding.node.initializer, next);
     }
-    const member = access(node);
+  const member = resolvedAccess(node);
     return Boolean(member?.method === "Object" && globalObjectOf(member.receiver, seen));
   }
   function globalIntrinsicOf(input, names, seen = new Set()) {
@@ -964,7 +1014,7 @@ collectResolvedAssignments(file);
       next.add(binding.node);
       return globalIntrinsicOf(binding.node.initializer, names, next);
     }
-    const member = access(node);
+  const member = resolvedAccess(node);
     return Boolean(member && names.includes(member.method) &&
       globalObjectOf(member.receiver, seen));
   }
@@ -977,7 +1027,7 @@ collectResolvedAssignments(file);
       if (seen.has(node)) return false;
       const next = new Set(seen);
       next.add(node);
-      const member = access(node);
+    const member = resolvedAccess(node);
       if (!member) return false;
       if (methods.includes(member.method) &&
           globalIntrinsicOf(member.receiver, receiverNames, next)) return true;
@@ -1024,6 +1074,33 @@ collectResolvedAssignments(file);
       methods.some((method) => patternSelectsProperty(
         declaration.name, node.text, method)));
   };
+  function boundIntrinsicArgumentsOf(
+    input, receiverNames, methods, seen = new Set()
+  ) {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return undefined;
+    const next = new Set(seen);
+    next.add(node);
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      const declaration = binding?.kind === "variable" &&
+        ts.isVariableDeclaration(binding.node) &&
+        ts.isIdentifier(binding.node.name) ? binding.node : undefined;
+      return declaration?.initializer
+        ? boundIntrinsicArgumentsOf(
+          declaration.initializer, receiverNames, methods, next
+        )
+        : undefined;
+    }
+    if (!ts.isCallExpression(node)) return undefined;
+    const wrapper = resolvedAccess(node.expression);
+    if (wrapper?.method !== "bind" ||
+        !globalIntrinsicMethodOf(
+          wrapper.receiver, receiverNames, methods, next
+        )) return undefined;
+    return node.arguments.slice(1)
+      .filter((argument) => !ts.isSpreadElement(argument));
+  }
   function intrinsicInvocationArgumentsOf(
     input, receiverNames, methods, seen = new Set()
   ) {
@@ -1032,7 +1109,16 @@ collectResolvedAssignments(file);
     if (globalIntrinsicMethodOf(node.expression, receiverNames, methods, seen)) {
       return node.arguments.filter((argument) => !ts.isSpreadElement(argument));
     }
-    const wrapper = access(unwrap(node.expression));
+    const boundArguments = boundIntrinsicArgumentsOf(
+      node.expression, receiverNames, methods, seen
+    );
+    if (boundArguments) {
+      return [
+        ...boundArguments,
+        ...node.arguments.filter((argument) => !ts.isSpreadElement(argument))
+      ];
+    }
+    const wrapper = resolvedAccess(unwrap(node.expression));
     if (!wrapper || !["apply", "call"].includes(wrapper.method) ||
         !globalIntrinsicMethodOf(wrapper.receiver, receiverNames, methods, seen)) {
       return undefined;
@@ -1092,7 +1178,7 @@ collectResolvedAssignments(file);
       next.add(binding.node);
       return objectAssignReference(binding.node.initializer, next);
     }
-    const member = access(node);
+  const member = resolvedAccess(node);
     const receiver = member && unwrap(member.receiver);
     return member?.method === "assign" && globalObjectOf(receiver, seen);
   }
@@ -1139,14 +1225,14 @@ collectResolvedAssignments(file);
     return processObjectOf(binding.node.initializer, next);
   };
   const isProcessPlatform = (node) => {
-    const member = access(unwrap(node));
+    const member = resolvedAccess(unwrap(node));
     return member?.method === "platform" && processObjectOf(member.receiver);
   };
   const testRunnerOf = (input, names, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return undefined;
     if (!ts.isIdentifier(node)) {
-      const member = access(node);
+      const member = resolvedAccess(node);
       if (member && ["concurrent", "fails", "sequential"].includes(member.method)) {
         return testRunnerOf(member.receiver, names, seen);
       }
@@ -1279,7 +1365,7 @@ const functionReturnExpressionsOf = (input, seen = new Set()) => {
     }
   }
   if (ts.isCallExpression(node)) {
-    const decorator = access(node.expression);
+    const decorator = resolvedAccess(node.expression);
     if (decorator && ["each", "skipIf", "runIf"].includes(decorator.method)) {
       return possibleTestRunnerOf(decorator.receiver, names, seen);
     }
@@ -1295,7 +1381,7 @@ if (candidate) return candidate;
 return undefined;
   }
   if (!ts.isIdentifier(node)) {
-    const member = access(node);
+    const member = resolvedAccess(node);
     if (member && ["concurrent", "fails", "sequential"].includes(member.method)) {
       return possibleTestRunnerOf(member.receiver, names, seen);
     }
@@ -1374,6 +1460,36 @@ if (candidate) return candidate;
     }
     return testRunnerOf(node, names);
   };
+  const selectedBindingNameOf = (pattern, targetName) => {
+   if (ts.isObjectBindingPattern(pattern)) {
+     for (const element of pattern.elements) {
+       const name = element.propertyName ?? element.name;
+       if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+         return assignmentKey(name);
+       }
+       if (ts.isObjectBindingPattern(element.name) ||
+           ts.isArrayBindingPattern(element.name)) {
+         const nested = selectedBindingNameOf(element.name, targetName);
+         if (nested !== undefined) return nested;
+       }
+     }
+   }
+   if (ts.isArrayBindingPattern(pattern)) {
+     for (let index = 0; index < pattern.elements.length; index += 1) {
+       const element = pattern.elements[index];
+      if (ts.isOmittedExpression(element)) continue;
+       if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+         return String(index);
+       }
+       if (ts.isObjectBindingPattern(element.name) ||
+           ts.isArrayBindingPattern(element.name)) {
+         const nested = selectedBindingNameOf(element.name, targetName);
+         if (nested !== undefined) return nested;
+       }
+     }
+   }
+   return undefined;
+ };
   const selectedExtractionContainerOf = (
     input, selectedName, names, seen = new Set()
   ) => {
@@ -1409,7 +1525,7 @@ if (candidate) return candidate;
       return values.some((value) => value &&
         selectedExtractionContainerOf(value, selectedName, names, bindingNext));
     }
-    const member = access(node);
+    const member = resolvedAccess(node);
     if (member?.method === "value" && selectedName === "value") {
       return testRunnerContainerOf(member.receiver, names, seen);
     }
@@ -1428,9 +1544,27 @@ if (candidate) return candidate;
     const bagArguments = intrinsicInvocationArgumentsOf(
       node, ["Object"], ["fromEntries", "getOwnPropertyDescriptors"], seen
     );
-    return Boolean(bagArguments && names.includes(selectedName) &&
-      bagArguments.some((argument) =>
-        testRunnerContainerOf(argument, names, seen)));
+    if (names.includes(selectedName) && bagArguments?.some((argument) =>
+      testRunnerContainerOf(argument, names, seen))) return true;
+    const valuesArguments = intrinsicInvocationArgumentsOf(
+      node, ["Object"], ["values"], seen
+    );
+    if (/^\d+$/.test(selectedName) && valuesArguments?.some((argument) =>
+      testRunnerContainerOf(argument, names, seen))) return true;
+    const entriesArguments = intrinsicInvocationArgumentsOf(
+      node, ["Object"], ["entries"], seen
+    );
+    if (/^\d+$/.test(selectedName) && entriesArguments?.some((argument) =>
+      testRunnerContainerOf(argument, names, seen))) return true;
+    if (member && /^\d+$/.test(member.method ?? "") &&
+        /^\d+$/.test(selectedName)) {
+      const entryArguments = intrinsicInvocationArgumentsOf(
+        member.receiver, ["Object"], ["entries"], seen
+      );
+      if (entryArguments?.some((argument) =>
+        testRunnerContainerOf(argument, names, seen))) return true;
+    }
+    return false;
   };
   const testRunnerContainerOf = (input, names, seen = new Set()) => {
     const node = unwrap(input);
@@ -1446,10 +1580,13 @@ if (candidate) return candidate;
           const next = new Set(seen);
           next.add(binding.node);
           if (declaration.initializer &&
-              !ts.isIdentifier(declaration.name) &&
-              selectedExtractionContainerOf(
-                declaration.initializer, node.text, names, next
-              )) return true;
+              !ts.isIdentifier(declaration.name)) {
+            const selectedName = selectedBindingNameOf(declaration.name, node.text);
+            if (selectedName !== undefined &&
+                selectedExtractionContainerOf(
+                  declaration.initializer, selectedName, names, next
+                )) return true;
+          }
           const values = ts.isIdentifier(declaration.name)
             ? [declaration.initializer, ...(assignmentsByBinding.get(declaration) ?? [])]
             : declaration.initializer
@@ -1461,7 +1598,7 @@ if (candidate) return candidate;
     }
     if (names.some((name) => objectPropertyValuesOf(node, name, seen)
       .some((value) => possibleTestRunnerOf(value, names, seen)))) return true;
-    const member = access(node);
+    const member = resolvedAccess(node);
     if (member && (member.method === "value" || names.includes(member.method) ||
         /^\d+$/.test(member.method ?? "")) &&
         testRunnerContainerOf(member.receiver, names, seen)) return true;
@@ -1470,9 +1607,9 @@ if (candidate) return candidate;
       return Boolean(node.arguments[0]) &&
         testRunnerContainerOf(node.arguments[0], names, seen);
     }
-    const factory = access(unwrap(node.expression));
+    const factory = resolvedAccess(unwrap(node.expression));
     if (globalIntrinsicMethodOf(node.expression, ["Reflect"], ["get"], seen)) {
-      const property = literal(node.arguments[1]);
+      const property = staticStringOf(node.arguments[1], seen);
       if (property === undefined) {
         return possibleTestRunnerOf(node.arguments[0], names, seen) ||
           possibleVitestNamespaceOf(node.arguments[0]);
@@ -1486,8 +1623,11 @@ if (candidate) return candidate;
     }
     if (factory?.method === "assign" &&
         globalIntrinsicOf(factory.receiver, ["Object"])) {
-      return node.arguments.some((argument) =>
-        testRunnerContainerOf(argument, names, seen));
+      return node.arguments.flatMap((argument) =>
+        ts.isSpreadElement(argument)
+          ? expandedArgumentValuesOf(argument.expression, seen)
+          : [argument]
+      ).some((argument) => testRunnerContainerOf(argument, names, seen));
     }
     if (factory?.method === "create" &&
         globalIntrinsicOf(factory.receiver, ["Object"])) {
@@ -1600,9 +1740,9 @@ if (candidate) return candidate;
     };
     visitAliasChains(file);
   }
-  return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
-    possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
-    resolveBinding };
+return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
+possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
+resolveBinding, resolvedAccess, staticStringOf };
 }
 
 /**
@@ -1614,9 +1754,9 @@ export function collectWindowsTestTitles(filename, source) {
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   if (file.parseDiagnostics.length) throw new Error("Cannot parse Vitest declarations");
   const titles = [];
-  const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
-    possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
-    resolveBinding } =
+const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
+possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
+resolveBinding, resolvedAccess, staticStringOf } =
     createWindowsTestBindingResolver(file);
 
   // Exclusive declarations anywhere in the file remain fail-closed, including
@@ -1672,16 +1812,16 @@ export function collectWindowsTestTitles(filename, source) {
         possibleTestRunnerOf(node.initializer, ["test", "it", "describe"])) {
       throw new Error("Exclusive or dynamically selected Vitest tests unaudited.");
     }
-    const member = access(node);
+const member = resolvedAccess(node);
     if (member && (member.method === undefined || member.method === "only") &&
         testRunnerContainerOf(member.receiver, ["test", "it", "describe"])) {
       throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
     }
     if (ts.isCallExpression(node)) {
-      const reflective = access(unwrap(node.expression));
+const reflective = resolvedAccess(unwrap(node.expression));
       if (reflective?.method === "get" &&
           globalIntrinsicOf(reflective.receiver, ["Reflect"])) {
-        const property = literal(node.arguments[1]);
+const property = staticStringOf(node.arguments[1]);
         const runner = possibleTestRunnerOf(
           node.arguments[0], ["test", "it", "describe"]);
         if (runner && (property === undefined || property === "only")) {
