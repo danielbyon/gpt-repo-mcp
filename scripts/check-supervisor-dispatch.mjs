@@ -1005,6 +1005,60 @@ const matches = declarations(scopeStatements);
     const member = memberAccess(node);
     return member?.property === "eval" && globalObjectOf(member.receiver);
   };
+  const functionValueOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (ts.isFunctionExpression(node) || ts.isArrowFunction(node) ||
+        ts.isClassExpression(node) || ts.isFunctionDeclaration(node) ||
+        ts.isClassDeclaration(node)) return true;
+    if (ts.isConditionalExpression(node)) {
+      return functionValueOf(node.whenTrue, seen) || functionValueOf(node.whenFalse, seen);
+    }
+    if (ts.isBinaryExpression(node) &&
+        [ts.SyntaxKind.CommaToken, ts.SyntaxKind.AmpersandAmpersandToken,
+         ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken]
+          .includes(node.operatorToken.kind)) {
+      return functionValueOf(node.left, seen) || functionValueOf(node.right, seen);
+    }
+    if (!ts.isIdentifier(node)) return false;
+    const binding = resolveBinding(node);
+    if (!binding || seen.has(binding.node)) return false;
+    if (binding.kind === "opaque" &&
+        (ts.isFunctionDeclaration(binding.node) || ts.isClassDeclaration(binding.node))) {
+      return true;
+    }
+    if (binding.kind !== "variable" || !binding.constant ||
+        !immutableAlias(binding.node) || !binding.node.initializer) return false;
+    const next = new Set(seen);
+    next.add(binding.node);
+    return functionValueOf(binding.node.initializer, next);
+  };
+  const constructorFunctionOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (functionValueOf(node, seen)) return true;
+    if (ts.isConditionalExpression(node)) {
+      return constructorFunctionOf(node.whenTrue, seen) ||
+        constructorFunctionOf(node.whenFalse, seen);
+    }
+    if (ts.isBinaryExpression(node) &&
+        [ts.SyntaxKind.CommaToken, ts.SyntaxKind.AmpersandAmpersandToken,
+         ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken]
+          .includes(node.operatorToken.kind)) {
+      return constructorFunctionOf(node.left, seen) ||
+        constructorFunctionOf(node.right, seen);
+    }
+    const member = memberAccess(node);
+    if (member?.property === "constructor") return true;
+    if (!ts.isIdentifier(node)) return false;
+    const binding = resolveBinding(node);
+    if (!binding || seen.has(binding.node) ||
+        binding.kind !== "variable" || !binding.constant ||
+        !immutableAlias(binding.node) || !binding.node.initializer) return false;
+    const next = new Set(seen);
+    next.add(binding.node);
+    return constructorFunctionOf(binding.node.initializer, next);
+  };
   const dynamicFunctionOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
@@ -1031,9 +1085,11 @@ const matches = declarations(scopeStatements);
     const member = memberAccess(node);
     if (member?.property === "Function" && globalObjectOf(member.receiver)) return true;
     if (member?.property !== "constructor") return false;
+    if (functionValueOf(member.receiver, seen) ||
+        constructorFunctionOf(member.receiver, seen)) return true;
     const owner = memberAccess(member.receiver);
-  if (owner && ["constructor", "Function"].includes(owner.property) &&
-      globalObjectOf(owner.receiver)) return true;
+    if (owner?.property === "constructor") return true;
+    if (owner?.property === "Function" && globalObjectOf(owner.receiver)) return true;
   const constructorObjectOf = (value, constructorSeen = new Set()) => {
     const candidate = unwrap(value);
     if (!candidate) return false;

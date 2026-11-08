@@ -58,6 +58,10 @@ describe("validation supervisor direct-execution guard", () => {
     ["mutable bare Function alias", "let make = Function; make(\"return process.getBuiltinModule('node:child_process')\")();"],
     ["computed global Function constructor", "globalThis['Fun' + 'ction'](\"return process.getBuiltinModule('node:child_process')\")();"],
     ["constructor-chain Function", "globalThis.constructor.constructor(\"return process.getBuiltinModule('node:child_process')\")();"],
+  ["object constructor chain", "({}).constructor.constructor(\"return 42\")();"],
+  ["async function constructor", "(async () => {}).constructor(\"return 42\")();"],
+  ["aliased async function constructor", "const AsyncFunction = (async () => {}).constructor; AsyncFunction(\"return 42\")();"],
+  ["aliased object constructor chain", "const Base = {}.constructor; Base.constructor(\"return 42\")();"],
   ["split constructor alias", "const ctor = globalThis.constructor; ctor.constructor(\"return process.getBuiltinModule('node:child_process')\")();"],
   ["comma constructor alias", "const ctor = (0, globalThis.constructor); ctor.constructor(\"return 42\")();"],
   ["destructured constructor capability", "const { constructor: ctor } = globalThis; ctor.constructor(\"return 42\")();"],
@@ -138,6 +142,8 @@ describe("validation supervisor direct-execution guard", () => {
       "process.argv.slice(2);",
       "const processLike = { getBuiltinModule() { return undefined; } };",
       "processLike.getBuiltinModule();",
+      "const data = {};",
+      "data.constructor('ordinary');",
       "const copied = { ...processLike }; copied.getBuiltinModule();",
       "import { spawn } from 'node:child_process'; spawn('node.exe', ['--version']);"
     ].join("\n");
