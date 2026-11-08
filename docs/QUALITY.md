@@ -50,22 +50,32 @@ architecture, clear tool surface, and conservative safety model.
 - Prefer repo-relative paths in outputs and logs.
 - Keep generated backups and cleanup artifacts out of commits unless explicitly reviewed.
 
-## Issue Admission
+## Native Dependency Clearance
 
-Before starting an implementation task from a GitHub issue, check its **live native
-dependency state** using the repository-scoped guardrail:
+Before choosing an issue for implementation, verify its **live native dependency
+state** with the repository-scoped guardrail:
 
 ```bash
 npm run issue:ready -- 25 --repo danielbyon/gpt-repo-mcp
 ```
 
-The command requires authenticated `gh`, verifies the issue is open, and reads
-all pages of GitHub's `blocked_by` endpoint. Exit 0 allows task selection;
-exit 2 means closed or blocked; exit 3 means unavailable/malformed evidence.
-Fail closed on nonzero status. A `ready-for-agent` label is not an override.
-This is an explicit task-admission step, not an automatic GitHub label change.
-Run the command again when selecting a different issue; cached status is not
-authoritative. See `scripts/check-issue-readiness.mjs` for the implementation.
+The command requires authenticated `gh` and checks the issue and every page of
+GitHub's `blocked_by` endpoint. Exit codes:
+
+- `0`: `DEPENDENCIES_CLEAR` — the issue is open and has no open native blockers.
+- `2`: blocked — the issue is closed or has open native blockers.
+- `3`: unverified — arguments or live evidence are unavailable, invalid, or incomplete.
+
+A zero exit is **necessary for dependency-aware selection**, not proof of full
+agent readiness. The `ready-for-agent` label cannot override open
+dependencies, and its absence does not cause this dependency-only check to
+fail. Specification completeness, task ownership, priority, and other
+admission criteria are evaluated separately.
+
+Fail closed on nonzero exit. This explicit check does not mutate GitHub labels
+or enforce a server-side admission policy. Recheck live dependencies when
+selecting another issue; cached status is not authoritative. See
+`scripts/check-issue-readiness.mjs` for the implementation.
 
 ## Required Verification
 

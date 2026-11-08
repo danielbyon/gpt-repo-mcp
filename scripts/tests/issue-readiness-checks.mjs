@@ -1,90 +1,168 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import process from "node:process";
-import { delimiter, join } from "node:path";
-import { URL, fileURLToPath } from "node:url";
+import { fileURLToPath, URL } from "node:url";
 import { test } from "node:test";
+import { checkIssueReadiness } from "../check-issue-readiness.mjs";
 
 const check = fileURLToPath(new URL("../check-issue-readiness.mjs", import.meta.url));
 const repo = "danielbyon/gpt-repo-mcp";
-const issue = { number: 25, title: "Selected validation", state: "OPEN", labels: [{ name: "ready-for-agent" }] };
+const defaultIssue = { number: 25, title: "Selected validation", state: "OPEN", labels: [{ name: "ready-for-agent" }] };
+const issueCommand = ["issue", "view", "25", "--repo", repo, "--json", "number,title,state,labels"];
+const dependencyCommand = ["api", "--paginate", "--slurp", "repos/" + repo + "/issues/25/dependencies/blocked_by"];
 
-function runCheck({ issueValue = issue, blockers = [[]], issueFailure = false, dependencyFailure = false, args = ["25", "--repo", repo] } = {}) {
-  const directory = mkdtempSync(join(tmpdir(), "gpt-issue-ready-"));
-  const fakeGh = join(directory, "gh");
-  writeFileSync(fakeGh, [
-    "#!" + process.execPath,
-    'const args = process.argv.slice(2);',
-    'if (args[0] === "issue" && args[1] === "view") {',
-    '  if (process.env.FAKE_ISSUE_FAILURE === "1") process.exit(7);',
-    '  process.stdout.write(process.env.FAKE_ISSUE_JSON);',
-    '} else if (args[0] === "api" && args.includes("--paginate") && args.includes("--slurp")) {',
-    '  if (process.env.FAKE_DEPENDENCY_FAILURE === "1") process.exit(9);',
-    '  process.stdout.write(process.env.FAKE_DEPENDENCY_JSON);',
-    '} else process.exit(11);'
-  ].join("\n") + "\n");
-  chmodSync(fakeGh, 0o755);
-  try {
-    return spawnSync(process.execPath, [check, ...args], {
-      encoding: "utf8",
-      timeout: 20_000,
-      env: {
-        ...process.env,
-        PATH: directory + delimiter + (process.env.PATH ?? ""),
-        FAKE_ISSUE_JSON: typeof issueValue === "string" ? issueValue : JSON.stringify(issueValue),
-        FAKE_DEPENDENCY_JSON: typeof blockers === "string" ? blockers : JSON.stringify(blockers),
-        FAKE_ISSUE_FAILURE: issueFailure ? "1" : "0",
-        FAKE_DEPENDENCY_FAILURE: dependencyFailure ? "1" : "0"
-      }
-    });
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
+function blocker(repository, number, state = "open") {
+  const repositoryUrl = "https://api.github.com/repos/" + repository;
+  return {
+    number,
+    state,
+    repository: { full_name: repository },
+    repository_url: repositoryUrl,
+    url: repositoryUrl + "/issues/" + number
+  };
 }
 
-test("open issue with no blockers is eligible", () => {
+function fakeGh({ issue = defaultIssue, blockers = [[]], issueFailure = false, dependencyFailure = false } = {}) {
+  const calls = [];
+  const invokeGh = (args) => {
+    calls.push(args);
+    if (assertArgs(args, issueCommand)) {
+      if (issueFailure) throw new Error("Issue lookup unavailable.");
+      return typeof issue === "string" ? issue : JSON.stringify(issue);
+    }
+    if (assertArgs(args, dependencyCommand)) {
+      if (dependencyFailure) throw new Error("Dependency endpoint unavailable.");
+      return typeof blockers === "string" ? blockers : JSON.stringify(blockers);
+    }
+    throw new Error("Unexpected gh invocation: " + JSON.stringify(args));
+  };
+  return { calls, invokeGh };
+}
+
+function assertArgs(actual, expected) {
+  return Array.isArray(actual) && actual.length === expected.length
+    && actual.every((value, index) => value === expected[index]);
+}
+
+function runCheck({ args = ["25", "--repo", repo], ...options } = {}) {
+  const fixture = fakeGh(options);
+  const stdout = [];
+  const stderr = [];
+  const status = checkIssueReadiness(args, {
+    invokeGh: fixture.invokeGh,
+    output: (line) => stdout.push(line),
+    error: (line) => stderr.push(line)
+  });
+  return { status, stdout: stdout.join("\n"), stderr: stderr.join("\n"), calls: fixture.calls };
+}
+
+test("labeled open issue with no native blockers reports dependency clearance only", () => {
   const result = runCheck();
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /READY.*#25/);
+  assert.match(result.stdout, /^DEPENDENCIES_CLEAR #25:/);
+  assert.doesNotMatch(result.stdout, /\bREADY\b/);
+  assert.match(result.stdout, /other task-admission requirements are not evaluated/);
+  assert.deepEqual(result.calls, [issueCommand, dependencyCommand]);
 });
 
-test("ready-for-agent label cannot override open native dependencies", () => {
-  const result = runCheck({ blockers: [[{ number: 12, state: "open" }, { number: 15, state: "open" }]] });
-  assert.equal(result.status, 2, result.stderr);
-  assert.match(result.stderr, /#12/);
-  assert.match(result.stderr, /#15/);
+test("unlabeled open issue can clear dependencies without asserting agent readiness", () => {
+  const result = runCheck({ issue: { ...defaultIssue, labels: [] } });
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /DEPENDENCIES_CLEAR/);
 });
 
-test("pagination does not hide an open blocker on a later page", () => {
-  const result = runCheck({ blockers: [[{ number: 10, state: "closed" }], [{ number: 15, state: "open" }]] });
-  assert.equal(result.status, 2, result.stderr);
-  assert.match(result.stderr, /#15/);
+test("ready-for-agent label does not override native blockers", () => {
+  const result = runCheck({ blockers: [[blocker(repo, 12), blocker(repo, 15)]] });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /danielbyon\/gpt-repo-mcp#12, danielbyon\/gpt-repo-mcp#15/);
 });
 
-test("closed issues cannot be selected", () => {
-  const result = runCheck({ issueValue: { ...issue, state: "CLOSED" } });
-  assert.equal(result.status, 2, result.stderr);
+test("unlabeled issue with native blockers remains blocked", () => {
+  const result = runCheck({ issue: { ...defaultIssue, labels: [] }, blockers: [[blocker(repo, 12)]] });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /gpt-repo-mcp#12/);
 });
 
-test("failed or malformed dependency evidence fails closed", () => {
-  const unavailable = runCheck({ dependencyFailure: true });
-  assert.equal(unavailable.status, 3);
-  const malformed = runCheck({ blockers: '{"oops":true}' });
-  assert.equal(malformed.status, 3);
-  const missingPages = runCheck({ blockers: [] });
-  assert.equal(missingPages.status, 3);
-  const badState = runCheck({ blockers: [[{ number: 12, state: "unknown" }]] });
-  assert.equal(badState.status, 3);
+test("later dependency pages cannot hide an open blocker", () => {
+  const result = runCheck({ blockers: [[blocker(repo, 10, "closed")], [blocker(repo, 15)]] });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /gpt-repo-mcp#15/);
+  assert.doesNotMatch(result.stderr, /gpt-repo-mcp#10/);
 });
 
-test("incorrect issue identity and unavailable issue lookup fail closed", () => {
-  assert.equal(runCheck({ issueValue: { ...issue, number: 99 } }).status, 3);
+test("same-number blockers in distinct repositories are not conflated", () => {
+  const result = runCheck({ blockers: [[blocker("other/project", 12), blocker(repo, 12)]] });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /danielbyon\/gpt-repo-mcp#12, other\/project#12/);
+});
+
+test("duplicate blocker entries across pages collapse by canonical repo and number", () => {
+  const result = runCheck({ blockers: [[blocker(repo, 15), blocker("Other/Project", 12)], [blocker(repo, 15), blocker("other/project", 12)]] });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /gpt-repo-mcp#15, other\/project#12/);
+  assert.equal(result.stderr.match(/gpt-repo-mcp#15/g)?.length, 1);
+  assert.equal(result.stderr.match(/other\/project#12/g)?.length, 1);
+});
+
+test("closed dependencies do not count as blockers but their identity must be valid", () => {
+  const result = runCheck({ blockers: [[blocker(repo, 10, "closed"), blocker(repo, 15), blocker("other/project", 20, "closed")]] });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /gpt-repo-mcp#15/);
+  assert.doesNotMatch(result.stderr, /gpt-repo-mcp#10|other\/project#20/);
+});
+
+test("closed selected issues are never admitted", () => {
+  const result = runCheck({ issue: { ...defaultIssue, state: "CLOSED" } });
+  assert.equal(result.status, 2);
+  assert.equal(result.calls.length, 1);
+});
+
+test("lookup failure, unexpected issue identity and malformed response fail closed", () => {
   assert.equal(runCheck({ issueFailure: true }).status, 3);
+  assert.equal(runCheck({ issue: { ...defaultIssue, number: 99 } }).status, 3);
+  assert.equal(runCheck({ issue: "{not-json" }).status, 3);
+  assert.equal(runCheck({ issue: { ...defaultIssue, state: "unknown" } }).status, 3);
 });
 
-test("invalid repo or issue arguments cannot be interpreted as gh flags", () => {
+test("dependency lookup failures and incomplete pages fail closed", () => {
+  assert.equal(runCheck({ dependencyFailure: true }).status, 3);
+  assert.equal(runCheck({ blockers: "{not-json" }).status, 3);
+  assert.equal(runCheck({ blockers: [] }).status, 3);
+  assert.equal(runCheck({ blockers: "{}" }).status, 3);
+  assert.equal(runCheck({ blockers: [[blocker(repo, 10)], {}] }).status, 3);
+});
+
+test("missing, malformed and inconsistent blocker repository identities fail closed", () => {
+  const valid = blocker(repo, 12);
+  assert.equal(runCheck({ blockers: [[{ ...valid, repository: undefined }]] }).status, 3);
+  assert.equal(runCheck({ blockers: [[{ ...valid, repository_url: undefined }]] }).status, 3);
+  assert.equal(runCheck({ blockers: [[{ ...valid, url: undefined }]] }).status, 3);
+  assert.equal(runCheck({ blockers: [[{ ...valid, repository: { full_name: "other/repo" } }]] }).status, 3);
+  assert.equal(runCheck({ blockers: [[{ ...valid, repository_url: "https://api.github.com/repos/other/repo" }]] }).status, 3);
+  assert.equal(runCheck({ blockers: [[{ ...valid, url: valid.url.replace("/12", "/13") }]] }).status, 3);
+  assert.equal(runCheck({ blockers: [[{ ...valid, state: "unknown" }]] }).status, 3);
+});
+
+test("incorrect endpoint, repository and argv shape are rejected by the strict test double", () => {
+  const fixture = fakeGh();
+  assert.throws(() => fixture.invokeGh(["api", "--paginate", "--slurp", "repos/" + repo + "/issues/25/dependencies/blocking"]));
+  assert.throws(() => fixture.invokeGh(["api", "--paginate", "--slurp", "repos/other/repo/issues/25/dependencies/blocked_by"]));
+  assert.throws(() => fixture.invokeGh(["issue", "view", "25", "--repo", "other/repo", "--json", "number,title,state,labels"]));
+  assert.throws(() => fixture.invokeGh(["issue", "view", "25", "--repo", repo, "--json", "number,title,state"]));
+  assert.throws(() => fixture.invokeGh(["api", "--slurp", "--paginate", dependencyCommand.at(-1)]));
+  assert.throws(() => fixture.invokeGh(["api", "--paginate", "--slurp", dependencyCommand.at(-1), "--extra"]));
+  assert.deepEqual(runCheck().calls, [issueCommand, dependencyCommand]);
+});
+
+test("bad issue CLI arguments cannot become GitHub flags", () => {
   assert.equal(runCheck({ args: ["--repo", repo, "--", "25"] }).status, 3);
   assert.equal(runCheck({ args: ["25", "--repo", "owner/repo;echo"] }).status, 3);
+  assert.equal(runCheck({ args: ["25", "--repo", "bad/repo", "--extra"] }).status, 3);
+  assert.equal(runCheck({ args: ["25", "--repo", "different/project"] }).status, 3);
+});
+
+test("Node CLI invalid-input smoke requires no gh binary on Windows or POSIX", () => {
+  const result = spawnSync(process.execPath, [check, "--bad", "--repo", repo], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(result.status, 3, result.stderr);
+  assert.match(result.stderr, /UNVERIFIED/);
 });
