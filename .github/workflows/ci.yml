@@ -32,6 +32,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify issue-readiness guardrail
+        run: npm run test:issue-readiness
+
       - name: Typecheck
         run: npm run typecheck
 

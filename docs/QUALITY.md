@@ -50,6 +50,23 @@ architecture, clear tool surface, and conservative safety model.
 - Prefer repo-relative paths in outputs and logs.
 - Keep generated backups and cleanup artifacts out of commits unless explicitly reviewed.
 
+## Issue Admission
+
+Before starting an implementation task from a GitHub issue, check its **live native
+dependency state** using the repository-scoped guardrail:
+
+```bash
+npm run issue:ready -- 25 --repo danielbyon/gpt-repo-mcp
+```
+
+The command requires authenticated `gh`, verifies the issue is open, and reads
+all pages of GitHub's `blocked_by` endpoint. Exit 0 allows task selection;
+exit 2 means closed or blocked; exit 3 means unavailable/malformed evidence.
+Fail closed on nonzero status. A `ready-for-agent` label is not an override.
+This is an explicit task-admission step, not an automatic GitHub label change.
+Run the command again when selecting a different issue; cached status is not
+authoritative. See `scripts/check-issue-readiness.mjs` for the implementation.
+
 ## Required Verification
 
 Run the focused checks for the area changed, then run:
