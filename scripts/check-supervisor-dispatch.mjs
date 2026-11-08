@@ -1005,6 +1005,28 @@ const matches = declarations(scopeStatements);
     const member = memberAccess(node);
     return member?.property === "eval" && globalObjectOf(member.receiver);
   };
+  const destructuresConstructor = (pattern, targetName) => {
+    if (ts.isObjectBindingPattern(pattern)) {
+      for (const element of pattern.elements) {
+        const key = element.propertyName
+          ? launchOptionName(element.propertyName)
+          : ts.isIdentifier(element.name) ? element.name.text : undefined;
+        if (ts.isIdentifier(element.name) && element.name.text === targetName &&
+            key === "constructor") return true;
+        if ((ts.isObjectBindingPattern(element.name) ||
+             ts.isArrayBindingPattern(element.name)) &&
+            destructuresConstructor(element.name, targetName)) return true;
+      }
+    }
+    if (ts.isArrayBindingPattern(pattern)) {
+      return pattern.elements.some((element) =>
+        ts.isBindingElement(element) &&
+        (ts.isObjectBindingPattern(element.name) ||
+         ts.isArrayBindingPattern(element.name)) &&
+        destructuresConstructor(element.name, targetName));
+    }
+    return false;
+  };
   const functionValueOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
@@ -1027,10 +1049,34 @@ const matches = declarations(scopeStatements);
         (ts.isFunctionDeclaration(binding.node) || ts.isClassDeclaration(binding.node))) {
       return true;
     }
-    if (binding.kind !== "variable" || !binding.constant ||
-        !immutableAlias(binding.node) || !binding.node.initializer) return false;
     const next = new Set(seen);
     next.add(binding.node);
+    if ((binding.kind === "variable" || binding.kind === "opaque") &&
+        ts.isVariableDeclaration(binding.node) &&
+        binding.node.initializer &&
+        (ts.isObjectBindingPattern(binding.node.name) ||
+         ts.isArrayBindingPattern(binding.node.name))) {
+      return bindingPatternValuesOf(
+        binding.node.name,
+        binding.node.initializer,
+        node.text,
+        next
+      ).some((value) => functionValueOf(value, next));
+    }
+    if (binding.kind === "parameter" && ts.isParameter(binding.node) &&
+        binding.node.initializer) {
+      if (ts.isIdentifier(binding.node.name)) {
+        return functionValueOf(binding.node.initializer, next);
+      }
+      return bindingPatternValuesOf(
+        binding.node.name,
+        binding.node.initializer,
+        node.text,
+        next
+      ).some((value) => functionValueOf(value, next));
+    }
+    if (binding.kind !== "variable" || !binding.constant ||
+        !immutableAlias(binding.node) || !binding.node.initializer) return false;
     return functionValueOf(binding.node.initializer, next);
   };
   const constructorFunctionOf = (input, seen = new Set()) => {
@@ -1052,11 +1098,31 @@ const matches = declarations(scopeStatements);
     if (member?.property === "constructor") return true;
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
-    if (!binding || seen.has(binding.node) ||
-        binding.kind !== "variable" || !binding.constant ||
-        !immutableAlias(binding.node) || !binding.node.initializer) return false;
+    if (!binding || seen.has(binding.node)) return false;
     const next = new Set(seen);
     next.add(binding.node);
+    if ((binding.kind === "variable" || binding.kind === "opaque" ||
+         binding.kind === "parameter")) {
+      const source = ts.isVariableDeclaration(binding.node) ||
+        ts.isParameter(binding.node) ? binding.node.initializer : undefined;
+      const pattern = ts.isVariableDeclaration(binding.node) ||
+        ts.isParameter(binding.node) ? binding.node.name : undefined;
+      if (pattern && (ts.isObjectBindingPattern(pattern) ||
+                      ts.isArrayBindingPattern(pattern))) {
+        const values = source ? bindingPatternValuesOf(
+          pattern,
+          source,
+          node.text,
+          next
+        ) : [];
+        if (values.length > 0) {
+          return values.some((value) => constructorFunctionOf(value, next));
+        }
+        if (destructuresConstructor(pattern, node.text)) return true;
+      }
+    }
+    if (binding.kind !== "variable" || !binding.constant ||
+        !immutableAlias(binding.node) || !binding.node.initializer) return false;
     return constructorFunctionOf(binding.node.initializer, next);
   };
   const dynamicFunctionOf = (input, seen = new Set()) => {

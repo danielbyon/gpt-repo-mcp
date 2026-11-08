@@ -60,6 +60,10 @@ describe("validation supervisor direct-execution guard", () => {
     ["constructor-chain Function", "globalThis.constructor.constructor(\"return process.getBuiltinModule('node:child_process')\")();"],
   ["object constructor chain", "({}).constructor.constructor(\"return 42\")();"],
   ["async function constructor", "(async () => {}).constructor(\"return 42\")();"],
+  ["destructured function value constructor", "const { make } = { make: () => {} }; make.constructor(\"return 42\")();"],
+  ["inherited destructured object constructor", "const { constructor: Base } = {}; Base.constructor(\"return 42\")();"],
+  ["shadowed destructured object constructor", "function safeFunction() {} const { constructor: Base } = { constructor: safeFunction }; Base.constructor(\"return 42\")();"],
+  ["nested destructured object constructor", "const { nested: { constructor: Base } } = { nested: {} }; Base.constructor(\"return 42\")();"],
   ["aliased async function constructor", "const AsyncFunction = (async () => {}).constructor; AsyncFunction(\"return 42\")();"],
   ["aliased object constructor chain", "const Base = {}.constructor; Base.constructor(\"return 42\")();"],
   ["split constructor alias", "const ctor = globalThis.constructor; ctor.constructor(\"return process.getBuiltinModule('node:child_process')\")();"],
@@ -144,6 +148,9 @@ describe("validation supervisor direct-execution guard", () => {
       "processLike.getBuiltinModule();",
       "const data = {};",
       "data.constructor('ordinary');",
+      "const ordinaryValue = 42;",
+      "const { constructor: Ordinary } = { constructor: ordinaryValue };",
+      "Ordinary.constructor('ordinary');",
       "const copied = { ...processLike }; copied.getBuiltinModule();",
       "import { spawn } from 'node:child_process'; spawn('node.exe', ['--version']);"
     ].join("\n");
