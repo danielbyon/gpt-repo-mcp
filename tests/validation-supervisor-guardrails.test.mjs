@@ -165,7 +165,9 @@ describe("validation supervisor direct-execution guard", () => {
     ["mutable require binding", "let {spawn} = require('node:child_process'); spawn('node.exe', []);", "immutable"],
     ["destructured default", "const {spawn: native = fallback} = require('node:child_process'); native('node.exe', []);", "unsupported child_process destructuring"],
     ["binding default escape", "import {spawn} from 'node:child_process'; const {value = spawn} = {};", "indirect or escaping"],
-    ["parameter default escape", "import {spawn} from 'node:child_process'; function f(value = spawn) {}", "indirect or escaping"]
+    ["parameter default escape", "import {spawn} from 'node:child_process'; function f(value = spawn) {}", "indirect or escaping"],
+    ["spread spawn invocation", "import {spawn} from 'node:child_process'; const packed: any[] = ['/bin/sh', []]; spawn(...packed);", "spread process-runner call arguments"],
+    ["wrapped spread execFile invocation", "import {execFile} from 'node:child_process'; const packed: any[] = ['/bin/sh', []]; (execFile as any)(...packed);", "spread process-runner call arguments"]
   ])("52-J rejects runner bypass: %s", (_name, source, reason) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source)
       .some((finding) => finding.includes(reason))).toBe(true);

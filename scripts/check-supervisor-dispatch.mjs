@@ -476,6 +476,9 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       const callee = unwrap(node.expression);
       const runner = ts.isIdentifier(callee) ? runnerOf(callee) : undefined;
       if (runner) {
+        if (node.arguments.some((argument) => ts.isSpreadElement(argument))) {
+          add(node, "spread process-runner call arguments cannot prove native dispatch");
+        }
         inspectLaunchOptions(node, runner);
         const program = moduleLiteral(unwrap(node.arguments[0]));
         if (program && (DISALLOWED_PROGRAMS.test(program) ||
