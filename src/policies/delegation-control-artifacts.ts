@@ -23,12 +23,13 @@ export function delegationControlArtifactGitExcludes(): string[] {
   ];
 }
 
-export function isDelegationControlArtifact(repoPath: string): boolean {
+export function isDelegationControlArtifact(repoPath: string, options: { includeResultJson?: boolean } = {}): boolean {
   const portablePath = repoPath.replaceAll("\\", "/").replace(/^\/+/, "");
   const normalized = posix.normalize(portablePath).replace(/^\.\//, "").toLowerCase();
   if (!normalized.startsWith(AGENT_RUN_PREFIX)) return false;
 
   const relativeToRun = normalized.slice(AGENT_RUN_PREFIX.length).split("/").slice(1).join("/");
+  if (options.includeResultJson && relativeToRun === "result.json") return true;
   return [...INTERNAL_RUN_FILES].some(
     (file) => relativeToRun === file || relativeToRun.startsWith(`${file}.tmp-`)
   ) || INTERNAL_REPLY_PATTERN.test(relativeToRun);

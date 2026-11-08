@@ -71,6 +71,12 @@ All tool errors return:
 | `VALIDATION_NODE_RUNTIME_UNAVAILABLE` | Repository requests an exact Node.js version, but no matching safe installed runtime exists under a supported manager root. |
 | `VALIDATION_PROCESS_CLEANUP_UNCONFIRMED` | The process supervisor could not prove that the managed process tree stopped; no validation receipt was published. |
 | `VALIDATION_PROCESS_SUPERVISION_FAILED` | The process supervisor failed to start or supervise the selected command; no validation receipt was published. |
+| `VALIDATION_RUST_TOOLCHAIN_UNPINNED` | A configured Rust validation recipe has no single exact root-level Rust toolchain pin. |
+| `VALIDATION_RUST_TOOLCHAIN_MISMATCH` | The Rust toolchain pin, runner recipe, or selected Cargo and Rustc do not agree. |
+| `VALIDATION_RUST_TOOLCHAIN_UNAVAILABLE` | The pinned Cargo and Rustc executables could not be resolved and verified. |
+| `VALIDATION_EVIDENCE_UNVERIFIED` | The validator could not collect enough bounded evidence to establish receipt eligibility. |
+| `VALIDATION_RUNNER_UNAVAILABLE` | The selected validation executable could not be identified safely. |
+| `VALIDATION_ARTIFACT_WRITE_FAILED` | The validation artifact or latest pointer could not be written inside the repository. |
 | `RUNNER_LOCK_ACTIVE` | A delegation run lock is already held by an active worker or fresh replacement guard. The error is retryable and may include safe lock metadata such as `run_id`, `owner_id`, and `updated_at`. |
 | `RUNNER_RUN_ID_INVALID` | A runner run id or runner manifest was invalid, mismatched its directory, or referenced non-canonical run artifact paths. |
 | `WORK_SESSION_REPO_MISMATCH` | Requested work-session state belongs to a different repository id. |

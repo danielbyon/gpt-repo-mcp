@@ -1,12 +1,21 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { lstat } from "node:fs/promises";
+import { delimiter, join } from "node:path";
 import ignore from "ignore";
 import type { GitReviewInput, GitReviewResult } from "../contracts/git-review.contract.js";
+import { ValidationLatestPointerV2Schema, ValidationReceiptV2Schema, ValidationSourceSnapshotSchema } from "../contracts/validation.contract.js";
 import { IgnoreEngine } from "./ignore-engine.js";
 import { GitService } from "./git-service.js";
 import { OperationsPolicy } from "./operations-policy.js";
 import { validateRepoPath } from "./path-sandbox.js";
 import { DelegationGateService } from "./delegation-gate-service.js";
+import { canonicalSha256, captureExecutableIdentity, readContainedRegularFile, ValidationEvidenceService } from "./validation-evidence.js";
+import { RustRuntimeResolver } from "./rust-runtime-resolver.js";
+import { NodeRuntimeResolver } from "./node-runtime-resolver.js";
+
+const MAX_VALIDATION_POINTER_BYTES = 256 * 1024;
+const MAX_VALIDATION_RECEIPT_BYTES = 128 * 1024 * 1024;
+const VALIDATION_ROOT = ".chatgpt/validation";
 
 type StatusFile = GitReviewResult["changed_paths"][number];
 
@@ -91,7 +100,7 @@ export class GitReviewService {
     )) {
       warnings.push("UNTRACKED_PATHS_EXCLUDED");
     }
-    const shipReadiness = await this.readShipReadiness(status.head_sha, worktreeFingerprint);
+    const shipReadiness = await this.readShipReadiness(input.repo_id, status.head_sha, worktreeFingerprint);
     if (shipReadiness.validation.status === "stale") {
       warnings.push("VALIDATION_STALE");
     }
@@ -343,51 +352,333 @@ export class GitReviewService {
     return !this.ignoreEngine.isSensitiveCandidate(path.path);
   }
 
-  private async readShipReadiness(headSha: string, worktreeFingerprint: string): Promise<NonNullable<GitReviewResult["ship_readiness"]>> {
+  private async readShipReadiness(
+  repoId: string,
+  headSha: string,
+  worktreeFingerprint: string
+): Promise<NonNullable<GitReviewResult["ship_readiness"]>> {
+  const latestPath = ".chatgpt/validation/latest.json";
+  let pointerBytes: Buffer;
+  try {
+    pointerBytes = await readContainedRegularFile(this.root, latestPath, MAX_VALIDATION_POINTER_BYTES);
+  } catch {
     try {
-      const raw = await readFile(join(this.root, ".chatgpt", "validation", "latest.json"), "utf8");
-      const parsed = JSON.parse(raw) as {
-        validation_id?: unknown;
-        profile?: unknown;
-        focused?: unknown;
-        test_paths?: unknown;
-        status?: unknown;
-        head_sha?: unknown;
-        worktree_fingerprint?: unknown;
-        artifact_path?: unknown;
-      };
-      const validationStatus = parsed.status === "passed" || parsed.status === "failed" || parsed.status === "skipped"
-        ? parsed.status
-        : undefined;
-      const validationHead = typeof parsed.head_sha === "string" ? parsed.head_sha : undefined;
-      const validationFingerprint = typeof parsed.worktree_fingerprint === "string" ? parsed.worktree_fingerprint : undefined;
-      const fingerprintStale = validationFingerprint ? validationFingerprint !== worktreeFingerprint : worktreeFingerprint !== "clean";
-      const status = validationHead && validationHead !== headSha
-        ? "stale"
-        : fingerprintStale
-          ? "stale"
-        : validationStatus === "passed"
-          ? "passed"
-          : validationStatus === "failed"
-            ? "failed"
-            : "missing";
-      return {
-        validation: {
-          status,
-          ...(typeof parsed.validation_id === "string" ? { validation_id: parsed.validation_id } : {}),
-          ...(validationStatus ? { validation_status: validationStatus } : {}),
-          ...(typeof parsed.profile === "string" ? { profile: parsed.profile } : {}),
-          ...(parsed.focused === true ? { focused: true } : {}),
-          ...(Array.isArray(parsed.test_paths) && parsed.test_paths.every((path) => typeof path === "string") ? { test_paths: parsed.test_paths as string[] } : {}),
-          ...(validationHead ? { head_sha: validationHead } : {}),
-          ...(validationFingerprint ? { worktree_fingerprint: validationFingerprint } : {}),
-          ...(typeof parsed.artifact_path === "string" ? { artifact_path: parsed.artifact_path } : {})
-        }
-      };
-    } catch {
-      return { validation: { status: "missing" } };
+      await lstat(join(this.root, latestPath));
+      return { validation: { status: "unverified", eligibility: "unverified" } };
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT"
+        ? { validation: { status: "missing" } }
+        : { validation: { status: "unverified", eligibility: "unverified" } };
     }
   }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(pointerBytes.toString("utf8")) as unknown;
+  } catch {
+    return { validation: { status: "unverified", eligibility: "unverified" } };
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { validation: { status: "unverified", eligibility: "unverified" } };
+  }
+
+  const parsedPointer = raw as Record<string, unknown>;
+  if (parsedPointer.schema_version === 1) {
+    const validationStatus = parsedPointer.status === "passed" || parsedPointer.status === "failed" || parsedPointer.status === "skipped"
+      ? parsedPointer.status
+      : undefined;
+    const validationHead = typeof parsedPointer.head_sha === "string" ? parsedPointer.head_sha : undefined;
+    const validationFingerprint = typeof parsedPointer.worktree_fingerprint === "string" ? parsedPointer.worktree_fingerprint : undefined;
+    const fingerprintStale = validationFingerprint ? validationFingerprint !== worktreeFingerprint : worktreeFingerprint !== "clean";
+    const stale = Boolean(validationHead && validationHead !== headSha) || fingerprintStale;
+    const status = stale ? "stale" : validationStatus === "failed" ? "failed" : "unverified";
+    return {
+      validation: {
+        status,
+        eligibility: "unverified",
+        evidence_contract_version: 1,
+        ...(typeof parsedPointer.validation_id === "string" ? { validation_id: parsedPointer.validation_id } : {}),
+        ...(validationStatus ? { validation_status: validationStatus } : {}),
+        ...(typeof parsedPointer.profile === "string" ? { profile: parsedPointer.profile } : {}),
+        ...(parsedPointer.focused === true ? { focused: true } : {}),
+        ...(Array.isArray(parsedPointer.test_paths) && parsedPointer.test_paths.every((path) => typeof path === "string")
+          ? { test_paths: parsedPointer.test_paths as string[] }
+          : {}),
+        ...(validationHead ? { head_sha: validationHead } : {}),
+        ...(validationFingerprint ? { worktree_fingerprint: validationFingerprint } : {}),
+        ...(typeof parsedPointer.artifact_path === "string" ? { artifact_path: parsedPointer.artifact_path } : {})
+      }
+    };
+  }
+  if (parsedPointer.schema_version !== 2) {
+    return { validation: { status: "unverified", eligibility: "unverified" } };
+  }
+
+  const pointerResult = ValidationLatestPointerV2Schema.safeParse(raw);
+  if (!pointerResult.success) return { validation: { status: "unverified", eligibility: "unverified", evidence_contract_version: 2 } };
+  const pointer = pointerResult.data;
+  const validationSummary = {
+    validation_id: pointer.validation_id,
+    validation_status: pointer.status,
+    profile: pointer.profile,
+    focused: pointer.focused,
+    test_paths: pointer.test_paths,
+    head_sha: pointer.head_sha,
+    worktree_fingerprint: pointer.worktree_fingerprint,
+    artifact_path: pointer.artifact_path,
+    evidence_contract_version: 2,
+    receipt_sha256: pointer.receipt_sha256
+  };
+  const unverified = () => ({
+    validation: { status: "unverified" as const, eligibility: "unverified" as const, ...validationSummary }
+  });
+  if (pointer.repo_id !== repoId || !/^validation-[A-Za-z0-9-]{1,100}$/.test(pointer.validation_id)) return unverified();
+  const expectedArtifactPath = VALIDATION_ROOT + "/" + pointer.validation_id + "/result.json";
+  if (pointer.artifact_path !== expectedArtifactPath) return unverified();
+
+  let receiptRaw: unknown;
+  try {
+    const receiptBytes = await readContainedRegularFile(this.root, pointer.artifact_path, MAX_VALIDATION_RECEIPT_BYTES);
+    receiptRaw = JSON.parse(receiptBytes.toString("utf8")) as unknown;
+  } catch {
+    return unverified();
+  }
+  const receiptResult = ValidationReceiptV2Schema.safeParse(receiptRaw);
+  if (!receiptResult.success) return unverified();
+  const receipt = receiptResult.data;
+  const { receipt_sha256: receiptSha, ...unsignedReceipt } = receipt;
+  const receiptHashMatches = canonicalSha256(unsignedReceipt) === receiptSha;
+  const pointerMatches = receiptSha === pointer.receipt_sha256
+    && receipt.validation_id === pointer.validation_id
+    && receipt.repo_id === pointer.repo_id
+    && receipt.profile === pointer.profile
+    && receipt.focused === pointer.focused
+    && sameStrings(receipt.test_paths, pointer.test_paths)
+    && receipt.status === pointer.status
+    && receipt.eligibility.status === pointer.eligibility
+    && receipt.head_sha === pointer.head_sha
+    && receipt.worktree_fingerprint === pointer.worktree_fingerprint
+    && receipt.artifact_path === pointer.artifact_path
+    && receipt.timestamp === pointer.timestamp;
+  if (!receiptHashMatches || !pointerMatches) return unverified();
+
+  const ineligibleReasons: string[] = [];
+  const unverifiedReasons: string[] = [];
+  if (receipt.eligibility.status === "ineligible") {
+    if (receipt.eligibility.reasons.length === 0) unverifiedReasons.push("VALIDATION_ELIGIBILITY_REASON_MISSING");
+    else ineligibleReasons.push(...receipt.eligibility.reasons);
+  } else if (receipt.eligibility.status === "unverified") {
+    unverifiedReasons.push(...(receipt.eligibility.reasons.length > 0
+      ? receipt.eligibility.reasons
+      : ["VALIDATION_ELIGIBILITY_REASON_MISSING"]));
+  } else if (receipt.eligibility.reasons.length > 0) {
+    unverifiedReasons.push("VALIDATION_ELIGIBILITY_STATE_CONTRADICTORY");
+  }
+  if (receipt.status === "failed") ineligibleReasons.push("VALIDATION_COMMAND_FAILED");
+  if (receipt.status === "skipped") unverifiedReasons.push("VALIDATION_COMMAND_NOT_EXECUTED");
+
+  if (canonicalSha256(receipt.effective_policy.value) !== receipt.effective_policy.sha256
+      || receipt.effective_policy.sha256 !== receipt.effective_policy.after_sha256
+      || canonicalSha256(this.operationsPolicy.config) !== receipt.effective_policy.sha256) {
+    ineligibleReasons.push("EFFECTIVE_POLICY_CHANGED");
+  }
+
+  const before = receipt.source_evidence.before;
+  const after = receipt.source_evidence.after;
+  if (!before || !after || !validSourceSnapshot(before) || !validSourceSnapshot(after)) {
+    unverifiedReasons.push("SOURCE_EVIDENCE_UNAVAILABLE_OR_INVALID");
+  } else if (before.sha256 !== after.sha256) {
+    ineligibleReasons.push("SOURCE_STATE_CHANGED_DURING_RUN");
+  } else {
+    const recipeSourcePaths = new Set<string>();
+    let recipeGraphAvailable = true;
+    for (const command of receipt.commands) {
+      if (!command.recipe) continue;
+      try {
+        const paths = await new RustRuntimeResolver(this.root).discoverRecipeSources([command.recipe.path]);
+        for (const path of paths) recipeSourcePaths.add(path);
+      } catch {
+        recipeGraphAvailable = false;
+        unverifiedReasons.push("RECIPE_SOURCE_GRAPH_UNAVAILABLE");
+      }
+    }
+    const validatedPaths = new Map(after.files.map((file) => [file.path, file]));
+    for (const path of recipeSourcePaths) {
+      const source = validatedPaths.get(path);
+      if (!source || source.worktree.kind !== "file" || !source.worktree.content_sha256) {
+        recipeGraphAvailable = false;
+        unverifiedReasons.push("RECIPE_SOURCE_EVIDENCE_INCOMPLETE");
+      }
+    }
+    if (recipeGraphAvailable) {
+      try {
+        const current = await new ValidationEvidenceService(this.root).captureSourceSnapshot(undefined, [...recipeSourcePaths].sort());
+        if (current.sha256 !== after.sha256) ineligibleReasons.push("CANDIDATE_STATE_CHANGED_AFTER_VALIDATION");
+      } catch {
+        unverifiedReasons.push("CURRENT_CANDIDATE_STATE_UNAVAILABLE");
+      }
+    }
+  }
+  if (receipt.head_sha && receipt.head_sha !== headSha) ineligibleReasons.push("CANDIDATE_HEAD_CHANGED_AFTER_VALIDATION");
+
+  if (receipt.runner_post_state.length !== receipt.commands.length) {
+    unverifiedReasons.push("RUNNER_RECHECK_UNAVAILABLE");
+  } else {
+    for (let index = 0; index < receipt.commands.length; index += 1) {
+      const command = receipt.commands[index]!;
+      const post = receipt.runner_post_state[index]!;
+      if (post.status !== "verified") {
+        unverifiedReasons.push("RUNNER_RECHECK_UNAVAILABLE");
+        continue;
+      }
+      if (canonicalSha256(runnerStateFromCommand(command)) !== canonicalSha256(runnerStateFromPost(post))) {
+        ineligibleReasons.push("RUNNER_STATE_CHANGED_DURING_RUN");
+      }
+
+      let pathPrefixes: string[] = [];
+      let selectedRust: Awaited<ReturnType<RustRuntimeResolver["resolve"]>>;
+      let selectedNode: Awaited<ReturnType<NodeRuntimeResolver["resolve"]>>;
+      if (command.runtime?.name === "rust") {
+        try {
+          selectedRust = await new RustRuntimeResolver(this.root).resolve({ recipe_paths: command.recipe ? [command.recipe.path] : [] });
+          if (!selectedRust) throw new Error("Rust toolchain unavailable.");
+          pathPrefixes = selectedRust.path_prefixes;
+          if (canonicalSha256(runtimeFromRust(selectedRust)) !== canonicalSha256(command.runtime)) {
+            ineligibleReasons.push("RUST_TOOLCHAIN_CHANGED_AFTER_VALIDATION");
+          }
+        } catch {
+          unverifiedReasons.push("RUST_TOOLCHAIN_UNAVAILABLE");
+        }
+      } else if (command.runtime?.name === "node") {
+        try {
+          selectedNode = await new NodeRuntimeResolver(this.root).resolve();
+          if (!selectedNode) throw new Error("Node runtime unavailable.");
+          pathPrefixes = [selectedNode.bin_directory];
+          if (selectedNode.version !== command.runtime.version || selectedNode.source !== command.runtime.source) {
+            ineligibleReasons.push("NODE_RUNTIME_CHANGED_AFTER_VALIDATION");
+          }
+        } catch {
+          unverifiedReasons.push("NODE_RUNTIME_UNAVAILABLE");
+        }
+      }
+      const currentPath = [...pathPrefixes, process.env.PATH ?? ""].filter(Boolean).join(delimiter);
+      if (!command.executable_identity) {
+        unverifiedReasons.push("RUNNER_IDENTITY_MISSING");
+      } else {
+        try {
+          const currentIdentity = await captureExecutableIdentity(this.root, command.executable, currentPath);
+          if (canonicalSha256(currentIdentity) !== canonicalSha256(command.executable_identity)) ineligibleReasons.push("RUNNER_CHANGED_AFTER_VALIDATION");
+        } catch {
+          unverifiedReasons.push("RUNNER_IDENTITY_UNAVAILABLE");
+        }
+      }
+      if (command.runtime_executable_identity) {
+        try {
+          const runtimeExecutable = command.runtime?.name === "node" && selectedNode
+            ? join(selectedNode.bin_directory, process.platform === "win32" ? "node.exe" : "node")
+            : "node";
+          const currentRuntimeIdentity = await captureExecutableIdentity(this.root, runtimeExecutable, currentPath);
+          if (canonicalSha256(currentRuntimeIdentity) !== canonicalSha256(command.runtime_executable_identity)) {
+            ineligibleReasons.push("RUNTIME_CHANGED_AFTER_VALIDATION");
+          }
+        } catch {
+          unverifiedReasons.push("RUNTIME_IDENTITY_UNAVAILABLE");
+        }
+      } else if (command.executable === "npm") {
+        unverifiedReasons.push("RUNTIME_IDENTITY_MISSING");
+      }
+      if (command.recipe) {
+        try {
+          const recipeBytes = await readContainedRegularFile(this.root, command.recipe.path, 256 * 1024);
+          const currentRecipe = { path: command.recipe.path, size_bytes: recipeBytes.length, sha256: createHash("sha256").update(recipeBytes).digest("hex") };
+          if (canonicalSha256(currentRecipe) !== canonicalSha256(command.recipe)) ineligibleReasons.push("RUNNER_RECIPE_CHANGED_AFTER_VALIDATION");
+        } catch {
+          ineligibleReasons.push("RUNNER_RECIPE_UNAVAILABLE");
+        }
+      }
+    }
+  }
+
+  const eligibility = ineligibleReasons.length > 0 ? "ineligible" : unverifiedReasons.length > 0 ? "unverified" : "eligible";
+  const status = receipt.status === "failed"
+    ? "failed"
+    : eligibility === "ineligible" ? "stale" : eligibility === "unverified" ? "unverified" : "passed";
+  return { validation: { status, eligibility, ...validationSummary } };
+}
+}
+
+function validSourceSnapshot(value: unknown): boolean {
+  const parsed = ValidationSourceSnapshotSchema.safeParse(value);
+  if (!parsed.success) return false;
+  const { sha256, ...unsigned } = parsed.data;
+  return canonicalSha256(unsigned) === sha256 && canonicalSha256(parsed.data.index.entries) === parsed.data.index.sha256;
+}
+
+function sameStrings(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function runnerStateFromCommand(command: {
+  profile: string;
+  script: string;
+  executable: string;
+  executable_identity?: unknown;
+  runtime_executable_identity?: unknown;
+  recipe?: unknown;
+  runtime?: unknown;
+}): Record<string, unknown> {
+  return {
+    profile: command.profile,
+    script: command.script,
+    executable: command.executable,
+    executable_identity: command.executable_identity,
+    runtime_executable_identity: command.runtime_executable_identity,
+    recipe: command.recipe,
+    runtime: command.runtime
+  };
+}
+
+function runnerStateFromPost(post: {
+  profile: string;
+  script: string;
+  executable: string;
+  executable_identity?: unknown;
+  runtime_executable_identity?: unknown;
+  recipe?: unknown;
+  runtime?: unknown;
+}): Record<string, unknown> {
+  return runnerStateFromCommand(post);
+}
+
+function runtimeFromRust(selection: Awaited<ReturnType<RustRuntimeResolver["resolve"]>>): unknown {
+  if (!selection) return undefined;
+  return {
+    name: "rust",
+    version: selection.version,
+    source: selection.source,
+    active_toolchain: selection.active_toolchain,
+    ...(selection.rustup ? {
+      rustup: {
+        path_sha256: selection.rustup.path_sha256,
+        real_path_sha256: selection.rustup.real_path_sha256,
+        version: selection.rustup.version,
+        sha256: selection.rustup.sha256
+      }
+    } : {}),
+    cargo: {
+      path_sha256: selection.cargo.path_sha256,
+      real_path_sha256: selection.cargo.real_path_sha256,
+      version: selection.cargo.version,
+      sha256: selection.cargo.sha256
+    },
+    rustc: {
+      path_sha256: selection.rustc.path_sha256,
+      real_path_sha256: selection.rustc.real_path_sha256,
+      version: selection.rustc.version,
+      sha256: selection.rustc.sha256
+    },
+    cargo_home_path_sha256: selection.cargo_home_path_sha256,
+    cargo_config_sha256: selection.cargo_config_sha256
+  };
 }
 
 function classifyStatus(index: string, worktree: string): StatusFile["status"] {
