@@ -65,10 +65,15 @@ describe("validation supervisor direct-execution guard", () => {
   ["shadowed destructured object constructor", "function safeFunction() {} const { constructor: Base } = { constructor: safeFunction }; Base.constructor(\"return 42\")();"],
   ["nested destructured object constructor", "const { nested: { constructor: Base } } = { nested: {} }; Base.constructor(\"return 42\")();"],
   ["aliased async function constructor", "const AsyncFunction = (async () => {}).constructor; AsyncFunction(\"return 42\")();"],
+      ["member-valued function constructor", "const holder = { make() {} }; holder.make.constructor(\"return 42\")();"],
   ["global Object constructor", "Object.constructor(\"return 42\")();"],
   ["function prototype constructor", "const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor; AsyncFunction(\"return 42\")();"],
+      ["aliased function prototype getter", "const getProto = Object.getPrototypeOf; const AsyncFunction = getProto(async function () {}).constructor; AsyncFunction(\"return 42\")();"],
+      ["stored function prototype", "const proto = Object.getPrototypeOf(async function () {}); const AsyncFunction = proto.constructor; AsyncFunction(\"return 42\")();"],
+      ["dunder function prototype", "const AsyncFunction = (async function () {}).__proto__.constructor; AsyncFunction(\"return 42\")();"],
   ["destructured async function constructor", "const { constructor: make } = async function () {}; make(\"return 42\")();"],
   ["destructured constructor assignment", "let Base; ({ constructor: Base } = {}); Base.constructor(\"return 42\")();"],
+      ["destructured member constructor assignment", "const holder = {}; ({ constructor: holder.make } = {}); holder.make.constructor(\"return 42\")();"],
   ["array-destructured function assignment", "let make; [make] = [() => {}]; make.constructor(\"return 42\")();"],
   ["aliased object constructor chain", "const Base = {}.constructor; Base.constructor(\"return 42\")();"],
   ["split constructor alias", "const ctor = globalThis.constructor; ctor.constructor(\"return process.getBuiltinModule('node:child_process')\")();"],
@@ -126,6 +131,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["process object assigned by nullish assignment", "let runtime; runtime ??= process; runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["process object assigned to an object property", "const holder = {}; holder.runtime = process; holder.runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["process object nullish-assigned to an object property", "const holder = {}; holder.runtime ??= process; holder.runtime.getBuiltinModule('node:child_process').exec('node -v');"],
+      ["process object destructured into an object property", "const holder = {}; ({ runtime: holder.runtime } = { runtime: process }); holder.runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["destructured process object assignment", "let runtime; ({ runtime } = { runtime: process }); runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["nested process destructuring assignment default", "let runtime; ({ outer: { runtime = process } } = { outer: {} }); runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["destructured process capability assignment", "let load; ({ getBuiltinModule: load } = process); load('node:child_process');"],
@@ -143,7 +149,8 @@ describe("validation supervisor direct-execution guard", () => {
     ["node:process runtime re-export", "export { getBuiltinModule } from 'node:process';"],
     ["node:process default re-export", "export { default as runtime } from 'node:process';"],
     ["imported process local re-export", "import process from 'node:process'; export { process };"],
-    ["aliased capability", "const load = process.getBuiltinModule; const loader = load; loader('node:child_process');"]
+    ["aliased capability", "const load = process.getBuiltinModule; const loader = load; loader('node:child_process');"],
+      ["node:vm dynamic evaluation", "import vm from 'node:vm'; vm.runInThisContext(\"process.getBuiltinModule('node:child_process')\");"]
   ])("rejects process module loading through %s", (_case, source) => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
   });

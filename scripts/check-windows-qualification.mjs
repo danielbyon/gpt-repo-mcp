@@ -386,7 +386,7 @@ const assignmentReferenceKey = (input, seen = new Set()) => {
   const next = new Set(seen);
   next.add(binding.node);
   if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
-      ts.isIdentifier(binding.node.name) &&
+      ts.isIdentifier(binding.node.name) && binding.node.initializer &&
       (ts.isIdentifier(unwrap(binding.node.initializer)) ||
        assignmentMemberAccess(binding.node.initializer))) {
     const aliased = assignmentReferenceKey(binding.node.initializer, next);
@@ -678,6 +678,10 @@ const destructuredValuesOf = (declaration, targetName) => {
 };
 const recordResolvedAssignments = (target, source) => {
   target = unwrap(target);
+  if (assignmentMemberAccess(target)) {
+    recordAssignment(target, source);
+    return;
+  }
   if (ts.isIdentifier(target)) {
     recordAssignment(target, source);
     return;
@@ -691,10 +695,17 @@ const recordResolvedAssignments = (target, source) => {
       }
       const key = assignmentKey(property.name);
       if (key === undefined) continue;
-      const targetValue = ts.isShorthandPropertyAssignment(property)
+      let targetValue = ts.isShorthandPropertyAssignment(property)
         ? property.name
         : ts.isPropertyAssignment(property) ? unwrap(property.initializer) : undefined;
       if (!targetValue) continue;
+      const patternDefault = ts.isBinaryExpression(targetValue) &&
+        targetValue.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        ? targetValue.right : undefined;
+      if (patternDefault) targetValue = unwrap(targetValue.left);
+      const defaultValue = ts.isShorthandPropertyAssignment(property)
+        ? property.objectAssignmentInitializer
+        : patternDefault;
       if (ts.isIdentifier(targetValue)) {
         if (["test", "it", "describe"].includes(key) &&
             possibleVitestNamespaceOf(source)) {
@@ -713,7 +724,11 @@ const recordResolvedAssignments = (target, source) => {
           }
         }
       }
-      for (const value of objectPropertyValuesOf(source, key)) {
+      const selected = objectPropertyValuesOf(source, key);
+      const resolvedValues = selected.length > 0
+        ? selected
+        : defaultValue ? [defaultValue] : [];
+      for (const value of resolvedValues) {
         recordResolvedAssignments(targetValue, value);
       }
     }

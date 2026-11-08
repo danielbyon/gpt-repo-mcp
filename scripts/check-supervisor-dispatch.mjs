@@ -14,6 +14,7 @@ export const SUPERVISOR_SOURCES = Object.freeze([
 
 const PROCESS_MODULES = new Set(["node:child_process", "child_process"]);
 const MODULE_LOADING_MODULES = new Set(["node:module", "module"]);
+const DYNAMIC_EVALUATION_MODULES = new Set(["node:vm", "vm"]);
 const SHELL_MODULES = new Set(["cross-spawn", "shelljs", "execa"]);
 const SAFE_PROCESS_EXPORTS = new Set(["spawn", "spawnSync", "execFile", "execFileSync"]);
 const DISALLOWED_PROGRAMS = /(?:^|[\\/])(?:cmd|command|powershell|pwsh|bash|sh|zsh)(?:\.exe)?$/i;
@@ -63,6 +64,8 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       add(node, "shell-capable runner imports are forbidden");
     } else if (MODULE_LOADING_MODULES.has(module)) {
       add(node, "node:module loading is forbidden in supervisor source");
+    } else if (DYNAMIC_EVALUATION_MODULES.has(module)) {
+      add(node, "dynamic evaluation module loading is forbidden in supervisor source");
     } else if (PROCESS_MODULES.has(module)) {
       const declaration = node.parent;
       if (!ts.isVariableDeclaration(declaration) || declaration.initializer !== node ||
@@ -254,6 +257,7 @@ const matches = declarations(scopeStatements);
   };
 const assignmentsByMemberPath = new Map();
 const constructorDestructuredBindings = new Set();
+const constructorDestructuredMembers = new Set();
 const assignmentMemberAccess = (node) => {
   node = unwrap(node);
   if (ts.isPropertyAccessExpression(node)) {
@@ -282,7 +286,7 @@ const assignmentReferenceKey = (input, seen = new Set()) => {
   const next = new Set(seen);
   next.add(binding.node);
   if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
-      ts.isIdentifier(binding.node.name) &&
+      ts.isIdentifier(binding.node.name) && binding.node.initializer &&
       (ts.isIdentifier(unwrap(binding.node.initializer)) ||
        assignmentMemberAccess(binding.node.initializer))) {
     const aliased = assignmentReferenceKey(binding.node.initializer, next);
@@ -627,6 +631,7 @@ const assignmentMemberPathKey = (receiver, property) => {
         if (name !== property) continue;
         if (ts.isPropertyAssignment(candidate)) values.push(candidate.initializer);
         if (ts.isShorthandPropertyAssignment(candidate)) values.push(candidate.name);
+      if (ts.isMethodDeclaration(candidate)) values.push(candidate);
       }
     }
     for (const value of resolvedValuesOf(input, seen)) {
@@ -923,6 +928,12 @@ const assignmentMemberPathKey = (receiver, property) => {
   };
   const recordConstructorDestructuring = (target) => {
     target = unwrap(target);
+    const member = assignmentMemberAccess(target);
+    if (member) {
+      const key = assignmentReferenceKey(target);
+      if (key !== undefined) constructorDestructuredMembers.add(key);
+      return;
+    }
     if (!ts.isIdentifier(target)) return;
     const binding = resolveBinding(target);
     if (binding?.kind === "variable" || binding?.kind === "opaque") {
@@ -931,13 +942,17 @@ const assignmentMemberPathKey = (receiver, property) => {
   };
   const recordResolvedAssignments = (target, source) => {
     target = unwrap(target);
+    if (assignmentMemberAccess(target)) {
+      recordAssignment(target, source);
+      return;
+    }
     if (ts.isIdentifier(target)) {
       recordAssignment(target, source);
       return;
     }
     if (ts.isObjectLiteralExpression(target)) {
       for (const property of target.properties) {
-        const targetValue = ts.isShorthandPropertyAssignment(property)
+        let targetValue = ts.isShorthandPropertyAssignment(property)
           ? property.name
           : ts.isPropertyAssignment(property) ? unwrap(property.initializer) : undefined;
         if (ts.isSpreadAssignment(property)) {
@@ -951,17 +966,20 @@ const assignmentMemberPathKey = (receiver, property) => {
         const key = assignmentPropertyName(property.name);
         if (key === undefined) continue;
         const selected = memberValueCandidatesOf(source, key);
-        if (key === "constructor" && selected.length === 0) {
-          recordConstructorDestructuring(targetValue);
-        }
+        const patternDefault = targetValue && ts.isBinaryExpression(targetValue) &&
+          targetValue.operatorToken.kind === ts.SyntaxKind.EqualsToken
+          ? targetValue.right : undefined;
+        if (patternDefault) targetValue = unwrap(targetValue.left);
         const defaultValue = ts.isShorthandPropertyAssignment(property)
           ? property.objectAssignmentInitializer
-          : undefined;
-        if (selected.length === 0 && defaultValue) {
-          recordResolvedAssignments(targetValue, defaultValue);
-          continue;
+          : patternDefault;
+        const resolvedValues = selected.length > 0
+          ? selected
+          : defaultValue ? [defaultValue] : [];
+        if (key === "constructor" && resolvedValues.length === 0) {
+          recordConstructorDestructuring(targetValue);
         }
-        for (const value of selected) {
+        for (const value of resolvedValues) {
           recordResolvedAssignments(targetValue, value);
         }
       }
@@ -1138,7 +1156,7 @@ const assignmentMemberPathKey = (receiver, property) => {
     if (!node) return false;
     if (ts.isFunctionExpression(node) || ts.isArrowFunction(node) ||
         ts.isClassExpression(node) || ts.isFunctionDeclaration(node) ||
-        ts.isClassDeclaration(node)) return true;
+        ts.isClassDeclaration(node) || ts.isMethodDeclaration(node)) return true;
     if (globalFunctionObjectOf(node)) return true;
     if (ts.isConditionalExpression(node)) {
       return functionValueOf(node.whenTrue, seen) || functionValueOf(node.whenFalse, seen);
@@ -1148,6 +1166,11 @@ const assignmentMemberPathKey = (receiver, property) => {
          ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken]
           .includes(node.operatorToken.kind)) {
       return functionValueOf(node.left, seen) || functionValueOf(node.right, seen);
+    }
+    const member = memberAccess(node);
+    if (member) {
+      return memberValueCandidatesOf(member.receiver, member.property, seen)
+        .some((value) => functionValueOf(value, seen));
     }
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
@@ -1207,6 +1230,7 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     const member = memberAccess(node);
     if (member?.property === "constructor") return true;
+    if (constructorDestructuredMembers.has(assignmentReferenceKey(node))) return true;
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
     if (!binding || seen.has(binding.node)) return false;
@@ -1241,21 +1265,48 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     return false;
   };
+  const getPrototypeOfFunctionOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    const method = memberAccess(node);
+    if (method?.property === "getPrototypeOf") {
+      const owner = unwrap(method.receiver);
+      return ts.isIdentifier(owner)
+        ? !resolveBinding(owner) && ["Object", "Reflect"].includes(owner.text)
+        : Boolean(memberAccess(owner) &&
+            ["Object", "Reflect"].includes(memberAccess(owner).property) &&
+            globalObjectOf(memberAccess(owner).receiver));
+    }
+    if (!ts.isIdentifier(node)) return false;
+    const binding = resolveBinding(node);
+    if (binding?.kind !== "variable" || !ts.isVariableDeclaration(binding.node) ||
+        !ts.isIdentifier(binding.node.name) || seen.has(binding.node)) return false;
+    const next = new Set(seen);
+    next.add(binding.node);
+    return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+      .filter(Boolean)
+      .some((value) => getPrototypeOfFunctionOf(value, next));
+  };
   const functionPrototypeObjectOf = (input, seen = new Set()) => {
     const node = unwrap(input);
-    if (!ts.isCallExpression(node) || node.arguments.length === 0) return false;
-    const method = memberAccess(node.expression);
-    if (method?.property !== "getPrototypeOf") return false;
-    const owner = unwrap(method.receiver);
-    const globalOwner = ts.isIdentifier(owner)
-      ? !resolveBinding(owner) && ["Object", "Reflect"].includes(owner.text)
-      : (() => {
-          const member = memberAccess(owner);
-          return Boolean(member && ["Object", "Reflect"].includes(member.property) &&
-            globalObjectOf(member.receiver));
-        })();
-    return globalOwner && (functionValueOf(node.arguments[0], seen) ||
-      constructorFunctionOf(node.arguments[0], seen));
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      if (binding?.kind !== "variable" || !ts.isVariableDeclaration(binding.node) ||
+          !ts.isIdentifier(binding.node.name) || seen.has(binding.node)) return false;
+      const next = new Set(seen);
+      next.add(binding.node);
+      return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+        .filter(Boolean)
+        .some((value) => functionPrototypeObjectOf(value, next));
+    }
+    if (ts.isCallExpression(node) && node.arguments.length > 0 &&
+        getPrototypeOfFunctionOf(node.expression, seen)) {
+      return functionValueOf(node.arguments[0], seen) ||
+        constructorFunctionOf(node.arguments[0], seen);
+    }
+    const member = memberAccess(node);
+    return member?.property === "__proto__" &&
+      (functionValueOf(member.receiver, seen) ||
+       constructorFunctionOf(member.receiver, seen));
   };
   const dynamicFunctionOf = (input, seen = new Set()) => {
     const node = unwrap(input);
@@ -1284,6 +1335,7 @@ const assignmentMemberPathKey = (receiver, property) => {
       }
       return false;
     }
+    if (constructorDestructuredMembers.has(assignmentReferenceKey(node))) return true;
     const member = memberAccess(node);
     if (member?.property === "Function" && globalObjectOf(member.receiver)) return true;
     if (member?.property !== "constructor") return false;
@@ -1455,6 +1507,9 @@ const assignmentMemberPathKey = (receiver, property) => {
         if (!typeOnly && (PROCESS_MODULES.has(module) || SHELL_MODULES.has(module))) {
           add(node, "runtime process-runner re-export is forbidden");
         }
+        if (!typeOnly && DYNAMIC_EVALUATION_MODULES.has(module)) {
+          add(node, "runtime dynamic-evaluation re-export is forbidden");
+        }
         if (!typeOnly && ["node:process", "process"].includes(module)) {
           add(node, "runtime process capability re-export is forbidden");
         }
@@ -1477,6 +1532,9 @@ const assignmentMemberPathKey = (receiver, property) => {
       if (SHELL_MODULES.has(module)) add(node, "shell-capable runner imports are forbidden");
       if (MODULE_LOADING_MODULES.has(module) && hasRuntimeImport(node)) {
         add(node, "node:module loading is forbidden in supervisor source");
+      }
+      if (DYNAMIC_EVALUATION_MODULES.has(module) && hasRuntimeImport(node)) {
+        add(node, "dynamic evaluation module loading is forbidden in supervisor source");
       }
       if (["node:process", "process"].includes(module) &&
           node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {

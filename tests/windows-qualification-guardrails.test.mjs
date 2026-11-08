@@ -260,6 +260,8 @@ describe("Windows qualification scope guard", () => {
     ["property-assigned test alias", "const holder = {}; holder.register = test; holder.register.only('extra', () => {});"],
     ["property-assigned namespace runner", "import * as vi from 'vitest'; const holder = {}; holder.register = vi.test; holder.register.only('extra', () => {});"],
     ["bracket-assigned test alias", "const holder = {}; holder['register'] = test; holder.register.only('extra', () => {});"],
+      ["member-target destructured test alias", "const holder = {}; ({ register: holder.register } = { register: test }); holder.register.only('extra', () => {});"],
+      ["nested assignment default test alias", "let register; ({ outer: { register = test } = {} } = {}); register.only('extra', () => {});"],
     ["chained concurrent only", "test.concurrent.only('extra', () => {});"],
     ["decorated skipIf only", "test.skipIf(false).only('extra', () => {});"],
     ["decorated runIf only", "test.runIf(true).only('extra', () => {});"],
