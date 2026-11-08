@@ -370,4 +370,93 @@ describe("Windows qualification scope guard", () => {
       "npm test -- tests/package-hygiene.test.ts " + selector + " --reporter=verbose";
     expect(inspect(workflow)).toEqual([]);
   });
+
+  test.each([
+    ["test", "V.test.only('extra', () => {});"],
+    ["it", "V.it.only('extra', () => {});"],
+    ["describe", "V.describe.only('extra', () => {});"],
+    ["bracket test", "V['test'].only('extra', () => {});"],
+    ["bracket only", "V.it['only']('extra', () => {});"],
+    ["computed only", "V.test[modifier]('extra', () => {});"],
+    ["computed namespace", "V[modifier].only('extra', () => {});"],
+    ["namespace const alias", "const W = V; W.test.only('extra', () => {});"],
+    ["transitive namespace alias", "const W = V; const N = W; N.it.only('extra', () => {});"],
+    ["member const alias", "const t = V.test; t.only('extra', () => {});"],
+    ["destructured member", "const { test: t } = V; t.only('extra', () => {});"],
+    ["computed literal destructure", "const { ['test']: t } = V; t.only('extra', () => {});"],
+    ["computed unresolved destructure", "const { [member]: t } = V; t.only('extra', () => {});"],
+    ["computed alias", "const t = V[member]; t.only('extra', () => {});"]
+  ])("independent finding D rejects Vitest namespace exclusive selection: %s", (_name, mutation) => {
+    const source = "import * as V from 'vitest'; import { test } from 'vitest'; " +
+      mutation + " test('required', () => {});";
+    expect(() => collectWindowsTestTitles("fixture.ts", source))
+      .toThrow(/Exclusive or dynamically selected Vitest tests are unaudited/);
+  });
+
+  test.each([
+    ["namespace test", "V.test('required', () => {});"],
+    ["namespace it", "V.it('required', () => {});"],
+    ["namespace describe", "V.describe('suite', () => { V.test('required', () => {}); });"],
+    ["immutable namespace", "const W = V; W.test('required', () => {});"],
+    ["immutable function", "const t = V.test; t('required', () => {});"],
+    ["destructured named", "const { test: t } = V; t('required', () => {});"],
+    ["computed destructure", "const { ['test']: t } = V; t('required', () => {});"],
+    ["namespace each", "V.test.each(['required'])('%s', () => {});"],
+    ["conditional suite", "V.describe.skipIf(process.platform !== 'win32')('suite', () => { V.test('required', () => {}); });"],
+    ["conditional test", "V.test.runIf(process.platform === 'win32')('required', () => {});"],
+    ["aliased named import", "import { test as t } from 'vitest'; t('required', () => {});"],
+    ["unrelated exclusive", "import * as Other from 'other'; Other.test.only('extra', () => {}); test('required', () => {});"],
+    ["shadowed namespace", "{ const V = { test: { only() {} } }; V.test.only('extra'); } test('required', () => {});"],
+    ["type-only namespace", "import type * as Types from 'vitest'; type T = Types.Suite; test('required', () => {});"]
+  ])("independent finding D keeps eligible namespace registrations: %s", (_name, mutation) => {
+    const source = "import * as V from 'vitest'; " + mutation;
+    expect(collectWindowsTestTitles("fixture.ts", source))
+      .toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test("independent finding D never counts mutable or unknown namespace aliases", () => {
+    expect(() => collectWindowsTestTitles("fixture.ts",
+      "import * as V from 'vitest'; let W = V; W.test('required', () => {});"))
+      .toThrow(/Mutable Vitest namespace aliases/);
+    expect(collectWindowsTestTitles("fixture.ts",
+      "const W = other; W.test('required', () => {});"))
+      .toEqual([]);
+    expect(collectWindowsTestTitles("fixture.ts",
+      "import * as W from 'other'; W.test('required', () => {});"))
+      .toEqual([]);
+  });
+
+  test.each([
+    ["test", "V.test.only('extra', () => {});"],
+    ["it", "V.it.only('extra', () => {});"],
+    ["describe", "V.describe.only('extra', () => {});"],
+    ["immutable namespace", "const W = V; W.test.only('extra', () => {});"],
+    ["immutable function", "const t = V.test; t.only('extra', () => {});"],
+    ["unresolved selector", "V[modifier].only('extra', () => {});"],
+    ["computed destructuring", "const { [member]: t } = V; t.only('extra', () => {});"]
+  ])("independent finding D blocks namespace-exclusive workflow evidence: %s", (_name, mutation) => {
+    const workflow = load();
+    const mandatory = [
+      "pins the repository package inventory to its runtime files",
+      "requires the Windows process host only for Windows package builds",
+      "checks the parent route before treating an absent Windows host as optional"
+    ].map((name) => "test(" + JSON.stringify(name) + ", () => {});").join("\n");
+    const source = "import * as V from 'vitest'; import { test } from 'vitest'; " +
+      mutation + mandatory;
+    const findings = inspectQualificationWorkflow(workflow, (path) =>
+      path === "tests/package-hygiene.test.ts" ? source :
+        readFileSync(join(root, path), "utf8"));
+    expect(findings).toContain("Could not parse mandatory Vitest declarations: tests/package-hygiene.test.ts");
+  });
+
+  test("independent finding D accepts verified namespace registrations in Windows workflow", () => {
+    const source = "import * as V from 'vitest'; const W = V; " +
+      "W.test('pins the repository package inventory to its runtime files', () => {}); " +
+      "V.it('requires the Windows process host only for Windows package builds', () => {}); " +
+      "W.test.each(['checks the parent route before treating an absent Windows host as optional'])('%s', () => {});";
+    const findings = inspectQualificationWorkflow(load(), (path) =>
+      path === "tests/package-hygiene.test.ts" ? source :
+        readFileSync(join(root, path), "utf8"));
+    expect(findings).toEqual([]);
+  });
 });

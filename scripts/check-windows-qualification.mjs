@@ -282,19 +282,78 @@ function verifiedPlatform(node) {
   return false;
 }
 
+// Only Vitest namespace imports and their immutable identifier aliases carry
+// namespace provenance. A foreign, mutable, or shadowed binding is unproven.
+function vitestNamespace(input, seen = new Set()) {
+  const node = input && unwrap(input);
+  if (!node || !ts.isIdentifier(node)) return false;
+  const binding = lexicalBinding(node);
+  if (binding?.kind === "import") return binding.module === "vitest" &&
+    !binding.typeOnly && binding.imported === "*";
+  if (binding?.kind !== "variable" || !binding.constant ||
+      !ts.isIdentifier(binding.node.name) || !binding.node.initializer ||
+      seen.has(binding.node)) return false;
+  const next = new Set(seen);
+  next.add(binding.node);
+  return vitestNamespace(binding.node.initializer, next);
+}
+
+const VITEST_REGISTRATIONS = new Set(["test", "it", "describe"]);
+
 function vitestKind(input, seen = new Set()) {
   const node = input && unwrap(input);
-  if (!node || !ts.isIdentifier(node)) return undefined;
+  if (!node) return undefined;
+  const member = access(node);
+  if (member && VITEST_REGISTRATIONS.has(member.method) &&
+      vitestNamespace(member.receiver, seen)) return member.method;
+  if (!ts.isIdentifier(node)) return undefined;
   const binding = lexicalBinding(node);
-  if (!binding) return ["test", "it", "describe"].includes(node.text) ? node.text : undefined;
+  if (!binding) return VITEST_REGISTRATIONS.has(node.text) ? node.text : undefined;
   if (binding.kind === "import") return binding.module === "vitest" &&
-    !binding.typeOnly && ["test", "it", "describe"].includes(binding.imported)
+    !binding.typeOnly && VITEST_REGISTRATIONS.has(binding.imported)
     ? binding.imported : undefined;
   if (binding.kind !== "variable" || !binding.constant ||
       !binding.node.initializer || seen.has(binding.node)) return undefined;
   const next = new Set(seen);
   next.add(binding.node);
+  if (ts.isObjectBindingPattern(binding.node.name) &&
+      vitestNamespace(binding.node.initializer, next)) {
+    const element = binding.node.name.elements.find((item) =>
+      ts.isIdentifier(item.name) && item.name.text === node.text &&
+      !item.dotDotDotToken && !item.initializer);
+    const name = element?.propertyName ?? element?.name;
+    const key = name && (ts.isIdentifier(name) || ts.isStringLiteralLike(name))
+      ? name.text : name && ts.isComputedPropertyName(name)
+        ? literal(name.expression) : undefined;
+    return VITEST_REGISTRATIONS.has(key) ? key : undefined;
+  }
   return vitestKind(binding.node.initializer, next);
+}
+
+// A computed Vitest namespace member cannot prove which registration API it
+// selects. If it is used with an exclusive/dynamic decorator, reject rather
+// than let another matching mandatory test hide the exclusive declaration.
+function unresolvedVitestMember(input, seen = new Set()) {
+  const node = input && unwrap(input);
+  if (!node) return false;
+  const member = access(node);
+  if (member) return member.method === undefined && vitestNamespace(member.receiver, seen);
+  if (!ts.isIdentifier(node)) return false;
+  const binding = lexicalBinding(node);
+  if (binding?.kind !== "variable" || !binding.constant ||
+      !binding.node.initializer || seen.has(binding.node)) return false;
+  const next = new Set(seen);
+  next.add(binding.node);
+  if (ts.isObjectBindingPattern(binding.node.name) &&
+      vitestNamespace(binding.node.initializer, next)) {
+    const element = binding.node.name.elements.find((item) =>
+      ts.isIdentifier(item.name) && item.name.text === node.text);
+    const name = element?.propertyName;
+    return !!name && ts.isComputedPropertyName(name) &&
+      literal(name.expression) === undefined;
+  }
+  return ts.isIdentifier(binding.node.name) &&
+    unresolvedVitestMember(binding.node.initializer, next);
 }
 
 /** A deliberately small Windows-only predicate evaluator; unknown means unproven. */
@@ -368,12 +427,17 @@ export function collectWindowsTestTitles(filename, source) {
   // element access and unknown dynamic member selectors.
   const checkExclusive = (node) => {
     const member = access(node);
-    if (member && vitestKind(member.receiver) &&
+    if (member && (vitestKind(member.receiver) ||
+        unresolvedVitestMember(member.receiver)) &&
         (member.method === undefined || member.method === "only")) {
       throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
     }
     if (ts.isVariableDeclaration(node) && node.initializer) {
       const kind = vitestKind(node.initializer);
+      if (vitestNamespace(node.initializer) &&
+          !(node.parent.flags & ts.NodeFlags.Const)) {
+        throw new Error("Mutable Vitest namespace aliases are unaudited.");
+      }
       if (kind && !(node.parent.flags & ts.NodeFlags.Const)) {
         throw new Error("Mutable Vitest registration aliases are unaudited.");
       }
