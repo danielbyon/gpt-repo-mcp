@@ -36,7 +36,6 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true,
     isLauncher ? ts.ScriptKind.JS : ts.ScriptKind.TS);
   const findings = [];
-  const processFunctions = new Map();
   let launcherCount = 0;
 
   const add = (node, message) => {
@@ -47,11 +46,9 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     return [filename + ": source cannot be parsed for process-execution inspection"];
   }
 
-  const processBinding = (binding, exported, node) => {
+  const processBinding = (_binding, exported, node) => {
     if (!SAFE_PROCESS_EXPORTS.has(exported)) {
       add(node, "unaudited child_process export: " + exported);
-    } else if (binding) {
-      processFunctions.set(binding, exported);
     }
   };
 
@@ -71,7 +68,14 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         add(node, "child_process require must destructure audited named exports");
         return;
       }
+      if (!(declaration.parent.flags & ts.NodeFlags.Const)) {
+        add(declaration, "child_process require bindings must be immutable");
+      }
       for (const element of declaration.name.elements) {
+        if (element.initializer || element.dotDotDotToken ||
+            !ts.isIdentifier(element.name)) {
+          add(element, "unsupported child_process destructuring binding");
+        }
         const exported = element.propertyName?.getText(file) ?? element.name.getText(file);
         processBinding(nameOf(element.name), exported, element);
       }
@@ -336,6 +340,109 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     }
   };
 
+  // Bounded runner provenance: immutable imports/aliases and one proven
+  // node:util promisify(execFile) adapter. All other references fail closed.
+  const importedExport = (binding, localName) => {
+    if (binding?.kind !== "import") return undefined;
+    const named = binding.node.importClause?.namedBindings;
+    if (!named || !ts.isNamedImports(named)) return undefined;
+    const item = named.elements.find((element) =>
+      element.name.text === localName && !element.isTypeOnly);
+    return item?.propertyName?.text ?? item?.name.text;
+  };
+  const immutableAlias = (declaration) => {
+    if (!declaration || !ts.isVariableDeclaration(declaration) ||
+        !ts.isIdentifier(declaration.name) ||
+        !ts.isVariableDeclarationList(declaration.parent) ||
+        !(declaration.parent.flags & ts.NodeFlags.Const)) return false;
+    const statement = declaration.parent.parent;
+    return !ts.isVariableStatement(statement) ||
+      !(statement.modifiers ?? []).some((modifier) =>
+        modifier.kind === ts.SyntaxKind.ExportKeyword);
+  };
+  const transparent = (parent, child) => parent?.expression === child &&
+    (ts.isParenthesizedExpression(parent) || ts.isAsExpression(parent) ||
+     ts.isTypeAssertionExpression(parent) || ts.isSatisfiesExpression(parent) ||
+     ts.isNonNullExpression(parent));
+  const outer = (node) => {
+    let current = node;
+    while (transparent(current.parent, current)) current = current.parent;
+    return current;
+  };
+  const runnerOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || !ts.isIdentifier(node)) return undefined;
+    const binding = resolveBinding(node);
+    if (!binding) return SAFE_PROCESS_EXPORTS.has(node.text) ? node.text : undefined;
+    if (binding.kind === "import" && PROCESS_MODULES.has(binding.module)) {
+      const exported = importedExport(binding, node.text);
+      return SAFE_PROCESS_EXPORTS.has(exported) ? exported : undefined;
+    }
+    if (binding.kind === "opaque" && ts.isVariableDeclaration(binding.node) &&
+        ts.isObjectBindingPattern(binding.node.name) &&
+        ts.isVariableDeclarationList(binding.node.parent) &&
+        (binding.node.parent.flags & ts.NodeFlags.Const)) {
+      const init = unwrap(binding.node.initializer);
+      if (!init || !ts.isCallExpression(init) ||
+          !ts.isIdentifier(unwrap(init.expression)) ||
+          unwrap(init.expression).text !== "require" ||
+          init.arguments.length !== 1 ||
+          !PROCESS_MODULES.has(moduleLiteral(init.arguments[0]))) return undefined;
+      const element = binding.node.name.elements.find((item) =>
+        ts.isIdentifier(item.name) && item.name.text === node.text &&
+        !item.initializer && !item.dotDotDotToken);
+      const exported = element?.propertyName?.text ?? element?.name.text;
+      return SAFE_PROCESS_EXPORTS.has(exported) ? exported : undefined;
+    }
+    if (binding.kind !== "variable" || !binding.constant ||
+        !immutableAlias(binding.node) || !binding.node.initializer ||
+        seen.has(binding.node)) return undefined;
+    const next = new Set(seen);
+    next.add(binding.node);
+    const init = unwrap(binding.node.initializer);
+    if (ts.isIdentifier(init)) return runnerOf(init, next);
+    return provenPromisify(init, next) ? "execFile" : undefined;
+  };
+  const provenPromisify = (expression, seen = new Set()) => {
+    const call = unwrap(expression);
+    if (!call || !ts.isCallExpression(call) || call.questionDotToken ||
+        call.arguments.length !== 1) return false;
+    const callee = unwrap(call.expression);
+    if (!ts.isIdentifier(callee)) return false;
+    const binding = resolveBinding(callee);
+    return binding?.kind === "import" && binding.module === "node:util" &&
+      importedExport(binding, callee.text) === "promisify" &&
+      runnerOf(call.arguments[0], seen) === "execFile";
+  };
+  const inspectRunnerReference = (node) => {
+    const parent = node.parent;
+    // Declaration names, property keys and erased types are not references.
+    if ((ts.isPropertyAccessExpression(parent) && parent.name === node) ||
+        (ts.isPropertyAssignment(parent) && parent.name === node) ||
+        ts.isImportSpecifier(parent) ||
+        (ts.isBindingElement(parent) &&
+         (parent.name === node || parent.propertyName === node)) ||
+        (ts.isVariableDeclaration(parent) && parent.name === node) ||
+        (ts.isFunctionDeclaration(parent) && parent.name === node) ||
+        (ts.isParameter(parent) && parent.name === node) ||
+        (ts.isMethodDeclaration(parent) && parent.name === node) ||
+        (ts.isPropertySignature(parent) && parent.name === node) ||
+        ts.isTypeQueryNode(parent) || ts.isTypeReferenceNode(parent)) return;
+    if (!runnerOf(node)) return;
+    const expression = outer(node);
+    const context = expression.parent;
+    if (ts.isCallExpression(context) && context.expression === expression &&
+        !context.questionDotToken) return;
+    if (immutableAlias(context) && context.initializer === expression) return;
+    if (ts.isCallExpression(context) && context.arguments.length === 1 &&
+        context.arguments[0] === expression && provenPromisify(context)) {
+      const initializer = outer(context);
+      if (immutableAlias(initializer.parent) &&
+          initializer.parent.initializer === initializer) return;
+    }
+    add(node, "indirect or escaping child_process runner reference is forbidden");
+  };
+
   const visit = (node) => {
     if (ts.isImportDeclaration(node)) {
       const module = moduleLiteral(node.moduleSpecifier);
@@ -366,18 +473,15 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       if (["createRequire", "eval"].includes(called) || called === "_parse") {
         add(node, "indirect process loading, eval, or private shim parsing is forbidden");
       }
-      if (ts.isIdentifier(node.expression) && processFunctions.has(node.expression.text) &&
-          ["exec", "execSync"].includes(processFunctions.get(node.expression.text))) {
-        add(node, "shell-string child_process execution is forbidden");
-      }
-      const direct = ts.isIdentifier(node.expression)
-        ? processFunctions.get(node.expression.text) ?? node.expression.text
-        : undefined;
-      if (SAFE_PROCESS_EXPORTS.has(direct)) inspectLaunchOptions(node, direct);
-      if (SAFE_PROCESS_EXPORTS.has(direct) && moduleLiteral(node.arguments[0]) &&
-          (DISALLOWED_PROGRAMS.test(moduleLiteral(node.arguments[0])) ||
-           DISALLOWED_SHIMS.test(moduleLiteral(node.arguments[0])))) {
-        add(node, "direct interpreter or command-shim dispatch is forbidden");
+      const callee = unwrap(node.expression);
+      const runner = ts.isIdentifier(callee) ? runnerOf(callee) : undefined;
+      if (runner) {
+        inspectLaunchOptions(node, runner);
+        const program = moduleLiteral(unwrap(node.arguments[0]));
+        if (program && (DISALLOWED_PROGRAMS.test(program) ||
+                        DISALLOWED_SHIMS.test(program))) {
+          add(node, "direct interpreter or command-shim dispatch is forbidden");
+        }
       }
     }
     if (ts.isVariableDeclaration(node) &&
@@ -397,10 +501,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     if (ts.isShorthandPropertyAssignment(node) && node.name.text === "shell") {
       add(node, "shell dispatch option is forbidden");
     }
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) &&
-        node.initializer && ts.isIdentifier(node.initializer) && processFunctions.has(node.initializer.text)) {
-      processFunctions.set(node.name.text, processFunctions.get(node.initializer.text));
-    }
+    if (ts.isIdentifier(node)) inspectRunnerReference(node);
 
     if (!isLauncher && filename === "src/services/process-exec.ts" &&
         ts.isVariableDeclaration(node) && nameOf(node.name) === "POSIX_GROUP_LAUNCHER") {
