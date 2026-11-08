@@ -266,6 +266,10 @@ describe("Windows qualification scope guard", () => {
       ["local function runner alias", "const makeRunner = () => test; makeRunner().only('extra', () => {});"],
       ["block-bodied runner factory", "const makeRunner = () => { return test; }; makeRunner().only('extra', () => {});"],
       ["spread namespace alias", "import * as vi from 'vitest'; const namespace = { ...vi }; namespace.test.only('extra', () => {});"],
+      ["Object.assign namespace copy", "import * as vi from 'vitest'; const namespace = {}; Object.assign(namespace, vi); namespace.test.only('extra', () => {});"],
+      ["aliased Object.assign namespace copy", "import * as vi from 'vitest'; const assign = Object.assign; const namespace = {}; assign(namespace, vi); namespace.test.only('extra', () => {});"],
+      ["returned Object.assign namespace copy", "import * as vi from 'vitest'; const namespace = Object.assign({}, vi); namespace.test.only('extra', () => {});"],
+      ["spread Object.assign namespace copy", "import * as vi from 'vitest'; const namespace = {}; Object.assign(namespace, ...[vi]); namespace.test.only('extra', () => {});"],
     ["chained concurrent only", "test.concurrent.only('extra', () => {});"],
     ["decorated skipIf only", "test.skipIf(false).only('extra', () => {});"],
     ["decorated runIf only", "test.runIf(true).only('extra', () => {});"],
@@ -337,6 +341,19 @@ describe("Windows qualification scope guard", () => {
     expect(collectWindowsTestTitles("fixture.ts",
       "const holder = {}; holder.register = { only() {} }; " +
       "holder.register.only('extra', () => {}); test('required', () => {});"))
+      .toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test("does not treat unrelated Object.assign copies as Vitest aliases", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "import * as vi from 'vitest'; const namespace = {}; " +
+      "Object.assign(namespace, { helper: true }); namespace.helper(); " +
+      "test('required', () => {});"))
+      .toEqual([{ title: "required", enabled: true }]);
+    expect(collectWindowsTestTitles("fixture.ts",
+      "import * as vi from 'vitest'; const namespace = {}; " +
+      "Object.assign(namespace, [vi]); namespace.test.only('extra', () => {}); " +
+      "test('required', () => {});"))
       .toEqual([{ title: "required", enabled: true }]);
   });
 

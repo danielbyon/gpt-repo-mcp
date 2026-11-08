@@ -513,6 +513,12 @@ const sourcePropertyValue = (source, key) => {
 const possibleVitestNamespaceOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node) return false;
+  if (objectAssignCall(node)) {
+    return node.arguments.slice(1).flatMap((source) =>
+      ts.isSpreadElement(source)
+        ? expandedArgumentValuesOf(source.expression, seen)
+        : [source]).some((source) => possibleVitestNamespaceOf(source, seen));
+  }
   if (ts.isConditionalExpression(node)) {
     return possibleVitestNamespaceOf(node.whenTrue, seen) ||
       possibleVitestNamespaceOf(node.whenFalse, seen);
@@ -597,6 +603,24 @@ const expressionValuesOf = (input, seen = new Set()) => {
     return expressionValuesOf(binding.node.initializer, next);
   }
   return [node];
+};
+const expandedArgumentValuesOf = (input, seen = new Set()) => {
+  const values = [];
+  for (const value of expressionValuesOf(input, seen)) {
+    if (!ts.isArrayLiteralExpression(value)) {
+      values.push(value);
+      continue;
+    }
+    for (const element of value.elements) {
+      if (ts.isOmittedExpression(element)) continue;
+      if (ts.isSpreadElement(element)) {
+        values.push(...expandedArgumentValuesOf(element.expression, seen));
+      } else {
+        values.push(element);
+      }
+    }
+  }
+  return values;
 };
 const containerValuesOf = (input, seen = new Set()) => {
   const values = [];
@@ -775,7 +799,37 @@ const collectResolvedAssignments = (node) => {
   ts.forEachChild(node, collectResolvedAssignments);
 };
 collectResolvedAssignments(file);
+  function objectAssignReference(input, seen = new Set()) {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      if (binding?.kind !== "variable" || !binding.constant ||
+          !binding.node.initializer || seen.has(binding.node)) return false;
+      const next = new Set(seen);
+      next.add(binding.node);
+      return objectAssignReference(binding.node.initializer, next);
+    }
+    const member = access(node);
+    const receiver = member && unwrap(member.receiver);
+    return member?.method === "assign" && ts.isIdentifier(receiver) &&
+      receiver.text === "Object" && !resolveBinding(receiver);
+  }
+  function objectAssignCall(node) {
+    return ts.isCallExpression(node) && objectAssignReference(node.expression);
+  }
   const collectAssignments = (node) => {
+    if (objectAssignCall(node)) {
+      const [target, ...sources] = node.arguments;
+      if (target && !ts.isSpreadElement(target)) {
+        for (const source of sources) {
+          const values = ts.isSpreadElement(source)
+            ? expandedArgumentValuesOf(source.expression)
+            : [source];
+          for (const value of values) recordAssignment(target, value);
+        }
+      }
+    }
     if (ts.isBinaryExpression(node) && aliasAssignmentKinds.has(node.operatorToken.kind)) {
       const target = unwrap(node.left);
     if (ts.isIdentifier(target) || assignmentMemberAccess(target)) {
