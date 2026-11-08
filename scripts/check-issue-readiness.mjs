@@ -27,7 +27,7 @@ function main(args) {
     // --slurp preserves all response pages. The current GitHub API returns
     // only open blockers, but validate state rather than trusting that filter.
     const pages = fetchJson(["api", "--paginate", "--slurp", "repos/" + repo + "/issues/" + number + "/dependencies/blocked_by"]);
-    if (!Array.isArray(pages) || !pages.every(Array.isArray)) {
+    if (!Array.isArray(pages) || pages.length === 0 || !pages.every(Array.isArray)) {
       throw new Error("Dependency pagination is incomplete or malformed.");
     }
     const blockers = [];

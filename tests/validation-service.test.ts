@@ -1869,11 +1869,12 @@ describe("ValidationService", () => {
           validation_id: result.value.validation_id
         };
       }
-      const reason = result.reason as { code?: unknown; name?: unknown } | null;
+      const reason = result.reason as { code?: unknown; name?: unknown; syscall?: unknown } | null;
       return {
         status: result.status,
         error_name: reason && typeof reason.name === "string" ? reason.name : "unknown",
-        error_code: reason && typeof reason.code === "string" ? reason.code : "UNCLASSIFIED_ERROR"
+        error_code: reason && typeof reason.code === "string" ? reason.code : "UNCLASSIFIED_ERROR",
+        error_syscall: reason && typeof reason.syscall === "string" ? reason.syscall : "unknown"
       };
     });
     expect(safeSettledSummary).toEqual([

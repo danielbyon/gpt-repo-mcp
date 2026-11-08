@@ -72,6 +72,8 @@ test("failed or malformed dependency evidence fails closed", () => {
   assert.equal(unavailable.status, 3);
   const malformed = runCheck({ blockers: '{"oops":true}' });
   assert.equal(malformed.status, 3);
+  const missingPages = runCheck({ blockers: [] });
+  assert.equal(missingPages.status, 3);
   const badState = runCheck({ blockers: [[{ number: 12, state: "unknown" }]] });
   assert.equal(badState.status, 3);
 });

@@ -30,7 +30,7 @@ async function fixture(): Promise<Context> {
     type: "module",
     scripts: { test: "node -e \"console.log('validation-matrix-ok')\"" }
   }));
-  await writeFile(join(root, ".gitignore"), "ignored-output/\n");
+  await writeFile(join(root, ".gitignore"), "dist/\n");
   await writeFile(join(root, "src", "dependency.txt"), "original\n");
   git(root, ["init", "--quiet"]);
   git(root, ["config", "user.name", "Validation Fixture"]);
@@ -91,7 +91,7 @@ const mutations: Mutation[] = [
   {
     name: "tracked ignore rules changed",
     expectedStatus: "stale", expectedEligibility: "ineligible",
-    mutate: async ({ root }) => { await writeFile(join(root, ".gitignore"), "ignored-output/\nnew-exclusion/\n"); }
+    mutate: async ({ root }) => { await writeFile(join(root, ".gitignore"), "dist/\nnew-exclusion/\n"); }
   },
   {
     name: "declared validation script changed",
@@ -151,8 +151,8 @@ const mutations: Mutation[] = [
     name: "untracked generated output explicitly ignored by Git",
     expectedStatus: "passed", expectedEligibility: "eligible",
     mutate: async ({ root }) => {
-      await mkdir(join(root, "ignored-output"), { recursive: true });
-      await writeFile(join(root, "ignored-output", "build.log"), "generated\n");
+      await mkdir(join(root, "dist"), { recursive: true });
+      await writeFile(join(root, "dist", "build.log"), "generated\n");
     }
   },
   {
