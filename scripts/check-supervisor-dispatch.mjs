@@ -71,6 +71,11 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       if (!(declaration.parent.flags & ts.NodeFlags.Const)) {
         add(declaration, "child_process require bindings must be immutable");
       }
+      const statement = declaration.parent.parent;
+      if (ts.isVariableStatement(statement) && (statement.modifiers ?? []).some(
+        (modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
+        add(declaration, "exported child_process require bindings are forbidden");
+      }
       for (const element of declaration.name.elements) {
         if (element.initializer || element.dotDotDotToken ||
             !ts.isIdentifier(element.name)) {
@@ -444,6 +449,25 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   };
 
   const visit = (node) => {
+    if (ts.isExportDeclaration(node)) {
+      if (node.isTypeOnly) return;
+      if (node.moduleSpecifier) {
+        const module = moduleLiteral(node.moduleSpecifier);
+        const clause = node.exportClause;
+        const typeOnly = clause && ts.isNamedExports(clause) &&
+          clause.elements.length > 0 && clause.elements.every((item) => item.isTypeOnly);
+        if (!typeOnly && (PROCESS_MODULES.has(module) || SHELL_MODULES.has(module))) {
+          add(node, "runtime process-runner re-export is forbidden");
+        }
+        // Source-module names are not references to this module's local bindings.
+        return;
+      }
+    }
+    if (ts.isExportSpecifier(node)) {
+      // Only a local value name can escape; type-only and public alias names cannot.
+      if (!node.isTypeOnly) inspectRunnerReference(node.propertyName ?? node.name);
+      return;
+    }
     if (ts.isImportDeclaration(node)) {
       const module = moduleLiteral(node.moduleSpecifier);
       if (SHELL_MODULES.has(module)) add(node, "shell-capable runner imports are forbidden");

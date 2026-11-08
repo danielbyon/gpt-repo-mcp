@@ -195,6 +195,98 @@ describe("validation supervisor direct-execution guard", () => {
       .toEqual([expect.stringContaining("indirect or escaping child_process runner")]);
   });
 
+  test.each([
+    ["node:child_process wildcard", "export * from \"node:child_process\";"],
+    ["node:child_process namespace", "export * as cp from \"node:child_process\";"],
+    ["node:child_process named shell runner", "export { exec } from \"node:child_process\";"],
+    ["node:child_process aliased shell runner", "export { exec as launch } from \"node:child_process\";"],
+    ["node:child_process supported native runner", "export { spawn } from \"node:child_process\";"],
+    ["node:child_process mixed type and value", "export { type ChildProcess, spawn } from \"node:child_process\";"],
+    ["node:child_process empty runtime clause", "export {} from \"node:child_process\";"],
+    ["child_process wildcard", "export * from \"child_process\";"],
+    ["child_process namespace", "export * as cp from \"child_process\";"],
+    ["child_process named shell runner", "export { exec } from \"child_process\";"],
+    ["child_process aliased shell runner", "export { exec as launch } from \"child_process\";"],
+    ["child_process supported native runner", "export { spawn } from \"child_process\";"],
+    ["child_process mixed type and value", "export { type ChildProcess, spawn } from \"child_process\";"],
+    ["child_process empty runtime clause", "export {} from \"child_process\";"],
+    ["cross-spawn wildcard", "export * from \"cross-spawn\";"],
+    ["cross-spawn namespace", "export * as runner from \"cross-spawn\";"],
+    ["cross-spawn aliased named", "export { default as runner } from \"cross-spawn\";"],
+    ["shelljs wildcard", "export * from \"shelljs\";"],
+    ["shelljs namespace", "export * as runner from \"shelljs\";"],
+    ["shelljs aliased named", "export { default as runner } from \"shelljs\";"],
+    ["execa wildcard", "export * from \"execa\";"],
+    ["execa namespace", "export * as runner from \"execa\";"],
+    ["execa aliased named", "export { default as runner } from \"execa\";"]
+  ])("52-K rejects runtime module re-exports: %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source))
+      .toEqual([expect.stringContaining("runtime process-runner re-export")]);
+  });
+
+  test.each([
+    ["spawn", "export const { spawn } = require(\"node:child_process\");"],
+    ["spawnSync", "export const { spawnSync } = require(\"node:child_process\");"],
+    ["execFile", "export const { execFile } = require(\"node:child_process\");"],
+    ["execFileSync", "export const { execFileSync } = require(\"node:child_process\");"],
+    ["short module alias", "export const { spawn: native } = require(\"child_process\");"],
+    ["multiple exported declarations", "export const version = 1, { spawn: native, execFile: runFile } = require(\"node:child_process\");"]
+  ])("52-K rejects exported CommonJS bindings: %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source))
+      .toEqual([expect.stringContaining("exported child_process require bindings")]);
+  });
+
+  test.each([
+    ["imported alias export", "import { spawn as native } from \"node:child_process\"; export { native as launch };"],
+    ["CommonJS local export", "const { spawn: native } = require(\"node:child_process\"); export { native as launch };"],
+    ["mixed local type and runner export", "import { spawn, type ChildProcess } from \"node:child_process\"; export { type ChildProcess, spawn as launch };"],
+    ["value export after type export", "import { spawn } from \"node:child_process\"; export type { spawn }; export { spawn };"]
+  ])("52-K retains local runtime export rejection: %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source))
+      .toEqual([expect.stringContaining("indirect or escaping child_process runner")]);
+  });
+
+  test.each([
+    ["unrelated wildcard", "export * from \"node:fs\";"],
+    ["unrelated namespace", "export * as paths from \"node:path\";"],
+    ["unrelated named", "export { readFileSync } from \"node:fs\";"],
+    ["unrelated aliased runner name", "export { label as spawn } from \"./metadata.js\";"],
+    ["unrelated source with matching local runner", "import { spawn } from \"node:child_process\"; export { spawn as label } from \"./metadata.js\"; spawn(\"node\", []);"],
+    ["local public alias matching runner name", "const label = \"native\"; export { label as spawn };"],
+    ["unrelated value declaration", "export const version = 1;"],
+    ["unrelated CommonJS destructuring", "export const { readFileSync } = require(\"node:fs\");"],
+    ["unrelated CommonJS binding named spawn", "export const { join: spawn } = require(\"node:path\");"],
+    ["type-only named", "export type { ChildProcess } from \"node:child_process\";"],
+    ["type-only alias", "export type { ChildProcess as ProcessHandle } from \"child_process\";"],
+    ["type-only wildcard", "export type * from \"node:child_process\";"],
+    ["type-only namespace", "export type * as ProcessTypes from \"child_process\";"],
+    ["type-only runner name", "export type { spawn } from \"node:child_process\";"],
+    ["inline type-only names", "export { type ChildProcess, type spawn as NativeRunner } from \"node:child_process\";"],
+    ["shell module type-only wildcard", "export type * from \"shelljs\";"],
+    ["shell module type-only namespace", "export type * as SpawnTypes from \"cross-spawn\";"],
+    ["shell module inline type-only", "export { type Options } from \"execa\";"],
+    ["local type-only runner export", "import { spawn } from \"node:child_process\"; export type { spawn as NativeRunner }; spawn(\"node\", []);"],
+    ["mixed local type and unrelated value", "import { spawn } from \"node:child_process\"; const version = 1; export { type spawn, version }; spawn(\"node\", []);"],
+    ["exported function using audited native call", "import { spawn } from \"node:child_process\"; export function launch() { return spawn(\"node\", []); }"],
+    ["nonexported CommonJS native alias", "const { spawn: native } = require(\"node:child_process\"); const launch = native; launch(\"node\", []);"]
+  ])("52-K accepts unrelated or type-only exports: %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source)).toEqual([]);
+  });
+
+  test.each([
+    ["wildcard", "export * from \"node:child_process\";", "runtime process-runner re-export"],
+    ["namespace", "export * as cp from \"child_process\";", "runtime process-runner re-export"],
+    ["named", "export { exec } from \"node:child_process\";", "runtime process-runner re-export"],
+    ["aliased", "export { spawn as native } from \"child_process\";", "runtime process-runner re-export"],
+    ["shell-capable module", "export * from \"execa\";", "runtime process-runner re-export"],
+    ["exported CommonJS", "export const { spawn } = require(\"node:child_process\");", "exported child_process require bindings"],
+    ["exported CommonJS alias", "export const { execFile: native } = require(\"child_process\");", "exported child_process require bindings"]
+  ])("52-K rejects runtime exports inside POSIX_GROUP_LAUNCHER: %s", (_name, source, reason) => {
+    const launcher = "const POSIX_GROUP_LAUNCHER = String.raw`" + source + "`;";
+    expect(inspectSupervisorSource("src/services/process-exec.ts", launcher))
+      .toEqual([expect.stringContaining("#POSIX_GROUP_LAUNCHER:1: " + reason)]);
+  });
+
   test("audits the embedded POSIX launcher and rejects shell dispatch inside it", () => {
     const valid = "const POSIX_GROUP_LAUNCHER = String.raw`" +
       "const { spawn } = require('node:child_process'); spawn('node', []);" + "`;";
