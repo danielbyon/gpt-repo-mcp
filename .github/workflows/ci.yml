@@ -53,8 +53,8 @@ jobs:
       - name: Public hygiene
         run: npm run check:public
 
-      - name: Build
-        run: npm run build
+      - name: Distribution build and health smoke
+        run: npm run verify:dist
 
       - name: Whitespace check
         run: git diff --check
