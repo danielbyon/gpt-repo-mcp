@@ -274,4 +274,100 @@ describe("Windows qualification scope guard", () => {
     expect(inspect(workflow)).toContain(
       "Windows must run mandatory validation guardrails");
   });
+
+  test.each([
+    ["shadowed process object", "const process={platform:'linux'}; if(process.platform==='win32'){test('required',()=>{});}"],
+    ["shadowed callback parameter", "describe('outer',(process)=>{if(process.platform==='win32'){test('required',()=>{});}});"],
+    ["shadowed process import", "import process from 'other'; if(process.platform==='win32'){test('required',()=>{});}"],
+    ["mutable process binding", "let process={platform:'linux'}; if(process.platform==='win32'){test('required',()=>{});}"],
+    ["unverified p.platform", "const p={platform:'win32'}; if(p.platform==='win32'){test('required',()=>{});}"],
+    ["unproven runIf predicate", "const process={platform:'win32'}; test.runIf(process.platform==='win32')('required',()=>{});"],
+    ["unproven skipIf predicate", "const process={platform:'linux'}; test.skipIf(process.platform!=='win32')('required',()=>{});"]
+  ])("independent review C does not count unproven Windows platform predicate: %s", (_name, source) => {
+    expect(collectWindowsTestTitles("fixture.ts", source)).toEqual([
+      { title: "required", enabled: false }
+    ]);
+  });
+
+  test.each([
+    ["global process", "if(process.platform==='win32'){test('required',()=>{});}"],
+    ["node:process default", "import process from 'node:process'; if(process.platform==='win32'){test('required',()=>{});}"],
+    ["node:process alias", "import p from 'node:process'; if(p.platform==='win32'){test('required',()=>{});}"],
+    ["node:process namespace", "import * as p from 'node:process'; if(p.platform==='win32'){test('required',()=>{});}"],
+    ["node:process named platform", "import {platform as osPlatform} from 'node:process';if(osPlatform==='win32'){test('required',()=>{});}"],
+    ["immutable process alias", "const p=process;if(p.platform==='win32'){test('required',()=>{});}"],
+    ["Windows else", "if(process.platform!=='win32'){} else {test('required',()=>{});}"],
+    ["Windows skipIf", "test.skipIf(process.platform!=='win32')('required',()=>{});"],
+    ["Windows runIf", "test.runIf(process.platform==='win32')('required',()=>{});"]
+  ])("independent review C preserves verified Windows predicates: %s", (_name, source) => {
+    expect(collectWindowsTestTitles("fixture.ts", source)).toEqual([
+      { title: "required", enabled: true }
+    ]);
+  });
+
+  test.each([
+    ["test alias", "const t=test;t.only('extra',()=>{});test('required',()=>{});"],
+    ["it computed exclusive", "const t=it;t['only']('extra',()=>{});test('required',()=>{});"],
+    ["describe alias", "const t=describe;t.only('extra',()=>{});test('required',()=>{});"],
+    ["transitive const alias", "const t=test;const u=t;u.only('extra',()=>{});test('required',()=>{});"],
+    ["destructured exclusive", "const {only}=test;only('extra',()=>{});test('required',()=>{});"],
+    ["aliased destructured exclusive", "const {only:isolated}=it;isolated('extra',()=>{});test('required',()=>{});"],
+    ["destructured const alias", "const t=test;const {only:isolated}=t;isolated('extra',()=>{});"],
+    ["property exclusive alias", "const exclusive=test.only;exclusive('extra',()=>{});"],
+    ["mutable test alias", "let t=test;t.only('extra',()=>{});"],
+    ["computed unknown alias", "const t=test;t[modifier]('extra',()=>{});"]
+  ])("independent review D rejects aliased exclusive Vitest execution: %s", (_name, source) => {
+    expect(() => collectWindowsTestTitles("fixture.ts", source))
+      .toThrow(/Exclusive or dynamically selected Vitest|Mutable Vitest/);
+  });
+
+  test.each([
+    ["immutable test alias", "const t=test;t('required',()=>{});"],
+    ["aliased describe callback", "const s=describe;s('suite',()=>{const t=test;t('required',()=>{});});"],
+    ["named Vitest import", "import {test as scenario} from 'vitest';scenario('required',()=>{});"],
+    ["aliased test.each", "const t=test;t.each(['required'])('%s',()=>{});"],
+    ["unrelated .only method", "const o={only(){}};o.only('hello');test('required',()=>{});"],
+    ["unrelated only destructuring", "const {only}=other;only('hello');test('required',()=>{});"],
+    ["original test.each", "test.each(['required'])('%s',()=>{});"]
+  ])("independent review D preserves verified Vitest registration: %s", (_name, source) => {
+    expect(collectWindowsTestTitles("fixture.ts", source)).toEqual([
+      { title: "required", enabled: true }
+    ]);
+  });
+
+  test.each([
+    ["shadowed test function", "const test=(_name,_fn)=>{}; test('required',()=>{});"],
+    ["unproven alias", "const t=other; t('required',()=>{});"],
+    ["non-Vitest import", "import {test} from 'other'; test('required',()=>{});"]
+  ])("independent review D never counts unproven aliases as mandatory coverage: %s", (_name, source) => {
+    expect(collectWindowsTestTitles("fixture.ts", source)).toEqual([]);
+  });
+
+  test.each([
+    ["PowerShell subexpression", '-t ".*|$(Write-Output SELECTOR_MUTATION)"'],
+    ["PowerShell environment variable", '-t "$env:SELECTOR_MUTATION"'],
+    ["PowerShell braced variable", '-t "${pattern}"'],
+    ["PowerShell embedded variable", '-t "foo$bar"'],
+    ["PowerShell unquoted substitution", '-t $(Write-Output selector)'],
+    ["PowerShell equals selector", '--testNamePattern=".*|$(Write-Output selector)"'],
+    ["PowerShell escape character", '-t "foo`$bar"']
+  ])("independent review E rejects expanded PowerShell selectors: %s", (_name, selector) => {
+    const workflow = load();
+    windowsStep(workflow, "Windows helper package hygiene").run =
+      "npm test -- tests/package-hygiene.test.ts " + selector + " --reporter=verbose";
+    expect(inspect(workflow).some((f) =>
+      f.includes("unaudited Vitest command") && f.includes("PowerShell"))).toBe(true);
+  });
+
+  test.each([
+    ["double-quoted regex end anchor", '-t ".*$"'],
+    ["single-quoted regex end anchor", "-t '.*$'"],
+    ["single-quoted literal dollar expression", "-t '.*|$(literal)'"],
+    ["valid regex alternation", '-t "^(pins|requires|checks).*$"']
+  ])("independent review E preserves nonexpanded PowerShell regex selectors: %s", (_name, selector) => {
+    const workflow = load();
+    windowsStep(workflow, "Windows helper package hygiene").run =
+      "npm test -- tests/package-hygiene.test.ts " + selector + " --reporter=verbose";
+    expect(inspect(workflow)).toEqual([]);
+  });
 });

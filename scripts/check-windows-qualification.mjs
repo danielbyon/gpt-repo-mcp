@@ -63,7 +63,17 @@ function tokenize(line) {
   let part = "";
   let quote;
   let open = false;
-  for (const char of line) {
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    // PowerShell expands subexpressions and variables outside single quotes.
+    // A bare regex end anchor ($) is safe; escaped command syntax is not.
+    if (quote !== "'" && char === "`") {
+      throw new Error("unaudited PowerShell escaping in Vitest command");
+    }
+    if (quote !== "'" && char === "$" &&
+        /[({A-Za-z_0-9?^$]/.test(line[i + 1] ?? "")) {
+      throw new Error("PowerShell expansion in Vitest command is forbidden");
+    }
     if (quote) {
       if (char === quote) quote = undefined;
       else part += char;
@@ -157,6 +167,136 @@ function access(node) {
   return undefined;
 }
 
+// Small lexical resolver shared by platform provenance and Vitest registration.
+// A binding that cannot be proved immutable is not evidence of eligibility.
+function lexicalBinding(reference) {
+  const name = reference.text;
+  const declares = (pattern) => ts.isIdentifier(pattern) ? pattern.text === name :
+    (ts.isArrayBindingPattern(pattern) || ts.isObjectBindingPattern(pattern)) &&
+      pattern.elements.some((element) => ts.isBindingElement(element) && declares(element.name));
+  const fromStatements = (statements) => {
+    const found = [];
+    for (const statement of statements) {
+      if (ts.isVariableStatement(statement)) {
+        for (const declaration of statement.declarationList.declarations) {
+          if (declares(declaration.name)) found.push({ kind: "variable", node: declaration,
+            constant: !!(statement.declarationList.flags & ts.NodeFlags.Const) });
+        }
+      }
+      if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+          statement.name?.text === name) found.push({ kind: "opaque" });
+      if (ts.isImportDeclaration(statement) && statement.importClause) {
+        const imports = statement.importClause;
+        const module = literal(statement.moduleSpecifier);
+        if (imports.name?.text === name) {
+          found.push({ kind: "import", module, imported: "default", typeOnly: imports.isTypeOnly });
+        }
+        const named = imports.namedBindings;
+        if (named && ts.isNamespaceImport(named) && named.name.text === name) {
+          found.push({ kind: "import", module, imported: "*", typeOnly: imports.isTypeOnly });
+        }
+        if (named && ts.isNamedImports(named)) {
+          for (const element of named.elements) {
+            if (element.name.text === name) found.push({ kind: "import", module,
+              imported: element.propertyName?.text ?? element.name.text,
+              typeOnly: imports.isTypeOnly || element.isTypeOnly });
+          }
+        }
+      }
+    }
+    return found;
+  };
+  const hasHoistedVar = (fn) => {
+    let found = false;
+    const visit = (node) => {
+      if (found || (node !== fn.body && ts.isFunctionLike(node))) return;
+      if (ts.isVariableDeclaration(node) && ts.isVariableDeclarationList(node.parent) &&
+          !(node.parent.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) &&
+          declares(node.name)) { found = true; return; }
+      ts.forEachChild(node, visit);
+    };
+    if (fn.body) visit(fn.body);
+    return found;
+  };
+  for (let scope = reference.parent; scope; scope = scope.parent) {
+    if (ts.isBlock(scope) || ts.isSourceFile(scope) ||
+        ts.isModuleBlock(scope) || ts.isCaseBlock(scope)) {
+      const found = fromStatements(scope.statements);
+      if (found.length) return found.length === 1 ? found[0] : { kind: "ambiguous" };
+    }
+    if (ts.isCatchClause(scope) && scope.variableDeclaration &&
+        declares(scope.variableDeclaration.name)) return { kind: "opaque" };
+    if (ts.isForStatement(scope) || ts.isForOfStatement(scope) ||
+        ts.isForInStatement(scope)) {
+      const init = scope.initializer;
+      if (init && ts.isVariableDeclarationList(init) &&
+          init.declarations.some((declaration) => declares(declaration.name))) {
+        return { kind: "opaque" };
+      }
+    }
+    if (ts.isFunctionLike(scope)) {
+      if (hasHoistedVar(scope) || scope.parameters.some((p) => declares(p.name)) ||
+          (scope.name && ts.isIdentifier(scope.name) && scope.name.text === name)) return { kind: "opaque" };
+    }
+  }
+  return undefined;
+}
+
+function verifiedProcess(input, seen = new Set()) {
+  const node = input && unwrap(input);
+  if (!node) return false;
+  if (ts.isIdentifier(node)) {
+    const binding = lexicalBinding(node);
+    if (!binding) return node.text === "process";
+    if (binding.kind === "import") return !binding.typeOnly &&
+      ["node:process", "process"].includes(binding.module) &&
+      ["default", "*"].includes(binding.imported);
+    if (binding.kind !== "variable" || !binding.constant ||
+        !binding.node.initializer || seen.has(binding.node)) return false;
+    const next = new Set(seen);
+    next.add(binding.node);
+    const init = unwrap(binding.node.initializer);
+    if (ts.isCallExpression(init) && ts.isIdentifier(init.expression) &&
+        init.expression.text === "require" && init.arguments.length === 1 &&
+        ["node:process", "process"].includes(literal(init.arguments[0]))) return true;
+    return verifiedProcess(init, next);
+  }
+  const member = access(node);
+  if (member && member.method === "process" &&
+      ts.isIdentifier(member.receiver) && member.receiver.text === "globalThis" &&
+      !lexicalBinding(member.receiver)) return true;
+  return false;
+}
+
+function verifiedPlatform(node) {
+  node = node && unwrap(node);
+  if (!node) return false;
+  const member = access(node);
+  if (member?.method === "platform") return verifiedProcess(member.receiver);
+  if (ts.isIdentifier(node)) {
+    const binding = lexicalBinding(node);
+    return binding?.kind === "import" && !binding.typeOnly &&
+      ["node:process", "process"].includes(binding.module) &&
+      binding.imported === "platform";
+  }
+  return false;
+}
+
+function vitestKind(input, seen = new Set()) {
+  const node = input && unwrap(input);
+  if (!node || !ts.isIdentifier(node)) return undefined;
+  const binding = lexicalBinding(node);
+  if (!binding) return ["test", "it", "describe"].includes(node.text) ? node.text : undefined;
+  if (binding.kind === "import") return binding.module === "vitest" &&
+    !binding.typeOnly && ["test", "it", "describe"].includes(binding.imported)
+    ? binding.imported : undefined;
+  if (binding.kind !== "variable" || !binding.constant ||
+      !binding.node.initializer || seen.has(binding.node)) return undefined;
+  const next = new Set(seen);
+  next.add(binding.node);
+  return vitestKind(binding.node.initializer, next);
+}
+
 /** A deliberately small Windows-only predicate evaluator; unknown means unproven. */
 function conditionOnWindows(node) {
   if (!node) return undefined;
@@ -175,10 +315,8 @@ function conditionOnWindows(node) {
     const unequal = op === ts.SyntaxKind.ExclamationEqualsEqualsToken ||
       op === ts.SyntaxKind.ExclamationEqualsToken;
     if (!equal && !unequal) return undefined;
-    const left = node.left.getText().replace(/\s+/g, "");
-    const right = node.right.getText().replace(/\s+/g, "");
-    const value = left === "process.platform" ? literal(node.right) :
-      right === "process.platform" ? literal(node.left) : undefined;
+    const value = verifiedPlatform(node.left) ? literal(node.right) :
+      verifiedPlatform(node.right) ? literal(node.left) : undefined;
     if (value !== undefined) {
       const matches = value === "win32";
       return equal ? matches : !matches;
@@ -188,12 +326,11 @@ function conditionOnWindows(node) {
 }
 
 function invocationKind(expression, names) {
-  if (ts.isIdentifier(expression) && names.includes(expression.text)) {
+  if (names.includes(vitestKind(expression))) {
     return { enabled: true };
   }
   const member = access(expression);
-  if (member && ts.isIdentifier(member.receiver) &&
-      names.includes(member.receiver.text) &&
+  if (member && names.includes(vitestKind(member.receiver)) &&
       ["skip", "todo"].includes(member.method)) {
     return { enabled: false };
   }
@@ -231,10 +368,24 @@ export function collectWindowsTestTitles(filename, source) {
   // element access and unknown dynamic member selectors.
   const checkExclusive = (node) => {
     const member = access(node);
-    if (member && ts.isIdentifier(member.receiver) &&
-        ["test", "it", "describe"].includes(member.receiver.text) &&
+    if (member && vitestKind(member.receiver) &&
         (member.method === undefined || member.method === "only")) {
       throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+    }
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      const kind = vitestKind(node.initializer);
+      if (kind && !(node.parent.flags & ts.NodeFlags.Const)) {
+        throw new Error("Mutable Vitest registration aliases are unaudited.");
+      }
+      if (kind && ts.isObjectBindingPattern(node.name) &&
+          node.name.elements.some((item) => {
+            const name = item.propertyName ?? item.name;
+            return ts.isIdentifier(name) && name.text === "only" ||
+              ts.isStringLiteralLike(name) && name.text === "only" ||
+              ts.isComputedPropertyName(name);
+          })) {
+        throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+      }
     }
     ts.forEachChild(node, checkExclusive);
   };

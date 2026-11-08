@@ -319,4 +319,61 @@ describe("validation supervisor direct-execution guard", () => {
       "import { execFile } from 'node:child_process'; execFile('node.exe', ['--version']);" +
       "spawn('node.exe', ['-e', 'console.log(1)'], { stdio: 'pipe' });")).toEqual([]);
   });
+
+  test.each([
+    ["direct builtin loader", "process.getBuiltinModule('node:child_process').exec('cmd.exe');"],
+    ["computed builtin loader", "process['getBuiltinModule']('child_process').exec('cmd.exe');"],
+    ["destructured loader", "const { getBuiltinModule: load } = process; load('child_process');"],
+    ["loader alias", "const load = process.getBuiltinModule; load('child_process');"],
+    ["immutable process alias", "const p = process; p.getBuiltinModule('node:child_process');"],
+    ["globalThis process alias", "const g = globalThis; const p = g.process; p.getBuiltinModule('child_process');"],
+    ["require node:process alias", "const p = require('node:process'); p.getBuiltinModule('child_process');"],
+    ["destructured require", "const {getBuiltinModule: load} = require('node:process'); load('child_process');"],
+    ["imported loader", "import { getBuiltinModule as load } from 'node:process'; load('child_process');"],
+    ["node:process default", "import p from 'node:process'; p.getBuiltinModule('child_process');"],
+    ["node:process namespace", "import * as p from 'node:process'; p.getBuiltinModule('child_process');"],
+    ["unknown computed process member", "process[member]('child_process');"]
+  ])("independent review A rejects built-in module loader capability: %s", (_name, source) => {
+    const findings = inspectSupervisorSource("src/services/node-runtime-resolver.ts", source);
+    expect(findings.some((f) => f.includes("built-in module loader"))).toBe(true);
+    expect(findings.every((f) => !f.includes("source cannot be parsed"))).toBe(true);
+  });
+
+  test.each([
+    ["eval alias", "const evaluate = eval; evaluate('console.log(1)');"],
+    ["eval callback escape", "register(eval);"],
+    ["indirect eval call", "(0, eval)('console.log(1)');"],
+    ["globalThis eval alias", "const evaluate = globalThis.eval; evaluate('console.log(1)');"],
+    ["global alias eval element", "const g = globalThis; const evaluate = g['eval']; evaluate('1');"],
+    ["destructured global eval", "const { eval: evaluate } = globalThis; evaluate('1');"],
+    ["global Function destructure", "const { Function: build } = globalThis; build('return 1');"],
+    ["Function alias", "const build = Function; build('return 1');"]
+  ])("independent review B rejects dynamic evaluation escapes: %s", (_name, source) => {
+    const findings = inspectSupervisorSource("src/services/node-runtime-resolver.ts", source);
+    expect(findings.some((f) => f.includes("dynamic evaluation"))).toBe(true);
+    expect(findings.every((f) => !f.includes("source cannot be parsed"))).toBe(true);
+  });
+
+  test.each([
+    ["native spawn/execFile", "import {spawn, execFile} from 'node:child_process'; spawn('node.exe',['--version']); execFile('node.exe',['--version']);"],
+    ["ordinary process properties", "const p=process; p.platform; p.argv; p.cwd();"],
+    ["unrelated loader method", "const o={getBuiltinModule(){return 1;}}; o.getBuiltinModule();"],
+    ["ordinary evaluate function", "const evaluate=(x)=>x; evaluate('hello');"],
+    ["ordinary launch method", "const custom={launch(x){return x;}}; custom.launch('node');"],
+    ["safe process destructuring", "const { platform } = process;"],
+    ["type-only process import", "import type { Process } from 'node:process'; export type { Process };"],
+    ["unrelated eval method alias", "const g={eval(x){return x}}; const e=g.eval; e('hello');"]
+  ])("independent review A/B preserves supported unrelated behavior: %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source)).toEqual([]);
+  });
+
+  test.each([
+    ["builtin loader", "process.getBuiltinModule('node:child_process').exec('cmd.exe');", "built-in module loader"],
+    ["eval alias", "const evaluate = eval; evaluate('1');", "dynamic evaluation"]
+  ])("independent review A/B enforces embedded POSIX launcher: %s", (_name, source, reason) => {
+    const launcher = "const POSIX_GROUP_LAUNCHER = String.raw`" + source + "`;";
+    const findings = inspectSupervisorSource("src/services/process-exec.ts", launcher);
+    expect(findings.some((f) => f.includes("#POSIX_GROUP_LAUNCHER:1: " + reason))).toBe(true);
+    expect(findings.every((f) => !f.includes("source cannot be parsed"))).toBe(true);
+  });
 });
