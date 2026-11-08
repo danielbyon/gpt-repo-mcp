@@ -1286,6 +1286,8 @@ if (candidate) return candidate;
     if (!node) return false;
     if (possibleTestRunnerOf(node, names, seen)) return true;
     if (globalIntrinsicOf(node, ["Proxy"])) return true;
+    if (names.some((name) => objectPropertyValuesOf(node, name, seen)
+      .some((value) => possibleTestRunnerOf(value, names, seen)))) return true;
     if (!ts.isCallExpression(node)) return false;
     if (globalIntrinsicOf(node.expression, ["Proxy"])) {
       return Boolean(node.arguments[0]) &&
@@ -1304,7 +1306,8 @@ if (candidate) return candidate;
         return possibleTestRunnerOf(node.arguments[0], names, seen);
       }
       return names.includes(property) &&
-        possibleVitestNamespaceOf(node.arguments[0]);
+        (possibleVitestNamespaceOf(node.arguments[0]) ||
+         testRunnerContainerOf(node.arguments[0], names, seen));
     }
     if (factory.method === "assign" &&
         globalIntrinsicOf(factory.receiver, ["Object"])) {

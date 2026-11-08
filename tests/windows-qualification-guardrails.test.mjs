@@ -547,6 +547,7 @@ describe("Windows qualification scope guard", () => {
 
   test.each([
     ["reflected test.only", "import { test } from 'vitest'; Reflect.get(test, 'only')('focused', () => {});"],
+    ["reflected runner held by object", "import { test } from 'vitest'; const holder: any = { test }; Reflect.get(holder, 'test').only('focused', () => {});"],
     ["option-only test", "import { test } from 'vitest'; test('focused', { only: true }, () => {});"],
     ["option-only suite", "import { describe } from 'vitest'; describe('suite', { only: true }, () => {});"],
     ["created test runner", "import { test } from 'vitest'; Object.create(test).only('focused', () => {});"],
@@ -556,6 +557,15 @@ describe("Windows qualification scope guard", () => {
   ])("rejects exclusive registration through %s", (_name, source) => {
     expect(() => collectWindowsTestTitles("fixture.ts", source))
       .toThrow(/Exclusive or dynamically selected Vitest/);
+  });
+
+  test("accepts ordinary objects containing test-named values", () => {
+    expect(collectWindowsTestTitles("fixture.ts", [
+      "import { test } from 'vitest';",
+      "const holder: any = { test: true };",
+      "Reflect.get(holder, 'test');",
+      "test('required', () => {});"
+    ].join("\n"))).toEqual([{ title: "required", enabled: true }]);
   });
 
   test("parses unfiltered mandatory files for exclusive registration", () => {

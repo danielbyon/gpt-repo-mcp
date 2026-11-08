@@ -1087,7 +1087,8 @@ const reflectiveReadOf = (input, seen = new Set()) => {
   const member = memberAccess(node);
   return Boolean(member &&
     ((member.property === "get" && globalReflectOf(member.receiver, seen)) ||
-     (member.property === "getOwnPropertyDescriptor" &&
+     (["entries", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors"].includes(
+       member.property) &&
       globalPrototypeObjectOf(member.receiver, seen))));
 };
   const destructuringEntries = (target) => {

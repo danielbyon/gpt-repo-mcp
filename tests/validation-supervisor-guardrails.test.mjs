@@ -191,6 +191,9 @@ test.each([
       "Ordinary.constructor('ordinary');",
       "const copied = { ...processLike }; copied.getBuiltinModule();",
       "const holder = {}; holder.api = { getBuiltinModule() { return undefined; } }; holder.api.getBuiltinModule();",
+      "const descriptors = Object.getOwnPropertyDescriptors({ value: 1 });",
+      "const descriptor = Object.getOwnPropertyDescriptor({ value: 1 }, 'value');",
+      "const entries = Object.fromEntries(Object.entries({ value: 1 }));",
       "import { spawn } from 'node:child_process'; spawn('node.exe', ['--version']);"
     ].join("\n");
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
@@ -306,6 +309,14 @@ test.each([
       "const load = Reflect.get(process, 'getBuiltinModule'); load('node:child_process');"],
     ["property descriptor Function",
       "const make = Object.getOwnPropertyDescriptor(globalThis, 'Function').value; make('return process')();"],
+    ["property descriptor bag global eval",
+     "const descriptors = Object.getOwnPropertyDescriptors(globalThis); descriptors.eval.value('process');"],
+    ["property descriptor bag process capability",
+     "const descriptors = Object.getOwnPropertyDescriptors(globalThis); const runtime = descriptors.process.get.call(globalThis); runtime.getBuiltinModule('node:child_process').exec('id');"],
+    ["process descriptor bag",
+     "const descriptors = Object.getOwnPropertyDescriptors(process); descriptors.getBuiltinModule.value('node:child_process').exec('id');"],
+    ["process entries copy",
+     "const copy = Object.fromEntries(Object.entries(process)); copy.getBuiltinModule('node:child_process').exec('id');"],
     ["reassigned Reflect alias",
       "let R: any = null; R = Reflect; const make = R.get(globalThis, 'Function'); make('return process')();"],
     ["reassigned Object alias",
