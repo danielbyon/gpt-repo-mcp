@@ -88,16 +88,104 @@ function inspectJavaScript(filename, source, isLauncher = false) {
 
   // A second argument must be provably an argv array: Node treats a non-array
   // object there as its options, even when a third argument is supplied.
-  const arrayBindings = new Map();
-  const collectBindings = (node) => {
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
-      const entries = arrayBindings.get(node.name.text) ?? [];
-      entries.push(node.initializer);
-      arrayBindings.set(node.name.text, entries);
+  const declaresName = (name, text) => {
+    if (ts.isIdentifier(name)) return name.text === text;
+    if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+      return name.elements.some((part) =>
+        ts.isBindingElement(part) && declaresName(part.name, text));
     }
-    ts.forEachChild(node, collectBindings);
+    return false;
   };
-  collectBindings(file);
+
+  // Resolve a reference through enclosing lexical scopes, not through a file-
+  // wide name table. An unknown or ambiguous binding is never argv evidence.
+  const resolveBinding = (reference) => {
+    const text = reference.text;
+    const declarations = (statements) => {
+      const found = [];
+      for (const statement of statements) {
+        if (ts.isVariableStatement(statement)) {
+          for (const declaration of statement.declarationList.declarations) {
+            if (declaresName(declaration.name, text)) {
+              found.push({
+                kind: ts.isIdentifier(declaration.name) ? "variable" : "opaque",
+                node: declaration,
+                constant: !!(statement.declarationList.flags & ts.NodeFlags.Const)
+              });
+            }
+          }
+        }
+        if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+            statement.name?.text === text) {
+          found.push({ kind: "opaque", node: statement });
+        }
+        if (ts.isImportDeclaration(statement) && statement.importClause) {
+          const imports = statement.importClause;
+          if (imports.name?.text === text ||
+              (imports.namedBindings && ts.isNamespaceImport(imports.namedBindings) &&
+               imports.namedBindings.name.text === text) ||
+              (imports.namedBindings && ts.isNamedImports(imports.namedBindings) &&
+               imports.namedBindings.elements.some((element) => element.name.text === text))) {
+            found.push({ kind: "import", node: statement, module: moduleLiteral(statement.moduleSpecifier) });
+          }
+        }
+      }
+      return found;
+    };
+
+    // var is function-hoisted even when declared in a nested conditional block.
+    // Conservatively reject such a name throughout that function.
+    const hasHoistedVar = (fn) => {
+      let found = false;
+      const visit = (node) => {
+        if (found || (node !== fn.body && ts.isFunctionLike(node))) return;
+        if (ts.isVariableDeclaration(node) &&
+            ts.isVariableDeclarationList(node.parent) &&
+            !(node.parent.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) &&
+            declaresName(node.name, text)) {
+          found = true;
+          return;
+        }
+        ts.forEachChild(node, visit);
+      };
+      if (fn.body) visit(fn.body);
+      return found;
+    };
+
+    for (let scope = reference.parent; scope; scope = scope.parent) {
+      if (ts.isBlock(scope) || ts.isSourceFile(scope) ||
+          ts.isModuleBlock(scope) || ts.isCaseBlock(scope)) {
+        const matches = declarations(scope.statements);
+        if (matches.length) {
+          return matches.length === 1 ? matches[0] : { kind: "ambiguous" };
+        }
+      }
+      if (ts.isCatchClause(scope) &&
+          scope.variableDeclaration && declaresName(scope.variableDeclaration.name, text)) {
+        return { kind: "opaque", node: scope.variableDeclaration };
+      }
+      if (ts.isForStatement(scope) || ts.isForOfStatement(scope) ||
+          ts.isForInStatement(scope)) {
+        const initializer = scope.initializer;
+        if (initializer && ts.isVariableDeclarationList(initializer) &&
+            initializer.declarations.some((declaration) => declaresName(declaration.name, text))) {
+          return { kind: "opaque", node: initializer };
+        }
+      }
+      if (ts.isFunctionLike(scope)) {
+        if (hasHoistedVar(scope)) return { kind: "opaque", node: scope };
+        const matches = scope.parameters.filter((parameter) =>
+          declaresName(parameter.name, text));
+        if (matches.length) return matches.length === 1
+          ? { kind: "parameter", node: matches[0] }
+          : { kind: "ambiguous" };
+        if (scope.name && ts.isIdentifier(scope.name) && scope.name.text === text) {
+          return { kind: "opaque", node: scope };
+        }
+      }
+    }
+    return undefined;
+  };
 
   const enclosingFunction = (node, expected) => {
     for (let parent = node.parent; parent; parent = parent.parent) {
@@ -121,15 +209,19 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     const field = node.getText(file).replace(/\s+/g, "");
     if (filename === "src/services/process-exec.ts" && field === "input.args") {
       const owner = enclosingFunction(node, "runProcessWithTail");
-      return !!owner && stringArrayMember(
-        owner.parameters.find((parameter) => nameOf(parameter.name) === "input")?.type, "args");
+      const parameter = owner?.parameters.find((item) => nameOf(item.name) === "input");
+      return !!parameter && ts.isIdentifier(node.expression) &&
+        resolveBinding(node.expression)?.node === parameter &&
+        stringArrayMember(parameter.type, "args");
     }
     if (filename === "src/services/windows-process-host.ts" && field === "launch?.args") {
       const owner = enclosingFunction(node, "runWindowsProcessWithTail");
       const parameter = owner?.parameters.find((item) => nameOf(item.name) === "launch");
       const alias = file.statements.find((item) => ts.isTypeAliasDeclaration(item) &&
         item.name.text === "WindowsProcessHostLaunch");
-      return !!parameter?.type && ts.isTypeReferenceNode(parameter.type) &&
+      return !!parameter?.type && ts.isIdentifier(node.expression) &&
+        resolveBinding(node.expression)?.node === parameter &&
+        ts.isTypeReferenceNode(parameter.type) &&
         parameter.type.typeName.getText(file) === "WindowsProcessHostLaunch" &&
         !!alias && stringArrayMember(alias.type, "args");
     }
@@ -137,14 +229,23 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   };
   const provenArrayProducer = (node) => {
     const target = node.expression.getText(file).replace(/\s+/g, "");
-    if (target === "process.argv.slice") return true;
+    if (target === "process.argv.slice") {
+      const argvAccess = node.expression.expression;
+      const processIdentifier = ts.isPropertyAccessExpression(argvAccess)
+        ? argvAccess.expression : undefined;
+      if (!processIdentifier || !ts.isIdentifier(processIdentifier)) return false;
+      const binding = resolveBinding(processIdentifier);
+      return !binding || (binding.kind === "import" && binding.module === "node:process");
+    }
     if (filename !== "src/services/windows-process-host.ts" ||
         target !== "windowsHostArgs" ||
         !enclosingFunction(node, "runWindowsProcessWithTail")) return false;
     const producer = file.statements.find((item) => ts.isFunctionDeclaration(item) &&
       item.name?.text === "windowsHostArgs");
     if (!producer?.body || !producer.type || !ts.isArrayTypeNode(producer.type) ||
-        producer.type.elementType.kind !== ts.SyntaxKind.StringKeyword) return false;
+        producer.type.elementType.kind !== ts.SyntaxKind.StringKeyword ||
+        !ts.isIdentifier(node.expression) ||
+        resolveBinding(node.expression)?.node !== producer) return false;
     const returns = [];
     const inspectReturns = (child) => {
       if (child !== producer.body && ts.isFunctionLike(child)) return;
@@ -170,12 +271,13 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     }
     if (ts.isPropertyAccessExpression(node)) return sourceContractArray(node);
     if (ts.isCallExpression(node)) return provenArrayProducer(node);
-    if (ts.isIdentifier(node) && !seen.has(node.text)) {
-      const bindings = arrayBindings.get(node.text);
-      if (bindings?.length === 1) {
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      if (binding?.kind === "variable" && binding.constant &&
+          binding.node.initializer && !seen.has(binding.node)) {
         const next = new Set(seen);
-        next.add(node.text);
-        return isArrayArguments(bindings[0], next);
+        next.add(binding.node);
+        return isArrayArguments(binding.node.initializer, next);
       }
     }
     return false;

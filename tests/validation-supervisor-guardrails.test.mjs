@@ -108,6 +108,40 @@ describe("validation supervisor direct-execution guard", () => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", code)).toEqual([]);
   });
 
+  test.each([
+    ["reassigned let", "let args: string[] | { shell?: boolean } = ['--version']; args = { shell: true }; spawn('node.exe', args);"],
+    ["mutable var", "var args = ['--version']; spawn('node.exe', args);"],
+    ["shadowed function argument", "const args = ['--version']; function runNative(args: { shell?: boolean }) { spawn('node.exe', args); }"],
+    ["nested function argument", "const args = ['--version']; function outer() { function inner(args: { shell?: boolean }) { spawn('node.exe', args); } }"],
+    ["shadowed block binding", "const args = ['--version']; { const args = { shell: true }; spawn('node.exe', args); }"],
+    ["shadowed let in block", "const args = ['--version']; { let args = { shell: true }; spawn('node.exe', args); }"],
+    ["same name in sibling block", "{ const args = ['--version']; } { spawn('node.exe', args); }"],
+    ["alias of mutable binding", "let args = ['--version']; const alias = args; spawn('node.exe', alias);"],
+    ["mutable alias of immutable binding", "const args = ['--version']; let alias = args; spawn('node.exe', alias);"],
+    ["cyclic aliases", "const args = alias; const alias = args; spawn('node.exe', args);"],
+    ["hoisted nested var", "const args = ['--version']; function call() { if (true) { var args = { shell: true }; } spawn('node.exe', args); }"],
+    ["opaque options", "const args = getOptions(); spawn('node.exe', args, { stdio: 'pipe' });"],
+    ["shadowed process global", "const process = { argv: { slice: () => ({shell:true}) } }; spawn('node.exe', process.argv.slice(2));"],
+    ["computed shell via shadowed const", "const args = ['--version']; { const args = { shell: true }; spawn('node.exe', (args as any)); }"]
+  ])("52-I rejects mutable or lexically unproven argv provenance: %s", (_name, source) => {
+    const findings = inspectSupervisorSource("src/services/node-runtime-resolver.ts", source);
+    expect(findings.some((finding) =>
+      finding.includes("unresolved process-launch argv may be options"))).toBe(true);
+  });
+
+  test.each([
+    ["immutable local argv", "const args = ['--version']; spawn('node.exe', args, {stdio:'pipe'});"],
+    ["nested immutable reference", "const args = ['--version']; { const nested = args; spawn('node.exe', nested, {stdio:'pipe'}); }"],
+    ["nested immutable shadow", "const args = { ['shell']: true }; { const args = ['--version']; spawn('node.exe', args); }"],
+    ["different outer names", "const outer = ['--version']; function run() { const inner = outer; spawn('node.exe', inner); }"],
+    ["conditional immutable arrays", "const left = ['a']; const right = ['b']; spawn('node.exe', true ? left : right);"],
+    ["nullish immutable arrays", "const primary = ['a']; const fallback = ['b']; spawn('node.exe', primary ?? fallback);"],
+    ["native literal argv", "spawn('node.exe', ['--version'], {stdio:'pipe'});"],
+    ["native callback overload", "execFile('node.exe', ['--version'], {windowsHide:true}, () => {});"]
+  ])("52-I accepts proven immutable lexical argv: %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source)).toEqual([]);
+  });
+
   test("audits the embedded POSIX launcher and rejects shell dispatch inside it", () => {
     const valid = "const POSIX_GROUP_LAUNCHER = String.raw`" +
       "const { spawn } = require('node:child_process'); spawn('node', []);" + "`;";
