@@ -39,10 +39,25 @@ describe("validation supervisor direct-execution guard", () => {
     ["dynamic import", "const p = import('node:child_process');"],
     ["dynamic require", "const p = require(moduleName);"],
     ["aliased require", "const loader = require; const cp = loader(\"node:child_process\");"],
+    ["parenthesized require alias", "const loader = (require); const cp = loader('node:child_process'); cp.exec('cmd.exe');"],
+    ["type-asserted require alias", "const loader = require as unknown as (name: string) => any; const cp = loader('node:child_process'); cp.exec('cmd.exe');"],
+    ["parenthesized require call", "(require)('node:module');"],
+    ["type-asserted require call", "(require as any)('node:child_process');"],
+    ["comma require call", "(0, require)('node:child_process');"],
+    ["comma require alias", "const loader = (0, require); loader('node:child_process');"],
+    ["assigned require alias", "let loader; loader = require; loader('node:child_process');"],
+    ["object-destructured require alias", "let loader; ({ loader } = { loader: require }); loader('node:child_process');"],
+    ["array-destructured require alias", "let loader; [loader] = [require]; loader('node:child_process');"],
     ["function constructor", "const create = Function(\"return 1\");"],
     ["require with computed member", "const p = require('node:child_process'); p['exec']('echo nope');"],
     ["namespace import", "import * as cp from 'node:child_process'; cp.exec('echo nope');"],
-    ["function evaluation", "new Function('return require(\\\"node:child_process\\\")')();"]
+    ["function evaluation", "new Function('return require(\\\"node:child_process\\\")')();"],
+    ["global Function property alias", "const make = globalThis['Function']; make(\"return process.getBuiltinModule('node:child_process')\")();"],
+    ["bare Function alias", "const make = Function; make(\"return process.getBuiltinModule('node:child_process')\")();"],
+    ["mutable global Function property alias", "let make = globalThis['Function']; make(\"return process.getBuiltinModule('node:child_process')\")();"],
+    ["mutable bare Function alias", "let make = Function; make(\"return process.getBuiltinModule('node:child_process')\")();"],
+    ["computed global Function constructor", "globalThis['Fun' + 'ction'](\"return process.getBuiltinModule('node:child_process')\")();"],
+    ["mutable process object alias", "let runtime = process; runtime.getBuiltinModule('node:child_process').exec('node -v');"]
   ])("rejects an unaudited loading route: %s", (_case, source) => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
   });
@@ -57,12 +72,153 @@ describe("validation supervisor direct-execution guard", () => {
     ["unknown computed expression", "spawn('node.exe', [], { ['sh' + 'ell']: true });"],
     ["opaque option object", "const opts = { stdio: 'pipe' }; spawn('node.exe', [], opts);"],
     ["spread process options", "spawn('node.exe', [], { ...runtimeOptions });"]
-  ])("52-D rejects shell-capable or unverifiable native launch options: %s", (_name, code) => {
+  ])("rejects shell-capable or unverifiable native launch options: %s", (_name, code) => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", code))
       .not.toEqual([]);
   });
 
-  test("52-D accepts native execution and unrelated computed objects", () => {
+  test.each([
+    ["global process method", "process.getBuiltinModule('node:child_process');"],
+    ["node:process import", "import process from 'node:process'; process.getBuiltinModule('node:child_process');"],
+    ["named default process import", "import { default as runtime } from 'node:process'; runtime.getBuiltinModule('node:child_process');"],
+    ["namespace default process object", "import * as processModule from 'node:process'; processModule.default.getBuiltinModule('node:child_process');"],
+    ["element access", "process['getBuiltinModule']('node:child_process');"],
+    ["dynamic element access", "process[loaderName]('node:child_process');"],
+    ["destructured capability", "const { getBuiltinModule } = process; getBuiltinModule('node:child_process');"],
+    ["destructured process object alias", "process.default = process; const { default: runtime } = process; runtime.getBuiltinModule('node:child_process');"],
+    ["destructured default alias", "const { getBuiltinModule: load = fallback } = process; load('node:child_process');"],
+    ["computed destructuring", "const { [loaderName]: load } = process; load('node:child_process');"],
+    ["process object rest", "const { ...processApi } = process; processApi.getBuiltinModule('node:child_process');"],
+    ["process object spread", "const processApi = { ...process }; processApi.getBuiltinModule('node:child_process');"],
+    ["aliased process object", "const runtime = process; runtime.getBuiltinModule('node:child_process');"],
+    ["process object assigned later", "let runtime = {}; runtime = process; runtime.getBuiltinModule('node:child_process').exec('node -v');"],
+    ["process object assigned by nullish assignment", "let runtime; runtime ??= process; runtime.getBuiltinModule('node:child_process').exec('node -v');"],
+    ["destructured process object assignment", "let runtime; ({ runtime } = { runtime: process }); runtime.getBuiltinModule('node:child_process').exec('node -v');"],
+    ["destructured process capability assignment", "let load; ({ getBuiltinModule: load } = process); load('node:child_process');"],
+    ["computed process capability assignment", "let load; ({ [loaderName]: load } = process); load('node:child_process');"],
+    ["process object rest assignment", "let processApi; ({ ...processApi } = process); processApi.getBuiltinModule('node:child_process');"],
+    ["array-destructured process object", "const [runtime] = [process]; runtime.getBuiltinModule('node:child_process');"],
+    ["array-destructured process object assignment", "let runtime; [runtime] = [process]; runtime.getBuiltinModule('node:child_process');"],
+    ["array rest process capability", "let runtime; [, ...runtime] = [safe, process]; runtime[0].getBuiltinModule('node:child_process');"],
+    ["parameter destructured capability", "function load({ getBuiltinModule } = process) { getBuiltinModule('node:child_process'); } load();"],
+    ["parameter process alias default", "function load(runtime = process) { runtime.getBuiltinModule('node:child_process'); } load();"],
+    ["destructured process through globalThis", "const { process: runtime } = globalThis; runtime.getBuiltinModule('node:child_process');"],
+    ["destructured process through globalThis assignment", "let runtime; ({ process: runtime } = globalThis); runtime.getBuiltinModule('node:child_process');"],
+    ["destructured global object assignment", "let runtimeGlobal = {}; ({ runtimeGlobal } = { runtimeGlobal: globalThis }); runtimeGlobal.Function(\"return process.getBuiltinModule('node:child_process')\")();"],
+    ["globalThis process object", "globalThis.process.getBuiltinModule('node:child_process').exec('node -v');"],
+    ["aliased capability", "const load = process.getBuiltinModule; const loader = load; loader('node:child_process');"]
+  ])("rejects process module loading through %s", (_case, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
+  });
+
+  test("accepts unrelated process use and unrelated getBuiltinModule methods", () => {
+    const source = [
+      "process.cwd();",
+      "process.argv.slice(2);",
+      "const processLike = { getBuiltinModule() { return undefined; } };",
+      "processLike.getBuiltinModule();",
+      "const copied = { ...processLike }; copied.getBuiltinModule();",
+      "import { spawn } from 'node:child_process'; spawn('node.exe', ['--version']);"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
+  });
+
+  test.each([
+    ["top-level block var", "{ var spawn = localRunner; }\nspawn('cmd.exe', ['/c', 'dir']);", false],
+    ["function-local var", "function runLocal() { var spawn = localRunner; }\nspawn('cmd.exe', ['/c', 'dir']);", true]
+  ])("resolves %s without crossing its hoisting scope", (_name, source, flagsInterpreter) => {
+    const findings = inspectSupervisorSource("src/services/windows-process-host.ts", source);
+    expect(findings.some((finding) =>
+      finding.includes("direct interpreter or command-shim dispatch is forbidden")))
+      .toBe(flagsInterpreter);
+  });
+
+  test.each([
+    ["immutable executable alias", "const executable = 'cmd.exe'; spawn(executable, ['/c', 'dir']);"],
+    ["chained immutable executable alias", "const executable = 'cmd.exe'; const command = executable; spawn(command, ['/c', 'dir']);"]
+  ])("rejects an interpreter hidden by an %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
+  });
+
+  test.each(["node:module", "module"])("rejects aliased createRequire imports from %s", (module) => {
+    const source = [
+      `import { createRequire as loadModule } from '${module}';`,
+      "const requireFromHere = loadModule(import.meta.url);",
+      "const childProcess = requireFromHere('node:child_process');",
+      "childProcess.exec('node -v');"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .toEqual([expect.stringContaining("node:module loading is forbidden")]);
+  });
+
+  test.each(["node:module", "module"])("rejects CommonJS module loading through %s", (module) => {
+    const source = [
+      `const { createRequire: loadModule } = require('${module}');`,
+      "const requireFromHere = loadModule(import.meta.url);",
+      "const childProcess = requireFromHere('node:child_process');",
+      "childProcess.exec('node -v');"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .toEqual([expect.stringContaining("node:module loading is forbidden")]);
+  });
+
+  test.each([
+    ["direct eval", "eval('process');"],
+    ["immutable alias", "const evaluator = eval; evaluator('process');"],
+    ["mutable alias", "let evaluator = eval; evaluator('process');"],
+    ["computed global eval property", "globalThis['e' + 'val']('process');"],
+    ["escaping reference", "registerCapability(eval);"],
+    ["indirect comma call", "(0, eval)('process');"],
+    ["globalThis eval", "globalThis.eval('process');"],
+    ["aliased globalThis eval", "const dynamicEval = globalThis['eval']; dynamicEval('process');"],
+    ["aliased Node global eval", "const dynamicEval = global.eval; dynamicEval('process');"],
+    ["mutable global object alias", "let runtimeGlobal = globalThis; runtimeGlobal.eval('process');"],
+    ["destructured global eval", "const { eval: dynamicEval } = globalThis; dynamicEval('process');"],
+    ["destructured global eval assignment", "let dynamicEval; ({ eval: dynamicEval } = globalThis); dynamicEval('process');"],
+    ["destructured global Function assignment", "let make; ({ Function: make } = globalThis); make(\"return process.getBuiltinModule('node:child_process')\")();"],
+    ["computed global capability assignment", "let dynamicEval; ({ [loaderName]: dynamicEval } = globalThis); dynamicEval('process');"],
+    ["global object rest assignment", "let runtimeGlobal; ({ ...runtimeGlobal } = globalThis); runtimeGlobal.eval('process');"],
+    ["array-destructured global object", "const [runtimeGlobal] = [globalThis]; runtimeGlobal.eval('process');"],
+    ["array-destructured global object assignment", "let runtimeGlobal; [runtimeGlobal] = [global]; runtimeGlobal.eval('process');"],
+    ["array rest global capability", "let runtimeGlobal; [, ...runtimeGlobal] = [safe, globalThis]; runtimeGlobal[0].eval('process');"],
+    ["parameter destructured global eval", "function evaluate({ eval: run } = globalThis) { run('process'); } evaluate();"],
+    ["parameter global alias default", "function evaluate(runtime = globalThis) { runtime.eval('process'); } evaluate();"],
+    ["dynamic computed global access", "const capability = getCapability(); globalThis[capability]('process');"],
+    ["deferred global object assignment", "let runtimeGlobal; runtimeGlobal = globalThis; runtimeGlobal.eval('process');"],
+    ["deferred destructured global object assignment", "let runtimeGlobal; ({ runtimeGlobal } = { runtimeGlobal: globalThis }); runtimeGlobal.Function('x');"],
+    ["globalThis self alias", "const runtimeGlobal = globalThis.globalThis; runtimeGlobal.eval('process');"],
+    ["Node global self alias", "const runtimeGlobal = global.global; runtimeGlobal.Function('x');"],
+    ["destructured Node global alias", "const { global: runtimeGlobal } = globalThis; runtimeGlobal.eval('process');"],
+    ["destructured globalThis alias assignment", "let runtimeGlobal; ({ globalThis: runtimeGlobal } = global); runtimeGlobal.eval('process');"]
+  ])("rejects dynamic evaluation through %s", (_case, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
+  });
+
+  test("accepts ordinary eval-named methods and evaluate functions", () => {
+    const source = [
+      "const parser = { eval(value) { return value; } };",
+      "parser.eval('literal');",
+      "const { Math: math } = globalThis; math.max(1, 2);",
+      "function evaluate(value) { return value; }",
+      "evaluate('literal');"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
+  });
+
+  test("accepts type-only node:module imports", () => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts",
+      "import type { Module } from 'node:module';")).toEqual([]);
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts",
+      "import { type Module } from 'node:module';")).toEqual([]);
+  });
+
+  test("accepts a locally shadowed require reference", () => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts",
+      "function load(require: (value: string) => unknown) { const alias = require; alias('ordinary-value'); }"))
+      .toEqual([]);
+  });
+
+  test("accepts native execution and unrelated computed objects", () => {
     const source = [
       "import { spawn as runNative, execFile as execNative } from 'node:child_process';",
       "const metadata = { ['shell']: 'not a launch option', [variable]: 1 };",
@@ -89,7 +245,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["spoofed input.args", "const input = { args: getOptions() }; spawn('node.exe', input.args, { stdio: 'pipe' });"],
     ["spoofed windowsHostArgs", "function windowsHostArgs() { return getOptions(); } spawn('node.exe', windowsHostArgs(), { stdio: 'pipe' });"],
     ["spoofed helperArgs", "const launch = { args: getOptions() }; const helperArgs = launch?.args ?? getOptions(); spawn('node.exe', helperArgs, { stdio: 'pipe' });"]
-  ])("52-G rejects unproven process-launch overload: %s", (_name, code) => {
+  ])("rejects unproven process-launch overload: %s", (_name, code) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", code)).not.toEqual([]);
   });
 
@@ -104,7 +260,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["sync arguments and options", "execFileSync('node.exe', ['--version'], ({ windowsHide: true } satisfies object));"],
     ["safe argv identifier", "const args = ['--version']; spawn('node.exe', args, { stdio: 'pipe' });"],
     ["safe native argv slice", "spawn('node.exe', process.argv.slice(2), { stdio: 'pipe' });"]
-  ])("52-G accepts provably native overload: %s", (_name, code) => {
+  ])("accepts provably native overload: %s", (_name, code) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", code)).toEqual([]);
   });
 
@@ -123,7 +279,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["opaque options", "const args = getOptions(); spawn('node.exe', args, { stdio: 'pipe' });"],
     ["shadowed process global", "const process = { argv: { slice: () => ({shell:true}) } }; spawn('node.exe', process.argv.slice(2));"],
     ["computed shell via shadowed const", "const args = ['--version']; { const args = { shell: true }; spawn('node.exe', (args as any)); }"]
-  ])("52-I rejects mutable or lexically unproven argv provenance: %s", (_name, source) => {
+  ])("rejects mutable or lexically unproven argv provenance: %s", (_name, source) => {
     const findings = inspectSupervisorSource("src/services/node-runtime-resolver.ts", source);
     expect(findings.some((finding) =>
       finding.includes("unresolved process-launch argv may be options"))).toBe(true);
@@ -138,7 +294,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["nullish immutable arrays", "const primary = ['a']; const fallback = ['b']; spawn('node.exe', primary ?? fallback);"],
     ["native literal argv", "spawn('node.exe', ['--version'], {stdio:'pipe'});"],
     ["native callback overload", "execFile('node.exe', ['--version'], {windowsHide:true}, () => {});"]
-  ])("52-I accepts proven immutable lexical argv: %s", (_name, source) => {
+  ])("accepts proven immutable lexical argv: %s", (_name, source) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source)).toEqual([]);
   });
 
@@ -168,7 +324,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["parameter default escape", "import {spawn} from 'node:child_process'; function f(value = spawn) {}", "indirect or escaping"],
     ["spread spawn invocation", "import {spawn} from 'node:child_process'; const packed: any[] = ['/bin/sh', []]; spawn(...packed);", "spread process-runner call arguments"],
     ["wrapped spread execFile invocation", "import {execFile} from 'node:child_process'; const packed: any[] = ['/bin/sh', []]; (execFile as any)(...packed);", "spread process-runner call arguments"]
-  ])("52-J rejects runner bypass: %s", (_name, source, reason) => {
+  ])("rejects runner bypass: %s", (_name, source, reason) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source)
       .some((finding) => finding.includes(reason))).toBe(true);
   });
@@ -183,11 +339,11 @@ describe("validation supervisor direct-execution guard", () => {
     ["CommonJS aliases", "const {spawn:s, execFile:e}=require('node:child_process'); s('node.exe', []); e('node.exe', [], () => {});"],
     ["trusted promisify", "import {execFile} from 'node:child_process'; import {promisify as p} from 'node:util'; const e=p(execFile); e('node.exe', [], {timeout:100});"],
     ["shadowed parameter", "import {spawn} from 'node:child_process'; function local(spawn: () => void) { spawn(); } spawn('node.exe', []);"]
-  ])("52-J accepts audited runner reference: %s", (_name, source) => {
+  ])("accepts audited runner reference: %s", (_name, source) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source)).toEqual([]);
   });
 
-  test("52-J audits indirect calls inside POSIX_GROUP_LAUNCHER", () => {
+  test("audits indirect calls inside POSIX_GROUP_LAUNCHER", () => {
     const valid = "const POSIX_GROUP_LAUNCHER = String.raw" + String.fromCharCode(96) +
       "const { spawn } = require('node:child_process'); spawn.bind(undefined, '/bin/sh');" +
       String.fromCharCode(96) + ";";
@@ -219,7 +375,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["execa wildcard", "export * from \"execa\";"],
     ["execa namespace", "export * as runner from \"execa\";"],
     ["execa aliased named", "export { default as runner } from \"execa\";"]
-  ])("52-K rejects runtime module re-exports: %s", (_name, source) => {
+  ])("rejects runtime module re-exports: %s", (_name, source) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source))
       .toEqual([expect.stringContaining("runtime process-runner re-export")]);
   });
@@ -231,7 +387,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["execFileSync", "export const { execFileSync } = require(\"node:child_process\");"],
     ["short module alias", "export const { spawn: native } = require(\"child_process\");"],
     ["multiple exported declarations", "export const version = 1, { spawn: native, execFile: runFile } = require(\"node:child_process\");"]
-  ])("52-K rejects exported CommonJS bindings: %s", (_name, source) => {
+  ])("rejects exported CommonJS bindings: %s", (_name, source) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source))
       .toEqual([expect.stringContaining("exported child_process require bindings")]);
   });
@@ -241,7 +397,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["CommonJS local export", "const { spawn: native } = require(\"node:child_process\"); export { native as launch };"],
     ["mixed local type and runner export", "import { spawn, type ChildProcess } from \"node:child_process\"; export { type ChildProcess, spawn as launch };"],
     ["value export after type export", "import { spawn } from \"node:child_process\"; export type { spawn }; export { spawn };"]
-  ])("52-K retains local runtime export rejection: %s", (_name, source) => {
+  ])("retains local runtime export rejection: %s", (_name, source) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source))
       .toEqual([expect.stringContaining("indirect or escaping child_process runner")]);
   });
@@ -269,7 +425,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["mixed local type and unrelated value", "import { spawn } from \"node:child_process\"; const version = 1; export { type spawn, version }; spawn(\"node\", []);"],
     ["exported function using audited native call", "import { spawn } from \"node:child_process\"; export function launch() { return spawn(\"node\", []); }"],
     ["nonexported CommonJS native alias", "const { spawn: native } = require(\"node:child_process\"); const launch = native; launch(\"node\", []);"]
-  ])("52-K accepts unrelated or type-only exports: %s", (_name, source) => {
+  ])("accepts unrelated or type-only exports: %s", (_name, source) => {
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts", source)).toEqual([]);
   });
 
@@ -281,7 +437,7 @@ describe("validation supervisor direct-execution guard", () => {
     ["shell-capable module", "export * from \"execa\";", "runtime process-runner re-export"],
     ["exported CommonJS", "export const { spawn } = require(\"node:child_process\");", "exported child_process require bindings"],
     ["exported CommonJS alias", "export const { execFile: native } = require(\"child_process\");", "exported child_process require bindings"]
-  ])("52-K rejects runtime exports inside POSIX_GROUP_LAUNCHER: %s", (_name, source, reason) => {
+  ])("rejects runtime exports inside POSIX_GROUP_LAUNCHER: %s", (_name, source, reason) => {
     const launcher = "const POSIX_GROUP_LAUNCHER = String.raw`" + source + "`;";
     expect(inspectSupervisorSource("src/services/process-exec.ts", launcher))
       .toEqual([expect.stringContaining("#POSIX_GROUP_LAUNCHER:1: " + reason)]);

@@ -64,12 +64,53 @@ describe("Windows qualification scope guard", () => {
     "-t Windows|echo skipped",
     '--exclude tests/validation-service.test.ts',
     '-t "Windows npm" --testNamePattern="Windows command shim"',
-    '--testNamePattern="["'
+    '--testNamePattern="["',
+    '-t "$(Write-Output required)"',
+    '-t "$env:REQUIRED"',
+    '-t $env:REQUIRED',
+    '-t $PID',
+    '-t "$:REQUIRED|.*"',
+    '-t "``$env:REQUIRED"',
+    '-t "${REQUIRED}"',
+    '-t "^(?:$é|REQUIRED)$"',
+    "-t ('required'.Substring(0,0)+'nomatch')"
   ])("rejects an unknown or ambiguous selector: %s", (flag) => {
     const workflow = load();
     windowsStep(workflow, "Windows exact Node runtime and shell-free npm dispatch").run =
       "npm test -- tests/validation-service.test.ts " + flag;
     expect(inspect(workflow).some((f) => f.includes("unaudited Vitest command"))).toBe(true);
+  });
+
+  test("accepts a double-quoted regex selector with a literal dollar anchor", () => {
+    const workflow = load();
+    windowsStep(workflow, "Windows helper package hygiene").run =
+      'npm test -- tests/package-hygiene.test.ts -t "^(pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$"';
+    expect(inspect(workflow)).toEqual([]);
+  });
+
+  test("accepts a double-quoted selector with a PowerShell-escaped dollar", () => {
+    const workflow = load();
+    windowsStep(workflow, "Windows helper package hygiene").run =
+      'npm test -- tests/package-hygiene.test.ts -t "`$env:REQUIRED|^(pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$"';
+    expect(inspect(workflow)).toEqual([]);
+  });
+
+  test("accepts a literal dollar before punctuation in a double-quoted selector", () => {
+    const workflow = load();
+    windowsStep(workflow, "Windows helper package hygiene").run =
+      'npm test -- tests/package-hygiene.test.ts -t "$!REQUIRED|^(pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$"';
+    expect(inspect(workflow)).toEqual([]);
+  });
+
+  test("rejects filtering a required file without audited mandatory cases", () => {
+    const workflow = load();
+    const step = windowsStep(workflow, "Windows process supervision");
+    step.run = step.run.replace(
+      "tests/windows-process-host.test.ts",
+      "tests/windows-process-host.test.ts -t no-such-test"
+    );
+    expect(inspect(workflow).some((finding) =>
+      finding.includes("cannot be filtered without mandatory case coverage"))).toBe(true);
   });
 
   test("requires named cases even when the whole test file is selected", () => {
@@ -113,7 +154,7 @@ describe("Windows qualification scope guard", () => {
     ["false conditional", "if (false) { test('required', () => {}); }"],
     ["non-Windows conditional", "if (process.platform !== 'win32') { test('required', () => {}); }"],
     ["unknown conditional", "if (runtimeFlag) { test('required', () => {}); }"]
-  ])("52-E does not count a required regression in %s", (_name, source) => {
+  ])("does not count a required regression in %s", (_name, source) => {
     expect(collectWindowsTestTitles("fixture.ts", source))
       .toEqual([{ title: "required", enabled: false }]);
   });
@@ -126,19 +167,34 @@ describe("Windows qualification scope guard", () => {
     ["nested enabled suite", "describe('outer', () => { describe.runIf(true)('inner', () => { test('required', () => {}); }); });"],
     ["true conditional", "if (true) { test('required', () => {}); }"],
     ["Windows branch", "if (process.platform === 'win32') { test('required', () => {}); }"],
+    ["negated Windows branch", "if (!(process.platform !== 'win32')) { test('required', () => {}); }"],
     ["Windows else", "if (process.platform !== 'win32') {} else { test('required', () => {}); }"]
-  ])("52-E permits a proven Windows-executable regression in %s", (_name, source) => {
+  ])("permits a proven Windows-executable regression in %s", (_name, source) => {
     expect(collectWindowsTestTitles("fixture.ts", source))
       .toEqual([{ title: "required", enabled: true }]);
   });
 
-  test("52-E tracks both statically decidable branches", () => {
+  test("tracks both statically decidable branches", () => {
     expect(collectWindowsTestTitles("fixture.ts",
       "if (false) { test('off', () => {}); } else { test('on', () => {}); }"))
       .toEqual([{ title: "off", enabled: false }, { title: "on", enabled: true }]);
   });
 
-  test("52-E rejects a mandatory regression hidden in a disabled parent suite", () => {
+  test.each([
+    ["shadowed process parameter", "describe('suite', (process) => { if (process.platform === 'win32') { test('required', () => {}); } });"],
+    ["shadowed process local", "describe('suite', () => { const process = { platform: 'win32' }; if (process.platform === 'win32') { test('required', () => {}); } });"]
+  ])("treats %s as an unknown Windows predicate", (_name, source) => {
+    expect(collectWindowsTestTitles("fixture.ts", source))
+      .toEqual([{ title: "required", enabled: false }]);
+  });
+
+  test("accepts the verified node:process binding", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "import process from 'node:process'; if (process.platform === 'win32') { test('required', () => {}); }"))
+      .toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test("rejects a mandatory regression hidden in a disabled parent suite", () => {
     const workflow = load();
     const findings = inspectQualificationWorkflow(workflow, (path) =>
       path === "tests/package-hygiene.test.ts"
@@ -149,24 +205,98 @@ describe("Windows qualification scope guard", () => {
 
   test.each([
     ["test.only", "test.only('extra', () => {});"],
+    ["Vitest namespace test.only", "import * as vi from 'vitest'; vi.test.only('extra', () => {});"],
     ["test bracket", "test['only']('extra', () => {});"],
     ["it bracket", "it[\"only\"]('extra', () => {});"],
     ["describe bracket", "describe['only']('suite', () => {});"],
     ["dynamic test selector", "test[modifier]('extra', () => {});"],
     ["dynamic describe selector", "describe[modifier]('suite', () => {});"]
-  ])("52-F rejects exclusive or unverifiable Vitest execution: %s", (_name, source) => {
+  ])("rejects exclusive or unverifiable Vitest execution: %s", (_name, source) => {
     expect(() => collectWindowsTestTitles("fixture.ts", source +
       " test('required', () => {});"))
       .toThrow(/Exclusive or dynamically selected Vitest/);
   });
 
-  test("52-F accepts unrelated element access without exclusive Vitest selection", () => {
+  test.each([
+    ["aliased test.only", "const register = test; register.only('extra', () => {});"],
+    ["mutable alias assigned later", "let register; register = test; register.only('extra', () => {});"],
+    ["nullish assignment alias", "let register; register ??= test; register.only('extra', () => {});"],
+    ["logical OR assignment alias", "let register; register ||= test; register.only('extra', () => {});"],
+    ["logical AND assignment alias", "let register = true; register &&= test; register.only('extra', () => {});"],
+    ["aliased it.only", "const spec = it; spec.only('extra', () => {});"],
+    ["aliased describe.only", "const suite = describe; suite.only('suite', () => {});"],
+    ["aliased only property", "const register = test; const focused = register.only; focused('extra', () => {});"],
+    ["destructured only", "const { only } = test; only('extra', () => {});"],
+    ["destructured assignment only", "let focus; ({ only: focus } = test); focus('extra', () => {});"],
+    ["renamed destructured only", "const register = test; const { only: focused } = register; focused('extra', () => {});"],
+    ["computed destructured only", "const { ['only']: focused } = test; focused('extra', () => {});"],
+    ["dynamic destructured selector", "const { [modifier]: focused } = test; focused('extra', () => {});"],
+    ["destructured test rest", "const { ...runner } = test; runner.only('extra', () => {});"],
+    ["Vitest namespace destructured test alias", "import * as vi from 'vitest'; const { test: register } = vi; register.only('extra', () => {});"],
+    ["parameter destructured only default", "function focus({ only } = test) { only('extra', () => {}); } focus();"],
+    ["parameter test alias default", "function focus(register = test) { register.only('extra', () => {}); } focus();"],
+    ["chained concurrent only", "test.concurrent.only('extra', () => {});"],
+    ["chained sequential describe only", "describe.sequential.only('suite', () => {});"],
+    ["angle-bracket asserted alias", "const register = <typeof test>test; register.only('extra', () => {});"],
+    ["non-null asserted alias", "const register = test!; register.only('extra', () => {});"],
+    ["object-destructured alias assignment", "let register; ({ register } = { register: test }); register.only('extra', () => {});"],
+    ["array-destructured alias assignment", "let register; [register] = [test]; register.only('extra', () => {});"],
+    ["object-destructured alias declaration", "const { runner: register } = { runner: test }; register.only('extra', () => {});"],
+    ["array-destructured alias declaration", "const [register] = [test]; register.only('extra', () => {});"],
+    ["namespace destructured alias assignment", "import * as vi from 'vitest'; let register; ({ test: register } = vi); register.only('extra', () => {});"],
+    ["nested destructured alias declaration", "import * as vi from 'vitest'; const { nested: { test: register } } = { nested: vi }; register.only('extra', () => {});"],
+    ["nested destructured alias assignment", "import * as vi from 'vitest'; let register; ({ nested: { test: register } } = { nested: vi }); register.only('extra', () => {});"],
+    ["namespace destructured parameter alias", "import * as vi from 'vitest'; function focus({ test: register } = vi) { register.only('extra', () => {}); } focus();"]
+  ])("rejects exclusive selectors through %s", (_name, source) => {
+    expect(() => collectWindowsTestTitles("fixture.ts", source))
+      .toThrow(/Exclusive or dynamically selected Vitest/);
+  });
+
+  test("recognizes immutable aliases of test, it, and describe", () => {
+    const source = [
+      "const register = test;",
+      "const spec = it;",
+      "const suite = describe;",
+      "register('top', () => {});",
+      "spec('it alias', () => {});",
+      "suite('suite alias', () => { register('nested', () => {}); });"
+    ].join("\n");
+    expect(collectWindowsTestTitles("fixture.ts", source)).toEqual([
+      { title: "top", enabled: true },
+      { title: "it alias", enabled: true },
+      { title: "nested", enabled: true }
+    ]);
+  });
+
+  test("recognizes an aliased Vitest import but leaves unresolved aliases unproven", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "import { test as register } from 'vitest'; register('required', () => {});"))
+      .toEqual([{ title: "required", enabled: true }]);
+    expect(collectWindowsTestTitles("fixture.ts",
+      "const register = maybeTest; register('required', () => {});"))
+      .toEqual([]);
+  });
+
+  test("does not treat a nested ordinary test property as a Vitest alias", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "const { nested: { test: register } } = { nested: { test: fakeRunner } }; " +
+      "register.only('extra', () => {}); test('required', () => {});"))
+      .toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test("accepts unrelated element access without exclusive Vitest selection", () => {
     expect(collectWindowsTestTitles("fixture.ts",
       "const flags = { ['only']: false }; test('required', () => {});"))
       .toEqual([{ title: "required", enabled: true }]);
   });
 
-  test("52-F rejects bracket-exclusive tests at the workflow evidence boundary", () => {
+  test("rejects an exclusive Vitest selector through a mutable alias", () => {
+    expect(() => collectWindowsTestTitles("fixture.ts",
+      "let register = test; register.only('extra', () => {}); test('required', () => {});"))
+      .toThrow(/Exclusive or dynamically selected Vitest/);
+  });
+
+  test("rejects bracket-exclusive tests at the workflow evidence boundary", () => {
     const workflow = load();
     const findings = inspectQualificationWorkflow(workflow, (path) =>
       path === "tests/package-hygiene.test.ts"
@@ -185,7 +315,7 @@ describe("Windows qualification scope guard", () => {
     ["nested unused suite callback", "describe('suite', () => { function later() { test('required', () => {}); } });"],
     ["uninvoked nested closure", "describe('suite', () => { const later = () => test('required', () => {}); });"],
     ["deferred nested callback", "describe('suite', () => { setTimeout(() => test('required', () => {}), 0); });"]
-  ])("52-H excludes mandatory text in %s", (_name, code) => {
+  ])("excludes mandatory text in %s", (_name, code) => {
     expect(collectWindowsTestTitles("fixture.ts", code)).toEqual([]);
   });
 
@@ -196,7 +326,7 @@ describe("Windows qualification scope guard", () => {
     ["Windows-only describe", "describe.skipIf(process.platform !== 'win32')('suite', () => { test('required', () => {}); });"],
     ["Windows conditional", "if (process.platform === 'win32') { test('required', () => {}); }"],
     ["table-driven test", "test.each(['required'])('%s', () => {});"]
-  ])("52-H retains proven registration in %s", (_name, code) => {
+  ])("retains proven registration in %s", (_name, code) => {
     expect(collectWindowsTestTitles("fixture.ts", code)).toEqual([
       { title: "required", enabled: true }
     ]);
@@ -207,7 +337,7 @@ describe("Windows qualification scope guard", () => {
     ["deferred callback", "setTimeout(() => test('pins the repository package inventory to its runtime files', () => {}), 0);"],
     ["unused closure", "const later = () => test('pins the repository package inventory to its runtime files', () => {});"],
     ["unused describe callback", "describe('outer', () => { const later = () => test('pins the repository package inventory to its runtime files', () => {}); });"]
-  ])("52-H rejects missing mandatory Windows coverage inside %s", (_name, code) => {
+  ])("rejects missing mandatory Windows coverage inside %s", (_name, code) => {
     const workflow = load();
     const findings = inspectQualificationWorkflow(workflow, (path) =>
       path === "tests/package-hygiene.test.ts" ? code :

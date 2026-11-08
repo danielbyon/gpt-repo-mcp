@@ -13,6 +13,7 @@ export const SUPERVISOR_SOURCES = Object.freeze([
 ]);
 
 const PROCESS_MODULES = new Set(["node:child_process", "child_process"]);
+const MODULE_LOADING_MODULES = new Set(["node:module", "module"]);
 const SHELL_MODULES = new Set(["cross-spawn", "shelljs", "execa"]);
 const SAFE_PROCESS_EXPORTS = new Set(["spawn", "spawnSync", "execFile", "execFileSync"]);
 const DISALLOWED_PROGRAMS = /(?:^|[\\/])(?:cmd|command|powershell|pwsh|bash|sh|zsh)(?:\.exe)?$/i;
@@ -53,7 +54,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   };
 
   const inspectRequire = (node) => {
-    if (!ts.isCallExpression(node) || callName(node.expression) !== "require") return;
+    if (!ts.isCallExpression(node) || !requireReferenceOf(node.expression)) return;
     if (node.arguments.length !== 1 || !moduleLiteral(node.arguments[0])) {
       add(node, "dynamic require is forbidden in supervisor source");
       return;
@@ -61,6 +62,8 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     const module = moduleLiteral(node.arguments[0]);
     if (SHELL_MODULES.has(module)) {
       add(node, "shell-capable runner imports are forbidden");
+    } else if (MODULE_LOADING_MODULES.has(module)) {
+      add(node, "node:module loading is forbidden in supervisor source");
     } else if (PROCESS_MODULES.has(module)) {
       const declaration = node.parent;
       if (!ts.isVariableDeclaration(declaration) || declaration.initializer !== node ||
@@ -92,6 +95,32 @@ function inspectJavaScript(filename, source, isLauncher = false) {
            ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node) ||
            ts.isNonNullExpression(node))) node = node.expression;
     return node;
+  };
+  const requireReferenceOf = (input) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (ts.isIdentifier(node)) return node.text === "require" && !resolveBinding(node);
+    if (!ts.isBinaryExpression(node)) return false;
+    const operator = node.operatorToken.kind;
+    if (operator === ts.SyntaxKind.CommaToken) {
+      return requireReferenceOf(node.right);
+    }
+    if (operator === ts.SyntaxKind.AmpersandAmpersandToken ||
+        operator === ts.SyntaxKind.BarBarToken ||
+        operator === ts.SyntaxKind.QuestionQuestionToken) {
+      return requireReferenceOf(node.left) || requireReferenceOf(node.right);
+    }
+    return false;
+  };
+  const hasRuntimeImport = (node) => {
+    const clause = node.importClause;
+    if (!clause) return true;
+    if (clause.isTypeOnly) return false;
+    if (clause.name) return true;
+    const bindings = clause.namedBindings;
+    if (ts.isNamespaceImport(bindings)) return true;
+    return !bindings || bindings.elements.length === 0 ||
+      bindings.elements.some((element) => !element.isTypeOnly);
   };
   const isCallback = (node) => ts.isFunctionExpression(node) || ts.isArrowFunction(node);
 
@@ -142,22 +171,26 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       return found;
     };
 
-    // var is function-hoisted even when declared in a nested conditional block.
-    // Conservatively reject such a name throughout that function.
-    const hasHoistedVar = (fn) => {
+    // Nested var declarations belong to their nearest function, module, or file scope.
+    // Keep those names opaque so they cannot fall through to ambient runner names.
+    const hasHoistedVar = (scope, name) => {
       let found = false;
       const visit = (node) => {
-        if (found || (node !== fn.body && ts.isFunctionLike(node))) return;
+        if (found || (node !== scope && (
+          ts.isFunctionLike(node) || ts.isModuleDeclaration(node) ||
+          ts.isClassStaticBlockDeclaration(node)
+        ))) return;
         if (ts.isVariableDeclaration(node) &&
             ts.isVariableDeclarationList(node.parent) &&
             !(node.parent.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) &&
-            declaresName(node.name, text)) {
+            declaresName(node.name, name)) {
           found = true;
           return;
         }
         ts.forEachChild(node, visit);
       };
-      if (fn.body) visit(fn.body);
+      const root = ts.isFunctionLike(scope) ? scope.body : scope;
+      if (root) visit(root);
       return found;
     };
 
@@ -182,7 +215,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         }
       }
       if (ts.isFunctionLike(scope)) {
-        if (hasHoistedVar(scope)) return { kind: "opaque", node: scope };
+        if (hasHoistedVar(scope, text)) return { kind: "opaque", node: scope };
         const matches = scope.parameters.filter((parameter) =>
           declaresName(parameter.name, text));
         if (matches.length) return matches.length === 1
@@ -192,9 +225,73 @@ function inspectJavaScript(filename, source, isLauncher = false) {
           return { kind: "opaque", node: scope };
         }
       }
+      if ((ts.isSourceFile(scope) || ts.isModuleBlock(scope)) &&
+          hasHoistedVar(scope, text)) {
+        return { kind: "opaque", node: scope };
+      }
     }
     return undefined;
   };
+
+  const aliasAssignmentKinds = new Set([
+    ts.SyntaxKind.EqualsToken,
+    ts.SyntaxKind.QuestionQuestionEqualsToken,
+    ts.SyntaxKind.BarBarEqualsToken,
+    ts.SyntaxKind.AmpersandAmpersandEqualsToken
+  ]);
+  const assignmentsByBinding = new Map();
+  const assignmentPropertyName = (name) => {
+    if (!name) return undefined;
+    if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) {
+      return name.text;
+    }
+    if (ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)) {
+      return name.expression.text;
+    }
+    return undefined;
+  };
+  const recordAssignment = (target, value) => {
+    if (!ts.isIdentifier(target)) return;
+    const binding = resolveBinding(target);
+    if (binding?.kind !== "variable") return;
+    const assignments = assignmentsByBinding.get(binding.node) ?? [];
+    assignments.push(value);
+    assignmentsByBinding.set(binding.node, assignments);
+  };
+  const collectAssignments = (node) => {
+    if (ts.isBinaryExpression(node) &&
+        aliasAssignmentKinds.has(node.operatorToken.kind)) {
+      const target = unwrap(node.left);
+      if (ts.isIdentifier(target)) {
+        recordAssignment(target, node.right);
+      } else if (ts.isObjectLiteralExpression(target) &&
+                 ts.isObjectLiteralExpression(unwrap(node.right))) {
+        const source = unwrap(node.right);
+        for (const property of target.properties) {
+          const key = ts.isShorthandPropertyAssignment(property)
+            ? property.name.text
+            : ts.isPropertyAssignment(property)
+              ? assignmentPropertyName(property.name)
+              : undefined;
+          const targetName = ts.isShorthandPropertyAssignment(property)
+            ? property.name
+            : ts.isPropertyAssignment(property) && ts.isIdentifier(property.initializer)
+              ? property.initializer
+              : undefined;
+          const sourceProperty = key === undefined ? undefined : source.properties.find((item) =>
+            assignmentPropertyName(item.name) === key);
+          const value = sourceProperty && ts.isPropertyAssignment(sourceProperty)
+            ? sourceProperty.initializer
+            : sourceProperty && ts.isShorthandPropertyAssignment(sourceProperty)
+              ? sourceProperty.name
+              : undefined;
+          if (targetName && value) recordAssignment(targetName, value);
+        }
+      }
+    }
+    ts.forEachChild(node, collectAssignments);
+  };
+  collectAssignments(file);
 
   const enclosingFunction = (node, expected) => {
     for (let parent = node.parent; parent; parent = parent.parent) {
@@ -292,6 +389,25 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     return false;
   };
 
+  // Keep literal executable checks effective across immutable local aliases.
+  const staticStringOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return undefined;
+    if (ts.isStringLiteralLike(node)) return node.text;
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = staticStringOf(node.left, seen);
+      const right = staticStringOf(node.right, seen);
+      return left !== undefined && right !== undefined ? left + right : undefined;
+    }
+    if (!ts.isIdentifier(node)) return undefined;
+    const binding = resolveBinding(node);
+    if (binding?.kind !== "variable" || !binding.constant ||
+        !binding.node.initializer || seen.has(binding.node)) return undefined;
+    const next = new Set(seen);
+    next.add(binding.node);
+    return staticStringOf(binding.node.initializer, next);
+  };
+
   const inspectOptionObject = (node) => {
     if (!ts.isObjectLiteralExpression(node)) {
       add(node, "unresolved process-launch options cannot prove shell-free dispatch");
@@ -364,6 +480,246 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     return !ts.isVariableStatement(statement) ||
       !(statement.modifiers ?? []).some((modifier) =>
         modifier.kind === ts.SyntaxKind.ExportKeyword);
+  };
+  const memberAccess = (node) => {
+    if (ts.isPropertyAccessExpression(node)) {
+      return { receiver: node.expression, property: node.name.text };
+    }
+    if (ts.isElementAccessExpression(node)) {
+      const property = staticStringOf(unwrap(node.argumentExpression));
+      if (property !== undefined) return { receiver: node.expression, property };
+    }
+    return undefined;
+  };
+  const processModuleRequire = (node) => {
+    if (!node || !ts.isCallExpression(node) ||
+        !ts.isIdentifier(unwrap(node.expression)) ||
+        unwrap(node.expression).text !== "require" || resolveBinding(unwrap(node.expression)) ||
+        node.arguments.length !== 1) return false;
+    return ["node:process", "process"].includes(moduleLiteral(node.arguments[0]));
+  };
+  // Follow local aliases and object spreads that preserve process capabilities.
+  const processObjectOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (ts.isCallExpression(node)) return processModuleRequire(node);
+    if (ts.isObjectLiteralExpression(node)) {
+      return node.properties.some((property) =>
+        ts.isSpreadAssignment(property) && processObjectOf(property.expression, seen));
+    }
+    if (!ts.isIdentifier(node)) {
+      const member = memberAccess(node);
+      if (member?.property === "process") return globalObjectOf(member.receiver);
+      return member?.property === "default" && processObjectOf(member.receiver, seen);
+    }
+    const binding = resolveBinding(node);
+    if (!binding) return node.text === "process";
+    if (binding.kind === "import" && ["node:process", "process"].includes(binding.module)) {
+      const clause = binding.node.importClause;
+      const named = clause?.namedBindings;
+      return clause?.name?.text === node.text ||
+        (named && ts.isNamespaceImport(named) && named.name.text === node.text) ||
+        (named && ts.isNamedImports(named) && named.elements.some((element) =>
+          element.name.text === node.text && !element.isTypeOnly &&
+          (element.propertyName?.text ?? element.name.text) === "default"));
+    }
+    if (binding.kind !== "variable" || seen.has(binding.node)) {
+      return false;
+    }
+    const next = new Set(seen);
+    next.add(binding.node);
+    const candidates = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
+    return candidates.some((candidate) => candidate && processObjectOf(candidate, next));
+  };
+  const globalObjectOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    const member = memberAccess(node);
+    if (member?.property === "globalThis" || member?.property === "global") {
+      return globalObjectOf(member.receiver, seen);
+    }
+    if (!ts.isIdentifier(node)) return false;
+    const binding = resolveBinding(node);
+    if (!binding) return node.text === "globalThis" || node.text === "global";
+    if (binding.kind !== "variable" || seen.has(binding.node)) {
+      return false;
+    }
+    const next = new Set(seen);
+    next.add(binding.node);
+    const candidates = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
+    return candidates.some((candidate) => candidate && globalObjectOf(candidate, next));
+  };
+  const destructuringEntries = (target) => {
+    if (ts.isObjectBindingPattern(target)) {
+      return target.elements.map((element) => ({
+        name: element.propertyName ?? element.name,
+        node: element,
+        rest: Boolean(element.dotDotDotToken)
+      }));
+    }
+    return target.properties.map((property) => {
+      if (ts.isPropertyAssignment(property)) {
+        return { name: property.name, node: property, rest: false };
+      }
+      if (ts.isShorthandPropertyAssignment(property)) {
+        return { name: property.name, node: property, rest: false };
+      }
+      return { name: undefined, node: property, rest: true };
+    });
+  };
+  const destructuringSourceValues = (target, source) => {
+    const values = unwrap(source);
+    const result = [];
+    if (ts.isObjectBindingPattern(target) || ts.isObjectLiteralExpression(target)) {
+      if (!ts.isObjectLiteralExpression(values)) return result;
+      for (const entry of destructuringEntries(target)) {
+        if (entry.rest) {
+          for (const property of values.properties) {
+            if (ts.isPropertyAssignment(property)) result.push(property.initializer);
+            else if (ts.isShorthandPropertyAssignment(property)) result.push(property.name);
+          }
+          continue;
+        }
+        const key = entry.name ? launchOptionName(entry.name) : undefined;
+        if (key === undefined) continue;
+        const property = values.properties.find((item) =>
+          assignmentPropertyName(item.name) === key);
+        if (property && ts.isPropertyAssignment(property)) result.push(property.initializer);
+        else if (property && ts.isShorthandPropertyAssignment(property)) result.push(property.name);
+      }
+      return result;
+    }
+    if (!ts.isArrayLiteralExpression(values)) return result;
+    const { elements: targets } = target;
+    for (let index = 0; index < targets.length; index += 1) {
+      const element = targets[index];
+      const rest = ts.isBindingElement(element)
+        ? Boolean(element.dotDotDotToken)
+        : ts.isSpreadElement(element);
+      if (!rest && ts.isOmittedExpression(element)) continue;
+      const end = rest ? values.elements.length : Math.min(index + 1, values.elements.length);
+      for (let valueIndex = index; valueIndex < end; valueIndex += 1) {
+        result.push(values.elements[valueIndex]);
+      }
+      if (rest) break;
+    }
+    return result;
+  };
+  const inspectRequireDestructuring = (target, source) => {
+    for (const value of destructuringSourceValues(target, source)) {
+      if (requireReferenceOf(value)) {
+        add(value, "aliasing require to bypass import inspection is forbidden");
+      }
+    }
+  };
+  const inspectProcessDestructuring = (target) => {
+    for (const entry of destructuringEntries(target)) {
+      const property = entry.name ? launchOptionName(entry.name) : undefined;
+      if (entry.rest || (entry.name && property === undefined)) {
+        add(entry.node,
+          "dynamic process capability destructuring is unproven in supervisor source");
+      } else if (property === "getBuiltinModule") {
+        add(entry.node, "process.getBuiltinModule is forbidden in supervisor source");
+      } else if (property === "default") {
+        add(entry.node, "process object alias destructuring is unproven in supervisor source");
+      }
+    }
+  };
+  const inspectGlobalDestructuring = (target) => {
+    for (const entry of destructuringEntries(target)) {
+      const property = entry.name ? launchOptionName(entry.name) : undefined;
+      if (entry.rest || (entry.name && property === undefined)) {
+        add(entry.node,
+          "dynamic global capability destructuring is unproven in supervisor source");
+      } else if (property === "eval") {
+        add(entry.node, "global dynamic evaluation is forbidden in supervisor source");
+      } else if (property === "Function") {
+        add(entry.node, "dynamic function construction is unaudited");
+      } else if (property === "process") {
+        add(entry.node,
+          "global process capability destructuring is unproven in supervisor source");
+      } else if (property === "global" || property === "globalThis") {
+        add(entry.node,
+          "global object alias destructuring is unproven in supervisor source");
+      }
+    }
+  };
+  const inspectCapabilityArrayDestructuring = (target, source) => {
+    const values = unwrap(source);
+    if (!ts.isArrayLiteralExpression(values)) return;
+    const targets = ts.isArrayBindingPattern(target)
+      ? target.elements
+      : ts.isArrayLiteralExpression(target) ? target.elements : [];
+    for (let index = 0; index < targets.length; index += 1) {
+      const element = targets[index];
+      const rest = ts.isBindingElement(element)
+        ? Boolean(element.dotDotDotToken)
+        : ts.isSpreadElement(element);
+      if (!rest && ts.isOmittedExpression(element)) continue;
+      const end = rest ? values.elements.length : Math.min(index + 1, values.elements.length);
+      for (let valueIndex = index; valueIndex < end; valueIndex += 1) {
+        const value = values.elements[valueIndex];
+        if (processObjectOf(value)) {
+          add(value,
+            "array destructuring of process capability is unproven in supervisor source");
+        } else if (globalObjectOf(value)) {
+          add(value,
+            "array destructuring of global capability is unproven in supervisor source");
+        }
+      }
+      if (rest) break;
+    }
+  };
+  // A global eval reference is unsafe even when it is stored or passed elsewhere.
+  const globalEvalOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      if (!binding) return node.text === "eval";
+      if (binding.kind !== "variable" || !binding.constant ||
+          !immutableAlias(binding.node) || !binding.node.initializer || seen.has(binding.node)) {
+        return false;
+      }
+      const next = new Set(seen);
+      next.add(binding.node);
+      return globalEvalOf(binding.node.initializer, next);
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+      return globalEvalOf(node.right, seen);
+    }
+    const member = memberAccess(node);
+    return member?.property === "eval" && globalObjectOf(member.receiver);
+  };
+  const dynamicFunctionOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      if (!binding) return node.text === "Function";
+      if (binding.kind !== "variable" || !binding.constant ||
+          !immutableAlias(binding.node) || !binding.node.initializer || seen.has(binding.node)) {
+        return false;
+      }
+      const next = new Set(seen);
+      next.add(binding.node);
+      return dynamicFunctionOf(binding.node.initializer, next);
+    }
+    const member = memberAccess(node);
+    return member?.property === "Function" && globalObjectOf(member.receiver);
+  };
+  const isReferenceIdentifier = (node) => {
+    const parent = node.parent;
+    return !((ts.isPropertyAccessExpression(parent) && parent.name === node) ||
+      (ts.isPropertyAssignment(parent) && parent.name === node) ||
+      ts.isImportSpecifier(parent) ||
+      (ts.isBindingElement(parent) && (parent.name === node || parent.propertyName === node)) ||
+      (ts.isVariableDeclaration(parent) && parent.name === node) ||
+      (ts.isFunctionDeclaration(parent) && parent.name === node) ||
+      (ts.isParameter(parent) && parent.name === node) ||
+      (ts.isMethodDeclaration(parent) && parent.name === node) ||
+      (ts.isPropertySignature(parent) && parent.name === node) ||
+      ts.isTypeQueryNode(parent) || ts.isTypeReferenceNode(parent));
   };
   const transparent = (parent, child) => parent?.expression === child &&
     (ts.isParenthesizedExpression(parent) || ts.isAsExpression(parent) ||
@@ -471,6 +827,18 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     if (ts.isImportDeclaration(node)) {
       const module = moduleLiteral(node.moduleSpecifier);
       if (SHELL_MODULES.has(module)) add(node, "shell-capable runner imports are forbidden");
+      if (MODULE_LOADING_MODULES.has(module) && hasRuntimeImport(node)) {
+        add(node, "node:module loading is forbidden in supervisor source");
+      }
+      if (["node:process", "process"].includes(module) &&
+          node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
+        for (const element of node.importClause.namedBindings.elements) {
+          if (!element.isTypeOnly &&
+              (element.propertyName?.text ?? element.name.text) === "getBuiltinModule") {
+            add(element, "process.getBuiltinModule is forbidden in supervisor source");
+          }
+        }
+      }
       if (PROCESS_MODULES.has(module) && !node.importClause?.isTypeOnly) {
         const bindings = node.importClause?.namedBindings;
         if (node.importClause?.name || !bindings || !ts.isNamedImports(bindings)) {
@@ -489,12 +857,12 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       add(node, "import-equals loading is unaudited in supervisor source");
     }
     if (ts.isCallExpression(node)) {
-      const called = callName(node.expression);
+      const called = callName(unwrap(node.expression));
       if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
         add(node, "dynamic import is forbidden in supervisor source");
       }
-      if (called === "require") inspectRequire(node);
-      if (["createRequire", "eval"].includes(called) || called === "_parse") {
+      if (requireReferenceOf(node.expression)) inspectRequire(node);
+      if (called === "createRequire" || called === "_parse") {
         add(node, "indirect process loading, eval, or private shim parsing is forbidden");
       }
       const callee = unwrap(node.expression);
@@ -504,23 +872,86 @@ function inspectJavaScript(filename, source, isLauncher = false) {
           add(node, "spread process-runner call arguments cannot prove native dispatch");
         }
         inspectLaunchOptions(node, runner);
-        const program = moduleLiteral(unwrap(node.arguments[0]));
+        const program = staticStringOf(node.arguments[0]);
         if (program && (DISALLOWED_PROGRAMS.test(program) ||
                         DISALLOWED_SHIMS.test(program))) {
           add(node, "direct interpreter or command-shim dispatch is forbidden");
         }
       }
     }
-    if (ts.isVariableDeclaration(node) &&
-        node.initializer && ts.isIdentifier(node.initializer) &&
-        node.initializer.text === "require") {
+    if (ts.isVariableDeclaration(node) && node.initializer &&
+        requireReferenceOf(node.initializer)) {
       add(node, "aliasing require to bypass import inspection is forbidden");
     }
-    if (ts.isCallExpression(node) && callName(node.expression) === "Function") {
+    if (ts.isBinaryExpression(node) && aliasAssignmentKinds.has(node.operatorToken.kind) &&
+        ts.isIdentifier(unwrap(node.left)) && requireReferenceOf(node.right)) {
+      add(node, "aliasing require to bypass import inspection is forbidden");
+    }
+    if (ts.isCallExpression(node) && dynamicFunctionOf(node.expression)) {
       add(node, "dynamic function construction is unaudited");
     }
-    if (ts.isNewExpression(node) && nameOf(node.expression) === "Function") {
+    if (ts.isNewExpression(node) && dynamicFunctionOf(node.expression)) {
       add(node, "dynamic function construction is unaudited");
+    }
+    const member = memberAccess(node);
+    if (member?.property === "getBuiltinModule" && processObjectOf(member.receiver)) {
+      add(node, "process.getBuiltinModule is forbidden in supervisor source");
+    }
+    if (ts.isElementAccessExpression(node) && processObjectOf(node.expression) && !member) {
+      add(node, "dynamic process capability access is unproven in supervisor source");
+    }
+    if (member?.property === "eval" && globalObjectOf(member.receiver)) {
+      add(node, "global dynamic evaluation is forbidden in supervisor source");
+    }
+    if (ts.isElementAccessExpression(node) && globalObjectOf(node.expression) && !member) {
+      add(node, "dynamic global capability access is unproven in supervisor source");
+    }
+    if (ts.isParameter(node) && node.initializer) {
+      if (processObjectOf(node.initializer)) {
+        add(node, "process capability parameter default is unproven in supervisor source");
+      }
+      if (globalObjectOf(node.initializer)) {
+        add(node, "global capability parameter default is unproven in supervisor source");
+      }
+    }
+    if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
+        node.initializer) {
+      if (processObjectOf(node.initializer)) inspectProcessDestructuring(node.name);
+      if (globalObjectOf(node.initializer)) inspectGlobalDestructuring(node.name);
+    }
+    if (ts.isVariableDeclaration(node) && ts.isArrayBindingPattern(node.name) &&
+        node.initializer) {
+      inspectCapabilityArrayDestructuring(node.name, node.initializer);
+    }
+    if (ts.isVariableDeclaration(node) && node.initializer &&
+        (ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name))) {
+      inspectRequireDestructuring(node.name, node.initializer);
+    }
+    if (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      const target = unwrap(node.left);
+      if (ts.isObjectLiteralExpression(target)) {
+        inspectRequireDestructuring(target, node.right);
+        if (processObjectOf(node.right)) inspectProcessDestructuring(target);
+        if (globalObjectOf(node.right)) inspectGlobalDestructuring(target);
+      } else if (ts.isArrayLiteralExpression(target)) {
+        inspectRequireDestructuring(target, node.right);
+        inspectCapabilityArrayDestructuring(target, node.right);
+      }
+    }
+    const functionReference = ts.isIdentifier(node)
+      ? isReferenceIdentifier(node)
+      : ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node);
+    if (functionReference && dynamicFunctionOf(node)) {
+      const expression = outer(node);
+      const context = expression.parent;
+      const called = ts.isCallExpression(context) && context.expression === expression &&
+        !context.questionDotToken;
+      const constructed = ts.isNewExpression(context) && context.expression === expression;
+      if (!called && !constructed &&
+          !(immutableAlias(context) && context.initializer === expression)) {
+        add(node, "dynamic function reference escapes its audited call");
+      }
     }
     if (ts.isPropertyAssignment(node) && propertyName(node, file) === "shell") {
       add(node, "shell dispatch option is forbidden");
@@ -528,7 +959,12 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     if (ts.isShorthandPropertyAssignment(node) && node.name.text === "shell") {
       add(node, "shell dispatch option is forbidden");
     }
-    if (ts.isIdentifier(node)) inspectRunnerReference(node);
+    if (ts.isIdentifier(node)) {
+      inspectRunnerReference(node);
+      if (isReferenceIdentifier(node) && globalEvalOf(node)) {
+        add(node, "global dynamic evaluation is forbidden in supervisor source");
+      }
+    }
 
     if (!isLauncher && filename === "src/services/process-exec.ts" &&
         ts.isVariableDeclaration(node) && nameOf(node.name) === "POSIX_GROUP_LAUNCHER") {

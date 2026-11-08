@@ -52,6 +52,7 @@ Run the focused checks for the area changed, then run:
 
 ```bash
 npm run typecheck
+npm run check:validation-guardrails
 npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts
 npm run lint
 npm run check:public

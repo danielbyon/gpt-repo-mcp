@@ -13,6 +13,7 @@ Run focused checks while developing, then run the relevant broader checks before
 
 ```bash
 npm run typecheck
+npm run check:validation-guardrails
 npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts
 npm run lint
 npm run build
