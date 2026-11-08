@@ -257,6 +257,9 @@ describe("Windows qualification scope guard", () => {
     ["conditional test alias", "const register = condition ? test : fake; register.only('extra', () => {});"],
     ["conditional array test alias", "const [register] = condition ? [test] : [fake]; register.only('extra', () => {});"],
     ["nested object-property test alias", "const holder = { nested: { register: test } }; holder.nested.register.only('extra', () => {});"],
+    ["property-assigned test alias", "const holder = {}; holder.register = test; holder.register.only('extra', () => {});"],
+    ["property-assigned namespace runner", "import * as vi from 'vitest'; const holder = {}; holder.register = vi.test; holder.register.only('extra', () => {});"],
+    ["bracket-assigned test alias", "const holder = {}; holder['register'] = test; holder.register.only('extra', () => {});"],
     ["chained concurrent only", "test.concurrent.only('extra', () => {});"],
     ["decorated skipIf only", "test.skipIf(false).only('extra', () => {});"],
     ["decorated runIf only", "test.runIf(true).only('extra', () => {});"],
@@ -272,6 +275,12 @@ describe("Windows qualification scope guard", () => {
     ["namespace destructured alias assignment", "import * as vi from 'vitest'; let register; ({ test: register } = vi); register.only('extra', () => {});"],
     ["mutable namespace source assignment", "import * as vi from 'vitest'; const source = vi; let register; ({ test: register } = source); register.only('extra', () => {});"],
     ["nested destructured alias declaration", "import * as vi from 'vitest'; const { nested: { test: register } } = { nested: vi }; register.only('extra', () => {});"],
+    ["nested namespace destructuring", "import * as vi from 'vitest'; const { wrapper: { module: namespace } } = { wrapper: { module: vi } }; namespace.test.only('extra', () => {});"],
+    ["array namespace destructuring", "import * as vi from 'vitest'; const { wrapper: [namespace] } = { wrapper: [vi] }; namespace.test.only('extra', () => {});"],
+    ["default namespace destructuring", "import * as vi from 'vitest'; const { module: namespace = vi } = {}; namespace.test.only('extra', () => {});"],
+    ["namespace rest destructuring", "import * as vi from 'vitest'; const { helper, ...namespace } = vi; namespace.test.only('extra', () => {});"],
+    ["nested namespace rest destructuring", "import * as vi from 'vitest'; const { wrapper: { helper, ...namespace } } = { wrapper: vi }; namespace.test.only('extra', () => {});"],
+    ["array namespace rest destructuring", "import * as vi from 'vitest'; const [{ helper, ...namespace }] = [vi]; namespace.test.only('extra', () => {});"],
     ["nested destructured alias assignment", "import * as vi from 'vitest'; let register; ({ nested: { test: register } } = { nested: vi }); register.only('extra', () => {});"],
     ["mutable Vitest namespace alias", "import * as vi from 'vitest'; let namespace = vi; namespace.test.only('extra', () => {});"],
     ["object-property test alias", "const holder = { register: test }; holder.register.only('extra', () => {});"],
@@ -315,6 +324,13 @@ describe("Windows qualification scope guard", () => {
     expect(collectWindowsTestTitles("fixture.ts",
       "const { nested: { test: register } } = { nested: { test: fakeRunner } }; " +
       "register.only('extra', () => {}); test('required', () => {});"))
+      .toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test("does not treat an assigned ordinary object as a Vitest alias", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "const holder = {}; holder.register = { only() {} }; " +
+      "holder.register.only('extra', () => {}); test('required', () => {});"))
       .toEqual([{ title: "required", enabled: true }]);
   });
 

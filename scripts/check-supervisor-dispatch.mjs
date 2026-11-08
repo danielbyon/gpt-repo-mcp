@@ -252,7 +252,59 @@ const matches = declarations(scopeStatements);
     }
     return undefined;
   };
+const assignmentsByMemberPath = new Map();
+const constructorDestructuredBindings = new Set();
+const assignmentMemberAccess = (node) => {
+  node = unwrap(node);
+  if (ts.isPropertyAccessExpression(node)) {
+    return { receiver: node.expression, property: node.name.text };
+  }
+  if (ts.isElementAccessExpression(node)) {
+    const argument = unwrap(node.argumentExpression);
+    if (ts.isStringLiteralLike(argument) || ts.isNoSubstitutionTemplateLiteral(argument)) {
+      return { receiver: node.expression, property: argument.text };
+    }
+  }
+  return undefined;
+};
+const assignmentReferenceKey = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return undefined;
+  const member = assignmentMemberAccess(node);
+  if (member) {
+    const receiver = assignmentReferenceKey(member.receiver, seen);
+    return receiver === undefined ? undefined : JSON.stringify([receiver, member.property]);
+  }
+  if (!ts.isIdentifier(node)) return `expression:${node.pos}:${node.end}`;
+  const binding = resolveBinding(node);
+  if (!binding) return `global:${node.text}`;
+  if (seen.has(binding.node)) return `binding:${binding.node.pos}`;
+  const next = new Set(seen);
+  next.add(binding.node);
+  if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name) &&
+      (ts.isIdentifier(unwrap(binding.node.initializer)) ||
+       assignmentMemberAccess(binding.node.initializer))) {
+    const aliased = assignmentReferenceKey(binding.node.initializer, next);
+    if (aliased !== undefined) return aliased;
+  }
+  return `binding:${binding.node.pos}`;
+};
+const assignmentMemberPathKey = (receiver, property) => {
+  const key = assignmentReferenceKey(receiver);
+  return key === undefined ? undefined : JSON.stringify([key, property]);
+};
   const recordAssignment = (target, value) => {
+  const member = assignmentMemberAccess(target);
+  if (member) {
+    const key = assignmentReferenceKey(target);
+    if (key !== undefined) {
+      const assignments = assignmentsByMemberPath.get(key) ?? [];
+      assignments.push(value);
+      assignmentsByMemberPath.set(key, assignments);
+    }
+    return;
+  }
     if (!ts.isIdentifier(target)) return;
     const binding = resolveBinding(target);
     if (binding?.kind !== "variable") return;
@@ -264,7 +316,7 @@ const matches = declarations(scopeStatements);
     if (ts.isBinaryExpression(node) &&
         aliasAssignmentKinds.has(node.operatorToken.kind)) {
       const target = unwrap(node.left);
-      if (ts.isIdentifier(target)) {
+      if (ts.isIdentifier(target) || assignmentMemberAccess(target)) {
         recordAssignment(target, node.right);
       } else if (ts.isObjectLiteralExpression(target) &&
                  ts.isObjectLiteralExpression(unwrap(node.right))) {
@@ -584,6 +636,10 @@ const matches = declarations(scopeStatements);
         values.push(indexed);
       }
     }
+  const key = assignmentMemberPathKey(input, property);
+  if (key !== undefined) {
+    values.push(...(assignmentsByMemberPath.get(key) ?? []));
+  }
     return values;
   };
   const bindingPatternValuesOf = (pattern, source, targetName, seen = new Set()) => {
@@ -865,6 +921,14 @@ const matches = declarations(scopeStatements);
       }
     }
   };
+  const recordConstructorDestructuring = (target) => {
+    target = unwrap(target);
+    if (!ts.isIdentifier(target)) return;
+    const binding = resolveBinding(target);
+    if (binding?.kind === "variable" || binding?.kind === "opaque") {
+      constructorDestructuredBindings.add(binding.node);
+    }
+  };
   const recordResolvedAssignments = (target, source) => {
     target = unwrap(target);
     if (ts.isIdentifier(target)) {
@@ -886,7 +950,18 @@ const matches = declarations(scopeStatements);
             !ts.isShorthandPropertyAssignment(property)) continue;
         const key = assignmentPropertyName(property.name);
         if (key === undefined) continue;
-        for (const value of memberValueCandidatesOf(source, key)) {
+        const selected = memberValueCandidatesOf(source, key);
+        if (key === "constructor" && selected.length === 0) {
+          recordConstructorDestructuring(targetValue);
+        }
+        const defaultValue = ts.isShorthandPropertyAssignment(property)
+          ? property.objectAssignmentInitializer
+          : undefined;
+        if (selected.length === 0 && defaultValue) {
+          recordResolvedAssignments(targetValue, defaultValue);
+          continue;
+        }
+        for (const value of selected) {
           recordResolvedAssignments(targetValue, value);
         }
       }
@@ -1027,12 +1102,44 @@ const matches = declarations(scopeStatements);
     }
     return false;
   };
+  const globalFunctionObjects = new Set([
+    "Array", "ArrayBuffer", "BigInt", "Boolean", "Date", "Error", "EvalError",
+    "Function", "Map", "Number", "Object", "Promise", "Proxy", "RangeError",
+    "ReferenceError", "RegExp", "Set", "String", "Symbol", "SyntaxError",
+    "TypeError", "URIError", "WeakMap", "WeakSet"
+  ]);
+  const globalFunctionObjectOf = (input) => {
+    const node = unwrap(input);
+    if (ts.isIdentifier(node)) return !resolveBinding(node) && globalFunctionObjects.has(node.text);
+    const member = memberAccess(node);
+    return Boolean(member && globalFunctionObjects.has(member.property) &&
+      globalObjectOf(member.receiver));
+  };
+  const constructorDestructuringOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!ts.isIdentifier(node)) return false;
+    const binding = resolveBinding(node);
+    if (!binding || seen.has(binding.node)) return false;
+    if (constructorDestructuredBindings.has(binding.node)) return true;
+    const next = new Set(seen);
+    next.add(binding.node);
+    const declaration = ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)
+      ? binding.node : undefined;
+    const pattern = declaration?.name;
+    if (!pattern || (!ts.isObjectBindingPattern(pattern) &&
+        !ts.isArrayBindingPattern(pattern))) return false;
+    const selected = declaration.initializer
+      ? bindingPatternValuesOf(pattern, declaration.initializer, node.text, next)
+      : [];
+    return selected.length === 0 && destructuresConstructor(pattern, node.text);
+  };
   const functionValueOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
     if (ts.isFunctionExpression(node) || ts.isArrowFunction(node) ||
         ts.isClassExpression(node) || ts.isFunctionDeclaration(node) ||
         ts.isClassDeclaration(node)) return true;
+    if (globalFunctionObjectOf(node)) return true;
     if (ts.isConditionalExpression(node)) {
       return functionValueOf(node.whenTrue, seen) || functionValueOf(node.whenFalse, seen);
     }
@@ -1075,9 +1182,13 @@ const matches = declarations(scopeStatements);
         next
       ).some((value) => functionValueOf(value, next));
     }
-    if (binding.kind !== "variable" || !binding.constant ||
-        !immutableAlias(binding.node) || !binding.node.initializer) return false;
-    return functionValueOf(binding.node.initializer, next);
+    if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+        ts.isIdentifier(binding.node.name)) {
+      return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+        .filter(Boolean)
+        .some((value) => functionValueOf(value, next));
+    }
+    return false;
   };
   const constructorFunctionOf = (input, seen = new Set()) => {
     const node = unwrap(input);
@@ -1121,9 +1232,30 @@ const matches = declarations(scopeStatements);
         if (destructuresConstructor(pattern, node.text)) return true;
       }
     }
-    if (binding.kind !== "variable" || !binding.constant ||
-        !immutableAlias(binding.node) || !binding.node.initializer) return false;
-    return constructorFunctionOf(binding.node.initializer, next);
+    if (constructorDestructuredBindings.has(binding.node)) return true;
+    if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+        ts.isIdentifier(binding.node.name)) {
+      return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+        .filter(Boolean)
+        .some((value) => constructorFunctionOf(value, next));
+    }
+    return false;
+  };
+  const functionPrototypeObjectOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!ts.isCallExpression(node) || node.arguments.length === 0) return false;
+    const method = memberAccess(node.expression);
+    if (method?.property !== "getPrototypeOf") return false;
+    const owner = unwrap(method.receiver);
+    const globalOwner = ts.isIdentifier(owner)
+      ? !resolveBinding(owner) && ["Object", "Reflect"].includes(owner.text)
+      : (() => {
+          const member = memberAccess(owner);
+          return Boolean(member && ["Object", "Reflect"].includes(member.property) &&
+            globalObjectOf(member.receiver));
+        })();
+    return globalOwner && (functionValueOf(node.arguments[0], seen) ||
+      constructorFunctionOf(node.arguments[0], seen));
   };
   const dynamicFunctionOf = (input, seen = new Set()) => {
     const node = unwrap(input);
@@ -1140,17 +1272,22 @@ const matches = declarations(scopeStatements);
     if (ts.isIdentifier(node)) {
       const binding = resolveBinding(node);
       if (!binding) return node.text === "Function";
-      if (binding.kind !== "variable" || !binding.constant ||
-          !immutableAlias(binding.node) || !binding.node.initializer || seen.has(binding.node)) {
-        return false;
-      }
+      if (seen.has(binding.node)) return false;
+      if (constructorDestructuringOf(node, seen)) return true;
       const next = new Set(seen);
       next.add(binding.node);
-      return dynamicFunctionOf(binding.node.initializer, next);
+      if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+          ts.isIdentifier(binding.node.name)) {
+        return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+          .filter(Boolean)
+          .some((value) => dynamicFunctionOf(value, next));
+      }
+      return false;
     }
     const member = memberAccess(node);
     if (member?.property === "Function" && globalObjectOf(member.receiver)) return true;
     if (member?.property !== "constructor") return false;
+    if (functionPrototypeObjectOf(member.receiver, seen)) return true;
     if (functionValueOf(member.receiver, seen) ||
         constructorFunctionOf(member.receiver, seen)) return true;
     const owner = memberAccess(member.receiver);

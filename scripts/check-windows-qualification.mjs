@@ -357,7 +357,54 @@ function createWindowsTestBindingResolver(file) {
   ]);
   const assignmentsByBinding = new Map();
   const runnerAssignmentsByBinding = new Map();
+const assignmentsByMemberPath = new Map();
+const assignmentMemberAccess = (node) => {
+  node = unwrap(node);
+  if (ts.isPropertyAccessExpression(node)) {
+    return { receiver: node.expression, property: node.name.text };
+  }
+  if (ts.isElementAccessExpression(node)) {
+    const argument = unwrap(node.argumentExpression);
+    if (ts.isStringLiteralLike(argument) || ts.isNoSubstitutionTemplateLiteral(argument)) {
+      return { receiver: node.expression, property: argument.text };
+    }
+  }
+  return undefined;
+};
+const assignmentReferenceKey = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return undefined;
+  const member = assignmentMemberAccess(node);
+  if (member) {
+    const receiver = assignmentReferenceKey(member.receiver, seen);
+    return receiver === undefined ? undefined : JSON.stringify([receiver, member.property]);
+  }
+  if (!ts.isIdentifier(node)) return `expression:${node.pos}:${node.end}`;
+  const binding = resolveBinding(node);
+  if (!binding) return `global:${node.text}`;
+  if (seen.has(binding.node)) return `binding:${binding.node.pos}`;
+  const next = new Set(seen);
+  next.add(binding.node);
+  if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name) &&
+      (ts.isIdentifier(unwrap(binding.node.initializer)) ||
+       assignmentMemberAccess(binding.node.initializer))) {
+    const aliased = assignmentReferenceKey(binding.node.initializer, next);
+    if (aliased !== undefined) return aliased;
+  }
+  return `binding:${binding.node.pos}`;
+};
   const recordAssignment = (target, value) => {
+  const member = assignmentMemberAccess(target);
+  if (member) {
+    const key = assignmentReferenceKey(target);
+    if (key !== undefined) {
+      const assignments = assignmentsByMemberPath.get(key) ?? [];
+      assignments.push(value);
+      assignmentsByMemberPath.set(key, assignments);
+    }
+    return;
+  }
     const binding = resolveBinding(target);
     if (binding?.kind !== "variable") return;
     const assignments = assignmentsByBinding.get(binding.node) ?? [];
@@ -482,10 +529,16 @@ const possibleVitestNamespaceOf = (input, seen = new Set()) => {
   if (binding?.kind === "import") {
     return !binding.typeOnly && binding.module === "vitest" && binding.imported === "*";
   }
-  if (binding?.kind !== "variable" || seen.has(binding.node)) return false;
+  if ((binding?.kind !== "variable" &&
+       !(binding?.kind === "opaque" && ts.isVariableDeclaration(binding.node))) ||
+      seen.has(binding.node)) return false;
   const next = new Set(seen);
   next.add(binding.node);
-  const values = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
+  const values = [
+    binding.node.initializer,
+    ...(assignmentsByBinding.get(binding.node) ?? []),
+    ...destructuredValuesOf(binding.node, node.text)
+  ];
   return values.some((value) => value && possibleVitestNamespaceOf(value, next));
 };
 const expressionValuesOf = (input, seen = new Set()) => {
@@ -565,6 +618,62 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
       }
     }
   }
+  const receiverKey = assignmentReferenceKey(input);
+  const memberKey = receiverKey === undefined
+    ? undefined
+    : JSON.stringify([receiverKey, key]);
+  if (memberKey !== undefined) {
+    values.push(...(assignmentsByMemberPath.get(memberKey) ?? []));
+  }
+  return values;
+};
+// Resolve the source value selected for one identifier in an assignment pattern.
+const destructuredValuesOf = (declaration, targetName) => {
+  if ((!ts.isVariableDeclaration(declaration) && !ts.isParameter(declaration)) ||
+      !declaration.initializer) return [];
+  const values = [];
+  const visitPattern = (pattern, source) => {
+    if (ts.isObjectBindingPattern(pattern)) {
+      for (const element of pattern.elements) {
+        if (!ts.isBindingElement(element)) continue;
+        if (element.dotDotDotToken) {
+          if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+            values.push(source);
+          }
+          continue;
+        }
+        const key = element.propertyName
+          ? assignmentKey(element.propertyName)
+          : ts.isIdentifier(element.name) ? element.name.text : undefined;
+        const selected = key === undefined ? [] : objectPropertyValuesOf(source, key);
+        const candidates = selected.length > 0
+          ? selected
+          : element.initializer ? [element.initializer] : [];
+        if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+          values.push(...candidates);
+        } else if (ts.isObjectBindingPattern(element.name) ||
+                   ts.isArrayBindingPattern(element.name)) {
+          for (const candidate of candidates) visitPattern(element.name, candidate);
+        }
+      }
+    } else if (ts.isArrayBindingPattern(pattern)) {
+      for (let index = 0; index < pattern.elements.length; index += 1) {
+        const element = pattern.elements[index];
+        if (!ts.isBindingElement(element) || element.dotDotDotToken) continue;
+        const selected = objectPropertyValuesOf(source, String(index));
+        const candidates = selected.length > 0
+          ? selected
+          : element.initializer ? [element.initializer] : [];
+        if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+          values.push(...candidates);
+        } else if (ts.isObjectBindingPattern(element.name) ||
+                   ts.isArrayBindingPattern(element.name)) {
+          for (const candidate of candidates) visitPattern(element.name, candidate);
+        }
+      }
+    }
+  };
+  visitPattern(declaration.name, declaration.initializer);
   return values;
 };
 const recordResolvedAssignments = (target, source) => {
@@ -639,7 +748,9 @@ collectResolvedAssignments(file);
   const collectAssignments = (node) => {
     if (ts.isBinaryExpression(node) && aliasAssignmentKinds.has(node.operatorToken.kind)) {
       const target = unwrap(node.left);
-      if (ts.isIdentifier(target)) recordAssignment(target, node.right);
+    if (ts.isIdentifier(target) || assignmentMemberAccess(target)) {
+      recordAssignment(target, node.right);
+    }
       else if (ts.isObjectLiteralExpression(target) || ts.isArrayLiteralExpression(target)) {
         recordDestructuredAssignments(target, node.right);
       }
