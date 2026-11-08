@@ -211,6 +211,10 @@ function invocationKind(expression, names, isProcessPlatform, testRunnerOf) {
   }
   const member = access(expression);
   if (member && testRunnerOf(member.receiver, names) &&
+      ["concurrent", "sequential"].includes(member.method)) {
+    return { enabled: true };
+  }
+  if (member && testRunnerOf(member.receiver, names) &&
       ["skip", "todo"].includes(member.method)) {
     return { enabled: false };
   }
@@ -219,6 +223,7 @@ function invocationKind(expression, names, isProcessPlatform, testRunnerOf) {
   if (!decorator) return undefined;
   const inner = invocationKind(decorator.receiver, names, isProcessPlatform, testRunnerOf);
   if (!inner) return undefined;
+  if (decorator.method === "concurrent" || decorator.method === "sequential") return inner;
   if (decorator.method === "skipIf") {
     return { ...inner, enabled: inner.enabled &&
       conditionOnWindows(expression.arguments[0], isProcessPlatform) === false };
@@ -440,6 +445,35 @@ const sourcePropertyValue = (source, key) => {
     next.add(binding.node);
     return vitestNamespaceOf(binding.node.initializer, next);
   };
+const possibleVitestNamespaceOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || !ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  if (binding?.kind === "import") {
+    return !binding.typeOnly && binding.module === "vitest" && binding.imported === "*";
+  }
+  if (binding?.kind !== "variable" || seen.has(binding.node)) return false;
+  const next = new Set(seen);
+  next.add(binding.node);
+  const values = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
+  return values.some((value) => value && possibleVitestNamespaceOf(value, next));
+};
+const objectPropertyValueOf = (input, key, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return undefined;
+  if (ts.isObjectLiteralExpression(node)) return sourcePropertyValue(node, key);
+  if (!ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (binding?.kind !== "variable" || seen.has(binding.node)) return undefined;
+  const next = new Set(seen);
+  next.add(binding.node);
+  const values = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
+  for (const value of values) {
+    const property = value && objectPropertyValueOf(value, key, next);
+    if (property) return property;
+  }
+  return undefined;
+};
   const collectAssignments = (node) => {
     if (ts.isBinaryExpression(node) && aliasAssignmentKinds.has(node.operatorToken.kind)) {
       const target = unwrap(node.left);
@@ -543,7 +577,31 @@ const sourcePropertyValue = (source, key) => {
   const possibleTestRunnerOf = (input, names, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return undefined;
-    if (!ts.isIdentifier(node)) return testRunnerOf(node, names);
+  if (ts.isBinaryExpression(node)) {
+    const operator = node.operatorToken.kind;
+    if (operator === ts.SyntaxKind.CommaToken) {
+      return possibleTestRunnerOf(node.right, names, seen);
+    }
+    if (operator === ts.SyntaxKind.AmpersandAmpersandToken ||
+        operator === ts.SyntaxKind.BarBarToken ||
+        operator === ts.SyntaxKind.QuestionQuestionToken) {
+      return possibleTestRunnerOf(node.left, names, seen) ??
+        possibleTestRunnerOf(node.right, names, seen);
+    }
+  }
+  if (!ts.isIdentifier(node)) {
+    const member = access(node);
+    if (member && ["concurrent", "sequential"].includes(member.method)) {
+      return possibleTestRunnerOf(member.receiver, names, seen);
+    }
+    if (member && names.includes(member.method) &&
+        (vitestNamespaceOf(member.receiver) || possibleVitestNamespaceOf(member.receiver))) {
+      return member.method;
+    }
+    const property = member && objectPropertyValueOf(member.receiver, member.method);
+    if (property) return possibleTestRunnerOf(property, names, seen);
+    return testRunnerOf(node, names);
+  }
     const binding = resolveBinding(node);
     const declaredCandidate = binding?.kind !== "import" && binding?.node
       ? destructuredBindingCandidate(binding.node, node.text, names)

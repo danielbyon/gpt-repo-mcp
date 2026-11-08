@@ -502,6 +502,13 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const processObjectOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
+    if (ts.isBinaryExpression(node) && [
+      ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.BarBarToken,
+      ts.SyntaxKind.QuestionQuestionToken
+    ].includes(node.operatorToken.kind)) {
+      return processObjectOf(node.left, seen) || processObjectOf(node.right, seen);
+    }
     if (ts.isCallExpression(node)) return processModuleRequire(node);
     if (ts.isObjectLiteralExpression(node)) {
       return node.properties.some((property) =>
@@ -514,6 +521,14 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     }
     const binding = resolveBinding(node);
     if (!binding) return node.text === "process";
+    if (binding.kind === "opaque" && ts.isVariableDeclaration(binding.node) &&
+        ts.isObjectBindingPattern(binding.node.name)) {
+      const element = binding.node.name.elements.find((item) =>
+        ts.isIdentifier(item.name) && item.name.text === node.text);
+      if (element?.initializer && processObjectOf(element.initializer, seen)) return true;
+      return destructuringSourceValues(binding.node.name, binding.node.initializer)
+        .some((value) => processObjectOf(value, seen));
+    }
     if (binding.kind === "import" && ["node:process", "process"].includes(binding.module)) {
       const clause = binding.node.importClause;
       const named = clause?.namedBindings;
@@ -534,6 +549,13 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const globalObjectOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
+    if (ts.isBinaryExpression(node) && [
+      ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.BarBarToken,
+      ts.SyntaxKind.QuestionQuestionToken
+    ].includes(node.operatorToken.kind)) {
+      return globalObjectOf(node.left, seen) || globalObjectOf(node.right, seen);
+    }
     const member = memberAccess(node);
     if (member?.property === "globalThis" || member?.property === "global") {
       return globalObjectOf(member.receiver, seen);
@@ -541,6 +563,14 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
     if (!binding) return node.text === "globalThis" || node.text === "global";
+    if (binding.kind === "opaque" && ts.isVariableDeclaration(binding.node) &&
+        ts.isObjectBindingPattern(binding.node.name)) {
+      const element = binding.node.name.elements.find((item) =>
+        ts.isIdentifier(item.name) && item.name.text === node.text);
+      if (element?.initializer && globalObjectOf(element.initializer, seen)) return true;
+      return destructuringSourceValues(binding.node.name, binding.node.initializer)
+        .some((value) => globalObjectOf(value, seen));
+    }
     if (binding.kind !== "variable" || seen.has(binding.node)) {
       return false;
     }
@@ -706,7 +736,11 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       return dynamicFunctionOf(binding.node.initializer, next);
     }
     const member = memberAccess(node);
-    return member?.property === "Function" && globalObjectOf(member.receiver);
+    if (member?.property === "Function" && globalObjectOf(member.receiver)) return true;
+    if (member?.property !== "constructor") return false;
+    const owner = memberAccess(member.receiver);
+    return Boolean(owner && ["constructor", "Function"].includes(owner.property) &&
+      globalObjectOf(owner.receiver));
   };
   const isReferenceIdentifier = (node) => {
     const parent = node.parent;
@@ -815,13 +849,21 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         if (!typeOnly && (PROCESS_MODULES.has(module) || SHELL_MODULES.has(module))) {
           add(node, "runtime process-runner re-export is forbidden");
         }
+        if (!typeOnly && ["node:process", "process"].includes(module)) {
+          add(node, "runtime process capability re-export is forbidden");
+        }
         // Source-module names are not references to this module's local bindings.
         return;
       }
     }
     if (ts.isExportSpecifier(node)) {
       // Only a local value name can escape; type-only and public alias names cannot.
-      if (!node.isTypeOnly) inspectRunnerReference(node.propertyName ?? node.name);
+    if (!node.isTypeOnly) {
+      inspectRunnerReference(node.propertyName ?? node.name);
+      if (processObjectOf(node.propertyName ?? node.name)) {
+        add(node, "runtime process capability re-export is forbidden");
+      }
+    }
       return;
     }
     if (ts.isImportDeclaration(node)) {

@@ -246,6 +246,10 @@ describe("Windows qualification scope guard", () => {
     ["namespace destructured alias assignment", "import * as vi from 'vitest'; let register; ({ test: register } = vi); register.only('extra', () => {});"],
     ["nested destructured alias declaration", "import * as vi from 'vitest'; const { nested: { test: register } } = { nested: vi }; register.only('extra', () => {});"],
     ["nested destructured alias assignment", "import * as vi from 'vitest'; let register; ({ nested: { test: register } } = { nested: vi }); register.only('extra', () => {});"],
+    ["mutable Vitest namespace alias", "import * as vi from 'vitest'; let namespace = vi; namespace.test.only('extra', () => {});"],
+    ["object-property test alias", "const holder = { register: test }; holder.register.only('extra', () => {});"],
+    ["comma test alias", "const register = (0, test); register.only('extra', () => {});"],
+    ["mutable concurrent-only alias", "let register = test; register.concurrent.only('extra', () => {});"],
     ["namespace destructured parameter alias", "import * as vi from 'vitest'; function focus({ test: register } = vi) { register.only('extra', () => {}); } focus();"]
   ])("rejects exclusive selectors through %s", (_name, source) => {
     expect(() => collectWindowsTestTitles("fixture.ts", source))
@@ -282,6 +286,15 @@ describe("Windows qualification scope guard", () => {
       "const { nested: { test: register } } = { nested: { test: fakeRunner } }; " +
       "register.only('extra', () => {}); test('required', () => {});"))
       .toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test("retains legitimate concurrent and sequential registration", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "test.concurrent('concurrent', () => {}); test.sequential('sequential', () => {});"))
+      .toEqual([
+        { title: "concurrent", enabled: true },
+        { title: "sequential", enabled: true }
+      ]);
   });
 
   test("accepts unrelated element access without exclusive Vitest selection", () => {

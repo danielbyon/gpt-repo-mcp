@@ -57,6 +57,8 @@ describe("validation supervisor direct-execution guard", () => {
     ["mutable global Function property alias", "let make = globalThis['Function']; make(\"return process.getBuiltinModule('node:child_process')\")();"],
     ["mutable bare Function alias", "let make = Function; make(\"return process.getBuiltinModule('node:child_process')\")();"],
     ["computed global Function constructor", "globalThis['Fun' + 'ction'](\"return process.getBuiltinModule('node:child_process')\")();"],
+    ["constructor-chain Function", "globalThis.constructor.constructor(\"return process.getBuiltinModule('node:child_process')\")();"],
+    ["object-destructured global object", "const { runtime } = { runtime: globalThis }; runtime.eval('process');"],
     ["mutable process object alias", "let runtime = process; runtime.getBuiltinModule('node:child_process').exec('node -v');"]
   ])("rejects an unaudited loading route: %s", (_case, source) => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
@@ -90,6 +92,10 @@ describe("validation supervisor direct-execution guard", () => {
     ["computed destructuring", "const { [loaderName]: load } = process; load('node:child_process');"],
     ["process object rest", "const { ...processApi } = process; processApi.getBuiltinModule('node:child_process');"],
     ["process object spread", "const processApi = { ...process }; processApi.getBuiltinModule('node:child_process');"],
+    ["logical process object alias", "const runtime = process || {}; runtime.getBuiltinModule('node:child_process');"],
+    ["nullish process object alias", "const runtime = process ?? {}; runtime.getBuiltinModule('node:child_process');"],
+    ["object-destructured process value", "const { runtime } = { runtime: process }; runtime.getBuiltinModule('node:child_process');"],
+    ["process destructuring default", "const { process: runtime = process } = {}; runtime.getBuiltinModule('node:child_process');"],
     ["aliased process object", "const runtime = process; runtime.getBuiltinModule('node:child_process');"],
     ["process object assigned later", "let runtime = {}; runtime = process; runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["process object assigned by nullish assignment", "let runtime; runtime ??= process; runtime.getBuiltinModule('node:child_process').exec('node -v');"],
@@ -106,6 +112,9 @@ describe("validation supervisor direct-execution guard", () => {
     ["destructured process through globalThis assignment", "let runtime; ({ process: runtime } = globalThis); runtime.getBuiltinModule('node:child_process');"],
     ["destructured global object assignment", "let runtimeGlobal = {}; ({ runtimeGlobal } = { runtimeGlobal: globalThis }); runtimeGlobal.Function(\"return process.getBuiltinModule('node:child_process')\")();"],
     ["globalThis process object", "globalThis.process.getBuiltinModule('node:child_process').exec('node -v');"],
+    ["node:process runtime re-export", "export { getBuiltinModule } from 'node:process';"],
+    ["node:process default re-export", "export { default as runtime } from 'node:process';"],
+    ["imported process local re-export", "import process from 'node:process'; export { process };"],
     ["aliased capability", "const load = process.getBuiltinModule; const loader = load; loader('node:child_process');"]
   ])("rejects process module loading through %s", (_case, source) => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
