@@ -58,7 +58,8 @@ async function rewriteReceiptAndPointer(context: Context, edit: (receipt: Record
   const receipt = JSON.parse(await readFile(context.receiptPath, "utf8")) as Record<string, unknown>;
   const pointer = JSON.parse(await readFile(context.pointerPath, "utf8")) as Record<string, unknown>;
   edit(receipt);
-  const { receipt_sha256: _old, ...unsigned } = receipt;
+  const unsigned: Record<string, unknown> = { ...receipt };
+  delete unsigned.receipt_sha256;
   const digest = canonicalSha256(unsigned);
   receipt.receipt_sha256 = digest;
   pointer.receipt_sha256 = digest;
@@ -139,7 +140,8 @@ const mutations: Mutation[] = [
         for (const key of ["before", "after"]) {
           const snapshot = source[key] as Record<string, unknown>;
           const files = (snapshot.files as Array<{ path: string }>).filter((file) => file.path !== "src/dependency.txt");
-          const { sha256: _previous, ...unsigned } = { ...snapshot, files };
+          const unsigned: Record<string, unknown> = { ...snapshot, files };
+          delete unsigned.sha256;
           source[key] = { ...unsigned, sha256: canonicalSha256(unsigned) };
         }
       });
