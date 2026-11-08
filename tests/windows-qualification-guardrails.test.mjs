@@ -270,6 +270,10 @@ describe("Windows qualification scope guard", () => {
       ["aliased Object.assign namespace copy", "import * as vi from 'vitest'; const assign = Object.assign; const namespace = {}; assign(namespace, vi); namespace.test.only('extra', () => {});"],
       ["returned Object.assign namespace copy", "import * as vi from 'vitest'; const namespace = Object.assign({}, vi); namespace.test.only('extra', () => {});"],
       ["spread Object.assign namespace copy", "import * as vi from 'vitest'; const namespace = {}; Object.assign(namespace, ...[vi]); namespace.test.only('extra', () => {});"],
+      ["dynamic Vitest import", "const { test: dynamicTest } = await import('vitest'); dynamicTest.only('extra', () => {});"],
+      ["destructured runner reassignment", "let { register } = {} as { register?: typeof test }; register = test; register.only('extra', () => {});"],
+      ["parameter runner reassignment", "function focus(register: any) { register = test; register.only('extra', () => {}); } focus({});"],
+      ["destructured Object.assign alias", "const { assign: copy } = Object; const namespace: any = {}; copy(namespace, { test }); namespace.test.only('extra', () => {});"],
     ["chained concurrent only", "test.concurrent.only('extra', () => {});"],
     ["decorated skipIf only", "test.skipIf(false).only('extra', () => {});"],
     ["decorated runIf only", "test.runIf(true).only('extra', () => {});"],
@@ -303,6 +307,12 @@ describe("Windows qualification scope guard", () => {
   ])("rejects exclusive selectors through %s", (_name, source) => {
     expect(() => collectWindowsTestTitles("fixture.ts", source))
       .toThrow(/Exclusive or dynamically selected Vitest/);
+  });
+
+  test("recognizes direct Vitest namespace registration", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "import * as V from 'vitest'; V.test('required', () => {});"))
+      .toEqual([{ title: "required", enabled: true }]);
   });
 
   test("recognizes immutable aliases of test, it, and describe", () => {

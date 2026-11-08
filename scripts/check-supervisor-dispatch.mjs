@@ -245,6 +245,7 @@ const matches = declarations(scopeStatements);
     ts.SyntaxKind.AmpersandAmpersandEqualsToken
   ]);
   const assignmentsByBinding = new Map();
+  const destructuredAssignmentsByBinding = new Map();
   const assignmentPropertyName = (name) => {
     if (!name) return undefined;
     if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) {
@@ -321,10 +322,25 @@ const assignmentMemberPathKey = (receiver, property) => {
   }
     if (!ts.isIdentifier(target)) return;
     const binding = resolveBinding(target);
-    if (binding?.kind !== "variable") return;
-    const assignments = assignmentsByBinding.get(binding.node) ?? [];
+    if (!binding?.node) return;
+    const directBinding =
+      (binding.kind === "variable" && ts.isVariableDeclaration(binding.node)) ||
+      (binding.kind === "parameter" && ts.isParameter(binding.node)) ||
+      (binding.kind === "opaque" && (ts.isVariableDeclaration(binding.node) ||
+       ts.isParameter(binding.node)));
+    if (!directBinding) return;
+    const name = ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)
+      ? binding.node.name : undefined;
+    if (!name) return;
+    const usesDirectBinding = ts.isIdentifier(name);
+    const key = usesDirectBinding
+      ? binding.node : `${binding.node.pos}:${target.text}`;
+    const assignments = usesDirectBinding
+      ? assignmentsByBinding.get(key) ?? []
+      : destructuredAssignmentsByBinding.get(key) ?? [];
     assignments.push(value);
-    assignmentsByBinding.set(binding.node, assignments);
+    (usesDirectBinding ? assignmentsByBinding : destructuredAssignmentsByBinding)
+      .set(key, assignments);
   };
   const collectAssignments = (node) => {
     if (ts.isBinaryExpression(node) &&
@@ -823,28 +839,38 @@ const assignmentMemberPathKey = (receiver, property) => {
     if (binding.node.initializer &&
         (ts.isObjectBindingPattern(binding.node.name) ||
          ts.isArrayBindingPattern(binding.node.name))) {
-      return bindingPatternValuesOf(
-        binding.node.name,
-        binding.node.initializer,
-        node.text,
-        next
-      ).some((value) => processObjectOf(value, next));
+      return [
+        ...bindingPatternValuesOf(
+          binding.node.name,
+          binding.node.initializer,
+          node.text,
+          next
+        ),
+        ...(destructuredAssignmentsByBinding.get(
+          `${binding.node.pos}:${node.text}`) ?? [])
+      ].some((value) => processObjectOf(value, next));
     }
   }
   if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
     if (ts.isIdentifier(binding.node.name)) {
-      return Boolean(binding.node.initializer &&
-        processObjectOf(binding.node.initializer, next));
+      return [binding.node.initializer,
+        ...(assignmentsByBinding.get(binding.node) ?? [])]
+        .filter(Boolean)
+        .some((value) => processObjectOf(value, next));
     }
-    if (binding.node.initializer &&
+    if (
         (ts.isObjectBindingPattern(binding.node.name) ||
          ts.isArrayBindingPattern(binding.node.name))) {
-      return bindingPatternValuesOf(
-        binding.node.name,
-        binding.node.initializer,
-        node.text,
-        next
-      ).some((value) => processObjectOf(value, next));
+      return [
+        ...(binding.node.initializer ? bindingPatternValuesOf(
+          binding.node.name,
+          binding.node.initializer,
+          node.text,
+          next
+        ) : []),
+        ...(destructuredAssignmentsByBinding.get(
+          `${binding.node.pos}:${node.text}`) ?? [])
+      ].some((value) => processObjectOf(value, next));
     }
   }
   return false;
@@ -908,32 +934,128 @@ const assignmentMemberPathKey = (receiver, property) => {
     if (binding.node.initializer &&
         (ts.isObjectBindingPattern(binding.node.name) ||
          ts.isArrayBindingPattern(binding.node.name))) {
-      return bindingPatternValuesOf(
-        binding.node.name,
-        binding.node.initializer,
-        node.text,
-        next
-      ).some((value) => globalObjectOf(value, next));
+      return [
+        ...bindingPatternValuesOf(
+          binding.node.name,
+          binding.node.initializer,
+          node.text,
+          next
+        ),
+        ...(destructuredAssignmentsByBinding.get(
+          `${binding.node.pos}:${node.text}`) ?? [])
+      ].some((value) => globalObjectOf(value, next));
     }
   }
   if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
     if (ts.isIdentifier(binding.node.name)) {
-      return Boolean(binding.node.initializer &&
-        globalObjectOf(binding.node.initializer, next));
+      return [binding.node.initializer,
+        ...(assignmentsByBinding.get(binding.node) ?? [])]
+        .filter(Boolean)
+        .some((value) => globalObjectOf(value, next));
     }
-    if (binding.node.initializer &&
+    if (
         (ts.isObjectBindingPattern(binding.node.name) ||
          ts.isArrayBindingPattern(binding.node.name))) {
-      return bindingPatternValuesOf(
-        binding.node.name,
-        binding.node.initializer,
-        node.text,
-        next
-      ).some((value) => globalObjectOf(value, next));
+      return [
+        ...(binding.node.initializer ? bindingPatternValuesOf(
+          binding.node.name,
+          binding.node.initializer,
+          node.text,
+          next
+        ) : []),
+        ...(destructuredAssignmentsByBinding.get(
+          `${binding.node.pos}:${node.text}`) ?? [])
+      ].some((value) => globalObjectOf(value, next));
     }
   }
   return false;
   };
+const globalReflectOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return false;
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (!binding) return node.text === "Reflect";
+    if (!binding.node || seen.has(binding.node) ||
+        !(ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) ||
+        !ts.isIdentifier(binding.node.name)) return false;
+    const next = new Set(seen);
+    next.add(binding.node);
+    return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+      .filter(Boolean)
+      .some((value) => globalReflectOf(value, next));
+  }
+  const member = memberAccess(node);
+  return member?.property === "Reflect" && globalObjectOf(member.receiver, seen);
+};
+const globalStringOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return false;
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (!binding) return node.text === "String";
+    if (!binding.node || seen.has(binding.node) ||
+        !(ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) ||
+        !ts.isIdentifier(binding.node.name)) return false;
+    const next = new Set(seen);
+    next.add(binding.node);
+    return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+      .filter(Boolean)
+      .some((value) => globalStringOf(value, next));
+  }
+  const member = memberAccess(node);
+  return member?.property === "String" && globalObjectOf(member.receiver, seen);
+};
+const staticStringRawTagOf = (input) => {
+  const member = memberAccess(unwrap(input));
+  return Boolean(member && member.property === "raw" && globalStringOf(member.receiver));
+};
+const untrustedProcessExecPathOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return false;
+  if (ts.isConditionalExpression(node)) {
+    return untrustedProcessExecPathOf(node.whenTrue, seen) ||
+      untrustedProcessExecPathOf(node.whenFalse, seen);
+  }
+  if (ts.isBinaryExpression(node)) {
+    return untrustedProcessExecPathOf(node.left, seen) ||
+      untrustedProcessExecPathOf(node.right, seen);
+  }
+  const member = memberAccess(node);
+  if (member?.property === "execPath") return !processObjectOf(member.receiver, seen);
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node) ||
+      !(ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) ||
+      !ts.isIdentifier(binding.node.name)) return false;
+  const next = new Set(seen);
+  next.add(binding.node);
+  return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+    .filter(Boolean)
+    .some((value) => untrustedProcessExecPathOf(value, next));
+};
+const reflectiveReadOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return false;
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (!binding?.node || seen.has(binding.node)) return false;
+    const next = new Set(seen);
+    next.add(binding.node);
+    if (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) {
+      const values = ts.isIdentifier(binding.node.name)
+        ? [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+        : [];
+      return values.filter(Boolean).some((value) => reflectiveReadOf(value, next));
+    }
+    return false;
+  }
+  const member = memberAccess(node);
+  return Boolean(member &&
+    ((member.property === "get" && globalReflectOf(member.receiver, seen)) ||
+     (member.property === "getOwnPropertyDescriptor" &&
+      globalPrototypeObjectOf(member.receiver, seen))));
+};
   const destructuringEntries = (target) => {
     if (ts.isObjectBindingPattern(target)) {
       return target.elements.map((element) => ({
@@ -1365,15 +1487,24 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     return false;
   };
-  const globalPrototypeObjectOf = (input) => {
+  const globalPrototypeObjectOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
     if (ts.isIdentifier(node)) {
-      return !resolveBinding(node) && ["Object", "Reflect"].includes(node.text);
+      const binding = resolveBinding(node);
+      if (!binding) return ["Object", "Reflect"].includes(node.text);
+      if (!binding.node || seen.has(binding.node) ||
+          !(ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) ||
+          !ts.isIdentifier(binding.node.name)) return false;
+      const next = new Set(seen);
+      next.add(binding.node);
+      return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+        .filter(Boolean)
+        .some((value) => globalPrototypeObjectOf(value, next));
     }
     const member = memberAccess(node);
     return Boolean(member && ["Object", "Reflect"].includes(member.property) &&
-      globalObjectOf(member.receiver));
+      globalObjectOf(member.receiver, seen));
   };
   const getPrototypeOfFunctionOf = (input, seen = new Set()) => {
     const node = unwrap(input);
@@ -1646,7 +1777,9 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     if (ts.isImportDeclaration(node)) {
       const module = moduleLiteral(node.moduleSpecifier);
-      if (SHELL_MODULES.has(module)) add(node, "shell-capable runner imports are forbidden");
+      if (SHELL_MODULES.has(module) && hasRuntimeImport(node)) {
+        add(node, "shell-capable runner imports are forbidden");
+      }
       if (MODULE_LOADING_MODULES.has(module) && hasRuntimeImport(node)) {
         add(node, "node:module loading is forbidden in supervisor source");
       }
@@ -1654,6 +1787,7 @@ const assignmentMemberPathKey = (receiver, property) => {
         add(node, "dynamic evaluation module loading is forbidden in supervisor source");
       }
       if (["node:process", "process"].includes(module) &&
+          !node.importClause?.isTypeOnly &&
           node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
         for (const element of node.importClause.namedBindings.elements) {
           if (!element.isTypeOnly &&
@@ -1688,6 +1822,18 @@ const assignmentMemberPathKey = (receiver, property) => {
       if (called === "createRequire" || called === "_parse") {
         add(node, "indirect process loading, eval, or private shim parsing is forbidden");
       }
+      if (reflectiveReadOf(node.expression)) {
+        const receiver = node.arguments[0];
+        const property = staticStringOf(node.arguments[1]);
+        const sensitive = property === undefined
+          ? globalObjectOf(receiver) || processObjectOf(receiver)
+          : (globalObjectOf(receiver) &&
+             ["Function", "eval", "process", "constructor"].includes(property)) ||
+            (processObjectOf(receiver) && property === "getBuiltinModule");
+        if (sensitive) {
+          add(node, "reflective access to dynamic execution or process capabilities forbidden");
+        }
+      }
       const callee = unwrap(node.expression);
       const runner = ts.isIdentifier(callee) ? runnerOf(callee) : undefined;
       if (runner) {
@@ -1695,6 +1841,9 @@ const assignmentMemberPathKey = (receiver, property) => {
           add(node, "spread process-runner call arguments cannot prove native dispatch");
         }
         inspectLaunchOptions(node, runner);
+        if (untrustedProcessExecPathOf(node.arguments[0])) {
+          add(node, "untrusted process.execPath launch source is forbidden");
+        }
         const program = staticStringOf(node.arguments[0]);
         if (program && (DISALLOWED_PROGRAMS.test(program) ||
                         DISALLOWED_SHIMS.test(program))) {
@@ -1799,7 +1948,7 @@ const assignmentMemberPathKey = (receiver, property) => {
       launcherCount += 1;
       const value = node.initializer;
       if (!value || !ts.isTaggedTemplateExpression(value) ||
-          value.tag.getText(file) !== "String.raw" ||
+          !staticStringRawTagOf(value.tag) ||
           !ts.isNoSubstitutionTemplateLiteral(value.template)) {
         add(node, "embedded POSIX launcher must be a static String.raw template");
       } else {

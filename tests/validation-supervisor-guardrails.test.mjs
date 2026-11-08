@@ -273,6 +273,60 @@ describe("validation supervisor direct-execution guard", () => {
       "import { type Module } from 'node:module';")).toEqual([]);
   });
 
+  test("accepts type-only shell and process capability imports", () => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts",
+      "import type { Options } from 'execa';")).toEqual([]);
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts",
+      "import type { getBuiltinModule } from 'node:process';")).toEqual([]);
+  });
+
+  test.each([
+    ["Reflect.get Function",
+      "const make = Reflect.get(globalThis, 'Function'); make('return process')();"],
+    ["Reflect.get process loader",
+      "const load = Reflect.get(process, 'getBuiltinModule'); load('node:child_process');"],
+    ["property descriptor Function",
+      "const make = Object.getOwnPropertyDescriptor(globalThis, 'Function').value; make('return process')();"],
+    ["reassigned Reflect alias",
+      "let R: any = null; R = Reflect; const make = R.get(globalThis, 'Function'); make('return process')();"],
+    ["reassigned Object alias",
+      "let O: any = null; O = Object; const make = O.getOwnPropertyDescriptor(globalThis, 'Function').value; make('return process')();"]
+  ])("rejects reflective capability access through %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+      .some((finding) => finding.includes("reflective access to dynamic execution or process")))
+      .toBe(true);
+  });
+
+  test.each([
+    ["parameter assignment",
+      "function load(runtime: any = {}) { runtime = process; return runtime.getBuiltinModule('node:child_process'); }"],
+    ["destructured assignment",
+      "let { runtime } = { runtime: {} as any }; runtime = process; runtime.getBuiltinModule('node:child_process');"]
+  ])("rejects process capability reassignment through %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+      .some((finding) => finding.includes("process.getBuiltinModule"))).toBe(true);
+  });
+
+  test("rejects a shadowed String.raw launcher tag", () => {
+    const production = readFileSync(join(root, "src/services/process-exec.ts"), "utf8");
+    const shadow = "const String = Object.assign(" +
+      "(value: unknown) => globalThis.String(value), " +
+      "{ raw: () => \"spawn('cmd.exe', [])\" });\n";
+    expect(inspectSupervisorSource("src/services/process-exec.ts", shadow + production)
+      .some((finding) => finding.includes("must be a static String.raw template"))).toBe(true);
+  });
+
+  test("rejects a lexically shadowed process.execPath launch source", () => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts",
+      "const process = { env: {}, execPath: 'cmd.exe' }; " +
+      "spawn(process.execPath, ['/c', 'node -v'], { stdio: 'ignore' });")
+      .some((finding) => finding.includes("untrusted process.execPath"))).toBe(true);
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts",
+      "const shadowed = { execPath: 'cmd.exe' }; let executable: any = 'safe'; " +
+      "executable = shadowed.execPath; spawn(executable, ['/c', 'node -v']);")
+      .some((finding) => finding.includes("untrusted process.execPath"))).toBe(true);
+  });
+
   test("accepts a locally shadowed require reference", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts",
       "function load(require: (value: string) => unknown) { const alias = require; alias('ordinary-value'); }"))

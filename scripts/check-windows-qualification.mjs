@@ -211,7 +211,7 @@ function conditionOnWindows(node, isProcessPlatform = () => false) {
 }
 
 function invocationKind(expression, names, isProcessPlatform, testRunnerOf) {
-  if (ts.isIdentifier(expression) && testRunnerOf(expression, names)) {
+  if (testRunnerOf(expression, names)) {
     return { enabled: true };
   }
   const member = access(expression);
@@ -357,6 +357,7 @@ function createWindowsTestBindingResolver(file) {
   ]);
   const assignmentsByBinding = new Map();
   const runnerAssignmentsByBinding = new Map();
+  const destructuredAssignmentsByBinding = new Map();
 const assignmentsByMemberPath = new Map();
 const assignmentMemberAccess = (node) => {
   node = unwrap(node);
@@ -416,10 +417,25 @@ const assignmentReferenceKey = (input, seen = new Set()) => {
     return;
   }
     const binding = resolveBinding(target);
-    if (binding?.kind !== "variable") return;
-    const assignments = assignmentsByBinding.get(binding.node) ?? [];
+    if (!binding?.node) return;
+    const directBinding =
+      (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+       ts.isIdentifier(binding.node.name)) ||
+      (binding.kind === "opaque" && (ts.isVariableDeclaration(binding.node) ||
+       ts.isParameter(binding.node)) &&
+       (ts.isIdentifier(binding.node.name) ||
+        ts.isObjectBindingPattern(binding.node.name) ||
+        ts.isArrayBindingPattern(binding.node.name)));
+    if (!directBinding) return;
+    const map = ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name) || ts.isParameter(binding.node) &&
+      ts.isIdentifier(binding.node.name)
+      ? assignmentsByBinding
+      : destructuredAssignmentsByBinding;
+    const key = map === assignmentsByBinding ? binding.node : `${binding.node.pos}:${target.text}`;
+    const assignments = map.get(key) ?? [];
     assignments.push(value);
-    assignmentsByBinding.set(binding.node, assignments);
+    map.set(key, assignments);
   };
   const assignmentKey = (name) => {
     if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) {
@@ -497,8 +513,16 @@ const sourcePropertyValue = (source, key) => {
       }
     }
   };
+  const isDynamicVitestNamespace = (input) => {
+    let node = unwrap(input);
+    if (ts.isAwaitExpression(node)) node = unwrap(node.expression);
+    return Boolean(node && ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+      node.arguments.length === 1 && literal(node.arguments[0]) === "vitest");
+  };
   const vitestNamespaceOf = (input, seen = new Set()) => {
     const node = unwrap(input);
+    if (isDynamicVitestNamespace(node)) return true;
     if (!node || !ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
     if (binding?.kind === "import") {
@@ -513,6 +537,7 @@ const sourcePropertyValue = (source, key) => {
 const possibleVitestNamespaceOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node) return false;
+  if (isDynamicVitestNamespace(node)) return true;
   if (objectAssignCall(node)) {
     return node.arguments.slice(1).flatMap((source) =>
       ts.isSpreadElement(source)
@@ -557,6 +582,7 @@ const possibleVitestNamespaceOf = (input, seen = new Set()) => {
   const values = [
     binding.node.initializer,
     ...(assignmentsByBinding.get(binding.node) ?? []),
+    ...(destructuredAssignmentsByBinding.get(`${binding.node.pos}:${node.text}`) ?? []),
     ...destructuredValuesOf(binding.node, node.text)
   ];
   return values.some((value) => value && possibleVitestNamespaceOf(value, next));
@@ -799,11 +825,63 @@ const collectResolvedAssignments = (node) => {
   ts.forEachChild(node, collectResolvedAssignments);
 };
 collectResolvedAssignments(file);
+  function globalObjectOf(input, seen = new Set()) {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      if (!binding) return node.text === "Object";
+      if (binding.kind !== "variable" || !binding.constant ||
+          !binding.node.initializer || seen.has(binding.node)) return false;
+      const next = new Set(seen);
+      next.add(binding.node);
+      return globalObjectOf(binding.node.initializer, next);
+    }
+    const member = access(node);
+    return Boolean(member?.method === "Object" && globalObjectOf(member.receiver, seen));
+  }
+  function patternSelectsProperty(pattern, targetName, property) {
+    if (ts.isObjectBindingPattern(pattern)) {
+      return pattern.elements.some((element) => {
+        if (!ts.isBindingElement(element)) return false;
+        const key = element.propertyName
+          ? assignmentKey(element.propertyName)
+          : ts.isIdentifier(element.name) ? element.name.text : undefined;
+        if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+          return key === property;
+        }
+        return (ts.isObjectBindingPattern(element.name) ||
+          ts.isArrayBindingPattern(element.name)) &&
+          patternSelectsProperty(element.name, targetName, property);
+      });
+    }
+    if (ts.isArrayBindingPattern(pattern)) {
+      return pattern.elements.some((element) => ts.isBindingElement(element) &&
+        (ts.isObjectBindingPattern(element.name) ||
+         ts.isArrayBindingPattern(element.name)) &&
+        patternSelectsProperty(element.name, targetName, property));
+    }
+    return false;
+  }
   function objectAssignReference(input, seen = new Set()) {
     const node = unwrap(input);
     if (!node) return false;
     if (ts.isIdentifier(node)) {
       const binding = resolveBinding(node);
+      const declaration = binding &&
+        (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node))
+        ? binding.node : undefined;
+      if (declaration?.initializer &&
+          (ts.isObjectBindingPattern(declaration.name) ||
+           ts.isArrayBindingPattern(declaration.name)) && !seen.has(binding.node)) {
+        const next = new Set(seen);
+        next.add(binding.node);
+        if (globalObjectOf(declaration.initializer, next) &&
+            patternSelectsProperty(declaration.name, node.text, "assign")) return true;
+        for (const value of destructuredValuesOf(declaration, node.text)) {
+          if (objectAssignReference(value, next)) return true;
+        }
+      }
       if (binding?.kind !== "variable" || !binding.constant ||
           !binding.node.initializer || seen.has(binding.node)) return false;
       const next = new Set(seen);
@@ -812,8 +890,7 @@ collectResolvedAssignments(file);
     }
     const member = access(node);
     const receiver = member && unwrap(member.receiver);
-    return member?.method === "assign" && ts.isIdentifier(receiver) &&
-      receiver.text === "Object" && !resolveBinding(receiver);
+    return member?.method === "assign" && globalObjectOf(receiver, seen);
   }
   function objectAssignCall(node) {
     return ts.isCallExpression(node) && objectAssignReference(node.expression);
@@ -1046,9 +1123,28 @@ if (candidate) return candidate;
       const candidate = possibleTestRunnerOf(declaredCandidate.value, names, next);
       if (candidate) return candidate;
     }
+  if (binding?.node && !seen.has(binding.node)) {
+    const next = new Set(seen);
+    next.add(binding.node);
+    const reassigned = destructuredAssignmentsByBinding.get(
+      `${binding.node.pos}:${node.text}`) ?? [];
+    for (const value of reassigned) {
+      const candidate = possibleTestRunnerOf(value, names, next);
+      if (candidate) return candidate;
+    }
+  }
     if (binding?.kind === "variable" && runnerAssignmentsByBinding.has(binding.node)) {
       return runnerAssignmentsByBinding.get(binding.node);
     }
+  if (binding?.kind === "opaque" && ts.isParameter(binding.node) &&
+      ts.isIdentifier(binding.node.name) && !seen.has(binding.node)) {
+    const next = new Set(seen);
+    next.add(binding.node);
+    for (const value of assignmentsByBinding.get(binding.node) ?? []) {
+      const candidate = possibleTestRunnerOf(value, names, next);
+      if (candidate) return candidate;
+    }
+  }
   if (binding?.kind === "opaque" && ts.isVariableDeclaration(binding.node) &&
         ts.isObjectBindingPattern(binding.node.name) && binding.node.initializer &&
       (vitestNamespaceOf(binding.node.initializer) ||
