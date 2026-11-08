@@ -24,14 +24,6 @@ const moduleLiteral = (node) => node && ts.isStringLiteralLike(node) ? node.text
 const nameOf = (node) => ts.isIdentifier(node) ? node.text : undefined;
 const callName = (node) => nameOf(node) ||
   (ts.isPropertyAccessExpression(node) ? node.name.text : undefined);
-const launchOptionName = (name) => {
-  if (name && (ts.isIdentifier(name) || ts.isStringLiteralLike(name) ||
-      ts.isNumericLiteral(name))) return name.text;
-  if (name && ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)) {
-    return name.expression.text;
-  }
-  return undefined;
-};
 
 function inspectJavaScript(filename, source, isLauncher = false) {
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true,
@@ -123,6 +115,41 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         operator === ts.SyntaxKind.BarBarToken ||
         operator === ts.SyntaxKind.QuestionQuestionToken) {
       return requireReferenceOf(node.left) || requireReferenceOf(node.right);
+    }
+    return false;
+  };
+  const requireReferenceInContainerOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (requireReferenceOf(node)) return true;
+    if (ts.isObjectLiteralExpression(node)) {
+      return node.properties.some((property) => {
+        if (ts.isPropertyAssignment(property)) {
+          return requireReferenceInContainerOf(property.initializer, seen);
+        }
+        if (ts.isShorthandPropertyAssignment(property)) {
+          return requireReferenceOf(property.name);
+        }
+        return ts.isSpreadAssignment(property) &&
+          requireReferenceInContainerOf(property.expression, seen);
+      });
+    }
+    if (ts.isArrayLiteralExpression(node)) {
+      return node.elements.some((element) =>
+        requireReferenceInContainerOf(element, seen));
+    }
+    if (ts.isConditionalExpression(node)) {
+      return requireReferenceInContainerOf(node.whenTrue, seen) ||
+        requireReferenceInContainerOf(node.whenFalse, seen);
+    }
+    if (ts.isBinaryExpression(node) && [
+      ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.BarBarToken,
+      ts.SyntaxKind.CommaToken,
+      ts.SyntaxKind.QuestionQuestionToken
+    ].includes(node.operatorToken.kind)) {
+      return requireReferenceInContainerOf(node.left, seen) ||
+        requireReferenceInContainerOf(node.right, seen);
     }
     return false;
   };
@@ -518,6 +545,11 @@ const assignmentMemberPathKey = (receiver, property) => {
     next.add(binding.node);
     return staticStringOf(binding.node.initializer, next);
   };
+  const staticPropertyNameOf = (name) => {
+    if (!name) return undefined;
+    if (ts.isComputedPropertyName(name)) return staticStringOf(name.expression);
+    return assignmentPropertyName(name);
+  };
 
   const inspectOptionObject = (node) => {
     if (!ts.isObjectLiteralExpression(node)) {
@@ -529,7 +561,7 @@ const assignmentMemberPathKey = (receiver, property) => {
         add(property, "spread process-launch options cannot prove shell-free dispatch");
         continue;
       }
-      const name = launchOptionName(property.name);
+      const name = staticPropertyNameOf(property.name);
       if (name === undefined) {
         add(property, "unresolved computed process-launch option");
       } else if (name === "shell") {
@@ -659,6 +691,18 @@ const assignmentMemberPathKey = (receiver, property) => {
         objects.push(value);
         continue;
       }
+      if (ts.isCallExpression(value)) {
+        const factory = memberAccess(unwrap(value.expression));
+        if (factory?.property === "assign" &&
+            globalPrototypeObjectOf(factory.receiver, seen)) {
+          for (const argument of value.arguments) {
+            if (!ts.isSpreadElement(argument)) {
+              objects.push(...objectValueCandidatesOf(argument, seen));
+            }
+          }
+        }
+        continue;
+      }
       const member = memberAccess(value);
       if (!member) continue;
       for (const candidate of memberValueCandidatesOf(
@@ -680,7 +724,7 @@ const assignmentMemberPathKey = (receiver, property) => {
           continue;
         }
         if (!("name" in candidate)) continue;
-        const name = launchOptionName(candidate.name);
+        const name = staticPropertyNameOf(candidate.name);
         if (name !== property) continue;
         if (ts.isPropertyAssignment(candidate)) values.push(candidate.initializer);
         if (ts.isShorthandPropertyAssignment(candidate)) values.push(candidate.name);
@@ -705,7 +749,7 @@ const assignmentMemberPathKey = (receiver, property) => {
     if (ts.isObjectBindingPattern(pattern)) {
       for (const element of pattern.elements) {
         const key = element.propertyName
-          ? launchOptionName(element.propertyName)
+          ? staticPropertyNameOf(element.propertyName)
           : ts.isIdentifier(element.name) ? element.name.text : undefined;
         if (element.dotDotDotToken) {
           if (ts.isIdentifier(element.name) && element.name.text === targetName) {
@@ -1141,7 +1185,7 @@ const reflectiveReadOf = (input, seen = new Set()) => {
           }
           continue;
         }
-        const key = entry.name ? launchOptionName(entry.name) : undefined;
+        const key = entry.name ? staticPropertyNameOf(entry.name) : undefined;
         if (key === undefined) continue;
         const property = values.properties.find((item) =>
           assignmentPropertyName(item.name) === key);
@@ -1256,7 +1300,7 @@ const reflectiveReadOf = (input, seen = new Set()) => {
   };
   const inspectProcessDestructuring = (target) => {
     for (const entry of destructuringEntries(target)) {
-      const property = entry.name ? launchOptionName(entry.name) : undefined;
+      const property = entry.name ? staticPropertyNameOf(entry.name) : undefined;
       if (entry.rest || (entry.name && property === undefined)) {
         add(entry.node,
           "dynamic process capability destructuring is unproven in supervisor source");
@@ -1278,7 +1322,7 @@ const reflectiveReadOf = (input, seen = new Set()) => {
   };
   const inspectGlobalDestructuring = (target) => {
     for (const entry of destructuringEntries(target)) {
-      const property = entry.name ? launchOptionName(entry.name) : undefined;
+      const property = entry.name ? staticPropertyNameOf(entry.name) : undefined;
       if (entry.rest || (entry.name && property === undefined)) {
         add(entry.node,
           "dynamic global capability destructuring is unproven in supervisor source");
@@ -1358,7 +1402,7 @@ const reflectiveReadOf = (input, seen = new Set()) => {
     if (ts.isObjectBindingPattern(pattern)) {
       for (const element of pattern.elements) {
         const key = element.propertyName
-          ? launchOptionName(element.propertyName)
+          ? staticPropertyNameOf(element.propertyName)
           : ts.isIdentifier(element.name) ? element.name.text : undefined;
         if (ts.isIdentifier(element.name) && element.name.text === targetName &&
             key === propertyName) return true;
@@ -1422,7 +1466,7 @@ const reflectiveReadOf = (input, seen = new Set()) => {
       next.add(owner);
       for (const member of owner.members) {
         if (ts.isMethodDeclaration(member) &&
-            launchOptionName(member.name) === property) methods.push(member);
+            staticPropertyNameOf(member.name) === property) methods.push(member);
       }
     }
     return methods;
@@ -1923,8 +1967,13 @@ const reflectiveReadOf = (input, seen = new Set()) => {
       add(node, "aliasing require to bypass import inspection is forbidden");
     }
     if (ts.isBinaryExpression(node) && aliasAssignmentKinds.has(node.operatorToken.kind) &&
-        ts.isIdentifier(unwrap(node.left)) && requireReferenceOf(node.right)) {
+        (ts.isIdentifier(unwrap(node.left)) || assignmentMemberAccess(node.left)) &&
+        requireReferenceOf(node.right)) {
       add(node, "aliasing require to bypass import inspection is forbidden");
+    }
+    if ((ts.isArrayLiteralExpression(node) || ts.isObjectLiteralExpression(node)) &&
+        requireReferenceInContainerOf(node)) {
+      add(node, "require capability escape through a container is forbidden");
     }
     if (ts.isCallExpression(node) && dynamicFunctionOf(node.expression)) {
       add(node, "dynamic function construction is unaudited");

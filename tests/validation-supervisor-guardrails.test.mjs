@@ -325,6 +325,14 @@ test.each([
      "const { getOwnPropertyDescriptors: descriptors } = Object; descriptors(globalThis).eval.value('process');"],
     ["property-held descriptor method",
      "const tools = { read: Object.getOwnPropertyDescriptors }; tools.read(globalThis).eval.value('process');"],
+    ["Object.assign-held descriptor method",
+     "const tools = Object.assign({}, { read: Object.getOwnPropertyDescriptors }); tools.read(globalThis).eval.value('process');"],
+    ["computed descriptor method",
+     "const key = 'read'; const tools = { [key]: Object.getOwnPropertyDescriptors }; tools.read(globalThis).eval.value('process');"],
+    ["computed descriptor destructuring",
+     "const key = 'getOwnPropertyDescriptors'; const { [key]: read } = Object; read(globalThis).eval.value('process');"],
+    ["Object.assign-held reflective call",
+     "const tools = Object.assign({}, { read: Object.getOwnPropertyDescriptors }); const descriptors = tools.read.call(Object, globalThis); descriptors.eval.value('process');"],
     ["destructured Reflect get",
      "const { get: reflectGet } = Reflect; reflectGet(globalThis, 'Function')('return process')();"],
     ["destructured process entries",
@@ -535,13 +543,19 @@ test.each([
   ["bind", "const load = require.bind(null); const cp = load('node:child_process'); cp.exec('id');"],
   ["Reflect.apply", "const cp = Reflect.apply(require, null, ['node:child_process']); cp.exec('id');"],
   ["global alias", "const cp = globalThis.require('node:child_process'); cp.exec('id');"],
-  ["global destructuring", "const { require: load } = globalThis; const cp = load('node:child_process'); cp.exec('id');"]
+  ["global destructuring", "const { require: load } = globalThis; const cp = load('node:child_process'); cp.exec('id');"],
+  ["object-held require", "const holder = { load: require }; const cp = holder.load('node:child_process'); cp.exec('id');"],
+  ["shorthand-held require", "const holder = { require }; const cp = holder.require('node:child_process'); cp.exec('id');"],
+  ["array-held require", "const holder = [require]; const cp = holder[0]('node:child_process'); cp.exec('id');"],
+  ["assigned member require", "const holder = {}; holder.load = require; const cp = holder.load('node:child_process'); cp.exec('id');"]
 ])("rejects indirect require through %s inside POSIX_GROUP_LAUNCHER", (_name, body) => {
   const quoted = "const POSIX_GROUP_LAUNCHER = String.raw" + String.fromCharCode(96) +
     body + String.fromCharCode(96) + ";";
   expect(inspectSupervisorSource("src/services/process-exec.ts", quoted))
     .toEqual(expect.arrayContaining([
-      expect.stringMatching(/require capability|dynamic require|child_process require/)
+      expect.stringMatching(
+        /require capability|dynamic require|child_process require|aliasing require/
+      )
     ]));
 });
 

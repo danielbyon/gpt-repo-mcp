@@ -565,6 +565,15 @@ describe("Windows qualification scope guard", () => {
     ["created test runner", "import { test } from 'vitest'; Object.create(test).only('focused', () => {});"],
     ["assigned test runner", "import { test } from 'vitest'; Object.assign({}, test).only('focused', () => {});"],
     ["proxied test runner", "import { test } from 'vitest'; Proxy(test, {}).only('focused', () => {});"],
+    ["stored descriptor value", "import { test } from 'vitest'; const holder: any = { test }; const descriptor = Object.getOwnPropertyDescriptor(holder, 'test'); const value = descriptor.value; value.only('focused', () => {});"],
+    ["stored descriptor bag value", "import { test } from 'vitest'; const holder: any = { test }; const descriptors = Object.getOwnPropertyDescriptors(holder); const descriptor = descriptors.test; const value = descriptor.value; value.only('focused', () => {});"],
+    ["stored values value", "import { test } from 'vitest'; const holder: any = { test }; const values = Object.values(holder); const value = values[0]; value.only('focused', () => {});"],
+    ["stored entries value", "import { test } from 'vitest'; const holder: any = { test }; const entries = Object.entries(holder); const entry = entries[0]; const value = entry[1]; value.only('focused', () => {});"],
+    ["stored entries round trip", "import { test } from 'vitest'; const holder: any = { test }; const entries = Object.entries(holder); const rebuilt = Object.fromEntries(entries); const runner = rebuilt.test; runner.only('focused', () => {});"],
+    ["destructured descriptor value", "import { test } from 'vitest'; const holder: any = { test }; const { value } = Object.getOwnPropertyDescriptor(holder, 'test'); value.only('focused', () => {});"],
+    ["reflective descriptor call", "import { test } from 'vitest'; const holder: any = { test }; const read = Object.getOwnPropertyDescriptor; const descriptor = read.call(Object, holder, 'test'); descriptor.value.only('focused', () => {});"],
+    ["Object.assign-held descriptor method", "import { test } from 'vitest'; const tools = Object.assign({}, { read: Object.getOwnPropertyDescriptors }); const holder: any = { test }; const descriptors = tools.read(holder); const value = descriptors.test.value; value.only('focused', () => {});"],
+    ["computed descriptor method", "import { test } from 'vitest'; const key = 'read'; const tools = { [key]: Object.getOwnPropertyDescriptors }; const holder: any = { test }; const value = tools.read(holder).test.value; value.only('focused', () => {});"],
     ["computed dynamic namespace", "const V = await import('vi' + 'test'); V.test.only('focused', () => {});"]
   ])("rejects exclusive registration through %s", (_name, source) => {
     expect(() => collectWindowsTestTitles("fixture.ts", source))
@@ -583,6 +592,8 @@ describe("Windows qualification scope guard", () => {
       "Object.fromEntries(Object.entries(holder)).test;",
       "const { read } = { read: Reflect.get };",
       "read({ value: 1 }, 'value');",
+      "const key = 'test'; const computedHolder: any = { [key]: true };",
+      "const { value: ordinaryValue } = Object.getOwnPropertyDescriptor(holder, 'test');",
       "test('required', () => {});"
     ].join("\n"))).toEqual([{ title: "required", enabled: true }]);
   });
