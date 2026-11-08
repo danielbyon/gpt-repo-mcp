@@ -46,7 +46,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     return [filename + ": source cannot be parsed for process-execution inspection"];
   }
 
-  const processBinding = (_binding, exported, node) => {
+  const processBinding = (exported, node) => {
     if (!SAFE_PROCESS_EXPORTS.has(exported)) {
       add(node, "unaudited child_process export: " + exported);
     }
@@ -77,7 +77,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
           add(element, "unsupported child_process destructuring binding");
         }
         const exported = element.propertyName?.getText(file) ?? element.name.getText(file);
-        processBinding(nameOf(element.name), exported, element);
+        processBinding(exported, element);
       }
     }
   };
@@ -454,7 +454,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         } else {
           for (const element of bindings.elements) {
             if (!element.isTypeOnly) {
-              processBinding(element.name.text, element.propertyName?.text ?? element.name.text, element);
+              processBinding(element.propertyName?.text ?? element.name.text, element);
             }
           }
         }
