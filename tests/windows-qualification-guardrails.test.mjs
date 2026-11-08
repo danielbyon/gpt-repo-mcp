@@ -102,6 +102,21 @@ describe("Windows qualification scope guard", () => {
     expect(inspect(workflow)).toEqual([]);
   });
 
+  test("preserves doubled single quotes inside a selector", () => {
+    const workflow = load();
+    windowsStep(workflow, "Windows helper package hygiene").run =
+      "npm test -- tests/package-hygiene.test.ts -t 'pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional|it''s' --reporter=verbose";
+    expect(inspect(workflow)).toEqual([]);
+  });
+
+  test("rejects a trailing doubled single quote that changes the selector", () => {
+    const workflow = load();
+    windowsStep(workflow, "Windows helper package hygiene").run =
+      "npm test -- tests/package-hygiene.test.ts -t '^(pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$''' --reporter=verbose";
+    expect(inspect(workflow).some((finding) =>
+      finding.includes("does not select mandatory regression"))).toBe(true);
+  });
+
   test("rejects filtering a required file without audited mandatory cases", () => {
     const workflow = load();
     const step = windowsStep(workflow, "Windows process supervision");
@@ -227,7 +242,10 @@ describe("Windows qualification scope guard", () => {
     ["aliased describe.only", "const suite = describe; suite.only('suite', () => {});"],
     ["aliased only property", "const register = test; const focused = register.only; focused('extra', () => {});"],
     ["destructured only", "const { only } = test; only('extra', () => {});"],
+    ["deep destructured concurrent only", "const { concurrent: { only } } = test; only('extra', () => {});"],
+    ["deep namespace destructured only", "import * as vi from 'vitest'; const { test: { only } } = vi; only('extra', () => {});"],
     ["destructured assignment only", "let focus; ({ only: focus } = test); focus('extra', () => {});"],
+    ["deep destructured assignment only", "let only; ({ concurrent: { only } } = test); only('extra', () => {});"],
     ["renamed destructured only", "const register = test; const { only: focused } = register; focused('extra', () => {});"],
     ["computed destructured only", "const { ['only']: focused } = test; focused('extra', () => {});"],
     ["dynamic destructured selector", "const { [modifier]: focused } = test; focused('extra', () => {});"],
@@ -235,21 +253,33 @@ describe("Windows qualification scope guard", () => {
     ["Vitest namespace destructured test alias", "import * as vi from 'vitest'; const { test: register } = vi; register.only('extra', () => {});"],
     ["parameter destructured only default", "function focus({ only } = test) { only('extra', () => {}); } focus();"],
     ["parameter test alias default", "function focus(register = test) { register.only('extra', () => {}); } focus();"],
+    ["binding-element test default", "const { register = test } = {}; register.only('extra', () => {});"],
+    ["conditional test alias", "const register = condition ? test : fake; register.only('extra', () => {});"],
+    ["conditional array test alias", "const [register] = condition ? [test] : [fake]; register.only('extra', () => {});"],
+    ["nested object-property test alias", "const holder = { nested: { register: test } }; holder.nested.register.only('extra', () => {});"],
     ["chained concurrent only", "test.concurrent.only('extra', () => {});"],
+    ["decorated skipIf only", "test.skipIf(false).only('extra', () => {});"],
+    ["decorated runIf only", "test.runIf(true).only('extra', () => {});"],
     ["chained sequential describe only", "describe.sequential.only('suite', () => {});"],
     ["angle-bracket asserted alias", "const register = <typeof test>test; register.only('extra', () => {});"],
     ["non-null asserted alias", "const register = test!; register.only('extra', () => {});"],
     ["object-destructured alias assignment", "let register; ({ register } = { register: test }); register.only('extra', () => {});"],
+    ["identifier-backed object-destructured assignment", "const source = { register: test }; let register; ({ register } = source); register.only('extra', () => {});"],
+    ["nested identifier-backed destructured assignment", "const source = { nested: { register: test } }; let register; ({ nested: { register } } = source); register.only('extra', () => {});"],
     ["array-destructured alias assignment", "let register; [register] = [test]; register.only('extra', () => {});"],
     ["object-destructured alias declaration", "const { runner: register } = { runner: test }; register.only('extra', () => {});"],
     ["array-destructured alias declaration", "const [register] = [test]; register.only('extra', () => {});"],
     ["namespace destructured alias assignment", "import * as vi from 'vitest'; let register; ({ test: register } = vi); register.only('extra', () => {});"],
+    ["mutable namespace source assignment", "import * as vi from 'vitest'; const source = vi; let register; ({ test: register } = source); register.only('extra', () => {});"],
     ["nested destructured alias declaration", "import * as vi from 'vitest'; const { nested: { test: register } } = { nested: vi }; register.only('extra', () => {});"],
     ["nested destructured alias assignment", "import * as vi from 'vitest'; let register; ({ nested: { test: register } } = { nested: vi }); register.only('extra', () => {});"],
     ["mutable Vitest namespace alias", "import * as vi from 'vitest'; let namespace = vi; namespace.test.only('extra', () => {});"],
     ["object-property test alias", "const holder = { register: test }; holder.register.only('extra', () => {});"],
     ["comma test alias", "const register = (0, test); register.only('extra', () => {});"],
     ["mutable concurrent-only alias", "let register = test; register.concurrent.only('extra', () => {});"],
+    ["destructured concurrent alias", "const { concurrent: register } = test; register.only('extra', () => {});"],
+    ["mutable namespace destructuring", "import * as vi from 'vitest'; let namespace = vi; const { test: register } = namespace; register.only('extra', () => {});"],
+    ["conditional namespace destructuring", "import * as vi from 'vitest'; const { test: register } = condition ? vi : fake; register.only('extra', () => {});"],
     ["namespace destructured parameter alias", "import * as vi from 'vitest'; function focus({ test: register } = vi) { register.only('extra', () => {}); } focus();"]
   ])("rejects exclusive selectors through %s", (_name, source) => {
     expect(() => collectWindowsTestTitles("fixture.ts", source))

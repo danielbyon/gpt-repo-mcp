@@ -60,6 +60,8 @@ npm run verify:dist
 git diff --check
 ```
 
+`npm run check:validation-guardrails` statically checks the supervisor dispatch boundary and Windows qualification workflow. A checker change needs a focused rejection fixture plus an accepted control for nearby ordinary syntax. Include aliases, destructuring, and shell quoting when they can carry the guarded capability.
+
 Run service tests when touching service behavior:
 
 ```bash

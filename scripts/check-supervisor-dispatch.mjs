@@ -23,7 +23,6 @@ const moduleLiteral = (node) => node && ts.isStringLiteralLike(node) ? node.text
 const nameOf = (node) => ts.isIdentifier(node) ? node.text : undefined;
 const callName = (node) => nameOf(node) ||
   (ts.isPropertyAccessExpression(node) ? node.name.text : undefined);
-const propertyName = (node, file) => node.name?.getText(file).replace(/^["']|["']$/g, "");
 const launchOptionName = (name) => {
   if (name && (ts.isIdentifier(name) || ts.isStringLiteralLike(name) ||
       ts.isNumericLiteral(name))) return name.text;
@@ -139,7 +138,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   // wide name table. An unknown or ambiguous binding is never argv evidence.
   const resolveBinding = (reference) => {
     const text = reference.text;
-    const declarations = (statements) => {
+const declarations = (statements = []) => {
       const found = [];
       for (const statement of statements) {
         if (ts.isVariableStatement(statement)) {
@@ -197,7 +196,10 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     for (let scope = reference.parent; scope; scope = scope.parent) {
       if (ts.isBlock(scope) || ts.isSourceFile(scope) ||
           ts.isModuleBlock(scope) || ts.isCaseBlock(scope)) {
-        const matches = declarations(scope.statements);
+const scopeStatements = ts.isCaseBlock(scope)
+? scope.clauses.flatMap((clause) => clause.statements)
+: scope.statements;
+const matches = declarations(scopeStatements);
         if (matches.length) {
           return matches.length === 1 ? matches[0] : { kind: "ambiguous" };
         }
@@ -498,11 +500,165 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         node.arguments.length !== 1) return false;
     return ["node:process", "process"].includes(moduleLiteral(node.arguments[0]));
   };
+  const resolvedValuesOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return [];
+    if (ts.isConditionalExpression(node)) {
+      return [
+        ...resolvedValuesOf(node.whenTrue, seen),
+        ...resolvedValuesOf(node.whenFalse, seen)
+      ];
+    }
+    if (ts.isBinaryExpression(node)) {
+      const operator = node.operatorToken.kind;
+      if (operator === ts.SyntaxKind.CommaToken) {
+        return resolvedValuesOf(node.right, seen);
+      }
+      if (operator === ts.SyntaxKind.AmpersandAmpersandToken ||
+          operator === ts.SyntaxKind.BarBarToken ||
+          operator === ts.SyntaxKind.QuestionQuestionToken) {
+        return [
+          ...resolvedValuesOf(node.left, seen),
+          ...resolvedValuesOf(node.right, seen)
+        ];
+      }
+    }
+    if (!ts.isIdentifier(node)) return [node];
+    const binding = resolveBinding(node);
+    if (!binding || binding.kind === "import" || seen.has(binding.node)) return [node];
+    const next = new Set(seen);
+    next.add(binding.node);
+    if (binding.kind === "variable" &&
+        ts.isVariableDeclaration(binding.node) &&
+        ts.isIdentifier(binding.node.name)) {
+      return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+        .filter(Boolean)
+        .flatMap((value) => resolvedValuesOf(value, next));
+    }
+    if (binding.kind === "parameter" &&
+        ts.isParameter(binding.node) &&
+        ts.isIdentifier(binding.node.name) &&
+        binding.node.initializer) {
+      return resolvedValuesOf(binding.node.initializer, next);
+    }
+    return [node];
+  };
+  const objectValueCandidatesOf = (input, seen = new Set()) => {
+    const objects = [];
+    for (const value of resolvedValuesOf(input, seen)) {
+      if (ts.isObjectLiteralExpression(value)) {
+        objects.push(value);
+        continue;
+      }
+      const member = memberAccess(value);
+      if (!member) continue;
+      for (const candidate of memberValueCandidatesOf(
+        member.receiver,
+        member.property,
+        seen
+      )) {
+        objects.push(...objectValueCandidatesOf(candidate, seen));
+      }
+    }
+    return objects;
+  };
+  const memberValueCandidatesOf = (input, property, seen = new Set()) => {
+    const values = [];
+    for (const object of objectValueCandidatesOf(input, seen)) {
+      for (const candidate of object.properties) {
+        if (ts.isSpreadAssignment(candidate)) {
+          values.push(...memberValueCandidatesOf(candidate.expression, property, seen));
+          continue;
+        }
+        if (!("name" in candidate)) continue;
+        const name = launchOptionName(candidate.name);
+        if (name !== property) continue;
+        if (ts.isPropertyAssignment(candidate)) values.push(candidate.initializer);
+        if (ts.isShorthandPropertyAssignment(candidate)) values.push(candidate.name);
+      }
+    }
+    for (const value of resolvedValuesOf(input, seen)) {
+      if (!ts.isArrayLiteralExpression(value) || !/^\d+$/.test(property)) continue;
+      const indexed = value.elements[Number(property)];
+      if (indexed && !ts.isOmittedExpression(indexed) && !ts.isSpreadElement(indexed)) {
+        values.push(indexed);
+      }
+    }
+    return values;
+  };
+  const bindingPatternValuesOf = (pattern, source, targetName, seen = new Set()) => {
+    const values = [];
+    if (ts.isObjectBindingPattern(pattern)) {
+      for (const element of pattern.elements) {
+        const key = element.propertyName
+          ? launchOptionName(element.propertyName)
+          : ts.isIdentifier(element.name) ? element.name.text : undefined;
+        if (element.dotDotDotToken) {
+          if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+            values.push(source);
+          }
+          continue;
+        }
+        const selected = key === undefined ? [] : memberValueCandidatesOf(source, key, seen);
+        const candidates = selected.length > 0
+          ? selected
+          : element.initializer ? [element.initializer] : [];
+        if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+          values.push(...candidates);
+        } else if (ts.isObjectBindingPattern(element.name) ||
+                   ts.isArrayBindingPattern(element.name)) {
+          for (const candidate of candidates) {
+            values.push(...bindingPatternValuesOf(element.name, candidate, targetName, seen));
+          }
+        }
+      }
+      return values;
+    }
+    if (ts.isArrayBindingPattern(pattern)) {
+      for (let index = 0; index < pattern.elements.length; index += 1) {
+        const element = pattern.elements[index];
+        if (ts.isOmittedExpression(element)) continue;
+        if (element.dotDotDotToken) {
+          if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+            values.push(source);
+          }
+          continue;
+        }
+        const selected = memberValueCandidatesOf(source, String(index), seen);
+        const candidates = selected.length > 0
+          ? selected
+          : element.initializer ? [element.initializer] : [];
+        if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+          values.push(...candidates);
+        } else if (ts.isObjectBindingPattern(element.name) ||
+                   ts.isArrayBindingPattern(element.name)) {
+          for (const candidate of candidates) {
+            values.push(...bindingPatternValuesOf(element.name, candidate, targetName, seen));
+          }
+        }
+      }
+    }
+    return values;
+  };
+  const bindingDefaultMatches = (pattern, predicate) => {
+    if (!ts.isObjectBindingPattern(pattern) && !ts.isArrayBindingPattern(pattern)) {
+      return false;
+    }
+    return pattern.elements.some((element) => {
+      if (!ts.isBindingElement(element)) return false;
+      if (element.initializer && predicate(element.initializer)) return true;
+      return bindingDefaultMatches(element.name, predicate);
+    });
+  };
   // Follow local aliases and object spreads that preserve process capabilities.
   const processObjectOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
+  if (ts.isConditionalExpression(node)) {
+    return processObjectOf(node.whenTrue, seen) || processObjectOf(node.whenFalse, seen);
+  }
     if (ts.isBinaryExpression(node) && [
+    ts.SyntaxKind.CommaToken,
       ts.SyntaxKind.AmpersandAmpersandToken,
       ts.SyntaxKind.BarBarToken,
       ts.SyntaxKind.QuestionQuestionToken
@@ -511,24 +667,22 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     }
     if (ts.isCallExpression(node)) return processModuleRequire(node);
     if (ts.isObjectLiteralExpression(node)) {
-      return node.properties.some((property) =>
-        ts.isSpreadAssignment(property) && processObjectOf(property.expression, seen));
+    return node.properties.some((property) => {
+      if (ts.isSpreadAssignment(property)) return processObjectOf(property.expression, seen);
+      if (ts.isPropertyAssignment(property)) return processObjectOf(property.initializer, seen);
+      if (ts.isShorthandPropertyAssignment(property)) return processObjectOf(property.name, seen);
+      return false;
+    });
     }
     if (!ts.isIdentifier(node)) {
       const member = memberAccess(node);
       if (member?.property === "process") return globalObjectOf(member.receiver);
+    if (member && memberValueCandidatesOf(member.receiver, member.property, seen)
+      .some((value) => processObjectOf(value, seen))) return true;
       return member?.property === "default" && processObjectOf(member.receiver, seen);
     }
     const binding = resolveBinding(node);
     if (!binding) return node.text === "process";
-    if (binding.kind === "opaque" && ts.isVariableDeclaration(binding.node) &&
-        ts.isObjectBindingPattern(binding.node.name)) {
-      const element = binding.node.name.elements.find((item) =>
-        ts.isIdentifier(item.name) && item.name.text === node.text);
-      if (element?.initializer && processObjectOf(element.initializer, seen)) return true;
-      return destructuringSourceValues(binding.node.name, binding.node.initializer)
-        .some((value) => processObjectOf(value, seen));
-    }
     if (binding.kind === "import" && ["node:process", "process"].includes(binding.module)) {
       const clause = binding.node.importClause;
       const named = clause?.namedBindings;
@@ -538,18 +692,53 @@ function inspectJavaScript(filename, source, isLauncher = false) {
           element.name.text === node.text && !element.isTypeOnly &&
           (element.propertyName?.text ?? element.name.text) === "default"));
     }
-    if (binding.kind !== "variable" || seen.has(binding.node)) {
-      return false;
+  if (seen.has(binding.node)) return false;
+  const next = new Set(seen);
+  next.add(binding.node);
+  if ((binding.kind === "variable" || binding.kind === "opaque") &&
+      ts.isVariableDeclaration(binding.node)) {
+    if (ts.isIdentifier(binding.node.name)) {
+      const candidates = [binding.node.initializer,
+        ...(assignmentsByBinding.get(binding.node) ?? [])];
+      return candidates.some((candidate) => candidate && processObjectOf(candidate, next));
     }
-    const next = new Set(seen);
-    next.add(binding.node);
-    const candidates = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
-    return candidates.some((candidate) => candidate && processObjectOf(candidate, next));
+    if (binding.node.initializer &&
+        (ts.isObjectBindingPattern(binding.node.name) ||
+         ts.isArrayBindingPattern(binding.node.name))) {
+      return bindingPatternValuesOf(
+        binding.node.name,
+        binding.node.initializer,
+        node.text,
+        next
+      ).some((value) => processObjectOf(value, next));
+    }
+  }
+  if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
+    if (ts.isIdentifier(binding.node.name)) {
+      return Boolean(binding.node.initializer &&
+        processObjectOf(binding.node.initializer, next));
+    }
+    if (binding.node.initializer &&
+        (ts.isObjectBindingPattern(binding.node.name) ||
+         ts.isArrayBindingPattern(binding.node.name))) {
+      return bindingPatternValuesOf(
+        binding.node.name,
+        binding.node.initializer,
+        node.text,
+        next
+      ).some((value) => processObjectOf(value, next));
+    }
+  }
+  return false;
   };
   const globalObjectOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
+  if (ts.isConditionalExpression(node)) {
+    return globalObjectOf(node.whenTrue, seen) || globalObjectOf(node.whenFalse, seen);
+  }
     if (ts.isBinaryExpression(node) && [
+    ts.SyntaxKind.CommaToken,
       ts.SyntaxKind.AmpersandAmpersandToken,
       ts.SyntaxKind.BarBarToken,
       ts.SyntaxKind.QuestionQuestionToken
@@ -560,24 +749,57 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     if (member?.property === "globalThis" || member?.property === "global") {
       return globalObjectOf(member.receiver, seen);
     }
+  if (member && memberValueCandidatesOf(member.receiver, member.property, seen)
+    .some((value) => globalObjectOf(value, seen))) return true;
+  if (ts.isObjectLiteralExpression(node)) {
+    return node.properties.some((property) => {
+      if (ts.isSpreadAssignment(property)) return globalObjectOf(property.expression, seen);
+      if (ts.isPropertyAssignment(property)) return globalObjectOf(property.initializer, seen);
+      if (ts.isShorthandPropertyAssignment(property)) return globalObjectOf(property.name, seen);
+      return false;
+    });
+  }
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
     if (!binding) return node.text === "globalThis" || node.text === "global";
-    if (binding.kind === "opaque" && ts.isVariableDeclaration(binding.node) &&
-        ts.isObjectBindingPattern(binding.node.name)) {
-      const element = binding.node.name.elements.find((item) =>
-        ts.isIdentifier(item.name) && item.name.text === node.text);
-      if (element?.initializer && globalObjectOf(element.initializer, seen)) return true;
-      return destructuringSourceValues(binding.node.name, binding.node.initializer)
-        .some((value) => globalObjectOf(value, seen));
-    }
-    if (binding.kind !== "variable" || seen.has(binding.node)) {
-      return false;
-    }
+  if (seen.has(binding.node)) return false;
     const next = new Set(seen);
     next.add(binding.node);
-    const candidates = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
-    return candidates.some((candidate) => candidate && globalObjectOf(candidate, next));
+  if ((binding.kind === "variable" || binding.kind === "opaque") &&
+      ts.isVariableDeclaration(binding.node)) {
+    if (ts.isIdentifier(binding.node.name)) {
+      const candidates = [binding.node.initializer,
+        ...(assignmentsByBinding.get(binding.node) ?? [])];
+      return candidates.some((candidate) => candidate && globalObjectOf(candidate, next));
+    }
+    if (binding.node.initializer &&
+        (ts.isObjectBindingPattern(binding.node.name) ||
+         ts.isArrayBindingPattern(binding.node.name))) {
+      return bindingPatternValuesOf(
+        binding.node.name,
+        binding.node.initializer,
+        node.text,
+        next
+      ).some((value) => globalObjectOf(value, next));
+    }
+  }
+  if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
+    if (ts.isIdentifier(binding.node.name)) {
+      return Boolean(binding.node.initializer &&
+        globalObjectOf(binding.node.initializer, next));
+    }
+    if (binding.node.initializer &&
+        (ts.isObjectBindingPattern(binding.node.name) ||
+         ts.isArrayBindingPattern(binding.node.name))) {
+      return bindingPatternValuesOf(
+        binding.node.name,
+        binding.node.initializer,
+        node.text,
+        next
+      ).some((value) => globalObjectOf(value, next));
+    }
+  }
+  return false;
   };
   const destructuringEntries = (target) => {
     if (ts.isObjectBindingPattern(target)) {
@@ -598,10 +820,10 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     });
   };
   const destructuringSourceValues = (target, source) => {
-    const values = unwrap(source);
     const result = [];
-    if (ts.isObjectBindingPattern(target) || ts.isObjectLiteralExpression(target)) {
-      if (!ts.isObjectLiteralExpression(values)) return result;
+  for (const values of resolvedValuesOf(source)) {
+  if ((ts.isObjectBindingPattern(target) || ts.isObjectLiteralExpression(target)) &&
+      ts.isObjectLiteralExpression(values)) {
       for (const entry of destructuringEntries(target)) {
         if (entry.rest) {
           for (const property of values.properties) {
@@ -617,9 +839,9 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         if (property && ts.isPropertyAssignment(property)) result.push(property.initializer);
         else if (property && ts.isShorthandPropertyAssignment(property)) result.push(property.name);
       }
-      return result;
+    continue;
     }
-    if (!ts.isArrayLiteralExpression(values)) return result;
+  if (!ts.isArrayLiteralExpression(values)) continue;
     const { elements: targets } = target;
     for (let index = 0; index < targets.length; index += 1) {
       const element = targets[index];
@@ -633,12 +855,55 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       }
       if (rest) break;
     }
+  }
     return result;
   };
   const inspectRequireDestructuring = (target, source) => {
     for (const value of destructuringSourceValues(target, source)) {
       if (requireReferenceOf(value)) {
         add(value, "aliasing require to bypass import inspection is forbidden");
+      }
+    }
+  };
+  const recordResolvedAssignments = (target, source) => {
+    target = unwrap(target);
+    if (ts.isIdentifier(target)) {
+      recordAssignment(target, source);
+      return;
+    }
+    if (ts.isObjectLiteralExpression(target)) {
+      for (const property of target.properties) {
+        const targetValue = ts.isShorthandPropertyAssignment(property)
+          ? property.name
+          : ts.isPropertyAssignment(property) ? unwrap(property.initializer) : undefined;
+        if (ts.isSpreadAssignment(property)) {
+          if (ts.isIdentifier(unwrap(property.expression))) {
+            recordAssignment(unwrap(property.expression), source);
+          }
+          continue;
+        }
+        if (!targetValue || !ts.isPropertyAssignment(property) &&
+            !ts.isShorthandPropertyAssignment(property)) continue;
+        const key = assignmentPropertyName(property.name);
+        if (key === undefined) continue;
+        for (const value of memberValueCandidatesOf(source, key)) {
+          recordResolvedAssignments(targetValue, value);
+        }
+      }
+      return;
+    }
+    if (ts.isArrayLiteralExpression(target)) {
+      for (let index = 0; index < target.elements.length; index += 1) {
+        const element = target.elements[index];
+        if (ts.isOmittedExpression(element)) continue;
+        if (ts.isSpreadElement(element)) {
+          const spreadTarget = unwrap(element.expression);
+          if (ts.isIdentifier(spreadTarget)) recordAssignment(spreadTarget, source);
+          continue;
+        }
+        for (const value of memberValueCandidatesOf(source, String(index))) {
+          recordResolvedAssignments(element, value);
+        }
       }
     }
   };
@@ -653,6 +918,15 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       } else if (property === "default") {
         add(entry.node, "process object alias destructuring is unproven in supervisor source");
       }
+    const nested = ts.isBindingElement(entry.node)
+      ? entry.node.name
+      : ts.isPropertyAssignment(entry.node) ? entry.node.initializer : undefined;
+    if (nested && (ts.isObjectBindingPattern(nested) ||
+                   ts.isArrayBindingPattern(nested) ||
+                   ts.isObjectLiteralExpression(nested) ||
+                   ts.isArrayLiteralExpression(nested))) {
+      inspectProcessDestructuring(nested);
+    }
     }
   };
   const inspectGlobalDestructuring = (target) => {
@@ -663,7 +937,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
           "dynamic global capability destructuring is unproven in supervisor source");
       } else if (property === "eval") {
         add(entry.node, "global dynamic evaluation is forbidden in supervisor source");
-      } else if (property === "Function") {
+    } else if (property === "Function" || property === "constructor") {
         add(entry.node, "dynamic function construction is unaudited");
       } else if (property === "process") {
         add(entry.node,
@@ -672,14 +946,23 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         add(entry.node,
           "global object alias destructuring is unproven in supervisor source");
       }
+    const nested = ts.isBindingElement(entry.node)
+      ? entry.node.name
+      : ts.isPropertyAssignment(entry.node) ? entry.node.initializer : undefined;
+    if (nested && (ts.isObjectBindingPattern(nested) ||
+                   ts.isArrayBindingPattern(nested) ||
+                   ts.isObjectLiteralExpression(nested) ||
+                   ts.isArrayLiteralExpression(nested))) {
+      inspectGlobalDestructuring(nested);
+    }
     }
   };
   const inspectCapabilityArrayDestructuring = (target, source) => {
-    const values = unwrap(source);
-    if (!ts.isArrayLiteralExpression(values)) return;
     const targets = ts.isArrayBindingPattern(target)
       ? target.elements
       : ts.isArrayLiteralExpression(target) ? target.elements : [];
+  for (const values of resolvedValuesOf(source)) {
+  if (!ts.isArrayLiteralExpression(values)) continue;
     for (let index = 0; index < targets.length; index += 1) {
       const element = targets[index];
       const rest = ts.isBindingElement(element)
@@ -699,6 +982,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
       }
       if (rest) break;
     }
+  }
   };
   // A global eval reference is unsafe even when it is stored or passed elsewhere.
   const globalEvalOf = (input, seen = new Set()) => {
@@ -724,6 +1008,15 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const dynamicFunctionOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
+  if (ts.isConditionalExpression(node)) {
+    return dynamicFunctionOf(node.whenTrue, seen) || dynamicFunctionOf(node.whenFalse, seen);
+  }
+  if (ts.isBinaryExpression(node) &&
+      [ts.SyntaxKind.CommaToken, ts.SyntaxKind.AmpersandAmpersandToken,
+       ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken]
+        .includes(node.operatorToken.kind)) {
+    return dynamicFunctionOf(node.left, seen) || dynamicFunctionOf(node.right, seen);
+  }
     if (ts.isIdentifier(node)) {
       const binding = resolveBinding(node);
       if (!binding) return node.text === "Function";
@@ -739,8 +1032,62 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     if (member?.property === "Function" && globalObjectOf(member.receiver)) return true;
     if (member?.property !== "constructor") return false;
     const owner = memberAccess(member.receiver);
-    return Boolean(owner && ["constructor", "Function"].includes(owner.property) &&
-      globalObjectOf(owner.receiver));
+  if (owner && ["constructor", "Function"].includes(owner.property) &&
+      globalObjectOf(owner.receiver)) return true;
+  const constructorObjectOf = (value, constructorSeen = new Set()) => {
+    const candidate = unwrap(value);
+    if (!candidate) return false;
+    if (ts.isConditionalExpression(candidate)) {
+      return constructorObjectOf(candidate.whenTrue, constructorSeen) ||
+        constructorObjectOf(candidate.whenFalse, constructorSeen);
+    }
+    if (ts.isBinaryExpression(candidate) &&
+        [ts.SyntaxKind.CommaToken, ts.SyntaxKind.AmpersandAmpersandToken,
+         ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken]
+          .includes(candidate.operatorToken.kind)) {
+      return constructorObjectOf(candidate.left, constructorSeen) ||
+        constructorObjectOf(candidate.right, constructorSeen);
+    }
+    if (ts.isIdentifier(candidate)) {
+      const binding = resolveBinding(candidate);
+      if (!binding) return false;
+      if (!binding.node || constructorSeen.has(binding.node)) return false;
+      const next = new Set(constructorSeen);
+      next.add(binding.node);
+      if ((binding.kind === "variable" || binding.kind === "opaque") &&
+          ts.isVariableDeclaration(binding.node) &&
+          binding.node.initializer &&
+          (ts.isObjectBindingPattern(binding.node.name) ||
+           ts.isArrayBindingPattern(binding.node.name))) {
+        return bindingPatternValuesOf(
+          binding.node.name,
+          binding.node.initializer,
+          candidate.text,
+          next
+        ).some((value) => constructorObjectOf(value, next));
+      }
+      if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
+        if (ts.isIdentifier(binding.node.name)) {
+          return Boolean(binding.node.initializer &&
+            constructorObjectOf(binding.node.initializer, next));
+        }
+        return Boolean(binding.node.initializer &&
+          bindingPatternValuesOf(
+            binding.node.name,
+            binding.node.initializer,
+            candidate.text,
+            next
+          ).some((value) => constructorObjectOf(value, next)));
+      }
+      if (binding.kind !== "variable" || !binding.constant ||
+          !immutableAlias(binding.node) || !binding.node.initializer) return false;
+      return constructorObjectOf(binding.node.initializer, next);
+    }
+    const inner = memberAccess(candidate);
+    return Boolean(inner && inner.property === "constructor" &&
+      (globalObjectOf(inner.receiver) || constructorObjectOf(inner.receiver, constructorSeen)));
+  };
+  return globalObjectOf(member.receiver) || constructorObjectOf(member.receiver, seen);
   };
   const isReferenceIdentifier = (node) => {
     const parent = node.parent;
@@ -956,6 +1303,15 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         add(node, "global capability parameter default is unproven in supervisor source");
       }
     }
+    if ((ts.isParameter(node) || ts.isVariableDeclaration(node)) &&
+        (ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name))) {
+      if (bindingDefaultMatches(node.name, (value) => processObjectOf(value))) {
+        add(node, "process capability destructuring default is unproven in supervisor source");
+      }
+      if (bindingDefaultMatches(node.name, (value) => globalObjectOf(value))) {
+        add(node, "global capability destructuring default is unproven in supervisor source");
+      }
+    }
     if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
         node.initializer) {
       if (processObjectOf(node.initializer)) inspectProcessDestructuring(node.name);
@@ -973,10 +1329,12 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
       const target = unwrap(node.left);
       if (ts.isObjectLiteralExpression(target)) {
+        recordResolvedAssignments(target, node.right);
         inspectRequireDestructuring(target, node.right);
         if (processObjectOf(node.right)) inspectProcessDestructuring(target);
         if (globalObjectOf(node.right)) inspectGlobalDestructuring(target);
       } else if (ts.isArrayLiteralExpression(target)) {
+        recordResolvedAssignments(target, node.right);
         inspectRequireDestructuring(target, node.right);
         inspectCapabilityArrayDestructuring(target, node.right);
       }
@@ -994,12 +1352,6 @@ function inspectJavaScript(filename, source, isLauncher = false) {
           !(immutableAlias(context) && context.initializer === expression)) {
         add(node, "dynamic function reference escapes its audited call");
       }
-    }
-    if (ts.isPropertyAssignment(node) && propertyName(node, file) === "shell") {
-      add(node, "shell dispatch option is forbidden");
-    }
-    if (ts.isShorthandPropertyAssignment(node) && node.name.text === "shell") {
-      add(node, "shell dispatch option is forbidden");
     }
     if (ts.isIdentifier(node)) {
       inspectRunnerReference(node);

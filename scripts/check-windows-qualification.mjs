@@ -75,7 +75,12 @@ function tokenize(line) {
         index += 1;
         continue;
       }
-      // PowerShell expands these forms inside double-quoted arguments.
+    if (quote === "'" && char === "'" && line[index + 1] === "'") {
+      part += "'";
+      index += 1;
+      continue;
+    }
+    // PowerShell expands these forms inside double-quoted arguments.
       if (quote === '"' && char === "$" && /[\p{L}\p{Nd}_?^$:({]/u.test(line[index + 1] ?? "")) {
         throw new Error("PowerShell interpolation in a double-quoted argument is unaudited");
       }
@@ -249,7 +254,7 @@ function createWindowsTestBindingResolver(file) {
     }
     return false;
   };
-  const bindingsIn = (statements, name) => {
+  const bindingsIn = (statements = [], name) => {
     const found = [];
     for (const statement of statements) {
       if (ts.isVariableStatement(statement)) {
@@ -312,9 +317,12 @@ function createWindowsTestBindingResolver(file) {
   const resolveBinding = (reference) => {
     const name = reference.text;
     for (let scope = reference.parent; scope; scope = scope.parent) {
-      if (ts.isBlock(scope) || ts.isSourceFile(scope) ||
-          ts.isModuleBlock(scope) || ts.isCaseBlock(scope)) {
-        const matches = bindingsIn(scope.statements, name);
+    if (ts.isBlock(scope) || ts.isSourceFile(scope) ||
+        ts.isModuleBlock(scope) || ts.isCaseBlock(scope)) {
+      const scopeStatements = ts.isCaseBlock(scope)
+        ? scope.clauses.flatMap((clause) => clause.statements)
+        : scope.statements;
+      const matches = bindingsIn(scopeStatements, name);
         if (matches.length) return matches.length === 1 ? matches[0] : { kind: "ambiguous" };
         if (ts.isSourceFile(scope) && hasHoistedVar(scope, name)) {
           return { kind: "opaque", node: scope };
@@ -447,7 +455,29 @@ const sourcePropertyValue = (source, key) => {
   };
 const possibleVitestNamespaceOf = (input, seen = new Set()) => {
   const node = unwrap(input);
-  if (!node || !ts.isIdentifier(node)) return false;
+  if (!node) return false;
+  if (ts.isConditionalExpression(node)) {
+    return possibleVitestNamespaceOf(node.whenTrue, seen) ||
+      possibleVitestNamespaceOf(node.whenFalse, seen);
+  }
+  if (ts.isBinaryExpression(node)) {
+    const operator = node.operatorToken.kind;
+    if (operator === ts.SyntaxKind.CommaToken) {
+      return possibleVitestNamespaceOf(node.right, seen);
+    }
+    if (operator === ts.SyntaxKind.AmpersandAmpersandToken ||
+        operator === ts.SyntaxKind.BarBarToken ||
+        operator === ts.SyntaxKind.QuestionQuestionToken) {
+      return possibleVitestNamespaceOf(node.left, seen) ||
+        possibleVitestNamespaceOf(node.right, seen);
+    }
+  }
+  if (!ts.isIdentifier(node)) {
+    const member = access(node);
+    return Boolean(member && member.method !== undefined &&
+      objectPropertyValuesOf(member.receiver, member.method, seen).some((value) =>
+        possibleVitestNamespaceOf(value, seen)));
+  }
   const binding = resolveBinding(node);
   if (binding?.kind === "import") {
     return !binding.typeOnly && binding.module === "vitest" && binding.imported === "*";
@@ -458,22 +488,154 @@ const possibleVitestNamespaceOf = (input, seen = new Set()) => {
   const values = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
   return values.some((value) => value && possibleVitestNamespaceOf(value, next));
 };
-const objectPropertyValueOf = (input, key, seen = new Set()) => {
+const expressionValuesOf = (input, seen = new Set()) => {
   const node = unwrap(input);
-  if (!node) return undefined;
-  if (ts.isObjectLiteralExpression(node)) return sourcePropertyValue(node, key);
-  if (!ts.isIdentifier(node)) return undefined;
+  if (!node) return [];
+  if (ts.isConditionalExpression(node)) {
+    return [
+      ...expressionValuesOf(node.whenTrue, seen),
+      ...expressionValuesOf(node.whenFalse, seen)
+    ];
+  }
+  if (ts.isBinaryExpression(node)) {
+    const operator = node.operatorToken.kind;
+    if (operator === ts.SyntaxKind.CommaToken) {
+      return expressionValuesOf(node.right, seen);
+    }
+    if (operator === ts.SyntaxKind.AmpersandAmpersandToken ||
+        operator === ts.SyntaxKind.BarBarToken ||
+        operator === ts.SyntaxKind.QuestionQuestionToken) {
+      return [
+        ...expressionValuesOf(node.left, seen),
+        ...expressionValuesOf(node.right, seen)
+      ];
+    }
+  }
+  if (!ts.isIdentifier(node)) return [node];
   const binding = resolveBinding(node);
-  if (binding?.kind !== "variable" || seen.has(binding.node)) return undefined;
+  if (!binding || binding.kind === "import" || seen.has(binding.node)) return [node];
   const next = new Set(seen);
   next.add(binding.node);
-  const values = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
-  for (const value of values) {
-    const property = value && objectPropertyValueOf(value, key, next);
-    if (property) return property;
+  if (binding.kind === "variable" &&
+      ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name)) {
+    return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+      .filter(Boolean)
+      .flatMap((value) => expressionValuesOf(value, next));
   }
-  return undefined;
+  if (binding.kind === "parameter" &&
+      ts.isParameter(binding.node) &&
+      ts.isIdentifier(binding.node.name) &&
+      binding.node.initializer) {
+    return expressionValuesOf(binding.node.initializer, next);
+  }
+  return [node];
 };
+const containerValuesOf = (input, seen = new Set()) => {
+  const values = [];
+  for (const value of expressionValuesOf(input, seen)) {
+    if (ts.isObjectLiteralExpression(value) || ts.isArrayLiteralExpression(value)) {
+      values.push(value);
+      continue;
+    }
+    const member = access(value);
+    if (!member || member.method === undefined) continue;
+    for (const candidate of objectPropertyValuesOf(member.receiver, member.method, seen)) {
+      values.push(...containerValuesOf(candidate, seen));
+    }
+  }
+  return values;
+};
+const objectPropertyValuesOf = (input, key, seen = new Set()) => {
+  const values = [];
+  for (const container of containerValuesOf(input, seen)) {
+    if (ts.isObjectLiteralExpression(container)) {
+      for (const property of container.properties) {
+        if (ts.isSpreadAssignment(property)) {
+          values.push(...objectPropertyValuesOf(property.expression, key, seen));
+        } else if (assignmentKey(property.name) === key) {
+          if (ts.isPropertyAssignment(property)) values.push(property.initializer);
+          else if (ts.isShorthandPropertyAssignment(property)) values.push(property.name);
+        }
+      }
+    } else if (ts.isArrayLiteralExpression(container) && /^\d+$/.test(key)) {
+      const element = container.elements[Number(key)];
+      if (element && !ts.isOmittedExpression(element) && !ts.isSpreadElement(element)) {
+        values.push(element);
+      }
+    }
+  }
+  return values;
+};
+const recordResolvedAssignments = (target, source) => {
+  target = unwrap(target);
+  if (ts.isIdentifier(target)) {
+    recordAssignment(target, source);
+    return;
+  }
+  if (ts.isObjectLiteralExpression(target)) {
+    for (const property of target.properties) {
+      if (ts.isSpreadAssignment(property)) {
+        const spreadTarget = unwrap(property.expression);
+        if (ts.isIdentifier(spreadTarget)) recordAssignment(spreadTarget, source);
+        continue;
+      }
+      const key = assignmentKey(property.name);
+      if (key === undefined) continue;
+      const targetValue = ts.isShorthandPropertyAssignment(property)
+        ? property.name
+        : ts.isPropertyAssignment(property) ? unwrap(property.initializer) : undefined;
+      if (!targetValue) continue;
+      if (ts.isIdentifier(targetValue)) {
+        if (["test", "it", "describe"].includes(key) &&
+            possibleVitestNamespaceOf(source)) {
+          const binding = resolveBinding(targetValue);
+          if (binding?.kind === "variable") {
+            runnerAssignmentsByBinding.set(binding.node, key);
+            continue;
+          }
+        }
+        if (["concurrent", "sequential"].includes(key)) {
+          const runner = testRunnerOf(source, ["test", "it", "describe"]);
+          const binding = resolveBinding(targetValue);
+          if (runner && binding?.kind === "variable") {
+            runnerAssignmentsByBinding.set(binding.node, runner);
+            continue;
+          }
+        }
+      }
+      for (const value of objectPropertyValuesOf(source, key)) {
+        recordResolvedAssignments(targetValue, value);
+      }
+    }
+    return;
+  }
+  if (ts.isArrayLiteralExpression(target)) {
+    for (let index = 0; index < target.elements.length; index += 1) {
+      const element = target.elements[index];
+      if (ts.isOmittedExpression(element)) continue;
+      if (ts.isSpreadElement(element)) {
+        const spreadTarget = unwrap(element.expression);
+        if (ts.isIdentifier(spreadTarget)) recordAssignment(spreadTarget, source);
+        continue;
+      }
+      for (const value of objectPropertyValuesOf(source, String(index))) {
+        recordResolvedAssignments(element, value);
+      }
+    }
+  }
+};
+const collectResolvedAssignments = (node) => {
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+    const target = unwrap(node.left);
+    if (ts.isObjectLiteralExpression(target) || ts.isArrayLiteralExpression(target)) {
+      recordResolvedAssignments(target, node.right);
+    }
+  }
+  ts.forEachChild(node, collectResolvedAssignments);
+};
+collectResolvedAssignments(file);
   const collectAssignments = (node) => {
     if (ts.isBinaryExpression(node) && aliasAssignmentKinds.has(node.operatorToken.kind)) {
       const target = unwrap(node.left);
@@ -533,40 +695,55 @@ const objectPropertyValueOf = (input, key, seen = new Set()) => {
   // Mutable aliases can carry .only, but they cannot prove test registration.
   const destructuredBindingCandidate = (declaration, targetName, names) => {
     if (!ts.isVariableDeclaration(declaration) && !ts.isParameter(declaration)) return undefined;
-    const source = unwrap(declaration.initializer);
-    if (!source) return undefined;
+  if (!declaration.initializer) return undefined;
+  const source = declaration.initializer;
   const patternSource = (pattern, value) => {
-    value = unwrap(value);
     if (ts.isObjectBindingPattern(pattern)) {
       for (const element of pattern.elements) {
         if (!ts.isBindingElement(element) || element.dotDotDotToken) continue;
         const key = element.propertyName
           ? assignmentKey(element.propertyName)
           : ts.isIdentifier(element.name) ? element.name.text : undefined;
+        const selected = key === undefined ? [] : objectPropertyValuesOf(value, key);
+        const candidates = selected.length > 0
+          ? selected
+          : element.initializer ? [element.initializer] : [];
         if (ts.isIdentifier(element.name) && element.name.text === targetName) {
-          if (key && names.includes(key) && vitestNamespaceOf(value)) return { runner: key };
-          if (!key || !ts.isObjectLiteralExpression(value)) continue;
-          const item = sourcePropertyValue(value, key);
-          if (item) return { value: item };
+          if (key && names.includes(key) &&
+              (vitestNamespaceOf(value) || possibleVitestNamespaceOf(value))) {
+            return { runner: key };
+          }
+          if (key && ["concurrent", "sequential"].includes(key)) {
+            const runner = possibleTestRunnerOf(value, names);
+            if (runner) return { runner };
+          }
+          if (candidates.length > 0) return { value: candidates[0] };
         }
-        if ((ts.isObjectBindingPattern(element.name) || ts.isArrayBindingPattern(element.name)) &&
-            ts.isObjectLiteralExpression(value) && key !== undefined) {
-          const item = sourcePropertyValue(value, key);
-          const nested = item && patternSource(element.name, item);
-          if (nested) return nested;
+        if (ts.isObjectBindingPattern(element.name) ||
+            ts.isArrayBindingPattern(element.name)) {
+          for (const candidate of candidates) {
+            const nested = patternSource(element.name, candidate);
+            if (nested) return nested;
+          }
         }
       }
     }
-    if (ts.isArrayBindingPattern(pattern) && ts.isArrayLiteralExpression(value)) {
+    if (ts.isArrayBindingPattern(pattern)) {
       for (let index = 0; index < pattern.elements.length; index += 1) {
         const element = pattern.elements[index];
-        if (!ts.isBindingElement(element) || element.dotDotDotToken || !value.elements[index]) continue;
+        if (!ts.isBindingElement(element) || element.dotDotDotToken) continue;
+        const selected = objectPropertyValuesOf(value, String(index));
+        const candidates = selected.length > 0
+          ? selected
+          : element.initializer ? [element.initializer] : [];
         if (ts.isIdentifier(element.name) && element.name.text === targetName) {
-          return { value: value.elements[index] };
+          if (candidates.length > 0) return { value: candidates[0] };
         }
         if (ts.isObjectBindingPattern(element.name) || ts.isArrayBindingPattern(element.name)) {
-          const nested = patternSource(element.name, value.elements[index]);
-          if (nested) return nested;
+          for (const candidate of candidates) {
+            const nested = patternSource(element.name, candidate);
+            if (nested) return nested;
+          }
         }
       }
     }
@@ -577,6 +754,10 @@ const objectPropertyValueOf = (input, key, seen = new Set()) => {
   const possibleTestRunnerOf = (input, names, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return undefined;
+  if (ts.isConditionalExpression(node)) {
+    return possibleTestRunnerOf(node.whenTrue, names, seen) ??
+      possibleTestRunnerOf(node.whenFalse, names, seen);
+  }
   if (ts.isBinaryExpression(node)) {
     const operator = node.operatorToken.kind;
     if (operator === ts.SyntaxKind.CommaToken) {
@@ -589,6 +770,13 @@ const objectPropertyValueOf = (input, key, seen = new Set()) => {
         possibleTestRunnerOf(node.right, names, seen);
     }
   }
+  if (ts.isCallExpression(node)) {
+    const decorator = access(node.expression);
+    if (decorator && ["each", "skipIf", "runIf"].includes(decorator.method)) {
+      return possibleTestRunnerOf(decorator.receiver, names, seen);
+    }
+    return undefined;
+  }
   if (!ts.isIdentifier(node)) {
     const member = access(node);
     if (member && ["concurrent", "sequential"].includes(member.method)) {
@@ -598,8 +786,12 @@ const objectPropertyValueOf = (input, key, seen = new Set()) => {
         (vitestNamespaceOf(member.receiver) || possibleVitestNamespaceOf(member.receiver))) {
       return member.method;
     }
-    const property = member && objectPropertyValueOf(member.receiver, member.method);
-    if (property) return possibleTestRunnerOf(property, names, seen);
+    if (member) {
+      for (const property of objectPropertyValuesOf(member.receiver, member.method)) {
+        const candidate = possibleTestRunnerOf(property, names, seen);
+        if (candidate) return candidate;
+      }
+    }
     return testRunnerOf(node, names);
   }
     const binding = resolveBinding(node);
@@ -616,9 +808,10 @@ const objectPropertyValueOf = (input, key, seen = new Set()) => {
     if (binding?.kind === "variable" && runnerAssignmentsByBinding.has(binding.node)) {
       return runnerAssignmentsByBinding.get(binding.node);
     }
-    if (binding?.kind === "opaque" && ts.isVariableDeclaration(binding.node) &&
+  if (binding?.kind === "opaque" && ts.isVariableDeclaration(binding.node) &&
         ts.isObjectBindingPattern(binding.node.name) && binding.node.initializer &&
-        vitestNamespaceOf(binding.node.initializer)) {
+      (vitestNamespaceOf(binding.node.initializer) ||
+       possibleVitestNamespaceOf(binding.node.initializer))) {
       for (const element of binding.node.name.elements) {
         if (ts.isIdentifier(element.name) && element.name.text === node.text) {
           const imported = element.propertyName?.text ?? element.name.text;
@@ -626,7 +819,10 @@ const objectPropertyValueOf = (input, key, seen = new Set()) => {
         }
       }
     }
-    if (binding?.kind === "variable" && !seen.has(binding.node)) {
+  if ((binding?.kind === "variable" || binding?.kind === "opaque") &&
+      binding.node && !seen.has(binding.node) &&
+      ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name)) {
       const next = new Set(seen);
       next.add(binding.node);
       const values = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
@@ -637,7 +833,7 @@ const objectPropertyValueOf = (input, key, seen = new Set()) => {
     }
     return testRunnerOf(node, names);
   };
-  return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf };
+  return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf, possibleVitestNamespaceOf };
 }
 
 /**
@@ -649,11 +845,58 @@ export function collectWindowsTestTitles(filename, source) {
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   if (file.parseDiagnostics.length) throw new Error("Cannot parse Vitest declarations");
   const titles = [];
-  const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf } =
+  const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
+    possibleVitestNamespaceOf } =
     createWindowsTestBindingResolver(file);
 
   // Exclusive declarations anywhere in the file remain fail-closed, including
   // element access and unknown dynamic member selectors.
+  const inspectExclusivePattern = (pattern) => {
+    if (ts.isObjectBindingPattern(pattern)) {
+      for (const element of pattern.elements) {
+        const propertyNode = element.propertyName;
+        const property = propertyNode
+          ? ts.isComputedPropertyName(propertyNode)
+            ? literal(propertyNode.expression)
+            : ts.isIdentifier(propertyNode) ? propertyNode.text : literal(propertyNode)
+          : ts.isIdentifier(element.name) ? element.name.text : undefined;
+        if (element.dotDotDotToken ||
+            (propertyNode && property === undefined) || property === "only") {
+          throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+        }
+        if (["test", "it", "describe", "concurrent", "sequential"].includes(property) &&
+            (ts.isObjectBindingPattern(element.name) ||
+             ts.isArrayBindingPattern(element.name))) {
+          inspectExclusivePattern(element.name);
+        }
+      }
+      return;
+    }
+    if (ts.isObjectLiteralExpression(pattern)) {
+      for (const property of pattern.properties) {
+        if (ts.isSpreadAssignment(property)) {
+          throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+        }
+        if (!ts.isPropertyAssignment(property) &&
+            !ts.isShorthandPropertyAssignment(property)) continue;
+        const name = ts.isShorthandPropertyAssignment(property)
+          ? property.name.text
+          : ts.isComputedPropertyName(property.name)
+          ? literal(property.name.expression)
+          : ts.isIdentifier(property.name) ? property.name.text : literal(property.name);
+        if (name === "only" ||
+            (ts.isComputedPropertyName(property.name) && name === undefined)) {
+          throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+        }
+        const nested = ts.isPropertyAssignment(property) ? unwrap(property.initializer) : undefined;
+        if (["test", "it", "describe", "concurrent", "sequential"].includes(name) &&
+            nested && (ts.isObjectLiteralExpression(nested) ||
+                       ts.isArrayLiteralExpression(nested))) {
+          inspectExclusivePattern(nested);
+        }
+      }
+    }
+  };
   const checkExclusive = (node) => {
     if (ts.isParameter(node) && node.initializer &&
         possibleTestRunnerOf(node.initializer, ["test", "it", "describe"])) {
@@ -667,7 +910,8 @@ export function collectWindowsTestTitles(filename, source) {
     if (ts.isBinaryExpression(node) &&
         node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
         ts.isObjectLiteralExpression(unwrap(node.left)) &&
-        possibleTestRunnerOf(node.right, ["test", "it", "describe"])) {
+        (possibleTestRunnerOf(node.right, ["test", "it", "describe"]) ||
+         possibleVitestNamespaceOf(node.right))) {
       for (const property of unwrap(node.left).properties) {
         if (ts.isSpreadAssignment(property)) {
           throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
@@ -681,10 +925,20 @@ export function collectWindowsTestTitles(filename, source) {
         if (name === "only" || (ts.isComputedPropertyName(property.name) && name === undefined)) {
           throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
         }
+        if (["test", "it", "describe", "concurrent", "sequential"].includes(name) &&
+            ts.isPropertyAssignment(property)) {
+          const nested = unwrap(property.initializer);
+          if (ts.isObjectLiteralExpression(nested) ||
+              ts.isArrayLiteralExpression(nested)) {
+            inspectExclusivePattern(nested);
+          }
+        }
       }
     }
     if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
-        node.initializer && possibleTestRunnerOf(node.initializer, ["test", "it", "describe"])) {
+        node.initializer &&
+        (possibleTestRunnerOf(node.initializer, ["test", "it", "describe"]) ||
+         possibleVitestNamespaceOf(node.initializer))) {
       for (const element of node.name.elements) {
         const propertyNode = element.propertyName;
         const property = propertyNode
@@ -694,6 +948,11 @@ export function collectWindowsTestTitles(filename, source) {
           : ts.isIdentifier(element.name) ? element.name.text : undefined;
         if (element.dotDotDotToken || (propertyNode && property === undefined) || property === "only") {
           throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+        }
+        if (["test", "it", "describe", "concurrent", "sequential"].includes(property) &&
+            (ts.isObjectBindingPattern(element.name) ||
+             ts.isArrayBindingPattern(element.name))) {
+          inspectExclusivePattern(element.name);
         }
       }
     }

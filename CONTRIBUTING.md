@@ -21,6 +21,12 @@ npm run build
 
 Use targeted tests for the area you changed before broad validation.
 
+## Validation Guardrails
+
+`npm run check:validation-guardrails` parses the supervisor sources and CI workflow without executing repository code. It rejects process capability loading through aliases, property values, or destructuring; dynamic evaluation and function construction; and shell launch options. The Windows check also rejects exclusive or dynamically selected Vitest declarations, selector mutations caused by PowerShell string substitution, and missing mandatory regression cases.
+
+Keep each accepted syntax rule paired with a rejection fixture and an accepted control. When a new syntax form can reach a guarded capability, add both cases before changing the checker.
+
 ## Safety Rules
 
 - Do not expose caller-supplied shell text, arbitrary executable selection, or free-form runner arguments. Keep validation limited to fixed, allowlisted profiles and their supported inputs.

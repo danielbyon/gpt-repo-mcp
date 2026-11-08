@@ -58,6 +58,11 @@ describe("validation supervisor direct-execution guard", () => {
     ["mutable bare Function alias", "let make = Function; make(\"return process.getBuiltinModule('node:child_process')\")();"],
     ["computed global Function constructor", "globalThis['Fun' + 'ction'](\"return process.getBuiltinModule('node:child_process')\")();"],
     ["constructor-chain Function", "globalThis.constructor.constructor(\"return process.getBuiltinModule('node:child_process')\")();"],
+  ["split constructor alias", "const ctor = globalThis.constructor; ctor.constructor(\"return process.getBuiltinModule('node:child_process')\")();"],
+  ["comma constructor alias", "const ctor = (0, globalThis.constructor); ctor.constructor(\"return 42\")();"],
+  ["destructured constructor capability", "const { constructor: ctor } = globalThis; ctor.constructor(\"return 42\")();"],
+  ["destructured constructor default", "const { constructor: ctor = globalThis.constructor } = {}; ctor.constructor(\"return 42\")();"],
+  ["comma global object alias", "const runtime = (0, globalThis); runtime.eval('process');"],
     ["object-destructured global object", "const { runtime } = { runtime: globalThis }; runtime.eval('process');"],
     ["mutable process object alias", "let runtime = process; runtime.getBuiltinModule('node:child_process').exec('node -v');"]
   ])("rejects an unaudited loading route: %s", (_case, source) => {
@@ -94,7 +99,14 @@ describe("validation supervisor direct-execution guard", () => {
     ["process object spread", "const processApi = { ...process }; processApi.getBuiltinModule('node:child_process');"],
     ["logical process object alias", "const runtime = process || {}; runtime.getBuiltinModule('node:child_process');"],
     ["nullish process object alias", "const runtime = process ?? {}; runtime.getBuiltinModule('node:child_process');"],
+  ["conditional process object alias", "const runtime = enabled ? process : {}; runtime.getBuiltinModule('node:child_process');"],
+  ["comma process object alias", "const runtime = (0, process); runtime.getBuiltinModule('node:child_process');"],
+  ["object-property process value", "const holder = { runtime: process }; holder.runtime.getBuiltinModule('node:child_process');"],
     ["object-destructured process value", "const { runtime } = { runtime: process }; runtime.getBuiltinModule('node:child_process');"],
+  ["nested object process destructuring", "const { nested: { getBuiltinModule } } = { nested: process }; getBuiltinModule('node:child_process');"],
+  ["identifier-backed process destructuring", "const source = { runtime: process }; const { runtime } = source; runtime.getBuiltinModule('node:child_process');"],
+  ["identifier-backed process assignment", "const source = { runtime: process }; let runtime; ({ runtime } = source); runtime.getBuiltinModule('node:child_process');"],
+  ["nested process destructuring default", "const { missing: { getBuiltinModule: load } = process } = {}; load('node:child_process');"],
     ["process destructuring default", "const { process: runtime = process } = {}; runtime.getBuiltinModule('node:child_process');"],
     ["aliased process object", "const runtime = process; runtime.getBuiltinModule('node:child_process');"],
     ["process object assigned later", "let runtime = {}; runtime = process; runtime.getBuiltinModule('node:child_process').exec('node -v');"],
@@ -230,13 +242,20 @@ describe("validation supervisor direct-execution guard", () => {
   test("accepts native execution and unrelated computed objects", () => {
     const source = [
       "import { spawn as runNative, execFile as execNative } from 'node:child_process';",
-      "const metadata = { ['shell']: 'not a launch option', [variable]: 1 };",
+      "const metadata = { shell: 'not a launch option', ['shell']: 'computed metadata', [variable]: 1 };",
       "runNative('node.exe', [], { cwd: '.', stdio: 'pipe' });",
       "execNative('node.exe', ['--version'], { windowsHide: true });",
       "spawn('node.exe', ['--version']);"
     ].join("\n");
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
       .toEqual([]);
+  });
+
+  test("accepts switch statements in supervisor source", () => {
+    expect(inspectSupervisorSource(
+      "src/services/windows-process-host.ts",
+      "switch (mode) { case 'a': consume(); break; default: consume(); }"
+    )).toEqual([]);
   });
 
 
