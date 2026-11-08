@@ -261,7 +261,11 @@ describe("Windows qualification scope guard", () => {
     ["property-assigned namespace runner", "import * as vi from 'vitest'; const holder = {}; holder.register = vi.test; holder.register.only('extra', () => {});"],
     ["bracket-assigned test alias", "const holder = {}; holder['register'] = test; holder.register.only('extra', () => {});"],
       ["member-target destructured test alias", "const holder = {}; ({ register: holder.register } = { register: test }); holder.register.only('extra', () => {});"],
+      ["dynamic member-target destructured test alias", "const holder = {}; ({ register: holder[key] } = { register: test }); holder[key].only('extra', () => {});"],
       ["nested assignment default test alias", "let register; ({ outer: { register = test } = {} } = {}); register.only('extra', () => {});"],
+      ["local function runner alias", "const makeRunner = () => test; makeRunner().only('extra', () => {});"],
+      ["block-bodied runner factory", "const makeRunner = () => { return test; }; makeRunner().only('extra', () => {});"],
+      ["spread namespace alias", "import * as vi from 'vitest'; const namespace = { ...vi }; namespace.test.only('extra', () => {});"],
     ["chained concurrent only", "test.concurrent.only('extra', () => {});"],
     ["decorated skipIf only", "test.skipIf(false).only('extra', () => {});"],
     ["decorated runIf only", "test.runIf(true).only('extra', () => {});"],
@@ -333,6 +337,13 @@ describe("Windows qualification scope guard", () => {
     expect(collectWindowsTestTitles("fixture.ts",
       "const holder = {}; holder.register = { only() {} }; " +
       "holder.register.only('extra', () => {}); test('required', () => {});"))
+      .toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test("terminates local runner-return cycles without inventing a runner", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "const makeRunner = () => makeRunner(); makeRunner().only('extra', () => {}); " +
+      "test('required', () => {});"))
       .toEqual([{ title: "required", enabled: true }]);
   });
 

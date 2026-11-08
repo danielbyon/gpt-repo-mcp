@@ -379,6 +379,7 @@ const assignmentReferenceKey = (input, seen = new Set()) => {
     const receiver = assignmentReferenceKey(member.receiver, seen);
     return receiver === undefined ? undefined : JSON.stringify([receiver, member.property]);
   }
+  if (ts.isElementAccessExpression(node)) return `dynamic:${node.getText(file)}`;
   if (!ts.isIdentifier(node)) return `expression:${node.pos}:${node.end}`;
   const binding = resolveBinding(node);
   if (!binding) return `global:${node.text}`;
@@ -397,6 +398,15 @@ const assignmentReferenceKey = (input, seen = new Set()) => {
   const recordAssignment = (target, value) => {
   const member = assignmentMemberAccess(target);
   if (member) {
+    const key = assignmentReferenceKey(target);
+    if (key !== undefined) {
+      const assignments = assignmentsByMemberPath.get(key) ?? [];
+      assignments.push(value);
+      assignmentsByMemberPath.set(key, assignments);
+    }
+    return;
+  }
+  if (ts.isElementAccessExpression(target)) {
     const key = assignmentReferenceKey(target);
     if (key !== undefined) {
       const assignments = assignmentsByMemberPath.get(key) ?? [];
@@ -518,6 +528,10 @@ const possibleVitestNamespaceOf = (input, seen = new Set()) => {
       return possibleVitestNamespaceOf(node.left, seen) ||
         possibleVitestNamespaceOf(node.right, seen);
     }
+  }
+  if (ts.isObjectLiteralExpression(node)) {
+    return node.properties.some((property) =>
+      ts.isSpreadAssignment(property) && possibleVitestNamespaceOf(property.expression, seen));
   }
   if (!ts.isIdentifier(node)) {
     const member = access(node);
@@ -678,7 +692,8 @@ const destructuredValuesOf = (declaration, targetName) => {
 };
 const recordResolvedAssignments = (target, source) => {
   target = unwrap(target);
-  if (assignmentMemberAccess(target)) {
+  if (assignmentMemberAccess(target) ||
+      (ts.isElementAccessExpression(target) && !assignmentMemberAccess(target))) {
     recordAssignment(target, source);
     return;
   }
@@ -877,6 +892,38 @@ collectResolvedAssignments(file);
   };
   return patternSource(declaration.name, source);
   };
+const functionReturnExpressionsOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return [];
+  if (ts.isArrowFunction(node)) {
+    if (!ts.isBlock(node.body)) return [node.body];
+  }
+  if (ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node) ||
+      ts.isArrowFunction(node)) {
+    const values = [];
+    const visit = (child) => {
+      if (ts.isFunctionLike(child) && child !== node) return;
+      if (ts.isReturnStatement(child) && child.expression) values.push(child.expression);
+      ts.forEachChild(child, visit);
+    };
+    if (node.body) visit(node.body);
+    return values;
+  }
+  if (!ts.isIdentifier(node)) return [];
+  const binding = resolveBinding(node);
+  if (!binding || seen.has(binding.node)) return [];
+  const next = new Set(seen);
+  next.add(binding.node);
+  if (ts.isFunctionDeclaration(binding.node) || ts.isFunctionExpression(binding.node) ||
+      ts.isArrowFunction(binding.node)) {
+    return functionReturnExpressionsOf(binding.node, next);
+  }
+  if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+    return functionReturnExpressionsOf(binding.node.initializer, next);
+  }
+  return [];
+};
   const possibleTestRunnerOf = (input, names, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return undefined;
@@ -901,7 +948,16 @@ collectResolvedAssignments(file);
     if (decorator && ["each", "skipIf", "runIf"].includes(decorator.method)) {
       return possibleTestRunnerOf(decorator.receiver, names, seen);
     }
-    return undefined;
+const callee = unwrap(node.expression);
+const binding = ts.isIdentifier(callee) ? resolveBinding(callee) : undefined;
+if (binding && seen.has(binding.node)) return undefined;
+const next = new Set(seen);
+if (binding) next.add(binding.node);
+for (const value of functionReturnExpressionsOf(node.expression)) {
+const candidate = possibleTestRunnerOf(value, names, next);
+if (candidate) return candidate;
+}
+return undefined;
   }
   if (!ts.isIdentifier(node)) {
     const member = access(node);
@@ -918,6 +974,11 @@ collectResolvedAssignments(file);
         if (candidate) return candidate;
       }
     }
+const stored = assignmentsByMemberPath.get(assignmentReferenceKey(node)) ?? [];
+for (const value of stored) {
+const candidate = possibleTestRunnerOf(value, names, seen);
+if (candidate) return candidate;
+}
     return testRunnerOf(node, names);
   }
     const binding = resolveBinding(node);

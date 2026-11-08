@@ -66,14 +66,18 @@ describe("validation supervisor direct-execution guard", () => {
   ["nested destructured object constructor", "const { nested: { constructor: Base } } = { nested: {} }; Base.constructor(\"return 42\")();"],
   ["aliased async function constructor", "const AsyncFunction = (async () => {}).constructor; AsyncFunction(\"return 42\")();"],
       ["member-valued function constructor", "const holder = { make() {} }; holder.make.constructor(\"return 42\")();"],
+      ["class-instance method constructor", "class Holder { make() {} } new Holder().make.constructor(\"return 42\")();"],
+      ["assigned class-instance method constructor", "class Holder { make() {} } const holder = new Holder(); holder.make.constructor(\"return 42\")();"],
   ["global Object constructor", "Object.constructor(\"return 42\")();"],
   ["function prototype constructor", "const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor; AsyncFunction(\"return 42\")();"],
       ["aliased function prototype getter", "const getProto = Object.getPrototypeOf; const AsyncFunction = getProto(async function () {}).constructor; AsyncFunction(\"return 42\")();"],
+      ["destructured function prototype getter", "const { getPrototypeOf: getProto } = Object; const AsyncFunction = getProto(async function () {}).constructor; AsyncFunction(\"return 42\")();"],
       ["stored function prototype", "const proto = Object.getPrototypeOf(async function () {}); const AsyncFunction = proto.constructor; AsyncFunction(\"return 42\")();"],
       ["dunder function prototype", "const AsyncFunction = (async function () {}).__proto__.constructor; AsyncFunction(\"return 42\")();"],
   ["destructured async function constructor", "const { constructor: make } = async function () {}; make(\"return 42\")();"],
   ["destructured constructor assignment", "let Base; ({ constructor: Base } = {}); Base.constructor(\"return 42\")();"],
       ["destructured member constructor assignment", "const holder = {}; ({ constructor: holder.make } = {}); holder.make.constructor(\"return 42\")();"],
+      ["dynamic destructured constructor target", "const holder = {}; ({ constructor: holder[key] } = {}); holder[key].constructor(\"return 42\")();"],
   ["array-destructured function assignment", "let make; [make] = [() => {}]; make.constructor(\"return 42\")();"],
   ["aliased object constructor chain", "const Base = {}.constructor; Base.constructor(\"return 42\")();"],
   ["split constructor alias", "const ctor = globalThis.constructor; ctor.constructor(\"return process.getBuiltinModule('node:child_process')\")();"],
@@ -132,6 +136,8 @@ describe("validation supervisor direct-execution guard", () => {
     ["process object assigned to an object property", "const holder = {}; holder.runtime = process; holder.runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["process object nullish-assigned to an object property", "const holder = {}; holder.runtime ??= process; holder.runtime.getBuiltinModule('node:child_process').exec('node -v');"],
       ["process object destructured into an object property", "const holder = {}; ({ runtime: holder.runtime } = { runtime: process }); holder.runtime.getBuiltinModule('node:child_process').exec('node -v');"],
+      ["process object returned by a local function", "const runtime = () => process; runtime().getBuiltinModule('node:child_process').exec('node -v');"],
+      ["process object returned by a block-bodied function", "const runtime = () => { return process; }; runtime().getBuiltinModule('node:child_process').exec('node -v');"],
     ["destructured process object assignment", "let runtime; ({ runtime } = { runtime: process }); runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["nested process destructuring assignment default", "let runtime; ({ outer: { runtime = process } } = { outer: {} }); runtime.getBuiltinModule('node:child_process').exec('node -v');"],
     ["destructured process capability assignment", "let load; ({ getBuiltinModule: load } = process); load('node:child_process');"],
@@ -170,6 +176,11 @@ describe("validation supervisor direct-execution guard", () => {
       "const holder = {}; holder.api = { getBuiltinModule() { return undefined; } }; holder.api.getBuiltinModule();",
       "import { spawn } from 'node:child_process'; spawn('node.exe', ['--version']);"
     ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
+  });
+
+  test("terminates local function-return cycles without inventing process capability", () => {
+    const source = "const runtime = () => runtime(); runtime().getBuiltinModule('node:child_process');";
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
   });
 

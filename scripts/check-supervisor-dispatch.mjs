@@ -279,6 +279,7 @@ const assignmentReferenceKey = (input, seen = new Set()) => {
     const receiver = assignmentReferenceKey(member.receiver, seen);
     return receiver === undefined ? undefined : JSON.stringify([receiver, member.property]);
   }
+  if (ts.isElementAccessExpression(node)) return `dynamic:${node.getText(file)}`;
   if (!ts.isIdentifier(node)) return `expression:${node.pos}:${node.end}`;
   const binding = resolveBinding(node);
   if (!binding) return `global:${node.text}`;
@@ -301,6 +302,15 @@ const assignmentMemberPathKey = (receiver, property) => {
   const recordAssignment = (target, value) => {
   const member = assignmentMemberAccess(target);
   if (member) {
+    const key = assignmentReferenceKey(target);
+    if (key !== undefined) {
+      const assignments = assignmentsByMemberPath.get(key) ?? [];
+      assignments.push(value);
+      assignmentsByMemberPath.set(key, assignments);
+    }
+    return;
+  }
+  if (ts.isElementAccessExpression(target)) {
     const key = assignmentReferenceKey(target);
     if (key !== undefined) {
       const assignments = assignmentsByMemberPath.get(key) ?? [];
@@ -711,6 +721,38 @@ const assignmentMemberPathKey = (receiver, property) => {
       return bindingDefaultMatches(element.name, predicate);
     });
   };
+  const functionReturnExpressionsOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return [];
+    if (ts.isArrowFunction(node)) {
+      if (!ts.isBlock(node.body)) return [node.body];
+    }
+    if (ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node) ||
+        ts.isArrowFunction(node)) {
+      const values = [];
+      const visit = (child) => {
+        if (ts.isFunctionLike(child) && child !== node) return;
+        if (ts.isReturnStatement(child) && child.expression) values.push(child.expression);
+        ts.forEachChild(child, visit);
+      };
+      if (node.body) visit(node.body);
+      return values;
+    }
+    if (!ts.isIdentifier(node)) return [];
+    const binding = resolveBinding(node);
+    if (!binding || seen.has(binding.node)) return [];
+    const next = new Set(seen);
+    next.add(binding.node);
+    if (ts.isFunctionDeclaration(binding.node) || ts.isFunctionExpression(binding.node) ||
+        ts.isArrowFunction(binding.node)) {
+      return functionReturnExpressionsOf(binding.node, next);
+    }
+    if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+        ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+      return functionReturnExpressionsOf(binding.node.initializer, next);
+    }
+    return [];
+  };
   // Follow local aliases and object spreads that preserve process capabilities.
   const processObjectOf = (input, seen = new Set()) => {
     const node = unwrap(input);
@@ -726,7 +768,17 @@ const assignmentMemberPathKey = (receiver, property) => {
     ].includes(node.operatorToken.kind)) {
       return processObjectOf(node.left, seen) || processObjectOf(node.right, seen);
     }
-    if (ts.isCallExpression(node)) return processModuleRequire(node);
+    if (ts.isCallExpression(node)) {
+      if (processModuleRequire(node)) return true;
+      const callee = unwrap(node.expression);
+      const binding = ts.isIdentifier(callee) ? resolveBinding(callee) : undefined;
+      if (binding && seen.has(binding.node)) return false;
+      const next = new Set(seen);
+      if (binding) next.add(binding.node);
+      return node.arguments.length === 0 &&
+        functionReturnExpressionsOf(node.expression)
+          .some((value) => processObjectOf(value, next));
+    }
     if (ts.isObjectLiteralExpression(node)) {
     return node.properties.some((property) => {
       if (ts.isSpreadAssignment(property)) return processObjectOf(property.expression, seen);
@@ -740,6 +792,11 @@ const assignmentMemberPathKey = (receiver, property) => {
       if (member?.property === "process") return globalObjectOf(member.receiver);
     if (member && memberValueCandidatesOf(member.receiver, member.property, seen)
       .some((value) => processObjectOf(value, seen))) return true;
+      if (ts.isElementAccessExpression(node)) {
+        const key = assignmentReferenceKey(node);
+        if (key !== undefined && (assignmentsByMemberPath.get(key) ?? [])
+          .some((value) => processObjectOf(value, seen))) return true;
+      }
       return member?.property === "default" && processObjectOf(member.receiver, seen);
     }
     const binding = resolveBinding(node);
@@ -806,6 +863,16 @@ const assignmentMemberPathKey = (receiver, property) => {
     ].includes(node.operatorToken.kind)) {
       return globalObjectOf(node.left, seen) || globalObjectOf(node.right, seen);
     }
+    if (ts.isCallExpression(node)) {
+      const callee = unwrap(node.expression);
+      const binding = ts.isIdentifier(callee) ? resolveBinding(callee) : undefined;
+      if (binding && seen.has(binding.node)) return false;
+      const next = new Set(seen);
+      if (binding) next.add(binding.node);
+      return node.arguments.length === 0 &&
+        functionReturnExpressionsOf(node.expression)
+          .some((value) => globalObjectOf(value, next));
+    }
     const member = memberAccess(node);
     if (member?.property === "globalThis" || member?.property === "global") {
       return globalObjectOf(member.receiver, seen);
@@ -820,6 +887,11 @@ const assignmentMemberPathKey = (receiver, property) => {
       return false;
     });
   }
+    if (ts.isElementAccessExpression(node)) {
+      const key = assignmentReferenceKey(node);
+      if (key !== undefined && (assignmentsByMemberPath.get(key) ?? [])
+        .some((value) => globalObjectOf(value, seen))) return true;
+    }
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
     if (!binding) return node.text === "globalThis" || node.text === "global";
@@ -934,6 +1006,11 @@ const assignmentMemberPathKey = (receiver, property) => {
       if (key !== undefined) constructorDestructuredMembers.add(key);
       return;
     }
+    if (ts.isElementAccessExpression(target)) {
+      const key = assignmentReferenceKey(target);
+      if (key !== undefined) constructorDestructuredMembers.add(key);
+      return;
+    }
     if (!ts.isIdentifier(target)) return;
     const binding = resolveBinding(target);
     if (binding?.kind === "variable" || binding?.kind === "opaque") {
@@ -942,7 +1019,8 @@ const assignmentMemberPathKey = (receiver, property) => {
   };
   const recordResolvedAssignments = (target, source) => {
     target = unwrap(target);
-    if (assignmentMemberAccess(target)) {
+    if (assignmentMemberAccess(target) ||
+        (ts.isElementAccessExpression(target) && !assignmentMemberAccess(target))) {
       recordAssignment(target, source);
       return;
     }
@@ -1098,17 +1176,17 @@ const assignmentMemberPathKey = (receiver, property) => {
     const member = memberAccess(node);
     return member?.property === "eval" && globalObjectOf(member.receiver);
   };
-  const destructuresConstructor = (pattern, targetName) => {
+  const destructuresConstructor = (pattern, targetName, propertyName = "constructor") => {
     if (ts.isObjectBindingPattern(pattern)) {
       for (const element of pattern.elements) {
         const key = element.propertyName
           ? launchOptionName(element.propertyName)
           : ts.isIdentifier(element.name) ? element.name.text : undefined;
         if (ts.isIdentifier(element.name) && element.name.text === targetName &&
-            key === "constructor") return true;
+            key === propertyName) return true;
         if ((ts.isObjectBindingPattern(element.name) ||
              ts.isArrayBindingPattern(element.name)) &&
-            destructuresConstructor(element.name, targetName)) return true;
+            destructuresConstructor(element.name, targetName, propertyName)) return true;
       }
     }
     if (ts.isArrayBindingPattern(pattern)) {
@@ -1116,7 +1194,7 @@ const assignmentMemberPathKey = (receiver, property) => {
         ts.isBindingElement(element) &&
         (ts.isObjectBindingPattern(element.name) ||
          ts.isArrayBindingPattern(element.name)) &&
-        destructuresConstructor(element.name, targetName));
+        destructuresConstructor(element.name, targetName, propertyName));
     }
     return false;
   };
@@ -1151,6 +1229,26 @@ const assignmentMemberPathKey = (receiver, property) => {
       : [];
     return selected.length === 0 && destructuresConstructor(pattern, node.text);
   };
+  const classMethodCandidatesOf = (input, property, seen = new Set()) => {
+    const methods = [];
+    for (const value of resolvedValuesOf(input, seen)) {
+      if (!ts.isNewExpression(value)) continue;
+      const expression = unwrap(value.expression);
+      let owner = ts.isClassExpression(expression) ? expression : undefined;
+      if (!owner && ts.isIdentifier(expression)) {
+        const binding = resolveBinding(expression);
+        if (binding && ts.isClassDeclaration(binding.node)) owner = binding.node;
+      }
+      if (!owner || seen.has(owner)) continue;
+      const next = new Set(seen);
+      next.add(owner);
+      for (const member of owner.members) {
+        if (ts.isMethodDeclaration(member) &&
+            launchOptionName(member.name) === property) methods.push(member);
+      }
+    }
+    return methods;
+  };
   const functionValueOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
@@ -1170,7 +1268,9 @@ const assignmentMemberPathKey = (receiver, property) => {
     const member = memberAccess(node);
     if (member) {
       return memberValueCandidatesOf(member.receiver, member.property, seen)
-        .some((value) => functionValueOf(value, seen));
+        .some((value) => functionValueOf(value, seen)) ||
+        classMethodCandidatesOf(member.receiver, member.property, seen)
+          .some((value) => functionValueOf(value, seen));
     }
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
@@ -1265,24 +1365,41 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     return false;
   };
+  const globalPrototypeObjectOf = (input) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (ts.isIdentifier(node)) {
+      return !resolveBinding(node) && ["Object", "Reflect"].includes(node.text);
+    }
+    const member = memberAccess(node);
+    return Boolean(member && ["Object", "Reflect"].includes(member.property) &&
+      globalObjectOf(member.receiver));
+  };
   const getPrototypeOfFunctionOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     const method = memberAccess(node);
     if (method?.property === "getPrototypeOf") {
-      const owner = unwrap(method.receiver);
-      return ts.isIdentifier(owner)
-        ? !resolveBinding(owner) && ["Object", "Reflect"].includes(owner.text)
-        : Boolean(memberAccess(owner) &&
-            ["Object", "Reflect"].includes(memberAccess(owner).property) &&
-            globalObjectOf(memberAccess(owner).receiver));
+      return globalPrototypeObjectOf(method.receiver);
     }
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
-    if (binding?.kind !== "variable" || !ts.isVariableDeclaration(binding.node) ||
-        !ts.isIdentifier(binding.node.name) || seen.has(binding.node)) return false;
+    if (!binding || seen.has(binding.node)) return false;
     const next = new Set(seen);
     next.add(binding.node);
-    return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+    const declaration = ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)
+      ? binding.node : undefined;
+    const pattern = declaration?.name;
+    if (pattern && (ts.isObjectBindingPattern(pattern) || ts.isArrayBindingPattern(pattern)) &&
+        destructuresConstructor(pattern, node.text, "getPrototypeOf")) {
+      const values = declaration.initializer
+        ? bindingPatternValuesOf(pattern, declaration.initializer, node.text, next)
+        : [];
+      if (values.some((value) => getPrototypeOfFunctionOf(value, next))) return true;
+      if (globalPrototypeObjectOf(declaration.initializer)) return true;
+    }
+    if (binding.kind !== "variable" || !declaration ||
+        !ts.isIdentifier(declaration.name) || !declaration.initializer) return false;
+    return [declaration.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
       .filter(Boolean)
       .some((value) => getPrototypeOfFunctionOf(value, next));
   };
