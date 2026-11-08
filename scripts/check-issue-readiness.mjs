@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
+import process from "node:process";
 
 const MAX_BYTES = 1024 * 1024;
 const GH_TIMEOUT_MS = 15_000;
@@ -7,7 +8,7 @@ const GH_TIMEOUT_MS = 15_000;
 function main(args) {
   if (args.length !== 3 || !/^[1-9]\d{0,8}$/.test(args[0] ?? "")
       || args[1] !== "--repo" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(args[2] ?? "")) {
-    console.error("UNVERIFIED: usage: node scripts/check-issue-readiness.mjs <issue-number> --repo <owner/repo>");
+    globalThis.console.error("UNVERIFIED: usage: node scripts/check-issue-readiness.mjs <issue-number> --repo <owner/repo>");
     return 3;
   }
   const number = Number(args[0]);
@@ -20,7 +21,7 @@ function main(args) {
       throw new Error("Issue identity or state is unavailable.");
     }
     if (issue.state === "CLOSED") {
-      console.error("BLOCKED #" + number + ": the issue is closed.");
+      globalThis.console.error("BLOCKED #" + number + ": the issue is closed.");
       return 2;
     }
 
@@ -43,17 +44,17 @@ function main(args) {
     }
     const remaining = [...new Set(blockers)].sort((a, b) => a - b);
     if (remaining.length > 0) {
-      console.error("BLOCKED #" + number + ": open native dependencies "
+      globalThis.console.error("BLOCKED #" + number + ": open native dependencies "
         + remaining.map((value) => "#" + value).join(", ")
         + ". The ready-for-agent label does not override dependencies.");
       return 2;
     }
-    console.log("READY #" + number + ": open issue with no open GitHub dependencies (" + repo + ").");
+    globalThis.console.log("READY #" + number + ": open issue with no open GitHub dependencies (" + repo + ").");
     return 0;
   } catch {
     // No fallback to stale labels or cached issue bodies: inability to verify
     // live GitHub dependencies means the task cannot be admitted.
-    console.error("UNVERIFIED #" + number + ": unable to verify live GitHub issue/dependency state; check gh authentication and the native dependency API.");
+    globalThis.console.error("UNVERIFIED #" + number + ": unable to verify live GitHub issue/dependency state; check gh authentication and the native dependency API.");
     return 3;
   }
 }

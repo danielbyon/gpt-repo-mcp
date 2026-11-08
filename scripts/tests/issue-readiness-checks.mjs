@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import process from "node:process";
 import { delimiter, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { URL, fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 const check = fileURLToPath(new URL("../check-issue-readiness.mjs", import.meta.url));
