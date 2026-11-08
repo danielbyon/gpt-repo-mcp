@@ -57,6 +57,15 @@ const FILTERED_CASES = Object.freeze([
     ]
   }
 ]);
+const WINDOWS_TEST_DECLARATION_CACHE = new Map();
+
+function collectCachedWindowsTestTitles(filename, source) {
+  const cached = WINDOWS_TEST_DECLARATION_CACHE.get(filename);
+  if (cached?.source === source) return cached.titles;
+  const titles = collectWindowsTestTitles(filename, source);
+  WINDOWS_TEST_DECLARATION_CACHE.set(filename, { source, titles });
+  return titles;
+}
 
 function tokenize(line) {
   const words = [];
@@ -244,8 +253,74 @@ function invocationKind(expression, names, isProcessPlatform, testRunnerOf) {
   return undefined;
 }
 
+// Vitest may disable an otherwise registered suite or test through its second
+// argument. Unknown option shapes cannot prove that a mandatory case runs.
+function registrationOptionValueOf(input, resolveBinding, seen = new Set()) {
+  const node = unwrap(input);
+  if (!node) return undefined;
+  if (ts.isArrowFunction(node) || ts.isFunctionExpression(node) ||
+      ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) {
+    return { kind: "callable" };
+  }
+  if (ts.isObjectLiteralExpression(node)) return { kind: "options", node };
+  if (!ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (!binding || seen.has(binding.node)) return undefined;
+  if (binding.kind === "opaque" &&
+      (ts.isFunctionDeclaration(binding.node) || ts.isClassDeclaration(binding.node))) {
+    return { kind: "callable" };
+  }
+  const declaration = ts.isVariableDeclaration(binding.node) ||
+    ts.isParameter(binding.node) ? binding.node : undefined;
+  if (!declaration?.initializer ||
+      (ts.isVariableDeclaration(declaration) && !binding.constant)) return undefined;
+  const next = new Set(seen);
+  next.add(binding.node);
+  return registrationOptionValueOf(declaration.initializer, resolveBinding, next);
+}
+
+function registrationOptionsEnabled(argumentsList, resolveBinding) {
+  if (argumentsList.length < 2) return true;
+  const candidate = unwrap(argumentsList[1]);
+  const option = registrationOptionValueOf(candidate, resolveBinding);
+  if (option?.kind === "callable") return true;
+  if (option?.kind !== "options") return false;
+  const supportedOptions = new Set([
+    "concurrent", "fails", "meta", "only", "repeats", "retry", "sequential",
+    "skip", "tags", "timeout", "todo"
+  ]);
+  for (const property of option.node.properties) {
+    if (ts.isSpreadAssignment(property)) return false;
+    const name = ts.isComputedPropertyName(property.name)
+      ? literal(property.name.expression)
+      : ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name) ||
+          ts.isNumericLiteral(property.name) ? property.name.text : undefined;
+    if (name === undefined) return false;
+    if (!supportedOptions.has(name)) return false;
+    if (!["only", "skip", "todo"].includes(name)) continue;
+    const value = ts.isPropertyAssignment(property)
+      ? unwrap(property.initializer)
+      : ts.isShorthandPropertyAssignment(property) ? property.name : undefined;
+    if (!value || (value.kind !== ts.SyntaxKind.TrueKeyword &&
+        value.kind !== ts.SyntaxKind.FalseKeyword)) return false;
+    const enabled = value.kind === ts.SyntaxKind.TrueKeyword;
+    if (name === "only" && enabled) {
+      throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+    }
+    if ((name === "skip" || name === "todo") && enabled) return false;
+  }
+  return true;
+}
+
+function hasRegistrationCallback(argumentsList, resolveBinding) {
+  return argumentsList.slice(1).some((argument) =>
+    registrationOptionValueOf(argument, resolveBinding)?.kind === "callable");
+}
+
 // Resolve only the names used by Windows predicates and Vitest registration.
 function createWindowsTestBindingResolver(file) {
+  const isAmbientDeclaration = (statement) => Boolean(statement.modifiers?.some(
+    (modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword));
   const declaresName = (name, expected) => {
     if (ts.isIdentifier(name)) return name.text === expected;
     if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
@@ -257,7 +332,7 @@ function createWindowsTestBindingResolver(file) {
   const bindingsIn = (statements = [], name) => {
     const found = [];
     for (const statement of statements) {
-      if (ts.isVariableStatement(statement)) {
+      if (!isAmbientDeclaration(statement) && ts.isVariableStatement(statement)) {
         for (const declaration of statement.declarationList.declarations) {
           if (declaresName(declaration.name, name)) {
             found.push({
@@ -268,7 +343,8 @@ function createWindowsTestBindingResolver(file) {
           }
         }
       }
-      if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) ||
+      if (!isAmbientDeclaration(statement) &&
+          (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) ||
            ts.isEnumDeclaration(statement) || ts.isModuleDeclaration(statement)) &&
           statement.name?.text === name) found.push({ kind: "opaque", node: statement });
       if (ts.isImportEqualsDeclaration(statement) && statement.name.text === name) {
@@ -305,6 +381,7 @@ function createWindowsTestBindingResolver(file) {
       if (found || (node !== owner && ts.isFunctionLike(node))) return;
       if (ts.isVariableDeclaration(node) && ts.isVariableDeclarationList(node.parent) &&
           !(node.parent.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) &&
+          !isAmbientDeclaration(node.parent.parent) &&
           declaresName(node.name, name)) {
         found = true;
         return;
@@ -518,7 +595,25 @@ const sourcePropertyValue = (source, key) => {
     if (ts.isAwaitExpression(node)) node = unwrap(node.expression);
     return Boolean(node && ts.isCallExpression(node) &&
       node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-      node.arguments.length === 1 && literal(node.arguments[0]) === "vitest");
+      node.arguments.length === 1 && staticModuleNameOf(node.arguments[0]) === "vitest");
+  };
+  const staticModuleNameOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return undefined;
+    if (ts.isStringLiteralLike(node)) return node.text;
+    if (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = staticModuleNameOf(node.left, seen);
+      const right = staticModuleNameOf(node.right, seen);
+      return left !== undefined && right !== undefined ? left + right : undefined;
+    }
+    if (!ts.isIdentifier(node)) return undefined;
+    const binding = resolveBinding(node);
+    if (binding?.kind !== "variable" || !binding.constant ||
+        !binding.node.initializer || seen.has(binding.node)) return undefined;
+    const next = new Set(seen);
+    next.add(binding.node);
+    return staticModuleNameOf(binding.node.initializer, next);
   };
   const vitestNamespaceOf = (input, seen = new Set()) => {
     const node = unwrap(input);
@@ -839,6 +934,22 @@ collectResolvedAssignments(file);
     }
     const member = access(node);
     return Boolean(member?.method === "Object" && globalObjectOf(member.receiver, seen));
+  }
+  function globalIntrinsicOf(input, names, seen = new Set()) {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      if (!binding) return names.includes(node.text);
+      if (binding.kind !== "variable" || !binding.constant ||
+          !binding.node.initializer || seen.has(binding.node)) return false;
+      const next = new Set(seen);
+      next.add(binding.node);
+      return globalIntrinsicOf(binding.node.initializer, names, next);
+    }
+    const member = access(node);
+    return Boolean(member && names.includes(member.method) &&
+      globalObjectOf(member.receiver, seen));
   }
   function patternSelectsProperty(pattern, targetName, property) {
     if (ts.isObjectBindingPattern(pattern)) {
@@ -1170,7 +1281,46 @@ if (candidate) return candidate;
     }
     return testRunnerOf(node, names);
   };
-  return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf, possibleVitestNamespaceOf };
+  const testRunnerContainerOf = (input, names, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node) return false;
+    if (possibleTestRunnerOf(node, names, seen)) return true;
+    if (globalIntrinsicOf(node, ["Proxy"])) return true;
+    if (!ts.isCallExpression(node)) return false;
+    if (globalIntrinsicOf(node.expression, ["Proxy"])) {
+      return Boolean(node.arguments[0]) &&
+        testRunnerContainerOf(node.arguments[0], names, seen);
+    }
+    const factory = access(unwrap(node.expression));
+    if (!factory) return false;
+    if (factory.method === "get" &&
+        globalIntrinsicOf(factory.receiver, ["Reflect"])) {
+      const property = literal(node.arguments[1]);
+      if (property === undefined) {
+        return possibleTestRunnerOf(node.arguments[0], names, seen) ||
+          possibleVitestNamespaceOf(node.arguments[0]);
+      }
+      if (property === "only") {
+        return possibleTestRunnerOf(node.arguments[0], names, seen);
+      }
+      return names.includes(property) &&
+        possibleVitestNamespaceOf(node.arguments[0]);
+    }
+    if (factory.method === "assign" &&
+        globalIntrinsicOf(factory.receiver, ["Object"])) {
+      return node.arguments.some((argument) =>
+        testRunnerContainerOf(argument, names, seen));
+    }
+    if (factory.method === "create" &&
+        globalIntrinsicOf(factory.receiver, ["Object"])) {
+      return Boolean(node.arguments[0]) &&
+        testRunnerContainerOf(node.arguments[0], names, seen);
+    }
+    return false;
+  };
+  return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
+    possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
+    resolveBinding };
 }
 
 /**
@@ -1183,7 +1333,8 @@ export function collectWindowsTestTitles(filename, source) {
   if (file.parseDiagnostics.length) throw new Error("Cannot parse Vitest declarations");
   const titles = [];
   const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
-    possibleVitestNamespaceOf } =
+    possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
+    resolveBinding } =
     createWindowsTestBindingResolver(file);
 
   // Exclusive declarations anywhere in the file remain fail-closed, including
@@ -1240,9 +1391,21 @@ export function collectWindowsTestTitles(filename, source) {
       throw new Error("Exclusive or dynamically selected Vitest tests unaudited.");
     }
     const member = access(node);
-    if (member && possibleTestRunnerOf(member.receiver, ["test", "it", "describe"]) &&
+    if (member && testRunnerContainerOf(member.receiver, ["test", "it", "describe"]) &&
         (member.method === undefined || member.method === "only")) {
       throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+    }
+    if (ts.isCallExpression(node)) {
+      const reflective = access(unwrap(node.expression));
+      if (reflective?.method === "get" &&
+          globalIntrinsicOf(reflective.receiver, ["Reflect"])) {
+        const property = literal(node.arguments[1]);
+        const runner = possibleTestRunnerOf(
+          node.arguments[0], ["test", "it", "describe"]);
+        if (runner && (property === undefined || property === "only")) {
+          throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+        }
+      }
     }
     if (ts.isBinaryExpression(node) &&
         node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
@@ -1299,46 +1462,62 @@ export function collectWindowsTestTitles(filename, source) {
 
   const register = (node, disabled = false) => {
     if (ts.isSourceFile(node) || ts.isBlock(node)) {
-      for (const statement of node.statements) register(statement, disabled);
-      return;
+      let continuing = true;
+      for (const statement of node.statements) {
+        const branchContinues = register(statement, disabled || !continuing);
+        if (continuing) continuing = branchContinues;
+      }
+      return continuing;
     }
     if (ts.isIfStatement(node)) {
       const outcome = conditionOnWindows(node.expression, isProcessPlatform);
-      register(node.thenStatement, disabled || outcome !== true);
-      if (node.elseStatement) register(node.elseStatement, disabled || outcome !== false);
-      return;
+      const thenContinues = register(node.thenStatement, disabled || outcome !== true);
+      const elseContinues = node.elseStatement
+        ? register(node.elseStatement, disabled || outcome !== false)
+        : true;
+      if (outcome === true) return thenContinues;
+      if (outcome === false) return elseContinues;
+      return thenContinues && elseContinues;
     }
     if (ts.isExpressionStatement(node)) {
       register(node.expression, disabled);
-      return;
+      return true;
     }
     node = unwrap(node);
     if (ts.isConditionalExpression(node)) {
       const outcome = conditionOnWindows(node.condition, isProcessPlatform);
       register(node.whenTrue, disabled || outcome !== true);
       register(node.whenFalse, disabled || outcome !== false);
-      return;
+      return true;
     }
-    if (!ts.isCallExpression(node)) return;
+    if (ts.isReturnStatement(node) || ts.isThrowStatement(node)) return false;
+    if (!ts.isCallExpression(node)) return true;
 
     const suite = invocationKind(node.expression, ["describe"], isProcessPlatform, testRunnerOf);
     if (suite) {
-      const callback = unwrap(node.arguments[1]);
+      const callback = node.arguments.slice(1).map(unwrap).find((argument) =>
+        ts.isArrowFunction(argument) || ts.isFunctionExpression(argument));
       if (callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) {
-        register(callback.body, disabled || !suite.enabled);
+        register(callback.body,
+          disabled || !suite.enabled ||
+          !registrationOptionsEnabled(node.arguments, resolveBinding));
       }
       // Unresolved suite callbacks are not proven to register tests.
-      return;
+      return true;
     }
     const title = literal(node.arguments[0]);
     const call = invocationKind(node.expression, ["test", "it"], isProcessPlatform, testRunnerOf);
     if (call && title !== undefined) {
       const expanded = call.values ? call.values.map((value, i) =>
         title.replace(/%s|%d|%i/, (p) => p === "%i" ? String(i) : String(value))) : [title];
-      for (const name of expanded) titles.push({ title: name, enabled: call.enabled && !disabled });
+      const enabled = call.enabled &&
+        registrationOptionsEnabled(node.arguments, resolveBinding) &&
+        hasRegistrationCallback(node.arguments, resolveBinding);
+      for (const name of expanded) titles.push({ title: name, enabled: enabled && !disabled });
     }
     // Other calls (setTimeout, .then, IIFEs, fixtures) are not Vitest
     // registration contexts; never descend through their callbacks.
+    return true;
   };
   register(file);
   return titles;
@@ -1379,6 +1558,9 @@ function mandatoryJob(jobs, name, runner, findings) {
       job["runs-on"] !== runner) {
     findings.push("Required CI job is conditional, optional, or uses an unexpected runner: " + name);
   }
+  if (Object.hasOwn(job, "needs") && job.needs !== undefined) {
+    findings.push("Required CI job must not depend on another job: " + name);
+  }
   if (JSON.stringify(job.strategy?.matrix?.["node-version"]) !==
         JSON.stringify(["20.x", "22.x"]) ||
       Object.keys(job.strategy?.matrix ?? {}).some((key) => key !== "node-version")) {
@@ -1390,6 +1572,12 @@ function mandatoryJob(jobs, name, runner, findings) {
 export function inspectQualificationWorkflow(workflow, readTest = (path) =>
   readFileSync(join(ROOT, path), "utf8")) {
   const findings = [];
+  const pullRequest = workflow?.on?.pull_request;
+  if (!workflow?.on || !Object.hasOwn(workflow.on, "pull_request") ||
+      (pullRequest !== null &&
+       (typeof pullRequest !== "object" || Object.keys(pullRequest).length > 0))) {
+    findings.push("CI must run for every pull request without event filters");
+  }
   const linux = mandatoryJob(workflow?.jobs, "test", "ubuntu-latest", findings);
   const windows = mandatoryJob(workflow?.jobs, "windows-test", "windows-2025", findings);
   for (const [steps, platform] of [[linux, "Linux"], [windows, "Windows"]]) {
@@ -1451,17 +1639,17 @@ export function inspectQualificationWorkflow(workflow, readTest = (path) =>
   }
 
   const parsedFiles = new Map();
+  for (const file of new Set(REQUIREMENTS.flatMap((scope) => scope.files))) {
+    try {
+      parsedFiles.set(file, collectCachedWindowsTestTitles(file, readTest(file)));
+    } catch {
+      parsedFiles.set(file, []);
+      findings.push("Could not parse mandatory Vitest declarations: " + file);
+    }
+  }
   for (const scope of FILTERED_CASES) {
     const commands = (selectedByStep.get(scope.step) ?? [])
       .filter((command) => command.files.includes(scope.file));
-    if (!parsedFiles.has(scope.file)) {
-      try {
-        parsedFiles.set(scope.file, collectWindowsTestTitles(scope.file, readTest(scope.file)));
-      } catch {
-        parsedFiles.set(scope.file, []);
-        findings.push("Could not parse mandatory Vitest declarations: " + scope.file);
-      }
-    }
     const declarations = parsedFiles.get(scope.file);
     for (const expected of scope.titles.flatMap(expandMandatory)) {
       const matching = declarations.filter((test) => test.title === expected && test.enabled);

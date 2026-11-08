@@ -196,6 +196,28 @@ describe("Windows qualification scope guard", () => {
   });
 
   test.each([
+    ["skip option", "test('required', { skip: true }, () => {});"],
+    ["todo option", "test('required', { todo: true }, () => {});"],
+    ["unsupported option", "test('required', { enabled: false }, () => {});"],
+    ["disabled suite options", "describe('suite', { skip: true }, () => { test('required', () => {}); });"],
+    ["opaque test options", "const options = { skip: true }; test('required', options, () => {});"],
+    ["options without a callback", "const options = { skip: true }; test('required', options);"],
+    ["dynamic test options", "test('required', { [optionName]: true }, () => {});"]
+  ])("does not count required regression with %s", (_name, source) => {
+    expect(collectWindowsTestTitles("fixture.ts", source))
+      .toEqual([{ title: "required", enabled: false }]);
+  });
+
+  test.each([
+    ["disabled fields", "test('required', { skip: false, todo: false }, () => {});"],
+    ["supported fields", "test('required', { only: false, timeout: 1000 }, () => {});"],
+    ["suite fields", "describe('suite', { skip: false }, () => { test('required', () => {}); });"]
+  ])("counts required regression with provably enabled %s", (_name, source) => {
+    expect(collectWindowsTestTitles("fixture.ts", source))
+      .toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test.each([
     ["shadowed process parameter", "describe('suite', (process) => { if (process.platform === 'win32') { test('required', () => {}); } });"],
     ["shadowed process local", "describe('suite', () => { const process = { platform: 'win32' }; if (process.platform === 'win32') { test('required', () => {}); } });"]
   ])("treats %s as an unknown Windows predicate", (_name, source) => {
@@ -207,6 +229,19 @@ describe("Windows qualification scope guard", () => {
     expect(collectWindowsTestTitles("fixture.ts",
       "import process from 'node:process'; if (process.platform === 'win32') { test('required', () => {}); }"))
       .toEqual([{ title: "required", enabled: true }]);
+  });
+  test("uses the runtime global after an ambient process declaration", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "declare const process: any; if (process.platform === 'win32') { test('required', () => {}); }"))
+      .toEqual([{ title: "required", enabled: true }]);
+    expect(collectWindowsTestTitles("fixture.ts",
+      "declare var process: any; if (process.platform === 'win32') { test('required', () => {}); }"))
+      .toEqual([{ title: "required", enabled: true }]);
+  });
+  test("does not trust an initializerless process declaration", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "let process: any; if (process.platform === 'win32') { test('required', () => {}); }"))
+      .toEqual([{ title: "required", enabled: false }]);
   });
 
   test("rejects a mandatory regression hidden in a disabled parent suite", () => {
@@ -502,5 +537,56 @@ describe("Windows qualification scope guard", () => {
     windowsStep(workflow, "Validation security and CI coverage guardrails").run = "npm run lint";
     expect(inspect(workflow)).toContain(
       "Windows must run mandatory validation guardrails");
+  });
+
+  test("rejects mandatory registration after an early Windows return", () => {
+    expect(collectWindowsTestTitles("fixture.ts",
+      "describe('suite', () => { if (process.platform === 'win32') return; test('required', () => {}); });"))
+      .toEqual([{ title: "required", enabled: false }]);
+  });
+
+  test.each([
+    ["reflected test.only", "import { test } from 'vitest'; Reflect.get(test, 'only')('focused', () => {});"],
+    ["option-only test", "import { test } from 'vitest'; test('focused', { only: true }, () => {});"],
+    ["option-only suite", "import { describe } from 'vitest'; describe('suite', { only: true }, () => {});"],
+    ["created test runner", "import { test } from 'vitest'; Object.create(test).only('focused', () => {});"],
+    ["assigned test runner", "import { test } from 'vitest'; Object.assign({}, test).only('focused', () => {});"],
+    ["proxied test runner", "import { test } from 'vitest'; Proxy(test, {}).only('focused', () => {});"],
+    ["computed dynamic namespace", "const V = await import('vi' + 'test'); V.test.only('focused', () => {});"]
+  ])("rejects exclusive registration through %s", (_name, source) => {
+    expect(() => collectWindowsTestTitles("fixture.ts", source))
+      .toThrow(/Exclusive or dynamically selected Vitest/);
+  });
+
+  test("parses unfiltered mandatory files for exclusive registration", () => {
+    const workflow = load();
+    const findings = inspectQualificationWorkflow(workflow, (path) =>
+      path === "tests/package-archive-verification.test.ts"
+        ? "test.only('focused', () => {});"
+        : readFileSync(join(root, path), "utf8"));
+    expect(findings).toContain(
+      "Could not parse mandatory Vitest declarations: tests/package-archive-verification.test.ts");
+  });
+
+  test("rejects a required job that depends on another job", () => {
+    const workflow = load();
+    workflow.jobs["skip-preflight"] = {
+      if: "false",
+      "runs-on": "ubuntu-latest",
+      steps: [{ uses: "actions/checkout@v6" }]
+    };
+    workflow.jobs.test.needs = "skip-preflight";
+    workflow.jobs["windows-test"].needs = "skip-preflight";
+    expect(inspect(workflow)).toEqual(expect.arrayContaining([
+      "Required CI job must not depend on another job: test",
+      "Required CI job must not depend on another job: windows-test"
+    ]));
+  });
+
+  test("requires pull request workflow execution", () => {
+    const workflow = load();
+    delete workflow.on.pull_request;
+    expect(inspect(workflow)).toContain(
+      "CI must run for every pull request without event filters");
   });
 });

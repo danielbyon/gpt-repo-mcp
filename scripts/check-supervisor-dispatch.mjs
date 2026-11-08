@@ -17,7 +17,7 @@ const MODULE_LOADING_MODULES = new Set(["node:module", "module"]);
 const DYNAMIC_EVALUATION_MODULES = new Set(["node:vm", "vm"]);
 const SHELL_MODULES = new Set(["cross-spawn", "shelljs", "execa"]);
 const SAFE_PROCESS_EXPORTS = new Set(["spawn", "spawnSync", "execFile", "execFileSync"]);
-const DISALLOWED_PROGRAMS = /(?:^|[\\/])(?:cmd|command|powershell|pwsh|bash|sh|zsh)(?:\.exe)?$/i;
+const DISALLOWED_PROGRAMS = /(?:^|[\\/])(?:cmd|command|powershell|pwsh|bash|dash|sh|zsh|ksh|ash|fish|csh|tcsh|busybox|env)(?:\.exe)?$/i;
 const DISALLOWED_SHIMS = /\.(?:cmd|bat|ps1|psm1|sh)$/i;
 
 const moduleLiteral = (node) => node && ts.isStringLiteralLike(node) ? node.text : undefined;
@@ -102,6 +102,18 @@ function inspectJavaScript(filename, source, isLauncher = false) {
     const node = unwrap(input);
     if (!node) return false;
     if (ts.isIdentifier(node)) return node.text === "require" && !resolveBinding(node);
+  if (ts.isPropertyAccessExpression(node)) {
+    const property = node.name.text;
+    if (property === "require") return globalObjectOf(node.expression);
+    return ["call", "apply", "bind"].includes(property) &&
+      requireReferenceOf(node.expression);
+  }
+  if (ts.isElementAccessExpression(node)) {
+    const property = moduleLiteral(node.argumentExpression);
+    if (property === "require") return globalObjectOf(node.expression);
+    return ["call", "apply", "bind"].includes(property) &&
+      requireReferenceOf(node.expression);
+  }
     if (!ts.isBinaryExpression(node)) return false;
     const operator = node.operatorToken.kind;
     if (operator === ts.SyntaxKind.CommaToken) {
@@ -141,10 +153,12 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   // wide name table. An unknown or ambiguous binding is never argv evidence.
   const resolveBinding = (reference) => {
     const text = reference.text;
+  const isAmbientDeclaration = (statement) => Boolean(statement.modifiers?.some(
+    (modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword));
 const declarations = (statements = []) => {
       const found = [];
       for (const statement of statements) {
-        if (ts.isVariableStatement(statement)) {
+      if (!isAmbientDeclaration(statement) && ts.isVariableStatement(statement)) {
           for (const declaration of statement.declarationList.declarations) {
             if (declaresName(declaration.name, text)) {
               found.push({
@@ -155,7 +169,8 @@ const declarations = (statements = []) => {
             }
           }
         }
-        if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+      if (!isAmbientDeclaration(statement) &&
+          (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
             statement.name?.text === text) {
           found.push({ kind: "opaque", node: statement });
         }
@@ -185,6 +200,7 @@ const declarations = (statements = []) => {
         if (ts.isVariableDeclaration(node) &&
             ts.isVariableDeclarationList(node.parent) &&
             !(node.parent.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) &&
+            !isAmbientDeclaration(node.parent.parent) &&
             declaresName(node.name, name)) {
           found = true;
           return;
@@ -483,6 +499,17 @@ const assignmentMemberPathKey = (receiver, property) => {
       const right = staticStringOf(node.right, seen);
       return left !== undefined && right !== undefined ? left + right : undefined;
     }
+  if (ts.isElementAccessExpression(node)) {
+    const index = unwrap(node.argumentExpression);
+    if (!index || (!ts.isNumericLiteral(index) && !ts.isStringLiteralLike(index))) {
+      return undefined;
+    }
+    const values = memberValueCandidatesOf(node.expression, index.text, seen)
+      .map((value) => staticStringOf(value, seen))
+      .filter((value) => value !== undefined);
+    const unique = [...new Set(values)];
+    return unique.length === 1 ? unique[0] : undefined;
+  }
     if (!ts.isIdentifier(node)) return undefined;
     const binding = resolveBinding(node);
     if (binding?.kind !== "variable" || !binding.constant ||
@@ -786,6 +813,13 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     if (ts.isCallExpression(node)) {
       if (processModuleRequire(node)) return true;
+    const copyFactory = memberAccess(unwrap(node.expression));
+    if (copyFactory && globalPrototypeObjectOf(copyFactory.receiver)) {
+      const copiedArguments = copyFactory.property === "assign"
+        ? node.arguments
+        : copyFactory.property === "create" ? node.arguments.slice(0, 1) : [];
+      if (copiedArguments.some((value) => processObjectOf(value, seen))) return true;
+    }
       const callee = unwrap(node.expression);
       const binding = ts.isIdentifier(callee) ? resolveBinding(callee) : undefined;
       if (binding && seen.has(binding.node)) return false;
@@ -1235,6 +1269,8 @@ const reflectiveReadOf = (input, seen = new Set()) => {
       } else if (property === "process") {
         add(entry.node,
           "global process capability destructuring is unproven in supervisor source");
+    } else if (property === "require") {
+      add(entry.node, "global require capability is forbidden in supervisor source");
       } else if (property === "global" || property === "globalThis") {
         add(entry.node,
           "global object alias destructuring is unproven in supervisor source");
@@ -1819,16 +1855,23 @@ const reflectiveReadOf = (input, seen = new Set()) => {
         add(node, "dynamic import is forbidden in supervisor source");
       }
       if (requireReferenceOf(node.expression)) inspectRequire(node);
+      const invoked = memberAccess(unwrap(node.expression));
+      if (invoked?.property === "apply" && globalReflectOf(invoked.receiver) &&
+          requireReferenceOf(node.arguments[0])) {
+        add(node, "dynamic require forbidden in supervisor source");
+      }
       if (called === "createRequire" || called === "_parse") {
         add(node, "indirect process loading, eval, or private shim parsing is forbidden");
       }
       if (reflectiveReadOf(node.expression)) {
         const receiver = node.arguments[0];
         const property = staticStringOf(node.arguments[1]);
+        const globalCapabilityReceiver = globalObjectOf(receiver) ||
+          globalFunctionObjectOf(receiver);
         const sensitive = property === undefined
-          ? globalObjectOf(receiver) || processObjectOf(receiver)
-          : (globalObjectOf(receiver) &&
-             ["Function", "eval", "process", "constructor"].includes(property)) ||
+          ? globalCapabilityReceiver || processObjectOf(receiver)
+          : (globalCapabilityReceiver &&
+            ["Function", "eval", "process", "constructor", "require"].includes(property)) ||
             (processObjectOf(receiver) && property === "getBuiltinModule");
         if (sensitive) {
           add(node, "reflective access to dynamic execution or process capabilities forbidden");

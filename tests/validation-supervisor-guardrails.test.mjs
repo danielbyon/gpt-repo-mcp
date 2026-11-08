@@ -161,6 +161,23 @@ describe("validation supervisor direct-execution guard", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
   });
 
+test.each([
+  ["Object.assign", "const copy = Object.assign({}, process); copy.getBuiltinModule('node:child_process').exec('id');"],
+  ["Object.create", "const copy = Object.create(process); copy.getBuiltinModule('node:child_process').exec('id');"]
+])("rejects process capability copies through %s", (_name, source) => {
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+    .some((finding) => finding.includes("process.getBuiltinModule"))).toBe(true);
+});
+
+test.each([
+  ["ambient process", "declare const process: any; process.getBuiltinModule('node:child_process');"],
+  ["ambient var process", "declare var process: any; process.getBuiltinModule('node:child_process');"],
+  ["ambient globalThis", "declare const globalThis: any; globalThis.Function('return 42')();"],
+  ["ambient Object", "declare const Object: any; Reflect.get(Object, 'constructor')('return 42')();"]
+])("treats %s as the erased runtime global", (_name, source) => {
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
+});
+
   test("accepts unrelated process use and unrelated getBuiltinModule methods", () => {
     const source = [
       "process.cwd();",
@@ -283,6 +300,8 @@ describe("validation supervisor direct-execution guard", () => {
   test.each([
     ["Reflect.get Function",
       "const make = Reflect.get(globalThis, 'Function'); make('return process')();"],
+    ["Reflect.get intrinsic constructor",
+      "const make = Reflect.get(Object, 'constructor'); make('return 42')();"],
     ["Reflect.get process loader",
       "const load = Reflect.get(process, 'getBuiltinModule'); load('node:child_process');"],
     ["property descriptor Function",
@@ -452,6 +471,15 @@ describe("validation supervisor direct-execution guard", () => {
   });
 
   test.each([
+    ["dash", "spawn('/bin/dash', ['-c', 'id']);"],
+    ["env wrapper", "spawn('/usr/bin/env', ['sh', '-c', 'id']);"],
+    ["fixed array indirection", "const program = ['cmd.exe']; spawn(program[0], ['/c', 'dir']);"]
+  ])("rejects shell dispatch through %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+      .some((finding) => finding.includes("direct interpreter or command-shim"))).toBe(true);
+  });
+
+  test.each([
     ["parenthesized", "import {spawn} from 'node:child_process'; (spawn)('node.exe', []);"],
     ["as assertion", "import {spawn as s} from 'node:child_process'; (s as any)('node.exe', [], {stdio:'pipe'});"],
     ["angle assertion", "import {execFile as e} from 'node:child_process'; (<any>e)('node.exe', [], () => {});"],
@@ -472,6 +500,21 @@ describe("validation supervisor direct-execution guard", () => {
     expect(inspectSupervisorSource("src/services/process-exec.ts", valid))
       .toEqual([expect.stringContaining("indirect or escaping child_process runner")]);
   });
+test.each([
+  ["call", "const cp = require.call(null, 'node:child_process'); cp.exec('id');"],
+  ["apply", "const cp = require.apply(null, ['node:child_process']); cp.exec('id');"],
+  ["bind", "const load = require.bind(null); const cp = load('node:child_process'); cp.exec('id');"],
+  ["Reflect.apply", "const cp = Reflect.apply(require, null, ['node:child_process']); cp.exec('id');"],
+  ["global alias", "const cp = globalThis.require('node:child_process'); cp.exec('id');"],
+  ["global destructuring", "const { require: load } = globalThis; const cp = load('node:child_process'); cp.exec('id');"]
+])("rejects indirect require through %s inside POSIX_GROUP_LAUNCHER", (_name, body) => {
+  const quoted = "const POSIX_GROUP_LAUNCHER = String.raw" + String.fromCharCode(96) +
+    body + String.fromCharCode(96) + ";";
+  expect(inspectSupervisorSource("src/services/process-exec.ts", quoted))
+    .toEqual(expect.arrayContaining([
+      expect.stringMatching(/require capability|dynamic require|child_process require/)
+    ]));
+});
 
   test.each([
     ["node:child_process wildcard", "export * from \"node:child_process\";"],
