@@ -510,7 +510,8 @@ const assignmentsByMemberPath = new Map();
   const parameterRestArguments = new Map();
   const parameterFunctionArguments = new Map();
   const functionArgumentsPlans = new Map();
-  const thisReceiverByGetter = new WeakMap();
+  const getterReceiverOf = (getter) =>
+    ts.isObjectLiteralExpression(getter.parent) ? getter.parent : undefined;
 const assignmentMemberAccess = (node) => {
   node = unwrap(node);
   if (ts.isPropertyAccessExpression(node)) {
@@ -1168,7 +1169,7 @@ if (node.kind === ts.SyntaxKind.ThisKeyword) {
   let current = node.parent;
   while (current) {
     if (ts.isGetAccessorDeclaration(current)) {
-      const receiver = thisReceiverByGetter.get(current);
+      const receiver = getterReceiverOf(current);
       if (receiver) values.push(...containerValuesOf(receiver, next));
       return values;
     }
@@ -1287,16 +1288,13 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
           else if (ts.isShorthandPropertyAssignment(property)) values.push(property.name);
             else if (ts.isMethodDeclaration(property)) values.push(property);
         else if (ts.isGetAccessorDeclaration(property)) {
-  thisReceiverByGetter.set(property, container);
           values.push(property, ...functionReturnExpressionsOf(property, seen));
         }
         }
       }
     } else if (ts.isArrayLiteralExpression(container) && /^\d+$/.test(key)) {
-      const element = container.elements[Number(key)];
-      if (element && !ts.isOmittedExpression(element) && !ts.isSpreadElement(element)) {
-        values.push(element);
-      }
+      const element = fixedSpreadValuesOf(container, new Set())?.[Number(key)];
+      if (element) values.push(element);
     }
   }
   const receiverKey = assignmentReferenceKey(input);

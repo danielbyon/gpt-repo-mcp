@@ -96,7 +96,8 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const parameterRestArguments = new Map();
 const parameterFunctionArguments = new Map();
 const functionArgumentsPlans = new Map();
-const thisReceiverByGetter = new WeakMap();
+const getterReceiverOf = (getter) =>
+  ts.isObjectLiteralExpression(getter.parent) ? getter.parent : undefined;
   const requireReferenceOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
@@ -818,7 +819,7 @@ const assignmentMemberPathKey = (receiver, property) => {
     let current = node.parent;
     while (current) {
       if (ts.isGetAccessorDeclaration(current)) {
-        const receiver = thisReceiverByGetter.get(current);
+        const receiver = getterReceiverOf(current);
         if (receiver) {
           objects.push(...objectValueCandidatesOf(receiver, next));
         }
@@ -900,17 +901,14 @@ const functionArgumentsPlanOf = (identifier, seen = new Set()) => {
         if (ts.isShorthandPropertyAssignment(candidate)) values.push(candidate.name);
       if (ts.isMethodDeclaration(candidate)) values.push(candidate);
 if (ts.isGetAccessorDeclaration(candidate)) {
-        thisReceiverByGetter.set(candidate, object);
-values.push(candidate, ...functionReturnExpressionsOf(candidate, next));
+        values.push(candidate, ...functionReturnExpressionsOf(candidate, next));
 }
       }
     }
     for (const value of resolvedValuesOf(node, next)) {
       if (!ts.isArrayLiteralExpression(value) || !/^\d+$/.test(property)) continue;
-      const indexed = value.elements[Number(property)];
-      if (indexed && !ts.isOmittedExpression(indexed) && !ts.isSpreadElement(indexed)) {
-        values.push(indexed);
-      }
+      const indexed = fixedSpreadValuesOf(value, new Set())?.[Number(property)];
+      if (indexed) values.push(indexed);
     }
     if (ts.isIdentifier(node)) {
     if (/^\d+$/.test(property)) {
