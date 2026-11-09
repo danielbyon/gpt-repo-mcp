@@ -888,6 +888,15 @@ const argumentArrayPlanOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node) return { before: [], after: [], unknownIndex: 0 };
   if (ts.isArrayLiteralExpression(node)) return fixedCallArgumentPlanOf(node.elements);
+  if (ts.isCallExpression(node)) {
+    const returned = functionReturnExpressionsOf(node.expression, seen);
+    if (returned.length > 0) {
+      const next = new Set(seen);
+      next.add(node);
+      return returned.map((value) => argumentArrayPlanOf(value, next))
+        .reduce((left, right) => mergeCallArgumentPlans(left, right));
+    }
+  }
   if (ts.isObjectLiteralExpression(node)) {
     const entries = new Map();
     const uncertainValues = [];
@@ -940,6 +949,28 @@ const argumentArrayPlanOf = (input, seen = new Set()) => {
         const value = ts.isPropertyAssignment(property)
           ? property.initializer
           : ts.isShorthandPropertyAssignment(property) ? property.name : undefined;
+        if (ts.isGetAccessorDeclaration(property)) {
+          const returned = functionReturnExpressionsOf(property, objectSeen);
+          if (key === undefined || returned.length !== 1) {
+            shapeIsStatic = false;
+            uncertainValues.push(...returned.map(unwrap));
+            continue;
+          }
+          if (key === "length") {
+            const candidate = staticNumericStringOf(unwrap(returned[0]));
+            if (candidate === undefined || !Number.isSafeInteger(candidate) ||
+                candidate < 0 || candidate > 1024) lengthIsStatic = false;
+            else {
+              length = candidate;
+              lengthIsStatic = true;
+            }
+            continue;
+          }
+          const index = Number(key);
+          if (Number.isSafeInteger(index) && index >= 0 &&
+              String(index) === key) entries.set(index, unwrap(returned[0]));
+          continue;
+        }
         if (key === undefined || (!value &&
             (ts.isMethodDeclaration(property) ||
              ts.isGetAccessorDeclaration(property)))) {
@@ -1017,6 +1048,30 @@ const argumentArrayPlanOf = (input, seen = new Set()) => {
     }
     return { before, after: [], unknownIndex: undefined };
   }
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    const restPlans = binding?.node && ts.isParameter(binding.node) &&
+      binding.node.dotDotDotToken
+      ? parameterRestArguments.get(binding.node) ?? [] : [];
+    if (restPlans.length > 0) {
+      return restPlans.reduce((left, right) =>
+        mergeCallArgumentPlans(left, right));
+    }
+    const argumentPlans = functionArgumentsPlanOf(node) ?? [];
+    if (argumentPlans.length > 0) {
+      return argumentPlans.map((plan) => ({
+        ...plan,
+        offset: (plan.offset ?? 0) + 1
+      })).reduce((left, right) => mergeCallArgumentPlans(left, right));
+    }
+    if (binding?.kind === "variable" &&
+        ts.isVariableDeclaration(binding.node) &&
+        ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+      const next = new Set(seen);
+      next.add(node);
+      return argumentArrayPlanOf(binding.node.initializer, next);
+    }
+  }
   const expanded = fixedSpreadValuesOf(node, seen);
   return expanded
     ? { before: expanded, after: [], unknownIndex: undefined }
@@ -1087,10 +1142,19 @@ const enclosingFunctionOf = (node) => {
   }
   return current;
 };
-const functionArgumentsPlanOf = (identifier) => {
-  if (!ts.isIdentifier(identifier) || identifier.text !== "arguments" ||
-      resolveBinding(identifier)) return undefined;
-  return functionArgumentsPlans.get(enclosingFunctionOf(identifier));
+const functionArgumentsPlanOf = (identifier, seen = new Set()) => {
+  if (!ts.isIdentifier(identifier) || seen.has(identifier)) return undefined;
+  const binding = resolveBinding(identifier);
+  if (identifier.text === "arguments" && !binding) {
+    return functionArgumentsPlans.get(enclosingFunctionOf(identifier));
+  }
+  if (binding?.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+    const next = new Set(seen);
+    next.add(identifier);
+    return functionArgumentsPlanOf(binding.node.initializer, next);
+  }
+  return undefined;
 };
 const objectPropertyValuesOf = (input, key, seen = new Set()) => {
     const values = restPropertyValuesOf(input, key, seen);
@@ -1098,6 +1162,18 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
   if (reference && ts.isIdentifier(reference) && /^\d+$/.test(key)) {
     for (const plan of functionArgumentsPlanOf(reference) ?? []) {
       values.push(...callArgumentCandidatesAt(plan, Number(key)));
+    }
+  }
+  if (reference && ts.isCallExpression(reference) && /^\d+$/.test(key)) {
+    for (const returned of functionReturnExpressionsOf(reference.expression, seen)) {
+      for (const plan of functionArgumentsPlanOf(returned, seen) ?? []) {
+        values.push(...callArgumentCandidatesAt(plan, Number(key)));
+      }
+      if (ts.isArrayLiteralExpression(unwrap(returned))) {
+        const indexed = unwrap(returned).elements[Number(key)];
+        if (indexed && !ts.isOmittedExpression(indexed) &&
+            !ts.isSpreadElement(indexed)) values.push(indexed);
+      }
     }
   }
   if (reference && ts.isIdentifier(reference)) {
@@ -1428,6 +1504,11 @@ collectResolvedAssignments(file);
             ? property.initializer
             : ts.isShorthandPropertyAssignment(property) ? property.name : undefined;
           if (value && reflectApplyReferenceOf(value, next)) return true;
+          if (ts.isGetAccessorDeclaration(property) &&
+              functionReturnExpressionsOf(property, next)
+                .some((returned) => reflectApplyReferenceOf(returned, next))) {
+            return true;
+          }
         }
       }
     }
@@ -1436,9 +1517,16 @@ collectResolvedAssignments(file);
     if (!binding?.node || seen.has(binding.node)) return false;
     const declaration = ts.isVariableDeclaration(binding.node) ||
       ts.isParameter(binding.node) ? binding.node : undefined;
-    if (!declaration || !ts.isIdentifier(declaration.name)) return false;
+    if (!declaration) return false;
     const next = new Set(seen);
     next.add(binding.node);
+    if (!ts.isIdentifier(declaration.name)) {
+      return Boolean(declaration.initializer &&
+        ((globalIntrinsicOf(declaration.initializer, ["Reflect"], next) &&
+          patternSelectsProperty(declaration.name, node.text, "apply")) ||
+         destructuredValuesOf(declaration, node.text)
+           .some((value) => reflectApplyReferenceOf(value, next))));
+    }
     return [declaration.initializer, ...(assignmentsByBinding.get(declaration) ?? [])]
       .filter(Boolean)
       .some((value) => reflectApplyReferenceOf(value, next));
@@ -1505,6 +1593,13 @@ collectResolvedAssignments(file);
         ? expandedArgumentValuesOf(argument.expression, seen)
         : [argument]);
   }
+function intrinsicArgumentPlanValuesOf(plan) {
+  const values = [...plan.before];
+  if (plan.unknownAll || plan.unknownIndex !== undefined) {
+    values.push(...plan.after);
+  }
+  return values;
+}
 function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
   const node = unwrap(input);
   if (!node || !ts.isCallExpression(node)) return undefined;
@@ -1528,7 +1623,9 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
   return {
     target,
     arguments: applicationArguments
-      ? expandedArgumentValuesOf(applicationArguments, seen)
+      ? intrinsicArgumentPlanValuesOf(
+        argumentArrayPlanOf(applicationArguments, seen)
+      )
       : []
   };
 }
@@ -2286,12 +2383,64 @@ const reflectApplyInvocationOf = (argumentsList, seen = new Set()) => {
   if (functions.length === 0) return undefined;
   return { functions, plan: argumentArrayPlanOf(argumentsList[2], seen) };
 };
+const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (binding?.kind === "variable" &&
+        ts.isVariableDeclaration(binding.node) &&
+        ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+      const initializer = unwrap(binding.node.initializer);
+      const bind = ts.isCallExpression(initializer)
+        ? resolvedAccess(unwrap(initializer.expression)) : undefined;
+      if (!ts.isIdentifier(initializer) && bind?.method !== "bind") {
+        return undefined;
+      }
+      return storedBindInvocationOf(
+        binding.node.initializer, invocationPlan, next
+      );
+    }
+    return undefined;
+  }
+  if (!ts.isCallExpression(node)) return undefined;
+  const bind = resolvedAccess(unwrap(node.expression));
+  if (bind?.method !== "bind") return undefined;
+  const plan = mergeCallArgumentPlans(
+    fixedCallArgumentPlanOf(node.arguments.slice(1)),
+    invocationPlan
+  );
+  if (reflectApplyReferenceOf(bind.receiver, next)) {
+    const functions = callArgumentCandidatesAt(plan, 0)
+      .flatMap((value) => localFunctionValuesOf(value, next));
+    if (functions.length > 0) {
+      const applicationPlans = callArgumentCandidatesAt(plan, 2)
+        .map((value) => argumentArrayPlanOf(value, next));
+      return {
+        functions,
+        plan: applicationPlans.length > 0
+          ? applicationPlans.reduce((left, right) =>
+            mergeCallArgumentPlans(left, right))
+          : { before: [], after: [], unknownIndex: 0 }
+      };
+    }
+  }
+  const functions = localFunctionValuesOf(bind.receiver, next);
+  if (functions.length === 0) return undefined;
+  return { functions, plan };
+};
 const localInvocationOf = (call) => {
   const callee = unwrap(call.expression);
   if (reflectApplyReferenceOf(callee)) {
     const reflected = reflectApplyInvocationOf(call.arguments);
     if (reflected) return reflected;
   }
+  const storedBound = storedBindInvocationOf(
+    callee, fixedCallArgumentPlanOf(call.arguments)
+  );
+  if (storedBound) return storedBound;
   if (ts.isCallExpression(callee)) {
     const bind = resolvedAccess(unwrap(callee.expression));
     if (bind?.method === "bind") {
@@ -2328,6 +2477,13 @@ const localInvocationOf = (call) => {
           : argumentArrayPlanOf(call.arguments[1])
       };
     }
+    const boundInvocation = storedBindInvocationOf(
+      wrapper.receiver,
+      wrapper.method === "call"
+        ? fixedCallArgumentPlanOf(call.arguments.slice(1))
+        : argumentArrayPlanOf(call.arguments[1])
+    );
+    if (boundInvocation) return boundInvocation;
     if (reflectApplyReferenceOf(wrapper.receiver)) {
       const reflectedArguments = wrapper.method === "call"
         ? call.arguments.slice(1)
