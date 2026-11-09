@@ -3195,6 +3195,20 @@ function intrinsicInvocationArgumentsOf(
   }
   const wrapper = resolvedAccess(unwrap(node.expression));
   if (wrapper && ["apply", "call"].includes(wrapper.method)) {
+    const boundWrapperMethod = boundIntrinsicWrapperMethodOf(
+      wrapper.receiver, receiverNames, methods, seen
+    );
+    if (boundWrapperMethod) {
+      const wrapperArguments = wrapper.method === "call"
+        ? intrinsicArgumentValuesOf(node.arguments.slice(1), seen)
+        : expandedCallArgumentValuesOf(node.arguments, 1, seen);
+      if (wrapperArguments) {
+        const wrapperValues = wrapperInvocationValuesOf(
+          boundWrapperMethod, wrapperArguments
+        );
+        if (wrapperValues) return wrapperValues;
+      }
+    }
     for (const wrapperMethod of ["apply", "call"]) {
       if (!intrinsicMethodWrapperOf(
         wrapper.receiver, wrapperMethod, receiverNames, methods, seen
@@ -4633,7 +4647,8 @@ argument, ["test", "it", "describe"]
 collectBroadArrayMutations(file);
 return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
-    intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, objectPropertyValuesOf,
+    intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, fixedIndexedValuesOf,
+    objectPropertyValuesOf,
     resolveBinding, resolvedAccess, staticStringOf };
 }
 
@@ -4648,7 +4663,8 @@ export function collectWindowsTestTitles(filename, source) {
   const titles = [];
 const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf,
-  intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, objectPropertyValuesOf,
+    intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, fixedIndexedValuesOf,
+    objectPropertyValuesOf,
   resolveBinding, resolvedAccess, staticStringOf } =
     createWindowsTestBindingResolver(file);
 
@@ -4700,9 +4716,19 @@ possibleVitestNamespaceOf, testRunnerContainerOf,
       }
       }
   };
+const selectedPatternValuesWithDefault = (selected, initializer) => {
+  if (!initializer) return selected;
+  if (selected.length === 0) return [initializer];
+  const usesDefault = selected.some((value) => {
+    const node = unwrap(value);
+    return ts.isVoidExpression(node) ||
+      (ts.isIdentifier(node) && node.text === "undefined" && !resolveBinding(node));
+  });
+  return usesDefault ? [...selected, initializer] : selected;
+};
 const inspectExclusivePatternFromValues = (pattern, values) => {
   pattern = unwrap(pattern);
-  if (!pattern || values.length === 0) return;
+  if (!pattern) return;
   if (ts.isObjectBindingPattern(pattern) ||
       ts.isObjectLiteralExpression(pattern)) {
     const sourceIsRunner = values.some((value) =>
@@ -4723,9 +4749,13 @@ const inspectExclusivePatternFromValues = (pattern, values) => {
         }
         if (name !== undefined && (ts.isObjectBindingPattern(property.name) ||
             ts.isArrayBindingPattern(property.name))) {
+      const nestedValues = selectedPatternValuesWithDefault(
+        values.flatMap((value) => objectPropertyValuesOf(value, name)),
+        property.initializer
+      );
           inspectExclusivePatternFromValues(
             property.name,
-            values.flatMap((value) => objectPropertyValuesOf(value, name))
+        nestedValues
           );
         }
         continue;
@@ -4766,10 +4796,25 @@ const inspectExclusivePatternFromValues = (pattern, values) => {
       const nested = ts.isBindingElement(element) ? element.name : element;
       if (ts.isObjectBindingPattern(nested) || ts.isArrayBindingPattern(nested) ||
           ts.isObjectLiteralExpression(nested) || ts.isArrayLiteralExpression(nested)) {
-        inspectExclusivePatternFromValues(
-          nested,
-          values.flatMap((value) => objectPropertyValuesOf(value, String(index)))
+      const nestedValues = ts.isBindingElement(element) && element.dotDotDotToken
+        ? values.flatMap((value) =>
+          (fixedSpreadValuesOf(value) ?? []).slice(index))
+        : selectedPatternValuesWithDefault(
+          values.flatMap((value) => {
+            const fixed = fixedIndexedValuesOf(value, index);
+            return fixed.length > 0
+              ? fixed
+              : objectPropertyValuesOf(value, String(index));
+          }),
+          ts.isBindingElement(element) ? element.initializer : undefined
         );
+      if ((ts.isBindingElement(element) && element.dotDotDotToken) &&
+          (ts.isArrayBindingPattern(nested) ||
+           ts.isArrayLiteralExpression(nested))) {
+        inspectExclusiveArrayPatternValues(nested, nestedValues);
+      } else {
+        inspectExclusivePatternFromValues(nested, nestedValues);
+      }
       }
     }
   }
@@ -4792,9 +4837,18 @@ const inspectExclusiveArrayPatternValues = (pattern, values) => {
         !ts.isObjectLiteralExpression(nested) &&
         !ts.isArrayBindingPattern(nested) &&
         !ts.isArrayLiteralExpression(nested)) continue;
-    const expanded = selected.flatMap((value) =>
+    const nestedValues = selectedPatternValuesWithDefault(
+      selected,
+      ts.isBindingElement(element) ? element.initializer : undefined
+    );
+    const expanded = nestedValues.flatMap((value) =>
       fixedSpreadValuesOf(value) ?? [unwrap(value)]);
-    inspectExclusivePatternFromValues(nested, expanded);
+    if (ts.isArrayBindingPattern(nested) ||
+        ts.isArrayLiteralExpression(nested)) {
+      inspectExclusiveArrayPatternValues(nested, expanded);
+    } else {
+      inspectExclusivePatternFromValues(nested, expanded);
+    }
     if (rest) break;
   }
 };
@@ -4803,6 +4857,17 @@ const checkExclusive = (node) => {
         possibleTestRunnerOf(node.initializer, ["test", "it", "describe"])) {
       throw new Error("Exclusive or dynamically selected Vitest tests unaudited.");
     }
+  if (ts.isParameter(node) && ts.isObjectBindingPattern(node.name)) {
+    inspectExclusivePatternFromValues(
+      node.name, node.initializer ? [node.initializer] : []
+    );
+  }
+  if (ts.isParameter(node) && ts.isArrayBindingPattern(node.name)) {
+    const values = node.initializer
+      ? fixedSpreadValuesOf(node.initializer) ?? []
+      : [];
+    inspectExclusiveArrayPatternValues(node.name, values);
+  }
 const member = resolvedAccess(node);
     if (member && (member.method === undefined || member.method === "only") &&
         testRunnerContainerOf(member.receiver, ["test", "it", "describe"])) {
@@ -4855,7 +4920,12 @@ if (ts.isForOfStatement(node)) {
      : [unwrap(node.initializer)];
    const iterated = fixedSpreadValuesOf(node.expression) ?? [];
    for (const target of targets) {
-     inspectExclusivePatternFromValues(target, iterated);
+    if (ts.isArrayBindingPattern(target) ||
+        ts.isArrayLiteralExpression(target)) {
+      inspectExclusiveArrayPatternValues(target, iterated);
+    } else {
+      inspectExclusivePatternFromValues(target, iterated);
+    }
    }
  }
   if (ts.isVariableDeclaration(node) &&
@@ -4866,16 +4936,21 @@ if (ts.isForOfStatement(node)) {
   if (ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
     const pattern = unwrap(node.left);
+  if (ts.isObjectBindingPattern(pattern) ||
+      ts.isObjectLiteralExpression(pattern)) {
+    inspectExclusivePatternFromValues(pattern, [node.right]);
+  }
     if (ts.isArrayBindingPattern(pattern) ||
         ts.isArrayLiteralExpression(pattern)) {
       const values = fixedSpreadValuesOf(node.right);
       if (values) inspectExclusiveArrayPatternValues(pattern, values);
     }
   }
-    if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
-        node.initializer &&
-        (possibleTestRunnerOf(node.initializer, ["test", "it", "describe"]) ||
-         possibleVitestNamespaceOf(node.initializer))) {
+if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
+    node.initializer) {
+  inspectExclusivePatternFromValues(node.name, [node.initializer]);
+  if (possibleTestRunnerOf(node.initializer, ["test", "it", "describe"]) ||
+      possibleVitestNamespaceOf(node.initializer)) {
       for (const element of node.name.elements) {
         const propertyNode = element.propertyName;
         const property = propertyNode
@@ -4892,6 +4967,7 @@ if (ts.isForOfStatement(node)) {
           inspectExclusivePattern(element.name);
         }
       }
+  }
     }
     ts.forEachChild(node, checkExclusive);
   };

@@ -500,9 +500,10 @@ const recordDestructuredPropertyAssignment = (target, source, property) => {
   const binding = resolveBinding(target);
   if (!binding?.node) return;
   const assignments = destructuredPropertyAssignmentsByBinding.get(binding.node) ?? [];
-  if (!assignments.some((assignment) => assignment.source === source &&
+  if (!assignments.some((assignment) => assignment.name === target.text &&
+      assignment.source === source &&
       assignment.property === property)) {
-    assignments.push({ source, property });
+    assignments.push({ name: target.text, source, property });
     destructuredPropertyAssignmentsByBinding.set(binding.node, assignments);
   }
 };
@@ -1130,6 +1131,9 @@ if (ts.isGetAccessorDeclaration(candidate)) {
           continue;
         }
         const selected = memberValueCandidatesOf(source, String(index), seen);
+        for (const candidate of fixedIndexedValuesOf(source, index, seen)) {
+          if (!selected.includes(candidate)) selected.push(candidate);
+        }
         const candidates = selected.length > 0
           ? selected
           : element.initializer ? [element.initializer] : [];
@@ -1787,6 +1791,10 @@ const reflectiveReadOf = (input, seen = new Set()) => {
   };
   const recordResolvedAssignments = (target, source) => {
     target = unwrap(target);
+    if (ts.isBindingElement(target)) {
+      recordResolvedAssignments(target.name, source);
+      return;
+    }
     if (assignmentMemberAccess(target) ||
         (ts.isElementAccessExpression(target) && !assignmentMemberAccess(target))) {
       recordAssignment(target, source);
@@ -1796,30 +1804,38 @@ const reflectiveReadOf = (input, seen = new Set()) => {
       recordAssignment(target, source);
       return;
     }
-    if (ts.isObjectLiteralExpression(target)) {
-      for (const property of target.properties) {
-        let targetValue = ts.isShorthandPropertyAssignment(property)
-          ? property.name
-          : ts.isPropertyAssignment(property) ? unwrap(property.initializer) : undefined;
+    if (ts.isObjectLiteralExpression(target) || ts.isObjectBindingPattern(target)) {
+      for (const property of target.properties ?? target.elements) {
+        if (ts.isBindingElement(property) && property.dotDotDotToken) continue;
+        let targetValue = ts.isBindingElement(property)
+          ? unwrap(property.name)
+          : ts.isShorthandPropertyAssignment(property)
+            ? property.name
+            : ts.isPropertyAssignment(property) ? unwrap(property.initializer) : undefined;
         if (ts.isSpreadAssignment(property)) {
           if (ts.isIdentifier(unwrap(property.expression))) {
             recordAssignment(unwrap(property.expression), source);
           }
           continue;
         }
-        if (!targetValue || !ts.isPropertyAssignment(property) &&
+        if (!targetValue || !ts.isBindingElement(property) &&
+            !ts.isPropertyAssignment(property) &&
             !ts.isShorthandPropertyAssignment(property)) continue;
-        const key = assignmentPropertyName(property.name);
+        const key = assignmentPropertyName(
+          ts.isBindingElement(property) ? property.propertyName ?? property.name : property.name
+        );
         if (key === undefined) continue;
         const selected = memberValueCandidatesOf(source, key);
         const patternDefault = targetValue && ts.isBinaryExpression(targetValue) &&
           targetValue.operatorToken.kind === ts.SyntaxKind.EqualsToken
           ? targetValue.right : undefined;
         if (patternDefault) targetValue = unwrap(targetValue.left);
-        const defaultValue = ts.isShorthandPropertyAssignment(property)
-          ? property.objectAssignmentInitializer
-          : patternDefault;
-    recordDestructuredPropertyAssignment(targetValue, source, key);
+        const defaultValue = ts.isBindingElement(property)
+          ? property.initializer
+          : ts.isShorthandPropertyAssignment(property)
+            ? property.objectAssignmentInitializer
+            : patternDefault;
+        recordDestructuredPropertyAssignment(targetValue, source, key);
         const resolvedValues = selected.length > 0
           ? selected
           : defaultValue ? [defaultValue] : [];
@@ -1832,17 +1848,38 @@ const reflectiveReadOf = (input, seen = new Set()) => {
       }
       return;
     }
-    if (ts.isArrayLiteralExpression(target)) {
-      for (let index = 0; index < target.elements.length; index += 1) {
-        const element = target.elements[index];
+    if (ts.isArrayLiteralExpression(target) || ts.isArrayBindingPattern(target)) {
+      const elements = target.elements;
+      for (let index = 0; index < elements.length; index += 1) {
+        const element = elements[index];
         if (ts.isOmittedExpression(element)) continue;
         if (ts.isSpreadElement(element)) {
           const spreadTarget = unwrap(element.expression);
           if (ts.isIdentifier(spreadTarget)) recordAssignment(spreadTarget, source);
           continue;
         }
-        for (const value of memberValueCandidatesOf(source, String(index))) {
-          recordResolvedAssignments(element, value);
+        const selected = memberValueCandidatesOf(source, String(index));
+        const rest = ts.isBindingElement(element) && element.dotDotDotToken;
+        if (rest && ts.isIdentifier(element.name)) {
+          const sourceValues = fixedSpreadValuesOf(source);
+          if (sourceValues) {
+            for (let tailIndex = index; tailIndex < sourceValues.length; tailIndex += 1) {
+              const target = ts.factory.createElementAccessExpression(
+                element.name,
+                ts.factory.createNumericLiteral(String(tailIndex - index))
+              );
+              recordAssignment(target, sourceValues[tailIndex]);
+            }
+          }
+          continue;
+        }
+        const defaultValue = ts.isBindingElement(element) ? element.initializer : undefined;
+        const candidates = selected.length > 0
+          ? selected
+          : defaultValue ? [defaultValue] : [];
+        const nestedTarget = ts.isBindingElement(element) ? element.name : element;
+        for (const value of candidates) {
+          recordResolvedAssignments(nestedTarget, value);
         }
       }
     }
@@ -1925,6 +1962,9 @@ const inspectCapabilityArrayDestructuring = (target, source) => {
         ? values.length
         : Math.min(index + 1, values.length);
       const selected = [];
+      for (const candidate of fixedIndexedValuesOf(source, index)) {
+        if (!selected.includes(candidate)) selected.push(candidate);
+      }
       for (let valueIndex = index; valueIndex < end; valueIndex += 1) {
         const value = unwrap(values[valueIndex]);
         if (!value) continue;
@@ -1939,6 +1979,7 @@ const inspectCapabilityArrayDestructuring = (target, source) => {
       }
       const nested = ts.isBindingElement(element) ? element.name : element;
       for (const value of selected) {
+        recordResolvedAssignments(nested, value);
         if (ts.isObjectBindingPattern(nested) ||
             ts.isObjectLiteralExpression(nested)) {
           const objectValues = ts.isArrayLiteralExpression(value)
@@ -2231,7 +2272,8 @@ const staticMethodReferenceOf = (
   const bindingNext = new Set(next);
   bindingNext.add(binding.node);
   if ((destructuredPropertyAssignmentsByBinding.get(binding.node) ?? [])
-    .some((assignment) => assignment.property === property &&
+    .some((assignment) => assignment.name === node.text &&
+      assignment.property === property &&
       ownerOf(assignment.source, bindingNext))) return true;
   if (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) {
     if (!ts.isIdentifier(binding.node.name)) {
@@ -2289,7 +2331,8 @@ const staticMethodWrapperReferenceOf = (
   const bindingNext = new Set(next);
   bindingNext.add(binding.node);
   if ((destructuredPropertyAssignmentsByBinding.get(binding.node) ?? [])
-      .some((assignment) => assignment.property === wrapperProperty &&
+    .some((assignment) => assignment.name === node.text &&
+      assignment.property === wrapperProperty &&
         staticMethodReferenceOf(
           assignment.source, property, ownerOf, bindingNext
         ))) return true;
@@ -2896,6 +2939,7 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
     }
     if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
         node.initializer) {
+      recordResolvedAssignments(node.name, node.initializer);
       if (processObjectOf(node.initializer)) inspectProcessDestructuring(node.name);
     if (globalCapabilityDestructuringOf(
       node.name, node.initializer
@@ -2905,6 +2949,7 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
     }
     if (ts.isVariableDeclaration(node) && ts.isArrayBindingPattern(node.name) &&
         node.initializer) {
+      recordResolvedAssignments(node.name, node.initializer);
       inspectCapabilityArrayDestructuring(node.name, node.initializer);
     }
     if (ts.isForOfStatement(node)) {
@@ -3095,6 +3140,15 @@ const fixedArrayOfInvocationArgumentsOf = (call, seen) => {
       : argumentsList[1]
         ? fixedSpreadValuesOf(argumentsList[1], seen) : [];
     if (!receiverArguments) return undefined;
+    const boundWrapperMethod = boundStaticMethodWrapperMethodOf(
+      wrapper.receiver, seen
+    );
+    if (boundWrapperMethod) {
+      const wrapperValues = wrapperInvocationValuesOf(
+        boundWrapperMethod, receiverArguments
+      );
+      if (wrapperValues) return wrapperValues;
+    }
     for (const wrapperMethod of ["apply", "call"]) {
       if (!staticMethodWrapperReferenceOf(
         wrapper.receiver, wrapperMethod, "of", globalArrayObjectOf, seen
@@ -3517,7 +3571,8 @@ const arrayMutationMethodAlternativesOf = (input, seen = new Set()) => {
       !ts.isVariableDeclaration(binding.node)) return [];
   const destructuredMethod = (
     destructuredPropertyAssignmentsByBinding.get(binding.node) ?? []
-  ).find((assignment) => mutableArrayMethods.has(assignment.property));
+  ).find((assignment) => assignment.name === node.text &&
+    mutableArrayMethods.has(assignment.property));
   if (destructuredMethod) {
     return [{
       kind: destructuredMethod.property,
@@ -4208,7 +4263,8 @@ const bindMethodReferenceOf = (input, seen = new Set()) => {
   next.add(node);
   next.add(binding.node);
   const destructuredBind = (destructuredPropertyAssignmentsByBinding.get(binding.node) ?? [])
-    .find((assignment) => assignment.property === "bind");
+    .find((assignment) => assignment.name === node.text &&
+      assignment.property === "bind");
   if (destructuredBind) {
     const sourceMember = memberAccess(destructuredBind.source);
     return {

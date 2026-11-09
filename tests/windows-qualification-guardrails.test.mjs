@@ -696,7 +696,22 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
   ["member-held Array.of apply bind", "import { test } from 'vitest'; const tools = { apply: Array.of.apply }; const invoke = tools.apply.bind(Array.of); invoke(Array, [test])[0].only('focused', () => {});"],
   ["spread-bound destructured Array.of apply", "import { test } from 'vitest'; const { apply } = Array.of; const invoke = apply.bind(...[Array.of]); invoke(Array, [test])[0].only('focused', () => {});"],
   ["Reflect.apply destructured Array.of apply", "import { test } from 'vitest'; const { apply } = Array.of; Reflect.apply(apply, Array.of, [Array, [test]])[0].only('focused', () => {});"],
-  ["Reflect.get Array.of apply call", "import { test } from 'vitest'; Reflect.get(Array.of, 'apply').call(Array.of, Array, [test])[0].only('focused', () => {});"]
+  ["Reflect.get Array.of apply call", "import { test } from 'vitest'; Reflect.get(Array.of, 'apply').call(Array.of, Array, [test])[0].only('focused', () => {});"],
+  ["deep object binding", "import { test } from 'vitest'; const { x: { only } } = { x: test }; only.call(test, 'focused', () => {});"],
+  ["deep nested array binding", "import { test } from 'vitest'; const [[{ only }]] = [[test]]; only.call(test, 'focused', () => {});"],
+  ["deep nested array assignment", "import { test } from 'vitest'; let only; [[{ only }]] = [[test]]; only.call(test, 'focused', () => {});"],
+  ["deep nested for-of Array.of binding", "import { test } from 'vitest'; for (const [[{ only }]] of Array.of([test])) only.call(test, 'focused', () => {});"],
+  ["deep for-of Array.of binding", "import { test } from 'vitest'; for (const [{ only }] of Array.of(test)) only.call(test, 'focused', () => {});"],
+  ["deep for-of Array.of assignment", "import { test } from 'vitest'; for ([[{ only }]] of Array.of([test])) only.call(test, 'focused', () => {});"],
+  ["deep nested parameter default", "import { test } from 'vitest'; function focus({ nested: { only } = test } = {}) { only('focused', () => {}); } focus();"],
+  ["deep nested parameter default without outer initializer", "import { test } from 'vitest'; function focus({ nested: { only } = test }) { only('focused', () => {}); } focus({});"],
+  ["deep nested array parameter default", "import { test } from 'vitest'; function focus([{ only } = test] = []) { only('focused', () => {}); } focus();"],
+  ["array default on undefined", "import { test } from 'vitest'; const [{ only } = test] = [undefined]; only('focused', () => {});"],
+  ["object nested default on undefined", "import { test } from 'vitest'; const { nested: { only } = test } = { nested: undefined }; only('focused', () => {});"],
+  ["object nested rest array", "import { test } from 'vitest'; const { nested: [...[{ only }]] } = { nested: [test] }; only('focused', () => {});"],
+  ["object nested rest array after skipped element", "import { test } from 'vitest'; const { nested: [skip, ...[{ only }]] } = { nested: [null, test] }; only('focused', () => {});"],
+  ["object nested rest Array.of after skipped element", "import { test } from 'vitest'; const { nested: [skip, ...[{ only }]] } = { nested: Array.of(null, test) }; only('focused', () => {});"],
+  ["stored bound Array.of apply invoked through call", "import { test } from 'vitest'; const invoke = Array.of.apply.bind(Array.of); const [register] = invoke.call(null, Array, [test]); register.only('focused', () => {});"]
   ])("rejects exclusive registration through %s", (_name, source) => {
     expect(() => collectWindowsTestTitles("fixture.ts", source))
       .toThrow(/Exclusive or dynamically selected Vitest/);
@@ -729,6 +744,16 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
       "const [{ only: ordinaryOnly }] = [testLike];",
       "let assignedOnly; [{ only: assignedOnly }] = [testLike];",
       "const [{ only: arrayOfOnly }] = Array.of([testLike]);",
+      "const { x: { only: deepSafeOnly } } = { x: testLike };",
+      "const [[{ only: deepArraySafeOnly }]] = [[testLike]];",
+      "for (const [[{ only: deepForOfSafeOnly }]] of Array.of([testLike])) deepForOfSafeOnly('safe', () => {});",
+  "for (const [{ only: deepSingleForOfSafeOnly }] of Array.of(testLike)) deepSingleForOfSafeOnly('safe', () => {});",
+  "function safeNestedDefault({ nested: { only } = testLike } = {}) { only('safe', () => {}); } safeNestedDefault();",
+  "function safeNestedArrayDefault([{ only } = testLike] = []) { only('safe', () => {}); } safeNestedArrayDefault();",
+  "const [{ only: selectedSafeOnly } = test] = [testLike]; selectedSafeOnly('safe', () => {});",
+  "const { nested: { only: selectedSafeNestedOnly } = test } = { nested: testLike }; selectedSafeNestedOnly('safe', () => {});",
+  "const { nested: [...[{ only: selectedSafeRestOnly }]] } = { nested: [testLike] }; selectedSafeRestOnly('safe', () => {});",
+  "const { nested: [skipSafe, ...[{ only: selectedSafeRestAfterSkip }]] } = { nested: [null, testLike] }; selectedSafeRestAfterSkip('safe', () => {});",
       "const { apply } = Array.of; const invokeSafe = apply.bind(Array.of);",
       "invokeSafe(Array, [testLike])[0].only('safe', () => {});",
       "const safeTools = { apply: Array.of.apply }; const invokeHeldSafe = safeTools.apply.bind(Array.of);",
@@ -737,6 +762,7 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
       "invokeSpreadSafe(Array, [testLike])[0].only('safe', () => {});",
       "Reflect.apply(apply, Array.of, [Array, [testLike]])[0].only('safe', () => {});",
       "Reflect.get(Array.of, 'apply').call(Array.of, Array, [testLike])[0].only('safe', () => {});",
+      "const invokeStoredSafe = Array.of.apply.bind(Array.of); const [storedSafeRegister] = invokeStoredSafe.call(null, Array, [testLike]);",
       "test('required', () => {});"
     ].join("\n"))).toEqual([{ title: "required", enabled: true }]);
   });

@@ -209,7 +209,13 @@ test.each([
   ["member-held Array.of apply bind", "const tools = { apply: Array.of.apply }; const invoke = tools.apply.bind(Array.of); invoke(Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
   ["spread-bound destructured Array.of apply", "const { apply } = Array.of; const invoke = apply.bind(...[Array.of]); invoke(Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
   ["Reflect.apply destructured Array.of apply", "const { apply } = Array.of; Reflect.apply(apply, Array.of, [Array, [process]])[0].getBuiltinModule('node:child_process').exec('id');"],
-  ["Reflect.get Array.of apply call", "Reflect.get(Array.of, 'apply').call(Array.of, Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"]
+  ["Reflect.get Array.of apply call", "Reflect.get(Array.of, 'apply').call(Array.of, Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["nested array-destructured Array.of apply", "const [[{ apply }]] = [[Array.of]]; apply.call(Array.of, Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["multi-property destructured Array.of call", "const { apply, call } = Array.of; call.call(Array.of, Array, process)[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["stored bound Array.of apply invoked through call", "const invoke = Array.of.apply.bind(Array.of); invoke.call(null, Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["stored bound Array.of apply invoked through apply", "const invoke = Array.of.apply.bind(Array.of); invoke.apply(null, [Array, [process]])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["rest-bound Array.of apply", "const [first, ...rest] = [null, Array.of]; const invoke = rest[0].apply.bind(Array.of); invoke.call(null, Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["rest-bound Array.of direct", "const [first, ...rest] = [null, Array.of]; rest[0](process)[0].getBuiltinModule('node:child_process').exec('id');"]
 ])("rejects process provenance through %s", (_name, source) => {
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
     .some((finding) => finding.includes("process.getBuiltinModule"))).toBe(true);
@@ -293,7 +299,11 @@ test("accepts nested and extracted Array.of uses without process capability", ()
     "const safeApplyTools = { apply: Array.of.apply }; const invokeHeldSafeApply = safeApplyTools.apply.bind(Array.of); invokeHeldSafeApply(Array, [processLike])[0].getBuiltinModule();",
     "const invokeSpreadSafeApply = safeApply.bind(...[Array.of]); invokeSpreadSafeApply(Array, [processLike])[0].getBuiltinModule();",
     "Reflect.apply(safeApply, Array.of, [Array, [processLike]])[0].getBuiltinModule();",
-    "Reflect.get(Array.of, 'apply').call(Array.of, Array, [processLike])[0].getBuiltinModule();"
+    "Reflect.get(Array.of, 'apply').call(Array.of, Array, [processLike])[0].getBuiltinModule();",
+    "const [[{ apply: nestedSafeApply }]] = [[Array.of]]; nestedSafeApply.call(Array.of, Array, [processLike])[0].getBuiltinModule();",
+    "const { apply: safeApplyAgain, call: safeCall } = Array.of; safeCall.call(Array.of, Array, processLike)[0].getBuiltinModule();",
+  "const invokeStoredSafe = Array.of.apply.bind(Array.of); invokeStoredSafe.call(null, Array, [processLike])[0].getBuiltinModule();",
+  "const [firstSafe, ...safeRest] = [null, Array.of]; const invokeRestSafe = safeRest[0].apply.bind(Array.of); invokeRestSafe.call(null, Array, [processLike])[0].getBuiltinModule();"
   ].join("\n");
   expect(inspectSupervisorSource(
     "src/services/windows-process-host.ts", source
