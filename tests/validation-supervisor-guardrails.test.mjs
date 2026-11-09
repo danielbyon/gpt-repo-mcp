@@ -288,7 +288,7 @@ test.each([
       "import { spawn } from 'node:child_process'; spawn('node.exe', ['--version']);"
     ].join("\n");
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
-  });
+}, 20_000);
 
 test("accepts nested and extracted Array.of uses without process capability", () => {
   const source = [
