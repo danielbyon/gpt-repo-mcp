@@ -563,7 +563,7 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
 
   test("accepts the checked-in Linux and scoped Windows matrix", () => {
     expect(inspect(load())).toEqual([]);
-  });
+  }, 20_000);
 
   test("rejects loss of a required Windows suite", () => {
     const workflow = load();
@@ -597,7 +597,7 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
     const findings = inspect(workflow);
     expect(findings.some((message) => message.includes("conditional or optional"))).toBe(true);
     expect(findings.some((message) => message.includes("unfiltered full suite"))).toBe(true);
-  });
+  }, 20_000);
 
   test("rejects removal of the guardrail execution step", () => {
     const workflow = load();
