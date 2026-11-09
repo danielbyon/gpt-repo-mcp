@@ -1001,7 +1001,17 @@ test.each([
     ["Object.assign apply", "const copy = globalThis.Object.assign.apply(Object, [{}, process]); copy.getBuiltinModule('node:child_process').exec('id');"],
     ["Object.assign bind", "const copy = globalThis.Object.assign.bind(Object, {}, process)(); copy.getBuiltinModule('node:child_process').exec('id');"],
     ["comma-wrapped Object.assign bind", "const copy = (0, globalThis.Object.assign.bind(Object, {}, process))(); copy.getBuiltinModule('node:child_process').exec('id');"],
-    ["Object.assign static spread", "const copy = globalThis.Object.assign.call(Object, ...[{}, process]); copy.getBuiltinModule('node:child_process').exec('id');"]
+  ["Object.assign static spread", "const copy = globalThis.Object.assign.call(Object, ...[{}, process]); copy.getBuiltinModule('node:child_process').exec('id');"],
+  ["tagged-template member receiver", "function load(this: any) { return this.runtime.getBuiltinModule('node:child_process'); } const tools = { load, runtime: process }; tools.load`ticket`.exec('id');"],
+    ["tagged-template substitution argument", "function load(strings, runtime) { return runtime.getBuiltinModule('node:child_process'); } const tools = { load }; tools.load`ticket ${process}`.exec('id');"],
+  ["new member factory", "function load() { return process; } const tools = { load }; new tools.load().getBuiltinModule('node:child_process').exec('id');"],
+  ["Reflect.construct member factory", "function load() { return process; } const tools = { load }; Reflect.construct(tools.load, []).getBuiltinModule('node:child_process').exec('id');"],
+  ["for-of array-rest binding", "for (const [, ...rest] of [[null, process]]) rest[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["for-of Array.of rest binding", "for (const [, ...rest] of Array.of([null, process])) rest[0].getBuiltinModule('node:child_process').exec('id');"],
+    ["array-rest unknown tail before capability", "declare const tail: any[]; const [, ...rest] = [null, ...tail, process]; rest[0].getBuiltinModule('node:child_process').exec('id');"],
+    ["array-rest unknown tail after capability", "declare const tail: any[]; const [, ...rest] = [null, process, ...tail]; rest[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["aliased undefined default", "const U = undefined; function load(this: any) { return this.getBuiltinModule('node:child_process'); } const { run = load } = { run: U }; run.call(process).exec('id');"],
+  ["aliased void default", "const U = void 0; function load(this: any) { return this.getBuiltinModule('node:child_process'); } const { run = load } = { run: U }; run.call(process).exec('id');"]
   ])('rejects bounded process provenance through %s', (_name, source) => {
     expect(inspectSupervisorSource('src/services/windows-process-host.ts', source))
       .not.toEqual([]);
@@ -1477,7 +1487,14 @@ test('rejects capability-bearing array read before a later safe write', () => {
       "const getters = { get make() { return processLike; } }; getters.make().getBuiltinModule();",
       "const carrier = { make: () => ({ runtime: processLike }) }; carrier.make().runtime.getBuiltinModule();",
       "globalThis.Object.assign.call(Object, {}, processLike).getBuiltinModule();",
-      "globalThis.Object.assign.call(Object, ...[{}, processLike]).getBuiltinModule();"
+  "globalThis.Object.assign.call(Object, ...[{}, processLike]).getBuiltinModule();",
+  "function taggedSafe(this: any) { return this.runtime.getBuiltinModule(); } const taggedTools = { taggedSafe, runtime: processLike }; taggedTools.taggedSafe`ticket`.getBuiltinModule();",
+      "function taggedArgumentSafe(strings: unknown, runtime: any) { return runtime.getBuiltinModule(); } const taggedArgumentTools = { taggedArgumentSafe }; taggedArgumentTools.taggedArgumentSafe`ticket ${processLike}`.getBuiltinModule();",
+  "function constructedSafe() { return processLike; } const constructedTools = { constructedSafe }; new constructedTools.constructedSafe().getBuiltinModule(); Reflect.construct(constructedTools.constructedSafe, []).getBuiltinModule();",
+  "for (const [, ...safeRest] of [[null, processLike]]) safeRest[0].getBuiltinModule();",
+      "declare const safeRestTail: any[]; const [, ...safeRestWithTail] = [null, processLike, ...safeRestTail]; safeRestWithTail[0].getBuiltinModule();",
+      "declare const opaqueRestSource: any[]; const [, ...opaqueRest] = opaqueRestSource; opaqueRest[0]?.length;",
+  "const U = undefined; function defaultSafe() { return processLike; } const { run = defaultSafe } = { run: U }; run().getBuiltinModule();"
     ].join("\n");
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
   });

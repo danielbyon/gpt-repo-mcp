@@ -917,7 +917,17 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
   ["aliased reflected Function.prototype.bind", "import { test } from 'vitest'; function focus(register) { register.only('focused', () => {}); } const bind = Function.prototype.bind; const bound = Reflect.apply(bind, focus, [null]); bound(test);"],
     ["generic bind unknown prefix", "import { test } from 'vitest'; declare const prefix: any[]; function focus(register) { register.only('focused', () => {}); } const bind = Function.prototype.bind; const bound = bind.call(focus, ...prefix, test); bound();"],
     ["factory carrier", "import { test } from 'vitest'; const tools = { make: () => ({ runtime: test }) }; tools.make().runtime.only('focused', () => {});"],
-    ["destructured factory carrier", "import { test } from 'vitest'; const make = () => ({ runtime: test }); const { runtime } = make(); runtime.only('focused', () => {});"]
+  ["destructured factory carrier", "import { test } from 'vitest'; const make = () => ({ runtime: test }); const { runtime } = make(); runtime.only('focused', () => {});"],
+  ["tagged-template member receiver", "import { test } from 'vitest'; const tools = { register: test, focus() { this.register.only('focused', () => {}); } }; tools.focus`ticket`; test('required', () => {});"],
+  ["tagged-template substitution argument", "import { test } from 'vitest'; function focus(strings, register) { register.only('focused', () => {}); } const tools = { focus }; tools.focus`ticket ${test}`; test('required', () => {});"],
+  ["new member factory", "import { test } from 'vitest'; function focus() { return test; } const tools = { focus }; new tools.focus().only('focused', () => {}); test('required', () => {});"],
+  ["Reflect.construct member factory", "import { test } from 'vitest'; function focus() { return test; } const tools = { focus }; Reflect.construct(tools.focus, []).only('focused', () => {}); test('required', () => {});"],
+  ["array-rest runner binding", "import { test } from 'vitest'; const [, ...rest] = [null, test]; rest[0].only('focused-only', () => {}); test('required', () => {});"],
+  ["Array.of rest runner binding", "import { test } from 'vitest'; const [, ...rest] = Array.of(null, test); rest[0].only('focused-only', () => {}); test('required', () => {});"],
+  ["array-rest unknown tail before runner", "import { test } from 'vitest'; declare const tail: any[]; const [, ...rest] = [null, ...tail, test]; rest[0].only('focused-only', () => {}); test('required', () => {});"],
+  ["array-rest unknown tail after runner", "import { test } from 'vitest'; declare const tail: any[]; const [, ...rest] = [null, test, ...tail]; rest[0].only('focused-only', () => {}); test('required', () => {});"],
+  ["aliased undefined default", "import { test } from 'vitest'; const U = undefined; const { register = test } = { register: U }; register.only('focused-only', () => {}); test('required', () => {});"],
+  ["aliased void default", "import { test } from 'vitest'; const U = void 0; const { register = test } = { register: U }; register.only('focused-only', () => {}); test('required', () => {});"]
   ])('rejects bounded Vitest provenance through %s', (_name, source) => {
     expect(() => collectWindowsTestTitles('fixture.ts', source))
       .toThrow(/Exclusive or dynamically selected Vitest/);
@@ -1426,6 +1436,26 @@ test("accepts ordinary holes, rests, helpers, factories, and opaque spreads with
       "function restAfterHeadSafeInner(head: any, ...args: any[]) { args[0].only('safe', () => {}); }",
       "function restAfterHeadSafeOuter(...args: any[]) { restAfterHeadSafeInner('head', ...args); }",
       "restAfterHeadSafeOuter(testLike);",
+  "const taggedTools = { register: testLike, focus() { this.register.only('safe', () => {}); } };",
+  "taggedTools.focus`ticket`;",
+  "function taggedArgumentSafe(strings: unknown, register: any) { register.only('safe', () => {}); }",
+  "const taggedArgumentTools = { taggedArgumentSafe };",
+  "taggedArgumentTools.taggedArgumentSafe`ticket ${testLike}`;",
+  "function constructedSafe() { return testLike; }",
+  "const constructedTools = { constructedSafe };",
+  "new constructedTools.constructedSafe().only('safe', () => {});",
+  "Reflect.construct(constructedTools.constructedSafe, []).only('safe', () => {});",
+  "const [, ...safeRest] = [null, testLike];",
+  "safeRest[0].only('safe', () => {});",
+  "declare const safeRestTail: any[];",
+  "const [, ...safeRestWithTail] = [null, testLike, ...safeRestTail];",
+  "safeRestWithTail[0].only('safe', () => {});",
+  "declare const opaqueRestSource: any[];",
+  "const [, ...opaqueRest] = opaqueRestSource;",
+  "opaqueRest[0]?.length;",
+  "const U = undefined;",
+  "const { register: defaultSafe = testLike } = { register: U };",
+  "defaultSafe.only('safe', () => {});",
     "test('required', () => {});"
     ].join('\n');
     expect(collectWindowsTestTitles('fixture.ts', source))

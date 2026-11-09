@@ -489,6 +489,23 @@ function createWindowsTestBindingResolver(file) {
     next.add(binding.node);
     return staticNumericStringOf(binding.node.initializer, next);
   };
+const staticUndefinedOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return false;
+  if (ts.isVoidExpression(node)) return true;
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  if (!binding) return node.text === "undefined";
+  if (binding.kind !== "variable" || !binding.constant ||
+      !ts.isVariableDeclaration(binding.node) ||
+      !ts.isIdentifier(binding.node.name) || !binding.node.initializer ||
+      seen.has(binding.node)) {
+    return false;
+  }
+  const next = new Set(seen);
+  next.add(binding.node);
+  return staticUndefinedOf(binding.node.initializer, next);
+};
   const resolvedAccess = (input) => {
     const node = unwrap(input);
     if (!node) return undefined;
@@ -1675,6 +1692,8 @@ const fixedSpreadPlansOf = (input, seen = new Set()) => {
   if (!node || seen.has(node)) return [];
   const next = new Set(seen);
   next.add(node);
+  const arrayRestPlan = arrayRestPlansByNode.get(node);
+  if (arrayRestPlan) return [arrayRestPlan];
   if (ts.isSpreadElement(node)) return fixedSpreadPlansOf(node.expression, next);
   if (ts.isConditionalExpression(node)) {
     return [
@@ -2295,6 +2314,18 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
         }
       }
     }
+    if ((binding?.kind === "variable" || binding?.kind === "opaque") &&
+        (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) &&
+        binding.node.initializer && !ts.isIdentifier(binding.node.name) &&
+        !seen.has(binding.node)) {
+      const next = new Set(seen);
+      next.add(binding.node);
+      for (const container of destructuredSourceValuesOf(
+        binding.node.name, binding.node.initializer, reference.text
+      )) {
+        values.push(...objectPropertyValuesOf(container, key, next));
+      }
+    }
   }
   for (const container of containerValuesOf(input, seen)) {
     if (ts.isObjectLiteralExpression(container)) {
@@ -2323,15 +2354,40 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
   }
   return values;
 };
+// Shift the source plan past the destructured prefix. An opaque tail keeps
+// the remaining positions so later indexed reads stay conservative.
+const arrayRestPlansByNode = new WeakMap();
+const arrayRestValuesBySource = new WeakMap();
+const arrayRestBindingValueOf = (source, startIndex) => {
+  const cached = arrayRestValuesBySource.get(source)?.get(startIndex);
+  if (cached) return cached;
+  const values = fixedSpreadValuesOf(source);
+  let value;
+  if (values !== undefined) {
+    value = ts.factory.createArrayLiteralExpression(values.slice(startIndex).map((entry) =>
+      entry ?? ts.factory.createOmittedExpression()));
+  } else {
+    const plan = fixedSpreadPlanOf(source);
+    if (!plan) return source;
+    value = ts.factory.createArrayLiteralExpression([]);
+    arrayRestPlansByNode.set(value, {
+      before: plan.unknownAll ? [] : plan.before.slice(startIndex),
+      after: [...plan.after],
+      unknownIndex: plan.unknownAll
+        ? 0
+        : Math.max(0, (plan.unknownIndex ?? 0) - startIndex),
+      ...(plan.unknownAll ? { unknownAll: true } : {})
+    });
+  }
+  const byIndex = arrayRestValuesBySource.get(source) ?? new Map();
+  byIndex.set(startIndex, value);
+  arrayRestValuesBySource.set(source, byIndex);
+  return value;
+};
 // Resolve the source value selected for one identifier in an assignment pattern.
   const destructuredSourceValuesOf = (pattern, source, targetName) => {
   const values = [];
-    const usesDefault = (value) => {
-      const candidate = unwrap(value);
-      return ts.isVoidExpression(candidate) ||
-        (ts.isIdentifier(candidate) && candidate.text === "undefined" &&
-          !resolveBinding(candidate));
-    };
+  const usesDefault = (value) => staticUndefinedOf(value);
     const candidatesWithDefault = (selected, initializer) =>
       initializer && (selected.length === 0 || selected.some(usesDefault))
         ? [...selected, initializer]
@@ -2342,11 +2398,13 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
         if (ts.isOmittedExpression(element)) continue;
         const index = startIndex + offset;
         if (element.dotDotDotToken) {
+      const restValue = arrayRestBindingValueOf(restSource, index);
+      if (!restValue) break;
           if (ts.isIdentifier(element.name) && element.name.text === targetName) {
-            values.push(restSource);
+        values.push(restValue);
           } else if (ts.isObjectBindingPattern(element.name) ||
             ts.isArrayBindingPattern(element.name)) {
-            visitArrayRestPattern(element.name, restSource, index);
+        visitArrayRestPattern(element.name, restValue, 0);
           }
           break;
         }
@@ -2391,9 +2449,14 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
         const element = pattern.elements[index];
         if (!ts.isBindingElement(element)) continue;
         if (element.dotDotDotToken) {
+      const restValue = arrayRestBindingValueOf(source, index);
+      if (!restValue) continue;
+      if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+        values.push(restValue);
+      }
           if (ts.isObjectBindingPattern(element.name) ||
             ts.isArrayBindingPattern(element.name)) {
-            visitArrayRestPattern(element.name, source, index);
+        visitArrayRestPattern(element.name, restValue, 0);
           }
           continue;
         }
@@ -2776,11 +2839,11 @@ const collectResolvedAssignments = (node) => {
     }
     return names.includes(member.method) && globalObjectOf(member.receiver, seen);
   }
-  function reflectApplyReferenceOf(input, seen = new Set()) {
+function reflectMethodReferenceOf(input, method, seen = new Set()) {
     const node = unwrap(input);
     if (!node) return false;
     const member = resolvedAccess(node);
-    if (member?.method === "apply" &&
+  if (member?.method === method &&
         globalIntrinsicOf(member.receiver, ["Reflect"], seen)) return true;
     if (member && member.method !== undefined && !seen.has(node)) {
       const next = new Set(seen);
@@ -2798,10 +2861,10 @@ const collectResolvedAssignments = (node) => {
           const value = ts.isPropertyAssignment(property)
             ? property.initializer
             : ts.isShorthandPropertyAssignment(property) ? property.name : undefined;
-          if (value && reflectApplyReferenceOf(value, next)) return true;
+      if (value && reflectMethodReferenceOf(value, method, next)) return true;
           if (ts.isGetAccessorDeclaration(property) &&
               functionReturnExpressionsOf(property, next)
-                .some((returned) => reflectApplyReferenceOf(returned, next))) {
+            .some((returned) => reflectMethodReferenceOf(returned, method, next))) {
             return true;
           }
         }
@@ -2818,14 +2881,20 @@ const collectResolvedAssignments = (node) => {
     if (!ts.isIdentifier(declaration.name)) {
       return Boolean(declaration.initializer &&
         ((globalIntrinsicOf(declaration.initializer, ["Reflect"], next) &&
-          patternSelectsProperty(declaration.name, node.text, "apply")) ||
+        patternSelectsProperty(declaration.name, node.text, method)) ||
          destructuredValuesOf(declaration, node.text)
-           .some((value) => reflectApplyReferenceOf(value, next))));
+         .some((value) => reflectMethodReferenceOf(value, method, next))));
     }
     return [declaration.initializer, ...(assignmentsByBinding.get(declaration) ?? [])]
       .filter(Boolean)
-      .some((value) => reflectApplyReferenceOf(value, next));
+    .some((value) => reflectMethodReferenceOf(value, method, next));
   }
+function reflectApplyReferenceOf(input, seen = new Set()) {
+  return reflectMethodReferenceOf(input, "apply", seen);
+}
+function reflectConstructReferenceOf(input, seen = new Set()) {
+  return reflectMethodReferenceOf(input, "construct", seen);
+}
   const intrinsicMethodAliasNames = new Set();
   const intrinsicMethodContainerNames = new Set();
   function intrinsicBindMethodOf(
@@ -3702,8 +3771,18 @@ return functionReturnExpressionsOf(node.expression, next)
     return values;
   }
 if (ts.isCallExpression(node)) {
+  if (reflectConstructReferenceOf(node.expression, next)) {
+    return localFunctionValuesOf(node.arguments[0], next)
+      .flatMap((value) => functionReturnExpressionsOf(value, next));
+  }
 return functionReturnExpressionsOf(node.expression, next)
-.flatMap((value) => functionReturnExpressionsOf(value, next));
+    .flatMap((value) => functionReturnExpressionsOf(value, next));
+}
+if (ts.isTaggedTemplateExpression(node) || ts.isNewExpression(node)) {
+  return localFunctionValuesOf(
+    ts.isTaggedTemplateExpression(node) ? node.tag : node.expression,
+    next
+  ).flatMap((value) => functionReturnExpressionsOf(value, next));
 }
     return localFunctionValuesOf(node, seen).flatMap((value) =>
       functionReturnExpressionsOf(value, next));
@@ -3764,12 +3843,25 @@ const binding = ts.isIdentifier(callee) ? resolveBinding(callee) : undefined;
 if (binding && seen.has(binding.node)) return undefined;
 const next = new Set(seen);
 if (binding) next.add(binding.node);
-for (const value of functionReturnExpressionsOf(node.expression)) {
+      const returned = reflectConstructReferenceOf(node.expression, next)
+        ? functionReturnExpressionsOf(node, next)
+        : functionReturnExpressionsOf(node.expression);
+      for (const value of returned) {
 const candidate = possibleTestRunnerOf(value, names, next);
 if (candidate) return candidate;
 }
 return undefined;
   }
+    if (ts.isTaggedTemplateExpression(node) || ts.isNewExpression(node)) {
+      if (seen.has(node)) return undefined;
+      const next = new Set(seen);
+      next.add(node);
+      for (const value of functionReturnExpressionsOf(node, seen)) {
+        const candidate = possibleTestRunnerOf(value, names, next);
+        if (candidate) return candidate;
+      }
+      return undefined;
+    }
   if (!ts.isIdentifier(node)) {
 if (seen.has(node)) return undefined;
 const next = new Set(seen);
@@ -4551,14 +4643,24 @@ const localFunctionTermInvocationOf = (
   }
   return alternatives.length > 0 ? { alternatives } : undefined;
 };
-const localInvocationOf = (call) => {
-  const callee = unwrap(call.expression);
+const localInvocationResultOf = (callExpression, argumentExpressions) => {
+  const callee = unwrap(callExpression);
   if (reflectApplyReferenceOf(callee)) {
-    const reflected = reflectApplyInvocationOf(call.arguments);
+    const reflected = reflectApplyInvocationOf(argumentExpressions);
     if (reflected) return reflected;
   }
+  if (reflectConstructReferenceOf(callee)) {
+    const functions = localFunctionValuesOf(argumentExpressions[0]);
+    if (functions.length > 0) {
+      return {
+        functions,
+        plan: argumentArrayPlanOf(argumentExpressions[1]),
+        thisArguments: []
+      };
+    }
+  }
   const storedBound = storedBindInvocationOf(
-    callee, fixedCallArgumentPlanOf(call.arguments)
+    callee, fixedCallArgumentPlanOf(argumentExpressions)
   );
   if (storedBound) return storedBound;
   if (ts.isCallExpression(callee)) {
@@ -4570,7 +4672,7 @@ const localInvocationOf = (call) => {
           functions,
           plan: mergeCallArgumentPlans(
             fixedCallArgumentPlanOf(callee.arguments.slice(1)),
-            fixedCallArgumentPlanOf(call.arguments)
+            fixedCallArgumentPlanOf(argumentExpressions)
           ),
         thisArguments: [callee.arguments[0]].filter(Boolean)
         };
@@ -4581,14 +4683,14 @@ const localInvocationOf = (call) => {
   if (directFunctions.length > 0) {
     return {
       functions: directFunctions,
-      plan: fixedCallArgumentPlanOf(call.arguments),
+      plan: fixedCallArgumentPlanOf(argumentExpressions),
       thisArguments: [resolvedAccess(callee)?.receiver].filter(Boolean)
     };
   }
   const callableTerm = localFunctionTermOf(callee);
   if (callableTerm?.kind === "method") {
     const invocation = localFunctionTermInvocationOf(
-      callableTerm, callableTerm.base, fixedCallArgumentPlanOf(call.arguments)
+      callableTerm, callableTerm.base, fixedCallArgumentPlanOf(argumentExpressions)
     );
     if (invocation) return invocation;
   }
@@ -4598,8 +4700,8 @@ const localInvocationOf = (call) => {
     if (functions.length > 0) {
       return {
         functions,
-        plan: fixedCallArgumentPlanOf(call.arguments.slice(1)),
-        thisArguments: [call.arguments[0]].filter(Boolean)
+        plan: fixedCallArgumentPlanOf(argumentExpressions.slice(1)),
+        thisArguments: [argumentExpressions[0]].filter(Boolean)
       };
     }
   }
@@ -4609,28 +4711,66 @@ const localInvocationOf = (call) => {
       return {
         functions,
         plan: wrapper.method === "call"
-          ? fixedCallArgumentPlanOf(call.arguments.slice(1))
-        : argumentArrayPlanOf(call.arguments[1]),
-      thisArguments: [call.arguments[0]].filter(Boolean)
+          ? fixedCallArgumentPlanOf(argumentExpressions.slice(1))
+        : argumentArrayPlanOf(argumentExpressions[1]),
+      thisArguments: [argumentExpressions[0]].filter(Boolean)
       };
     }
     const boundInvocation = storedBindInvocationOf(
       wrapper.receiver,
       wrapper.method === "call"
-        ? fixedCallArgumentPlanOf(call.arguments.slice(1))
-        : argumentArrayPlanOf(call.arguments[1])
+        ? fixedCallArgumentPlanOf(argumentExpressions.slice(1))
+        : argumentArrayPlanOf(argumentExpressions[1])
     );
     if (boundInvocation) return boundInvocation;
     if (reflectApplyReferenceOf(wrapper.receiver)) {
       const reflectedArguments = wrapper.method === "call"
-        ? call.arguments.slice(1)
-        : fixedSpreadValuesOf(call.arguments[1]);
+        ? argumentExpressions.slice(1)
+        : fixedSpreadValuesOf(argumentExpressions[1]);
       const reflected = reflectedArguments &&
         reflectApplyInvocationOf(reflectedArguments);
       if (reflected) return reflected;
     }
   }
   return undefined;
+};
+const localInvocationOf = (expression, argumentExpressions, kind = "call") => {
+  const invocation = localInvocationResultOf(expression, argumentExpressions);
+  if (kind !== "construct" || !invocation) return invocation;
+  const withoutConstructedThis = (alternative) => ({
+    ...alternative,
+    thisArguments: []
+  });
+  return invocation.alternatives
+    ? { alternatives: invocation.alternatives.map(withoutConstructedThis) }
+    : withoutConstructedThis(invocation);
+};
+// Reuse the synthetic argument plan so repeated fixpoint scans compare equal.
+const taggedTemplateArgumentsByNode = new WeakMap();
+const taggedTemplateArgumentsOf = (node) => {
+  const cached = taggedTemplateArgumentsByNode.get(node);
+  if (cached) return cached;
+  const templateStrings = ts.factory.createArrayLiteralExpression(
+    ts.isTemplateExpression(node.template)
+      ? [node.template.head, ...node.template.templateSpans.map((span) => span.literal)]
+      : [node.template]
+  );
+  const values = [
+    templateStrings,
+    ...(ts.isTemplateExpression(node.template)
+      ? node.template.templateSpans.map((span) => span.expression)
+      : [])
+  ];
+  taggedTemplateArgumentsByNode.set(node, values);
+  return values;
+};
+const localTaggedTemplateInvocationOf = (node) => localInvocationOf(
+  node.tag, taggedTemplateArgumentsOf(node)
+);
+const localNewExpressionInvocationOf = (node) => {
+  return localInvocationOf(
+    node.expression, node.arguments ?? [], "construct"
+  );
 };
 const recordRestArgumentsOf = (parameter, plan, offset = 0) => {
   const positionedPlan = offset === 0 ? plan : { ...plan, offset };
@@ -4697,8 +4837,14 @@ collectAssignments(file);
   while (parameterRunnerArgumentsChanged) {
     parameterRunnerArgumentsChanged = false;
     const collectParameterRunnerArguments = (node) => {
-      if (ts.isCallExpression(node)) {
-      const invocation = localInvocationOf(node);
+      const invocation = ts.isCallExpression(node)
+        ? localInvocationOf(node.expression, node.arguments)
+        : ts.isTaggedTemplateExpression(node)
+        ? localTaggedTemplateInvocationOf(node)
+        : ts.isNewExpression(node)
+        ? localNewExpressionInvocationOf(node)
+        : undefined;
+      if (invocation) {
       const alternatives = invocation?.alternatives ?? [invocation].filter(Boolean);
       for (const alternative of alternatives) {
       const { functions, plan, thisArguments = [] } = alternative;
@@ -4769,7 +4915,7 @@ return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
     intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, fixedIndexedValuesOf,
     objectPropertyValuesOf,
-    resolveBinding, resolvedAccess, staticStringOf };
+resolveBinding, resolvedAccess, staticStringOf, staticUndefinedOf };
 }
 
 /**
@@ -4785,9 +4931,8 @@ const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf,
     intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, fixedIndexedValuesOf,
     objectPropertyValuesOf,
-  resolveBinding, resolvedAccess, staticStringOf } =
+resolveBinding, resolvedAccess, staticStringOf, staticUndefinedOf } =
     createWindowsTestBindingResolver(file);
-
   // Exclusive declarations anywhere in the file remain fail-closed, including
   // element access and unknown dynamic member selectors.
   const inspectExclusivePattern = (pattern) => {
@@ -4839,11 +4984,7 @@ possibleVitestNamespaceOf, testRunnerContainerOf,
 const selectedPatternValuesWithDefault = (selected, initializer) => {
   if (!initializer) return selected;
   if (selected.length === 0) return [initializer];
-  const usesDefault = selected.some((value) => {
-    const node = unwrap(value);
-    return ts.isVoidExpression(node) ||
-      (ts.isIdentifier(node) && node.text === "undefined" && !resolveBinding(node));
-  });
+  const usesDefault = selected.some((value) => staticUndefinedOf(value));
   return usesDefault ? [...selected, initializer] : selected;
 };
 const inspectExclusivePatternFromValues = (pattern, values) => {
