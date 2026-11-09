@@ -382,13 +382,14 @@ const staticAssignmentNameOf = (input, seen = new Set()) => {
   const assignmentsByBinding = new Map();
   const destructuredAssignmentsByBinding = new Map();
 const destructuredPropertyAssignmentsByBinding = new Map();
+const arrayMutationValuesByBinding = new Map();
   const assignmentPropertyName = (name) => {
     if (!name) return undefined;
     if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) {
       return name.text;
     }
-    if (ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)) {
-      return name.expression.text;
+  if (ts.isComputedPropertyName(name)) {
+    return staticAssignmentNameOf(name.expression);
     }
     return undefined;
   };
@@ -487,10 +488,70 @@ const recordDestructuredPropertyAssignment = (target, source, property) => {
     destructuredPropertyAssignmentsByBinding.set(binding.node, assignments);
   }
 };
+const destructuredObjectPropertyValuesOf = (
+  source, property, seen = new Set()
+) => {
+  const node = unwrap(source);
+  if (!node || seen.has(node)) return [];
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isObjectLiteralExpression(node)) {
+    const values = [];
+    for (const item of node.properties) {
+      if (ts.isSpreadAssignment(item)) {
+        values.push(...destructuredObjectPropertyValuesOf(
+          item.expression, property, next
+        ));
+      } else if (assignmentPropertyName(item.name) === property) {
+        if (ts.isPropertyAssignment(item)) values.push(item.initializer);
+        else if (ts.isShorthandPropertyAssignment(item)) values.push(item.name);
+      }
+    }
+    return values;
+  }
+  if (!ts.isIdentifier(node)) return [];
+  const binding = resolveBinding(node);
+  return binding?.kind === "variable" &&
+    ts.isVariableDeclaration(binding.node) && binding.node.initializer
+    ? destructuredObjectPropertyValuesOf(
+      binding.node.initializer, property, next
+    )
+    : [];
+};
+const recordNestedDestructuredProperties = (target, source) => {
+  target = unwrap(target);
+  source = unwrap(source);
+  if (ts.isObjectLiteralExpression(target)) {
+    for (const property of target.properties) {
+      const key = assignmentPropertyName(property.name);
+      let targetValue = ts.isShorthandPropertyAssignment(property)
+        ? property.name
+        : ts.isPropertyAssignment(property) ? unwrap(property.initializer) : undefined;
+      if (!targetValue) continue;
+      const patternDefault = ts.isBinaryExpression(targetValue) &&
+        targetValue.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        ? targetValue.right : undefined;
+      if (patternDefault) targetValue = unwrap(targetValue.left);
+      if (key !== undefined) {
+        recordDestructuredPropertyAssignment(targetValue, source, key);
+        const values = destructuredObjectPropertyValuesOf(source, key);
+        const resolved = values.length > 0
+          ? values : patternDefault ? [patternDefault] : [];
+        for (const value of resolved) {
+          if (ts.isIdentifier(targetValue)) {
+            recordAssignment(targetValue, value);
+          }
+          recordNestedDestructuredProperties(targetValue, value);
+        }
+      }
+    }
+  }
+};
   const collectAssignments = (node) => {
     if (ts.isBinaryExpression(node) &&
         aliasAssignmentKinds.has(node.operatorToken.kind)) {
       const target = unwrap(node.left);
+    recordNestedDestructuredProperties(target, node.right);
       if (ts.isIdentifier(target) || assignmentMemberAccess(target)) {
         recordAssignment(target, node.right);
     } else if (ts.isObjectLiteralExpression(target)) {
@@ -2052,6 +2113,61 @@ const staticMethodReferenceOf = (
   }
   return false;
 };
+const globalCapabilitySourceOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isIdentifier(node) && ["Object", "Reflect"].includes(node.text)) {
+    return true;
+  }
+  if (globalObjectOf(node, next) || globalPrototypeObjectOf(node, next) ||
+      staticMethodReferenceOf(
+        node, "create", globalPrototypeObjectOf, next
+      ) || staticMethodReferenceOf(node, "assign", globalObjectOf, next)) {
+    return true;
+  }
+  const member = memberAccess(node);
+  if (member && ["create", "assign"].includes(member.property) &&
+      ts.isIdentifier(member.receiver) && member.receiver.text === "Object") {
+    return true;
+  }
+  if (ts.isConditionalExpression(node)) {
+    return globalCapabilitySourceOf(node.whenTrue, next) ||
+      globalCapabilitySourceOf(node.whenFalse, next);
+  }
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return globalCapabilitySourceOf(node.right, next);
+  }
+  if (ts.isObjectLiteralExpression(node)) {
+    return node.properties.some((property) => {
+      if (ts.isSpreadAssignment(property)) {
+        return globalCapabilitySourceOf(property.expression, next);
+      }
+      if (ts.isPropertyAssignment(property)) {
+        return globalCapabilitySourceOf(property.initializer, next);
+      }
+      return ts.isShorthandPropertyAssignment(property) &&
+        globalCapabilitySourceOf(property.name, next);
+    });
+  }
+  if (ts.isArrayLiteralExpression(node)) {
+    return node.elements.some((element) =>
+      !ts.isOmittedExpression(element) &&
+      globalCapabilitySourceOf(
+        ts.isSpreadElement(element) ? element.expression : element, next
+      ));
+  }
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  return Boolean(binding?.node && (ts.isVariableDeclaration(binding.node) ||
+    ts.isParameter(binding.node)) &&
+    !seen.has(binding.node) &&
+    [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+      .filter(Boolean)
+      .some((value) => globalCapabilitySourceOf(value, next)));
+};
 const boundStaticMethodPrefixPlanOf = (
   input, property, ownerOf, seen = new Set()
 ) => {
@@ -2080,6 +2196,30 @@ const boundStaticMethodPrefixPlanOf = (
       staticMethodReferenceOf(bind.receiver, property, ownerOf, next)) {
     return dropLeadingCallArgument(fixedCallArgumentPlanOf(node.arguments));
   }
+const wrapper = memberAccess(node.expression);
+if (wrapper && ["apply", "call"].includes(wrapper.property)) {
+  const intrinsicBind = bindMethodReferenceOf(wrapper.receiver, next);
+  if (intrinsicBind?.property === "bind" &&
+      staticMethodReferenceOf(
+        intrinsicBind.receiver, property, ownerOf, next
+      )) {
+    const plan = wrapper.property === "call"
+      ? fixedCallArgumentPlanOf(node.arguments.slice(1))
+      : argumentArrayPlanOf(node.arguments[1], next);
+    return dropLeadingCallArgument(plan);
+  }
+}
+if (reflectApplyReferenceOf(node.expression, next)) {
+  const intrinsicBind = bindMethodReferenceOf(node.arguments[0], next);
+  if (intrinsicBind?.property === "bind" &&
+      staticMethodReferenceOf(
+        intrinsicBind.receiver, property, ownerOf, next
+      )) {
+    return dropLeadingCallArgument(
+      argumentArrayPlanOf(node.arguments[2], next)
+    );
+  }
+}
   if (genericBindMethodOf(node.expression, next) &&
       staticMethodReferenceOf(node.arguments[0], property, ownerOf, next)) {
     return fixedCallArgumentPlanOf(node.arguments.slice(2));
@@ -2572,7 +2712,16 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
         recordResolvedAssignments(target, node.right);
         inspectRequireDestructuring(target, node.right);
         if (processObjectOf(node.right)) inspectProcessDestructuring(target);
-        if (globalObjectOf(node.right)) inspectGlobalDestructuring(target);
+        if (globalObjectOf(node.right) || globalPrototypeObjectOf(node.right) ||
+            globalCapabilitySourceOf(node.right)) {
+          inspectGlobalDestructuring(target);
+          for (const property of target.properties) {
+            if (property.name && ts.isComputedPropertyName(property.name) &&
+                assignmentPropertyName(property.name) === undefined) {
+              add(property, "dynamic global capability destructuring is unproven in supervisor source");
+            }
+          }
+        }
       } else if (ts.isArrayLiteralExpression(target)) {
         recordResolvedAssignments(target, node.right);
         inspectRequireDestructuring(target, node.right);
@@ -2626,6 +2775,7 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
     next.add(node);
   if (ts.isIdentifier(node)) {
     const binding = resolveBinding(node);
+    if (binding?.node && seen.has(binding.node)) return undefined;
     const restPlans = binding?.node && ts.isParameter(binding.node) &&
       binding.node.dotDotDotToken
       ? parameterRestArguments.get(binding.node) ?? [] : [];
@@ -2636,6 +2786,46 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
         return undefined;
       }
       return merged.before;
+    }
+    if (binding?.kind === "variable" &&
+        ts.isVariableDeclaration(binding.node) &&
+        ts.isIdentifier(binding.node.name) && binding.node.initializer &&
+        ts.isArrayLiteralExpression(unwrap(binding.node.initializer))) {
+    const usageStart = node.getStart(file);
+    const mutations = (arrayMutationValuesByBinding.get(binding.node) ?? [])
+      .filter((mutation) => mutation.start <= usageStart);
+      if (mutations.length > 0) {
+      const mutationSeen = new Set(next);
+      mutationSeen.add(binding.node);
+      const values = fixedSpreadValuesOf(
+        binding.node.initializer, mutationSeen
+      );
+        if (!values) return undefined;
+        for (const mutation of mutations) {
+          const additions = mutation.values.flatMap((value) =>
+            ts.isSpreadElement(value)
+            ? fixedSpreadValuesOf(
+              value.expression, mutationSeen
+            ) ?? [value.expression]
+              : [unwrap(value)]);
+          if (mutation.kind === "push") values.push(...additions);
+          else if (mutation.kind === "unshift") values.unshift(...additions);
+          else if (mutation.kind === "set") {
+            const index = mutation.index === undefined
+              ? values.length : Number(mutation.index);
+            values[index] = additions[0];
+          } else {
+            const index = mutation.index === undefined
+              ? 0 : Number(mutation.index);
+        const deleteCount = mutation.deleteCount === "rest"
+          ? values.length - index
+          : mutation.deleteCount === undefined
+          ? 0 : Number(mutation.deleteCount);
+        values.splice(index, deleteCount, ...additions);
+          }
+        }
+        return values;
+      }
     }
   }
     if (ts.isConditionalExpression(node)) {
@@ -2681,6 +2871,154 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
     }
     return values;
   };
+const arrayBindingOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || !ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node)) return undefined;
+  const next = new Set(seen);
+  next.add(binding.node);
+  if (binding.kind === "variable" &&
+    ts.isVariableDeclaration(binding.node) &&
+    ts.isIdentifier(binding.node.name)) {
+    const values = [
+      binding.node.initializer,
+      ...(assignmentsByBinding.get(binding.node) ?? [])
+    ].filter(Boolean);
+    for (const value of values) {
+      const initializer = unwrap(value);
+      if (ts.isArrayLiteralExpression(initializer)) return binding.node;
+      if (ts.isIdentifier(initializer)) {
+        const resolved = arrayBindingOf(initializer, next);
+        if (resolved) return resolved;
+      }
+    }
+  }
+  return undefined;
+};
+const arrayMutationValueCarriesCapability = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isSpreadElement(node)) {
+    return arrayMutationValueCarriesCapability(node.expression, next);
+  }
+  if (processObjectOf(node, next) || globalObjectOf(node, next) ||
+      requireReferenceOf(node, next)) return true;
+  if (ts.isConditionalExpression(node)) {
+    return arrayMutationValueCarriesCapability(node.whenTrue, next) ||
+      arrayMutationValueCarriesCapability(node.whenFalse, next);
+  }
+  if (ts.isArrayLiteralExpression(node)) {
+    return node.elements.some((element) =>
+      !ts.isOmittedExpression(element) &&
+      arrayMutationValueCarriesCapability(element, next));
+  }
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  return Boolean(binding?.kind === "variable" &&
+    ts.isVariableDeclaration(binding.node) && binding.node.initializer &&
+    arrayMutationValueCarriesCapability(binding.node.initializer, next));
+};
+const arrayMutationIsConditional = (input) => {
+  for (let node = input.parent; node; node = node.parent) {
+    if (ts.isFunctionLike(node)) return false;
+    if (ts.isConditionalExpression(node) || ts.isIfStatement(node) ||
+        ts.isSwitchStatement(node) || ts.isCaseClause(node) ||
+        ts.isForStatement(node) || ts.isForInStatement(node) ||
+        ts.isForOfStatement(node) || ts.isWhileStatement(node) ||
+        ts.isDoStatement(node) ||
+        (ts.isBinaryExpression(node) && [
+          ts.SyntaxKind.AmpersandAmpersandToken,
+          ts.SyntaxKind.BarBarToken,
+          ts.SyntaxKind.QuestionQuestionToken
+        ].includes(node.operatorToken.kind))) return true;
+  }
+  return false;
+};
+const collectArrayMutations = (node) => {
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isElementAccessExpression(unwrap(node.left))) {
+    const target = unwrap(node.left);
+    const binding = arrayBindingOf(target.expression);
+    if (binding) {
+      const mutations = arrayMutationValuesByBinding.get(binding) ?? [];
+      const previousValues = [
+        binding.initializer,
+        ...mutations.flatMap((mutation) => mutation.values)
+      ].filter(Boolean);
+      if (arrayMutationValueCarriesCapability(node.right) ||
+          (arrayMutationIsConditional(node) && previousValues.some(
+            (value) => arrayMutationValueCarriesCapability(value)
+          ))) {
+        add(node, "capability escape through mutable array mutation is unproven in supervisor source");
+      }
+      mutations.push({
+        kind: "set",
+        start: node.getStart(file),
+        index: staticAssignmentNameOf(target.argumentExpression),
+        values: [unwrap(node.right)]
+      });
+      arrayMutationValuesByBinding.set(binding, mutations);
+    }
+  }
+  if (ts.isCallExpression(node)) {
+    const member = memberAccess(node.expression);
+    const binding = member && [
+      "push", "unshift", "splice", "fill", "copyWithin",
+      "reverse", "sort", "pop", "shift"
+    ].includes(member.property)
+      ? arrayBindingOf(member.receiver) : undefined;
+    if (binding) {
+      const kind = member.property;
+      const mutations = arrayMutationValuesByBinding.get(binding) ?? [];
+      const previousValues = [
+        binding.initializer,
+        ...mutations.flatMap((mutation) => mutation.values)
+      ].filter(Boolean);
+      if (!["push", "unshift", "splice"].includes(kind)) {
+        if (node.arguments.some((value) =>
+          arrayMutationValueCarriesCapability(value)) ||
+            previousValues.some((value) =>
+              arrayMutationValueCarriesCapability(value))) {
+          add(node, "capability escape through mutable array method is unproven in supervisor source");
+        }
+      } else {
+      const values = kind === "splice" ? node.arguments.slice(2) : node.arguments;
+      const deleteCount = kind === "splice" && node.arguments.length > 1
+        ? staticAssignmentNameOf(node.arguments[1])
+        : kind === "splice" ? "rest" : undefined;
+      if (values.some((value) => arrayMutationValueCarriesCapability(value))) {
+        add(node, "capability escape through mutable array mutation is unproven in supervisor source");
+      }
+      if (arrayMutationIsConditional(node) && previousValues.some(
+        (value) => arrayMutationValueCarriesCapability(value)
+      )) {
+        add(node, "conditional mutable array mutation is unproven in supervisor source");
+      }
+      const deletesValues = deleteCount === "rest" ||
+        deleteCount === undefined || Number(deleteCount) > 0;
+      if (deletesValues && previousValues.some(
+        (value) => arrayMutationValueCarriesCapability(value)
+      )) {
+        add(node, "capability escape through mutable array splice is unproven in supervisor source");
+      }
+      mutations.push({
+        kind,
+        start: node.getStart(file),
+        index: kind === "splice"
+          ? staticAssignmentNameOf(node.arguments[0]) : undefined,
+        deleteCount,
+        values
+      });
+      arrayMutationValuesByBinding.set(binding, mutations);
+      }
+    }
+  }
+  ts.forEachChild(node, collectArrayMutations);
+};
 const staticLogicalValueOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node) return undefined;
@@ -2767,6 +3105,46 @@ const fixedSpreadPlansOf = (input, seen = new Set()) => {
     return plans;
   }
   if (ts.isIdentifier(node)) {
+const binding = resolveBinding(node);
+if (binding?.kind === "variable" &&
+ts.isVariableDeclaration(binding.node) &&
+ts.isIdentifier(binding.node.name) && binding.node.initializer &&
+    ts.isArrayLiteralExpression(unwrap(binding.node.initializer))) {
+    const usageStart = node.getStart(file);
+    const mutations = (arrayMutationValuesByBinding.get(binding.node) ?? [])
+      .filter((mutation) => mutation.start <= usageStart);
+    if (mutations.length > 0) {
+      const mutationSeen = new Set(next);
+      mutationSeen.add(binding.node);
+      const values = fixedSpreadValuesOf(
+        binding.node.initializer, mutationSeen
+      );
+      if (!values) return [];
+      for (const mutation of mutations) {
+        const additions = mutation.values.flatMap((value) =>
+          ts.isSpreadElement(value)
+            ? fixedSpreadValuesOf(
+              value.expression, mutationSeen
+            ) ?? [value.expression]
+            : [unwrap(value)]);
+        if (mutation.kind === "push") values.push(...additions);
+        else if (mutation.kind === "unshift") values.unshift(...additions);
+        else if (mutation.kind === "set") {
+          const index = mutation.index === undefined
+            ? values.length : Number(mutation.index);
+          values[index] = additions[0];
+        } else {
+          const index = mutation.index === undefined ? 0 : Number(mutation.index);
+        const deleteCount = mutation.deleteCount === "rest"
+          ? values.length - index
+          : mutation.deleteCount === undefined
+          ? 0 : Number(mutation.deleteCount);
+        values.splice(index, deleteCount, ...additions);
+        }
+}
+      return [{ before: values, after: [], unknownIndex: undefined }];
+}
+}
     const values = resolvedValuesOf(node, next).filter((value) => value !== node);
     return values.flatMap((value) => fixedSpreadPlansOf(value, next)).slice(0, 32);
   }
@@ -3164,6 +3542,7 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
   next.add(node);
   if (ts.isIdentifier(node)) {
     const binding = resolveBinding(node);
+    if (binding?.node && seen.has(binding.node)) return undefined;
     if (binding?.kind === "variable" &&
         ts.isVariableDeclaration(binding.node) &&
         ts.isIdentifier(binding.node.name)) {
@@ -3189,6 +3568,15 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
     }
     return undefined;
   }
+    if (ts.isConditionalExpression(node)) {
+      const alternatives = [node.whenTrue, node.whenFalse].flatMap((value) => {
+        const candidate = storedBindInvocationOf(
+          value, invocationPlan, next
+        );
+        return candidate ? candidate.alternatives ?? [candidate] : [];
+      });
+      if (alternatives.length > 0) return { alternatives };
+    }
   if (!ts.isCallExpression(node)) return undefined;
   const bind = bindMethodReferenceOf(node.expression, next);
   if (bind?.property === "bind") {
@@ -3496,6 +3884,7 @@ const recordParameterFunctions = (parameter, functions) => {
     };
     collect(file);
   }
+  collectArrayMutations(file);
   visit(file);
   if (!isLauncher && filename === "src/services/process-exec.ts" && launcherCount !== 1) {
     findings.push(filename + ": expected exactly one audited POSIX_GROUP_LAUNCHER declaration");

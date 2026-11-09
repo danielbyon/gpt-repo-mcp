@@ -910,6 +910,20 @@ const staticProvenanceCases = [
     `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...(null ?? [${capability}]));`],
   ['zero BigInt logical OR spread alternatives', (capability) =>
     `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...(0n || [${capability}]));`],
+  ['numeric zero logical OR spread alternatives', (capability) =>
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...(0 || [${capability}]));`],
+  ['truthy numeric logical AND spread alternatives', (capability) =>
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...(1 && [${capability}]));`],
+  ['truthy string logical AND spread alternatives', (capability) =>
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...('value' && [${capability}]));`],
+  ['negated false logical AND spread alternatives', (capability) =>
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...(!false && [${capability}]));`],
+  ['truthy array logical OR spread alternatives', (capability) =>
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...([${capability}] || [safe]));`],
+  ['truthy array logical AND spread alternatives', (capability) =>
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...([safe] && [${capability}]));`],
+  ['non-null array logical nullish spread alternatives', (capability) =>
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...([${capability}] ?? [safe]));`],
   ['nested unknown spread followed by capability', (capability) =>
     `declare const args: any[]; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...[...args, ${capability}]);`],
   ['unknown prefix indexed capability', (capability) =>
@@ -970,10 +984,34 @@ const staticProvenanceCases = [
     `Reflect.apply(Object.assign, Object, [{}, { runtime: ${capability} }]).runtime.getBuiltinModule('node:child_process');`],
   ['Object.create apply with unknown prefix', (capability) =>
     `declare const args: any[]; const created = Object.create.apply(Object, [...args, { runtime: ${capability} }]); created.runtime.getBuiltinModule('node:child_process');`],
-  ['detached Object.create bind', (capability) =>
-    `const bind = Object.create.bind; const create = bind(Object); const args = create({ runtime: ${capability} }); args.runtime.getBuiltinModule('node:child_process');`],
-  ['detached Object.assign bind', (capability) =>
-    `const bind = Object.assign.bind; const assign = bind(Object); assign({}, { runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
+  ['detached Object.create bind call', (capability) =>
+    `const bind = Object.create.bind; const create = bind.call(Object.create, Object); const args = create({ runtime: ${capability} }); args.runtime.getBuiltinModule('node:child_process');`],
+  ['detached Object.create bind call captured arguments', (capability) =>
+    `const bind = Object.create.bind; const create = bind.call(Object.create, Object, { runtime: ${capability} }); create().runtime.getBuiltinModule('node:child_process');`],
+  ['detached Object.create bind apply', (capability) =>
+    `const bind = Object.create.bind; const create = bind.apply(Object.create, [Object]); const args = create({ runtime: ${capability} }); args.runtime.getBuiltinModule('node:child_process');`],
+  ['detached Object.create Reflect.apply', (capability) =>
+    `const bind = Object.create.bind; const create = Reflect.apply(bind, Object.create, [Object]); const args = create({ runtime: ${capability} }); args.runtime.getBuiltinModule('node:child_process');`],
+  ['detached Object.assign bind call', (capability) =>
+    `const bind = Object.assign.bind; const assign = bind.call(Object.assign, Object); assign({}, { runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
+  ['detached Object.assign bind call captured arguments', (capability) =>
+    `const bind = Object.assign.bind; const assign = bind.call(Object.assign, Object, {}, { runtime: ${capability} }); assign().runtime.getBuiltinModule('node:child_process');`],
+  ['detached Object.assign bind apply', (capability) =>
+    `const bind = Object.assign.bind; const assign = bind.apply(Object.assign, [Object]); assign({}, { runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
+  ['detached Object.assign Reflect.apply', (capability) =>
+    `const bind = Object.assign.bind; const assign = Reflect.apply(bind, Object.assign, [Object]); assign({}, { runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
+  ['conditional stored helper bind', (capability) =>
+    `declare const condition: boolean; const safe = () => ({ getBuiltinModule() {} }); function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const chosen = condition ? load.bind(null) : safe.bind(null); chosen(${capability}).exec('id');`],
+  ['nested destructured Object.create', (capability) =>
+    `let create; ({ outer: { create } } = { outer: { create: Object.create } }); create({ runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
+  ['nested destructured Object.assign', (capability) =>
+    `let assign; ({ outer: { assign } } = { outer: { assign: Object.assign } }); assign({}, { runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
+  ['nested computed destructured Object.create', (capability) =>
+    `const key = 'create'; let create; ({ outer: { [key]: create } } = { outer: { create: Object.create } }); create({ runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
+  ['nested computed destructured Object.assign', (capability) =>
+    `const key = 'assign'; let assign; ({ outer: { [key]: assign } } = { outer: { assign: Object.assign } }); assign({}, { runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
+  ['immutable computed destructured Object.create', (capability) =>
+    `const key = 'create'; let create; ({ [key]: create } = Object); create({ runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
   ['later-assigned stored helper bind', (capability) =>
     `function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } let bound; bound = load.bind(null); bound(${capability}).exec('id');`],
   ['alternative stored helper bind assignments', (capability) =>
@@ -1017,9 +1055,82 @@ test.each(staticProvenanceCases)(
   });
 
 test.each([
+  ['push', `const args = []; args.push(process); load(...args).exec('id');`],
+  ['index assignment', `const args = [undefined]; args[0] = process; load(...args).exec('id');`],
+  ['splice insertion', `const args = []; args.splice(0, 0, process); load(...args).exec('id');`],
+  ['spread push', `const args = []; args.push(...[process]); load(...args).exec('id');`],
+  ['aliased push', `const args = []; const alias = args; alias.push(process); load(...args).exec('id');`],
+  ['later-assigned aliased push', `let alias; const args = []; alias = args; alias.push(process); load(...args).exec('id');`],
+  ['dynamic index assignment', `const args = []; let index = 0; args[index] = process; load(...args).exec('id');`],
+  ['apply read', `const args = []; args.push(process); load.apply(null, args).exec('id');`],
+  ['later safe write', `const args = []; args.push(process); args[0] = { getBuiltinModule() {} }; load(...args);`],
+  ['splice deletion', `const args = [safe, process]; args.splice(0, 1); load(...args);`],
+  ['splice deletion to end', `const args = [safe, process]; args.splice(0); load(...args);`],
+  ['fill insertion', `const args = [safe]; args.fill(process); load(...args);`],
+  ['copyWithin reorder', `const args = [process, safe]; args.copyWithin(1, 0); load(...args);`],
+  ['reverse reorder', `const args = [process, safe]; args.reverse(); load(...args);`],
+  ['conditional safe write', `declare const condition: boolean; const args = [process]; if (condition) args[0] = safe; load(...args);`]
+])('rejects capability-bearing mutable array %s', (_name, mutation) => {
+  const source = `function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } ${mutation}`;
+  expect(inspectSupervisorSource(
+    'src/services/windows-process-host.ts', source
+  )).toEqual(expect.arrayContaining([
+    expect.stringMatching(/capability escape through mutable array/)
+  ]));
+});
+
+test.each([
+  ['push', `const args = []; args.push(safe); load(...args);`],
+  ['index assignment', `const args = [safe]; args[0] = safe; load(...args);`],
+  ['splice insertion', `const args = []; args.splice(0, 0, safe); load(...args);`],
+  ['spread push', `const args = []; args.push(...[safe]); load(...args);`],
+  ['aliased push', `const args = []; const alias = args; alias.push(safe); load(...args);`],
+  ['later-assigned aliased push', `let alias; const args = []; alias = args; alias.push(safe); load(...args);`],
+  ['self spread', `const args = [safe]; args.push(...args); load(...args);`],
+  ['apply read', `const args = []; args.push(safe); load.apply(null, args);`],
+  ['fill', `const args = []; args.fill(safe); load(...args);`],
+  ['copyWithin', `const args = [safe, safe]; args.copyWithin(1, 0); load(...args);`],
+  ['reverse', `const args = [safe, safe]; args.reverse(); load(...args);`],
+  ['conditional write', `declare const condition: boolean; const args = [safe]; if (condition) args[0] = safe; load(...args);`]
+])('accepts safe mutable array %s', (_name, mutation) => {
+  const source = `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } ${mutation}`;
+  expect(inspectSupervisorSource(
+    'src/services/windows-process-host.ts', source
+  )).toEqual([]);
+});
+
+test.each([
+  ['mutable key', `let key = 'create';`],
+  ['conditional key', `declare const condition: boolean; const key = condition ? 'create' : 'assign';`]
+])('rejects dynamically selected global destructuring with %s', (_name, key) => {
+  const source = `${key} let create; ({ [key]: create } = Object); create({ runtime: process }).runtime.getBuiltinModule('node:child_process');`;
+  expect(inspectSupervisorSource(
+    'src/services/windows-process-host.ts', source
+  )).toEqual(expect.arrayContaining([
+    expect.stringMatching(/dynamic global capability destructuring/)
+  ]));
+});
+
+test('rejects dynamically selected nested global capability destructuring', () => {
+  const source = `let key = 'create'; let create; ({ outer: { [key]: create } } = { outer: { create: Object.create } });`;
+  expect(inspectSupervisorSource(
+    'src/services/windows-process-host.ts', source
+  )).toEqual(expect.arrayContaining([
+    expect.stringMatching(/dynamic global capability destructuring/)
+  ]));
+});
+
+test.each([
   ['logical AND', '[process] && [safe]'],
   ['logical OR', 'false || [safe]'],
-  ['nullish coalescing', 'null ?? [safe]']
+  ['nullish coalescing', 'null ?? [safe]'],
+  ['truthy logical AND', 'true && [safe]'],
+  ['truthy logical OR', '[safe] || [process]'],
+  ['non-null logical nullish', '[safe] ?? [process]'],
+  ['numeric zero logical OR', '0 || [safe]'],
+  ['zero BigInt logical OR', '0n || [safe]'],
+  ['truthy string logical AND', "'value' && [safe]"],
+  ['negated false logical AND', '!false && [safe]']
 ] )('accepts statically unreachable %s spread operand', (_name, spread) => {
   expect(inspectSupervisorSource('src/services/windows-process-host.ts',
     `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...(${spread}));`)) .toEqual([]);
@@ -1039,6 +1150,13 @@ test.each(genericBindProvenanceCases)(
       'src/services/windows-process-host.ts', makeSource('process')
     )).toEqual(safeFindings);
   });
+
+test('rejects capability-bearing array read before a later safe write', () => {
+  const source = `function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const args = [process]; load(...args); args[0] = { getBuiltinModule() {} };`;
+  expect(inspectSupervisorSource(
+    'src/services/windows-process-host.ts', source
+  )).not.toEqual([]);
+});
 
   test("accepts ordinary holes, rests, helpers, factories, and opaque spreads without process capability", () => {
     const source = [

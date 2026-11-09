@@ -795,6 +795,20 @@ describe("Windows qualification scope guard", () => {
       `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(null ?? [${capability}]));`],
     ['zero BigInt logical OR spread alternatives', (capability) =>
       `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(0n || [${capability}]));`],
+    ['numeric zero logical OR spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(0 || [${capability}]));`],
+    ['truthy numeric logical AND spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(1 && [${capability}]));`],
+    ['truthy string logical AND spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...('value' && [${capability}]));`],
+    ['negated false logical AND spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(!false && [${capability}]));`],
+    ['truthy array logical OR spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...([${capability}] || [safe]));`],
+    ['truthy array logical AND spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...([safe] && [${capability}]));`],
+    ['non-null array logical nullish spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...([${capability}] ?? [safe]));`],
     ['nested unknown spread followed by capability', (capability) =>
       `import { test } from 'vitest'; declare const args: any[]; function focus(register) { register.only('focused', () => {}); } focus(...[...args, ${capability}]);`],
     ['unknown prefix indexed capability', (capability) =>
@@ -875,10 +889,34 @@ describe("Windows qualification scope guard", () => {
       `import { test } from 'vitest'; const assign = Reflect.apply(Function.prototype.bind, Object.assign, [Object, {}, { runtime: ${capability} }]); assign().runtime.only('focused', () => {});`],
     ['Object.create apply with unknown prefix', (capability) =>
       `import { test } from 'vitest'; declare const args: any[]; const created = Object.create.apply(Object, [...args, { runtime: ${capability} }]); created.runtime.only('focused', () => {});`],
-    ['detached Object.create bind', (capability) =>
-      `import { test } from 'vitest'; const bind = Object.create.bind; const create = bind(Object); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
-    ['detached Object.assign bind', (capability) =>
-      `import { test } from 'vitest'; const bind = Object.assign.bind; const assign = bind(Object); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['detached Object.create bind call', (capability) =>
+      `import { test } from 'vitest'; const bind = Object.create.bind; const create = bind.call(Object.create, Object); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['detached Object.create bind call captured arguments', (capability) =>
+      `import { test } from 'vitest'; const bind = Object.create.bind; const create = bind.call(Object.create, Object, { runtime: ${capability} }); create().runtime.only('focused', () => {});`],
+    ['detached Object.create bind apply', (capability) =>
+      `import { test } from 'vitest'; const bind = Object.create.bind; const create = bind.apply(Object.create, [Object]); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['detached Object.create Reflect.apply', (capability) =>
+      `import { test } from 'vitest'; const bind = Object.create.bind; const create = Reflect.apply(bind, Object.create, [Object]); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['detached Object.assign bind call', (capability) =>
+      `import { test } from 'vitest'; const bind = Object.assign.bind; const assign = bind.call(Object.assign, Object); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['detached Object.assign bind call captured arguments', (capability) =>
+      `import { test } from 'vitest'; const bind = Object.assign.bind; const assign = bind.call(Object.assign, Object, {}, { runtime: ${capability} }); assign().runtime.only('focused', () => {});`],
+    ['detached Object.assign bind apply', (capability) =>
+      `import { test } from 'vitest'; const bind = Object.assign.bind; const assign = bind.apply(Object.assign, [Object]); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['detached Object.assign Reflect.apply', (capability) =>
+      `import { test } from 'vitest'; const bind = Object.assign.bind; const assign = Reflect.apply(bind, Object.assign, [Object]); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['conditional stored helper bind', (capability) =>
+      `import { test } from 'vitest'; declare const condition: boolean; const safe = () => ({ only() {} }); function focus(register) { register.only('focused', () => {}); } const chosen = condition ? focus.bind(null) : safe.bind(null); chosen(${capability});`],
+    ['nested destructured Object.create', (capability) =>
+      `import { test } from 'vitest'; let create; ({ outer: { create } } = { outer: { create: Object.create } }); create({ runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['nested destructured Object.assign', (capability) =>
+      `import { test } from 'vitest'; let assign; ({ outer: { assign } } = { outer: { assign: Object.assign } }); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['nested computed destructured Object.create', (capability) =>
+      `import { test } from 'vitest'; const key = 'create'; let create; ({ outer: { [key]: create } } = { outer: { create: Object.create } }); create({ runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['nested computed destructured Object.assign', (capability) =>
+      `import { test } from 'vitest'; const key = 'assign'; let assign; ({ outer: { [key]: assign } } = { outer: { assign: Object.assign } }); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['immutable computed destructured Object.create', (capability) =>
+      `import { test } from 'vitest'; const key = 'create'; let create; ({ [key]: create } = Object); create({ runtime: ${capability} }).runtime.only('focused', () => {});`],
     ['later-assigned stored helper bind', (capability) =>
       `import { test } from 'vitest'; function focus(register) { register.only('focused', () => {}); } let bound; bound = focus.bind(null); bound(${capability});`],
     ['alternative stored helper bind assignments', (capability) =>
@@ -901,6 +939,62 @@ describe("Windows qualification scope guard", () => {
         'fixture.ts', makeSource('({ only() {} })')
       )).not.toThrow();
     });
+
+test.each([
+  ['push', `const args = []; args.push(test); focus(...args);`],
+  ['index assignment', `const args = [safe]; args[0] = test; focus(...args);`],
+      ['splice insertion', `const args = []; args.splice(0, 0, test); focus(...args);`],
+      ['spread push', `const args = []; args.push(...[test]); focus(...args);`],
+      ['aliased push', `const args = []; const alias = args; alias.push(test); focus(...args);`],
+      ['later-assigned aliased push', `let alias; const args = []; alias = args; alias.push(test); focus(...args);`],
+      ['dynamic index assignment', `const args = []; let index = 0; args[index] = test; focus(...args);`],
+      ['apply read', `const args = []; args.push(test); focus.apply(null, args);`],
+      ['later safe write', `const args = []; args.push(test); args[0] = { only() {} }; focus(...args);`],
+      ['splice deletion', `const args = [safe, test]; args.splice(0, 1); focus(...args);`],
+      ['splice deletion to end', `const args = [safe, test]; args.splice(0); focus(...args);`],
+      ['read before safe write', `const args = [test]; focus(...args); args[0] = { only() {} };`],
+      ['fill insertion', `const args = [safe]; args.fill(test); focus(...args);`],
+      ['copyWithin reorder', `const args = [test, safe]; args.copyWithin(1, 0); focus(...args);`],
+      ['reverse reorder', `const args = [test, safe]; args.reverse(); focus(...args);`],
+      ['conditional safe write', `declare const condition: boolean; const args = [test]; if (condition) args[0] = safe; focus(...args);`]
+])('rejects capability-bearing mutable array %s', (_name, mutation) => {
+  const source = `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } ${mutation}`;
+  expect(() => collectWindowsTestTitles('fixture.ts', source))
+    .toThrow(/Exclusive or dynamically selected Vitest/);
+});
+
+test.each([
+  ['push', `const args = []; args.push(safe); focus(...args);`],
+  ['index assignment', `const args = [safe]; args[0] = safe; focus(...args);`],
+      ['splice insertion', `const args = []; args.splice(0, 0, safe); focus(...args);`],
+      ['spread push', `const args = []; args.push(...[safe]); focus(...args);`],
+      ['aliased push', `const args = []; const alias = args; alias.push(safe); focus(...args);`],
+      ['later-assigned aliased push', `let alias; const args = []; alias = args; alias.push(safe); focus(...args);`],
+      ['self spread', `const args = [safe]; args.push(...args); focus(...args);`],
+      ['apply read', `const args = []; args.push(safe); focus.apply(null, args);`],
+      ['fill', `const args = []; args.fill(safe); focus(...args);`],
+      ['copyWithin', `const args = [safe, safe]; args.copyWithin(1, 0); focus(...args);`],
+      ['reverse', `const args = [safe, safe]; args.reverse(); focus(...args);`],
+      ['conditional write', `declare const condition: boolean; const args = [safe]; if (condition) args[0] = safe; focus(...args);`]
+])('accepts safe mutable array %s', (_name, mutation) => {
+  const source = `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } ${mutation}`;
+  expect(collectWindowsTestTitles('fixture.ts', source)).toEqual([]);
+});
+
+test.each([
+  ['mutable key', `let key = 'create';`],
+  ['conditional key', `declare const condition: boolean; const key = condition ? 'create' : 'assign';`]
+])('rejects dynamically selected global destructuring with %s', (_name, key) => {
+  const source = `import { test } from 'vitest'; ${key} let create; ({ [key]: create } = Object); create({ runtime: test }).runtime.only('focused', () => {});`;
+  expect(() => collectWindowsTestTitles('fixture.ts', source))
+    .toThrow(/Exclusive or dynamically selected Vitest/);
+});
+
+test('rejects dynamically selected nested global capability destructuring', () => {
+  const source = `import { test } from 'vitest'; let key = 'create'; let create; ({ outer: { [key]: create } } = { outer: { create: Object.create } });`;
+  expect(() => collectWindowsTestTitles('fixture.ts', source))
+    .toThrow(/Exclusive or dynamically selected Vitest/);
+});
 
   test.each([
     ['logical AND', '[test] && [safe]'],
