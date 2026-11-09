@@ -3059,65 +3059,131 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
   }
   return undefined;
   }
-  function intrinsicMethodWrapperOf(
-    input, wrapperMethod, receiverNames, methods, seen = new Set()
-  ) {
-    const node = unwrap(input);
-    if (!node || seen.has(node)) return false;
-    const next = new Set(seen);
-    next.add(node);
-    if (ts.isBinaryExpression(node) &&
-        node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
-      return intrinsicMethodWrapperOf(
-        node.right, wrapperMethod, receiverNames, methods, next
-      );
-    }
-    const member = resolvedAccess(node);
-    if (member) {
-      if (member.method === wrapperMethod && globalIntrinsicMethodOf(
-        member.receiver, receiverNames, methods, next
-      )) return true;
-      if (objectPropertyValuesOf(member.receiver, member.method, next)
+function intrinsicWrapperMethodOf(input, receiverNames, methods, seen) {
+  for (const wrapperMethod of ["apply", "call"]) {
+    if (intrinsicMethodWrapperOf(
+      input, wrapperMethod, receiverNames, methods, seen
+    )) return wrapperMethod;
+  }
+  return undefined;
+}
+function boundIntrinsicWrapperMethodOf(
+  input, receiverNames, methods, seen = new Set()
+) {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    const declaration = binding?.kind === "variable" &&
+      ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name) ? binding.node : undefined;
+    return declaration?.initializer
+      ? boundIntrinsicWrapperMethodOf(
+        declaration.initializer, receiverNames, methods, next
+      )
+      : undefined;
+  }
+  if (!ts.isCallExpression(node)) return undefined;
+  const bind = resolvedAccess(node.expression);
+  if (bind?.method !== "bind") return undefined;
+  const boundArguments = intrinsicArgumentValuesOf(node.arguments, next);
+  if (!boundArguments || !globalIntrinsicMethodOf(
+    boundArguments[0], receiverNames, methods, next
+  )) return undefined;
+  return intrinsicWrapperMethodOf(
+    bind.receiver, receiverNames, methods, next
+  );
+}
+function intrinsicMethodWrapperOf(
+  input, wrapperMethod, receiverNames, methods, seen = new Set()
+) {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return intrinsicMethodWrapperOf(
+      node.right, wrapperMethod, receiverNames, methods, next
+    );
+  }
+  const member = resolvedAccess(node);
+  if (member) {
+    if (member.method === wrapperMethod && globalIntrinsicMethodOf(
+      member.receiver, receiverNames, methods, next
+    )) return true;
+    if (objectPropertyValuesOf(member.receiver, member.method, next)
         .some((value) => intrinsicMethodWrapperOf(
           value, wrapperMethod, receiverNames, methods, next
         ))) return true;
-    }
-    if (ts.isCallExpression(node)) {
-      return functionReturnExpressionsOf(node.expression, next)
-        .some((value) => intrinsicMethodWrapperOf(
-          value, wrapperMethod, receiverNames, methods, next
-        ));
-    }
-    if (!ts.isIdentifier(node)) return false;
-    const binding = resolveBinding(node);
-    const declaration = binding?.node &&
-      (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node))
-      ? binding.node : undefined;
-    if (!declaration || seen.has(declaration)) return false;
-    const bindingNext = new Set(next);
-    bindingNext.add(declaration);
-    if ((destructuredPropertyAssignmentsByBinding.get(declaration) ?? [])
+  }
+  if (ts.isCallExpression(node)) {
+    const reflectiveGet = intrinsicInvocationArgumentsOf(
+      node, ["Reflect"], ["get"], next
+    );
+    if (reflectiveGet &&
+        staticStringOf(reflectiveGet[1]) === wrapperMethod &&
+        globalIntrinsicMethodOf(
+          reflectiveGet[0], receiverNames, methods, next
+        )) return true;
+    return functionReturnExpressionsOf(node.expression, next)
+      .some((value) => intrinsicMethodWrapperOf(
+        value, wrapperMethod, receiverNames, methods, next
+      ));
+  }
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  const declaration = binding?.node &&
+    (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node))
+    ? binding.node : undefined;
+  if (!declaration || seen.has(declaration)) return false;
+  const bindingNext = new Set(next);
+  bindingNext.add(declaration);
+  if ((destructuredPropertyAssignmentsByBinding.get(declaration) ?? [])
       .some((assignment) => assignment.property === wrapperMethod &&
         globalIntrinsicMethodOf(
           assignment.source, receiverNames, methods, bindingNext
         ))) return true;
-    if ([declaration.initializer,
-      ...(assignmentsByBinding.get(declaration) ?? [])].some((value) => value &&
+  if ([declaration.initializer,
+    ...(assignmentsByBinding.get(declaration) ?? [])].some((value) => value &&
       intrinsicMethodWrapperOf(
         value, wrapperMethod, receiverNames, methods, bindingNext
       ))) return true;
-    return destructuredValuesOf(declaration, node.text).some((value) =>
-      intrinsicMethodWrapperOf(
-        value, wrapperMethod, receiverNames, methods, bindingNext
-      ));
-  }
-  function intrinsicInvocationArgumentsOf(
-    input, receiverNames, methods, seen = new Set()
-  ) {
-    const node = unwrap(input);
-    if (!node || !ts.isCallExpression(node)) return undefined;
+  return destructuredValuesOf(declaration, node.text).some((value) =>
+    intrinsicMethodWrapperOf(
+      value, wrapperMethod, receiverNames, methods, bindingNext
+    ));
+}
+function intrinsicInvocationArgumentsOf(
+  input, receiverNames, methods, seen = new Set()
+) {
+  const node = unwrap(input);
+  if (!node || !ts.isCallExpression(node)) return undefined;
+
+  const wrapperInvocationValuesOf = (wrapperMethod, invocationArguments) => {
+    if (!globalIntrinsicOf(invocationArguments[0], ["Array"], seen)) {
+      return undefined;
+    }
+    if (wrapperMethod === "apply") {
+      return invocationArguments[1]
+        ? expandedArgumentValuesOf(invocationArguments[1], seen) : [];
+    }
+    return intrinsicArgumentValuesOf(invocationArguments.slice(1), seen);
+  };
+
   const reflected = reflectApplyTargetArgumentsOf(node, seen);
   if (reflected) {
+    const wrapperMethod = intrinsicWrapperMethodOf(
+      reflected.target, receiverNames, methods, seen
+    );
+    if (wrapperMethod) {
+      if (!globalIntrinsicMethodOf(
+        node.arguments[1], receiverNames, methods, seen
+      )) return undefined;
+      return wrapperInvocationValuesOf(wrapperMethod, reflected.arguments);
+    }
     const boundArguments = boundIntrinsicArgumentsOf(
       reflected.target, receiverNames, methods, seen
     );
@@ -3127,58 +3193,66 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
       return [...(boundArguments ?? []), ...reflected.arguments];
     }
   }
-    const wrapper = resolvedAccess(unwrap(node.expression));
-    if (wrapper && ["apply", "call"].includes(wrapper.method)) {
-      for (const wrapperMethod of ["apply", "call"]) {
-        if (!intrinsicMethodWrapperOf(
-          wrapper.receiver, wrapperMethod, receiverNames, methods, seen
-        )) continue;
-        if (!globalIntrinsicMethodOf(
-          node.arguments[0], receiverNames, methods, seen
-        )) return undefined;
-        const methodArguments = wrapper.method === "call"
-          ? intrinsicArgumentValuesOf(node.arguments.slice(1), seen)
-          : expandedCallArgumentValuesOf(node.arguments, 1, seen);
-        if (!methodArguments) return undefined;
-        if (wrapperMethod === "apply") {
-          return methodArguments[1]
-            ? expandedArgumentValuesOf(methodArguments[1], seen) : [];
-        }
-        return methodArguments.slice(1);
+  const wrapper = resolvedAccess(unwrap(node.expression));
+  if (wrapper && ["apply", "call"].includes(wrapper.method)) {
+    for (const wrapperMethod of ["apply", "call"]) {
+      if (!intrinsicMethodWrapperOf(
+        wrapper.receiver, wrapperMethod, receiverNames, methods, seen
+      )) continue;
+      if (!globalIntrinsicMethodOf(
+        node.arguments[0], receiverNames, methods, seen
+      )) return undefined;
+      const methodArguments = wrapper.method === "call"
+        ? intrinsicArgumentValuesOf(node.arguments.slice(1), seen)
+        : expandedCallArgumentValuesOf(node.arguments, 1, seen);
+      if (!methodArguments) return undefined;
+      if (wrapperMethod === "apply") {
+        return methodArguments[1]
+          ? expandedArgumentValuesOf(methodArguments[1], seen) : [];
       }
-      const boundArguments = boundIntrinsicArgumentsOf(
-        wrapper.receiver, receiverNames, methods, seen
-      );
-      if (boundArguments !== undefined) {
-        const invocationArguments = wrapper.method === "call"
-          ? intrinsicArgumentValuesOf(node.arguments.slice(1), seen)
-          : expandedCallArgumentValuesOf(node.arguments, 1, seen);
-        if (invocationArguments) {
-          return [...boundArguments, ...invocationArguments];
-        }
-      }
+      return methodArguments.slice(1);
     }
     const boundArguments = boundIntrinsicArgumentsOf(
-      node.expression, receiverNames, methods, seen
+      wrapper.receiver, receiverNames, methods, seen
     );
-    if (globalIntrinsicMethodOf(
-      node.expression, receiverNames, methods, seen
-    ) || boundArguments) {
-      return [
-        ...(boundArguments ?? []),
-        ...intrinsicArgumentValuesOf(node.arguments, seen)
-      ];
+    if (boundArguments !== undefined) {
+      const invocationArguments = wrapper.method === "call"
+        ? intrinsicArgumentValuesOf(node.arguments.slice(1), seen)
+        : expandedCallArgumentValuesOf(node.arguments, 1, seen);
+      if (invocationArguments) {
+        return [...boundArguments, ...invocationArguments];
+      }
     }
-    if (!wrapper || !["apply", "call"].includes(wrapper.method) ||
-        !globalIntrinsicMethodOf(wrapper.receiver, receiverNames, methods, seen)) {
-      return undefined;
-    }
-    if (wrapper.method === "call") {
-      return intrinsicArgumentValuesOf(node.arguments.slice(1), seen);
-    }
-    if (!node.arguments[1]) return [];
-    return expandedCallArgumentValuesOf(node.arguments, 1, seen);
   }
+  const boundWrapperMethod = boundIntrinsicWrapperMethodOf(
+    node.expression, receiverNames, methods, seen
+  );
+  if (boundWrapperMethod) {
+    return wrapperInvocationValuesOf(boundWrapperMethod, node.arguments);
+  }
+  const boundArguments = boundIntrinsicArgumentsOf(
+    node.expression, receiverNames, methods, seen
+  );
+  if (globalIntrinsicMethodOf(
+    node.expression, receiverNames, methods, seen
+  ) || boundArguments) {
+    return [
+      ...(boundArguments ?? []),
+      ...intrinsicArgumentValuesOf(node.arguments, seen)
+    ];
+  }
+  if (!wrapper || !["apply", "call"].includes(wrapper.method) ||
+      !globalIntrinsicMethodOf(
+        wrapper.receiver, receiverNames, methods, seen
+      )) {
+    return undefined;
+  }
+  if (wrapper.method === "call") {
+    return intrinsicArgumentValuesOf(node.arguments.slice(1), seen);
+  }
+  if (!node.arguments[1]) return [];
+  return expandedCallArgumentValuesOf(node.arguments, 1, seen);
+}
   function patternSelectsProperty(pattern, targetName, property) {
     if (ts.isObjectBindingPattern(pattern)) {
       return pattern.elements.some((element) => {
@@ -4700,7 +4774,31 @@ const inspectExclusivePatternFromValues = (pattern, values) => {
     }
   }
 };
-  const checkExclusive = (node) => {
+const inspectExclusiveArrayPatternValues = (pattern, values) => {
+  pattern = unwrap(pattern);
+  if (!ts.isArrayBindingPattern(pattern) &&
+      !ts.isArrayLiteralExpression(pattern)) return;
+  for (let index = 0; index < pattern.elements.length; index += 1) {
+    const element = pattern.elements[index];
+    if (!ts.isSpreadElement(element) && ts.isOmittedExpression(element)) continue;
+    const rest = ts.isBindingElement(element)
+      ? Boolean(element.dotDotDotToken)
+      : ts.isSpreadElement(element);
+    const selected = rest
+      ? values.slice(index)
+      : index < values.length ? [values[index]] : [];
+    const nested = ts.isBindingElement(element) ? element.name : element;
+    if (!ts.isObjectBindingPattern(nested) &&
+        !ts.isObjectLiteralExpression(nested) &&
+        !ts.isArrayBindingPattern(nested) &&
+        !ts.isArrayLiteralExpression(nested)) continue;
+    const expanded = selected.flatMap((value) =>
+      fixedSpreadValuesOf(value) ?? [unwrap(value)]);
+    inspectExclusivePatternFromValues(nested, expanded);
+    if (rest) break;
+  }
+};
+const checkExclusive = (node) => {
     if (ts.isParameter(node) && node.initializer &&
         possibleTestRunnerOf(node.initializer, ["test", "it", "describe"])) {
       throw new Error("Exclusive or dynamically selected Vitest tests unaudited.");
@@ -4751,7 +4849,7 @@ const member = resolvedAccess(node);
         }
       }
     }
- if (ts.isForOfStatement(node)) {
+if (ts.isForOfStatement(node)) {
    const targets = ts.isVariableDeclarationList(node.initializer)
      ? node.initializer.declarations.map((declaration) => declaration.name)
      : [unwrap(node.initializer)];
@@ -4760,6 +4858,20 @@ const member = resolvedAccess(node);
      inspectExclusivePatternFromValues(target, iterated);
    }
  }
+  if (ts.isVariableDeclaration(node) &&
+      ts.isArrayBindingPattern(node.name) && node.initializer) {
+    const values = fixedSpreadValuesOf(node.initializer);
+    if (values) inspectExclusiveArrayPatternValues(node.name, values);
+  }
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+    const pattern = unwrap(node.left);
+    if (ts.isArrayBindingPattern(pattern) ||
+        ts.isArrayLiteralExpression(pattern)) {
+      const values = fixedSpreadValuesOf(node.right);
+      if (values) inspectExclusiveArrayPatternValues(pattern, values);
+    }
+  }
     if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
         node.initializer &&
         (possibleTestRunnerOf(node.initializer, ["test", "it", "describe"]) ||

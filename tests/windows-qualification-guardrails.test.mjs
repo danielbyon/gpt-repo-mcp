@@ -688,7 +688,15 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
   ["member-held runner factory", "import { test } from 'vitest'; const make = () => test; const tools = { make }; tools.make().only('focused', () => {});"],
   ["method-held runner factory", "import { test } from 'vitest'; const tools = { make() { return test; } }; tools.make().only('focused', () => {});"],
   ["assigned member-held runner factory", "import { test } from 'vitest'; const tools: any = {}; tools.make = () => test; tools.make().only('focused', () => {});"],
-    ["computed dynamic namespace", "const V = await import('vi' + 'test'); V.test.only('focused', () => {});"]
+  ["computed dynamic namespace", "const V = await import('vi' + 'test'); V.test.only('focused', () => {});"],
+  ["nested array binding", "import { test } from 'vitest'; const [{ only }] = [test]; only.call(test, 'focused', () => {});"],
+  ["nested array assignment", "import { test } from 'vitest'; let only; [{ only }] = [test]; only.call(test, 'focused', () => {});"],
+  ["nested Array.of binding", "import { test } from 'vitest'; const [{ only }] = Array.of([test]); only.call(test, 'focused', () => {});"],
+  ["destructured Array.of apply bind", "import { test } from 'vitest'; const { apply } = Array.of; const invoke = apply.bind(Array.of); invoke(Array, [test])[0].only('focused', () => {});"],
+  ["member-held Array.of apply bind", "import { test } from 'vitest'; const tools = { apply: Array.of.apply }; const invoke = tools.apply.bind(Array.of); invoke(Array, [test])[0].only('focused', () => {});"],
+  ["spread-bound destructured Array.of apply", "import { test } from 'vitest'; const { apply } = Array.of; const invoke = apply.bind(...[Array.of]); invoke(Array, [test])[0].only('focused', () => {});"],
+  ["Reflect.apply destructured Array.of apply", "import { test } from 'vitest'; const { apply } = Array.of; Reflect.apply(apply, Array.of, [Array, [test]])[0].only('focused', () => {});"],
+  ["Reflect.get Array.of apply call", "import { test } from 'vitest'; Reflect.get(Array.of, 'apply').call(Array.of, Array, [test])[0].only('focused', () => {});"]
   ])("rejects exclusive registration through %s", (_name, source) => {
     expect(() => collectWindowsTestTitles("fixture.ts", source))
       .toThrow(/Exclusive or dynamically selected Vitest/);
@@ -716,6 +724,19 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
       "const globalDescriptorValue = globalThis.Object.getOwnPropertyDescriptor(holder, 'test').value;",
       "const globalAssignedValue = globalThis.Object.assign({}, { value: 1 });",
 "const numericMetadata: any = {}; numericMetadata[1 + 2] = true;",
+      "const testLike = { only() {} };",
+      "const [{ only: nullOnly }] = [null];",
+      "const [{ only: ordinaryOnly }] = [testLike];",
+      "let assignedOnly; [{ only: assignedOnly }] = [testLike];",
+      "const [{ only: arrayOfOnly }] = Array.of([testLike]);",
+      "const { apply } = Array.of; const invokeSafe = apply.bind(Array.of);",
+      "invokeSafe(Array, [testLike])[0].only('safe', () => {});",
+      "const safeTools = { apply: Array.of.apply }; const invokeHeldSafe = safeTools.apply.bind(Array.of);",
+      "invokeHeldSafe(Array, [testLike])[0].only('safe', () => {});",
+      "const invokeSpreadSafe = apply.bind(...[Array.of]);",
+      "invokeSpreadSafe(Array, [testLike])[0].only('safe', () => {});",
+      "Reflect.apply(apply, Array.of, [Array, [testLike]])[0].only('safe', () => {});",
+      "Reflect.get(Array.of, 'apply').call(Array.of, Array, [testLike])[0].only('safe', () => {});",
       "test('required', () => {});"
     ].join("\n"))).toEqual([{ title: "required", enabled: true }]);
   });

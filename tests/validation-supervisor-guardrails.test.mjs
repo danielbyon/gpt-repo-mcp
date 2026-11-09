@@ -202,7 +202,14 @@ test.each([
   ["stored bound this through apply", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const bound = load.bind(process); bound.apply(null, []).exec('id');"],
   ["spread bind receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const receiver = process; load.bind(...[receiver])().exec('id');"],
   ["alternate spread bind receiver", "declare const condition: boolean; function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const receiver = condition ? { getBuiltinModule() {} } : process; load.bind(...[receiver])().exec('id');"],
-  ["runtime argument after explicit this", "function load(this: unknown, runtime: typeof process) { return runtime.getBuiltinModule('node:child_process'); } load.call(null, process).exec('id');"]
+  ["runtime argument after explicit this", "function load(this: unknown, runtime: typeof process) { return runtime.getBuiltinModule('node:child_process'); } load.call(null, process).exec('id');"],
+  ["nested for-of process array destructuring", "for (const [{ getBuiltinModule: load }] of [[process]]) { load('node:child_process').exec('id'); }"],
+  ["Array.of nested object destructuring", "const [{ getBuiltinModule: load }] = Array.of(process); load('node:child_process').exec('id');"],
+  ["destructured Array.of apply bind", "const { apply } = Array.of; const invoke = apply.bind(Array.of); invoke(Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["member-held Array.of apply bind", "const tools = { apply: Array.of.apply }; const invoke = tools.apply.bind(Array.of); invoke(Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["spread-bound destructured Array.of apply", "const { apply } = Array.of; const invoke = apply.bind(...[Array.of]); invoke(Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["Reflect.apply destructured Array.of apply", "const { apply } = Array.of; Reflect.apply(apply, Array.of, [Array, [process]])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["Reflect.get Array.of apply call", "Reflect.get(Array.of, 'apply').call(Array.of, Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"]
 ])("rejects process provenance through %s", (_name, source) => {
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
     .some((finding) => finding.includes("process.getBuiltinModule"))).toBe(true);
@@ -277,7 +284,23 @@ test.each([
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
   });
 
-  test("terminates local function-return cycles without inventing process capability", () => {
+test("accepts nested and extracted Array.of uses without process capability", () => {
+  const source = [
+    "const processLike = { getBuiltinModule() { return undefined; } };",
+    "for (const [{ getBuiltinModule: nestedSafeLoad }] of [[processLike]]) nestedSafeLoad();",
+    "const [{ getBuiltinModule: arrayOfSafeLoad }] = Array.of(processLike); arrayOfSafeLoad();",
+    "const { apply: safeApply } = Array.of; const invokeSafeApply = safeApply.bind(Array.of); invokeSafeApply(Array, [processLike])[0].getBuiltinModule();",
+    "const safeApplyTools = { apply: Array.of.apply }; const invokeHeldSafeApply = safeApplyTools.apply.bind(Array.of); invokeHeldSafeApply(Array, [processLike])[0].getBuiltinModule();",
+    "const invokeSpreadSafeApply = safeApply.bind(...[Array.of]); invokeSpreadSafeApply(Array, [processLike])[0].getBuiltinModule();",
+    "Reflect.apply(safeApply, Array.of, [Array, [processLike]])[0].getBuiltinModule();",
+    "Reflect.get(Array.of, 'apply').call(Array.of, Array, [processLike])[0].getBuiltinModule();"
+  ].join("\n");
+  expect(inspectSupervisorSource(
+    "src/services/windows-process-host.ts", source
+  )).toEqual([]);
+});
+
+test("terminates local function-return cycles without inventing process capability", () => {
     const source = "const runtime = () => runtime(); runtime().getBuiltinModule('node:child_process');";
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
   });
