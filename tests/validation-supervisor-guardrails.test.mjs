@@ -1185,7 +1185,35 @@ const staticProvenanceCases = [
   ['stored logical AND array', (capability) =>
     `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const args = [safe] && [${capability}]; load(...args);`],
   ['stored logical nullish array', (capability) =>
-    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const args = null ?? [${capability}]; load(...args);`]
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const args = null ?? [${capability}]; load(...args);`],
+  ['comma undefined default', (capability) =>
+    `const U = (0, undefined); function load() { return ${capability}; } const { run = load } = { run: U }; run().getBuiltinModule('node:child_process');`],
+  ['logical undefined default', (capability) =>
+    `const U = true && undefined; function load() { return ${capability}; } const { run = load } = { run: U }; run().getBuiltinModule('node:child_process');`],
+  ['conditional undefined default', (capability) =>
+    `const U = true ? undefined : 1; function load() { return ${capability}; } const { run = load } = { run: U }; run().getBuiltinModule('node:child_process');`],
+  ['unknown conditional undefined or capability source', (capability) =>
+    `declare const condition: boolean; function load() { return ${capability}; } const { run = load } = { run: condition ? undefined : load }; run().getBuiltinModule('node:child_process');`],
+  ['class constructor through new', (capability) =>
+    `class C { constructor() { return ${capability}; } } new C().getBuiltinModule('node:child_process');`],
+  ['class constructor through Reflect.construct', (capability) =>
+    `const C = class { constructor() { return ${capability}; } }; Reflect.construct(C, []).getBuiltinModule('node:child_process');`],
+  ['static class factory', (capability) =>
+    `class C { static load() { return ${capability}; } } C.load().getBuiltinModule('node:child_process');`],
+  ['static class property', (capability) =>
+    `const C = class { static runtime = ${capability}; }; C.runtime.getBuiltinModule('node:child_process');`],
+  ['instance class factory', (capability) =>
+    `class C { load() { return ${capability}; } } const tools = new C(); tools.load().getBuiltinModule('node:child_process');`],
+  ['instance class property', (capability) =>
+    `class C { runtime = ${capability}; } new C().runtime.getBuiltinModule('node:child_process');`],
+  ['static class tagged-template receiver', (capability) =>
+    `class C { static runtime = ${capability}; static load() { return this.runtime.getBuiltinModule('node:child_process'); } } C.load\`ticket\`.exec('id');`],
+  ['instance class tagged-template receiver', (capability) =>
+    `class C { runtime = ${capability}; load() { return this.runtime.getBuiltinModule('node:child_process'); } } new C().load\`ticket\`.exec('id');`],
+  ['static class getter', (capability) =>
+    `class C { static runtime = ${capability}; static get load() { return this.runtime; } } C.load.getBuiltinModule('node:child_process');`],
+  ['instance class getter', (capability) =>
+    `class C { runtime = ${capability}; get load() { return this.runtime; } } const tools = new C(); tools.load.getBuiltinModule('node:child_process');`]
 ];
 
 const genericBindProvenanceCases = [
@@ -1238,6 +1266,21 @@ test.each([
 ])('accepts %s shadowing an intrinsic name', (_name, source) => {
   expect(inspectSupervisorSource(
     'src/services/windows-process-host.ts', source
+  )).toEqual([]);
+});
+
+test('accepts capability-safe class fixtures with duplicate declarations', () => {
+  expect(inspectSupervisorSource(
+    'src/services/windows-process-host.ts',
+    [
+      'const processLike = { getBuiltinModule() { return undefined; } };',
+      'class C { constructor() { return processLike; } static load() { return processLike; } make() { return processLike; } }',
+      'new C().getBuiltinModule(); Reflect.construct(C, []).getBuiltinModule();',
+      'C.load().getBuiltinModule(); new C().make().getBuiltinModule();',
+      'const processLike = { getBuiltinModule() { return undefined; } };',
+      'const U = false && undefined; function load() { return processLike; }',
+      'const { run = load } = { run: U }; run().getBuiltinModule();'
+    ].join(String.fromCharCode(10))
   )).toEqual([]);
 });
 

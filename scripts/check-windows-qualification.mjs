@@ -319,6 +319,7 @@ function hasRegistrationCallback(argumentsList, resolveBinding) {
 
 // Resolve only the names used by Windows predicates and Vitest registration.
 function createWindowsTestBindingResolver(file) {
+  const hasLocalClasses = /\bclass\b/.test(file.text);
   const isAmbientDeclaration = (statement) => Boolean(statement.modifiers?.some(
     (modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword));
   const declaresName = (name, expected) => {
@@ -489,10 +490,42 @@ function createWindowsTestBindingResolver(file) {
     next.add(binding.node);
     return staticNumericStringOf(binding.node.initializer, next);
   };
-const staticUndefinedOf = (input, seen = new Set()) => {
+// A destructuring default applies when any reachable branch is undefined.
+const mayBeUndefinedOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node) return false;
   if (ts.isVoidExpression(node)) return true;
+  if (ts.isBinaryExpression(node)) {
+    const operator = node.operatorToken.kind;
+    if (operator === ts.SyntaxKind.CommaToken) {
+      return mayBeUndefinedOf(node.right, seen);
+    }
+    if ([ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.BarBarToken,
+      ts.SyntaxKind.QuestionQuestionToken].includes(operator)) {
+      const left = staticLogicalValueOf(node.left, seen);
+      if (!left) {
+        return mayBeUndefinedOf(node.left, seen) ||
+          mayBeUndefinedOf(node.right, seen);
+      }
+      const selectsLeft = operator === ts.SyntaxKind.AmpersandAmpersandToken
+        ? !left.truthy
+        : operator === ts.SyntaxKind.BarBarToken
+        ? left.truthy
+        : !left.nullish;
+      return mayBeUndefinedOf(selectsLeft ? node.left : node.right, seen);
+    }
+  }
+  if (ts.isConditionalExpression(node)) {
+    const condition = staticLogicalValueOf(node.condition, seen);
+    if (!condition) {
+      return mayBeUndefinedOf(node.whenTrue, seen) ||
+        mayBeUndefinedOf(node.whenFalse, seen);
+    }
+    return mayBeUndefinedOf(
+      condition.truthy ? node.whenTrue : node.whenFalse, seen
+    );
+  }
   if (!ts.isIdentifier(node)) return false;
   const binding = resolveBinding(node);
   if (!binding) return node.text === "undefined";
@@ -504,7 +537,7 @@ const staticUndefinedOf = (input, seen = new Set()) => {
   }
   const next = new Set(seen);
   next.add(binding.node);
-  return staticUndefinedOf(binding.node.initializer, next);
+  return mayBeUndefinedOf(binding.node.initializer, next);
 };
   const resolvedAccess = (input) => {
     const node = unwrap(input);
@@ -541,6 +574,7 @@ const assignmentsByMemberPath = new Map();
   const parameterFunctionArguments = new Map();
   const parameterArraySources = new Map();
 const functionThisArguments = new Map();
+const classMemberThisArguments = new WeakMap();
   const functionArgumentsPlans = new Map();
 const isThisParameter = (parameter) => Boolean(
   parameter && ts.isIdentifier(parameter.name) && parameter.name.text === "this"
@@ -551,6 +585,10 @@ const runtimeParameterIndexOf = (fn, parameter) => {
 };
   const getterReceiverOf = (getter) =>
     ts.isObjectLiteralExpression(getter.parent) ? getter.parent : undefined;
+const thisArgumentsOf = (owner) => [
+  ...(functionThisArguments.get(owner) ?? []),
+  ...(classMemberThisArguments.get(owner) ?? [])
+];
 const assignmentMemberAccess = (node) => {
   node = unwrap(node);
   if (ts.isPropertyAccessExpression(node)) {
@@ -2137,7 +2175,7 @@ if (node.kind === ts.SyntaxKind.ThisKeyword) {
       return values;
     }
       if (ts.isFunctionLike(current) && !ts.isArrowFunction(current)) {
-        const receivers = functionThisArguments.get(current) ?? [];
+        const receivers = thisArgumentsOf(current);
         values.push(...receivers.flatMap((receiver) =>
           containerValuesOf(receiver, next)));
         return values;
@@ -2249,8 +2287,74 @@ const functionArgumentsPlanOf = (identifier, seen = new Set()) => {
   }
   return undefined;
 };
+const localClassMemberTargetOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+    return { classNode: node, instance: false };
+  }
+  if (ts.isNewExpression(node)) {
+    const target = localClassMemberTargetOf(node.expression, seen);
+    return target ? { classNode: target.classNode, instance: true } : undefined;
+  }
+  if (!ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node)) return undefined;
+  if (ts.isClassDeclaration(binding.node) || ts.isClassExpression(binding.node)) {
+    return { classNode: binding.node, instance: false };
+  }
+  if ((binding.kind === "variable" || binding.kind === "opaque") &&
+      ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+    const next = new Set(seen);
+    next.add(binding.node);
+    return localClassMemberTargetOf(binding.node.initializer, next);
+  }
+  return undefined;
+};
+const localClassMemberValuesOf = (input, property, seen = new Set()) => {
+  if (!hasLocalClasses) return [];
+  const node = unwrap(input);
+  if (!node) return [];
+  if (node.kind === ts.SyntaxKind.ThisKeyword) {
+    const owner = enclosingFunctionOf(node);
+    const ownerClass = owner?.parent;
+    if (!ownerClass ||
+        (!ts.isClassDeclaration(ownerClass) && !ts.isClassExpression(ownerClass))) {
+      return [];
+    }
+    const next = new Set(seen);
+    next.delete(owner);
+    next.add(node);
+    return thisArgumentsOf(owner).flatMap((receiver) =>
+      localClassMemberValuesOf(receiver, property, next));
+  }
+  const target = localClassMemberTargetOf(node, seen);
+  if (!target) return [];
+  const { classNode, instance } = target;
+  const values = [];
+  for (const member of classNode.members) {
+    if (!("name" in member) || assignmentKey(member.name) !== property) continue;
+    const isStatic = (member.modifiers ?? []).some((modifier) =>
+      modifier.kind === ts.SyntaxKind.StaticKeyword);
+    if (isStatic !== !instance) continue;
+    if (ts.isPropertyDeclaration(member) && member.initializer) {
+      values.push(member.initializer);
+    } else if (ts.isMethodDeclaration(member) ||
+               ts.isGetAccessorDeclaration(member)) {
+      const receivers = classMemberThisArguments.get(member) ?? [];
+      if (!receivers.includes(node)) {
+        receivers.push(node);
+        classMemberThisArguments.set(member, receivers);
+      }
+      values.push(member);
+    }
+  }
+  return values;
+};
 const objectPropertyValuesOf = (input, key, seen = new Set()) => {
     const values = restPropertyValuesOf(input, key, seen);
+  values.push(...localClassMemberValuesOf(input, key, seen));
   const reference = unwrap(input);
   if (reference && ts.isIdentifier(reference) && /^\d+$/.test(key)) {
     for (const plan of functionArgumentsPlanOf(reference) ?? []) {
@@ -2387,7 +2491,7 @@ const arrayRestBindingValueOf = (source, startIndex) => {
 // Resolve the source value selected for one identifier in an assignment pattern.
   const destructuredSourceValuesOf = (pattern, source, targetName) => {
   const values = [];
-  const usesDefault = (value) => staticUndefinedOf(value);
+  const usesDefault = (value) => mayBeUndefinedOf(value);
     const candidatesWithDefault = (selected, initializer) =>
       initializer && (selected.length === 0 || selected.some(usesDefault))
         ? [...selected, initializer]
@@ -3685,6 +3789,10 @@ function intrinsicInvocationArgumentsOf(
   const node = unwrap(input);
     if (!node || seen.has(node)) return [];
     if (ts.isFunctionLike(node)) return [node];
+    if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+      const constructor = node.members.find(ts.isConstructorDeclaration);
+      return constructor ? [constructor] : [];
+    }
     const next = new Set(seen);
     next.add(node);
     if (ts.isConditionalExpression(node)) {
@@ -3714,6 +3822,11 @@ return functionReturnExpressionsOf(node.expression, next)
       const bindingNext = new Set(next);
       bindingNext.add(binding.node);
       if (ts.isFunctionLike(binding.node)) return [binding.node];
+      if (ts.isClassDeclaration(binding.node) ||
+          ts.isClassExpression(binding.node)) {
+        const constructor = binding.node.members.find(ts.isConstructorDeclaration);
+        return constructor ? [constructor] : [];
+      }
       if (binding.kind === "opaque" && binding.iterable &&
           ts.isVariableDeclarationList(binding.node)) {
         const declaration = binding.node.declarations.find((candidate) =>
@@ -4915,7 +5028,7 @@ return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
     intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, fixedIndexedValuesOf,
     objectPropertyValuesOf,
-resolveBinding, resolvedAccess, staticStringOf, staticUndefinedOf };
+  resolveBinding, resolvedAccess, staticStringOf, mayBeUndefinedOf };
 }
 
 /**
@@ -4931,7 +5044,7 @@ const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf,
     intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, fixedIndexedValuesOf,
     objectPropertyValuesOf,
-resolveBinding, resolvedAccess, staticStringOf, staticUndefinedOf } =
+  resolveBinding, resolvedAccess, staticStringOf, mayBeUndefinedOf } =
     createWindowsTestBindingResolver(file);
   // Exclusive declarations anywhere in the file remain fail-closed, including
   // element access and unknown dynamic member selectors.
@@ -4984,7 +5097,7 @@ resolveBinding, resolvedAccess, staticStringOf, staticUndefinedOf } =
 const selectedPatternValuesWithDefault = (selected, initializer) => {
   if (!initializer) return selected;
   if (selected.length === 0) return [initializer];
-  const usesDefault = selected.some((value) => staticUndefinedOf(value));
+  const usesDefault = selected.some((value) => mayBeUndefinedOf(value));
   return usesDefault ? [...selected, initializer] : selected;
 };
 const inspectExclusivePatternFromValues = (pattern, values) => {

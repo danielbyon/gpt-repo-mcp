@@ -1073,7 +1073,35 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
     ['later-assigned member-held Object.create', (capability) =>
       `import { test } from 'vitest'; const tools = {}; tools.create = Object.create; const args = tools.create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
     ['later-assigned member-held Object.assign', (capability) =>
-      `import { test } from 'vitest'; const tools = {}; tools.assign = Object.assign; tools.assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`]
+      `import { test } from 'vitest'; const tools = {}; tools.assign = Object.assign; tools.assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['comma undefined default', (capability) =>
+      `import { test } from 'vitest'; const U = (0, undefined); const { register = ${capability} } = { register: U }; register.only('focused', () => {}); test('required', () => {});`],
+    ['logical undefined default', (capability) =>
+      `import { test } from 'vitest'; const U = true && undefined; const { register = ${capability} } = { register: U }; register.only('focused', () => {}); test('required', () => {});`],
+    ['conditional undefined default', (capability) =>
+      `import { test } from 'vitest'; const U = true ? undefined : 1; const { register = ${capability} } = { register: U }; register.only('focused', () => {}); test('required', () => {});`],
+    ['unknown conditional undefined or capability source', (capability) =>
+      `import { test } from 'vitest'; declare const condition: boolean; const { register = ${capability} } = { register: condition ? undefined : ${capability} }; register.only('focused', () => {}); test('required', () => {});`],
+    ['class constructor through new', (capability) =>
+      `import { test } from 'vitest'; class C { constructor() { return ${capability}; } } new C().only('focused', () => {}); test('required', () => {});`],
+    ['class constructor through Reflect.construct', (capability) =>
+      `import { test } from 'vitest'; const C = class { constructor() { return ${capability}; } }; Reflect.construct(C, []).only('focused', () => {}); test('required', () => {});`],
+    ['static class factory', (capability) =>
+      `import { test } from 'vitest'; class C { static focus() { return ${capability}; } } C.focus().only('focused', () => {}); test('required', () => {});`],
+    ['static class property', (capability) =>
+      `import { test } from 'vitest'; const C = class { static register = ${capability}; }; C.register.only('focused', () => {}); test('required', () => {});`],
+    ['instance class factory', (capability) =>
+      `import { test } from 'vitest'; class C { focus() { return ${capability}; } } const tools = new C(); tools.focus().only('focused', () => {}); test('required', () => {});`],
+    ['instance class property', (capability) =>
+      `import { test } from 'vitest'; class C { register = ${capability}; } new C().register.only('focused', () => {}); test('required', () => {});`],
+    ['static class tagged-template receiver', (capability) =>
+      `import { test } from 'vitest'; class C { static register = ${capability}; static focus(strings) { this.register.only('focused', () => {}); } } C.focus\`ticket\`; test('required', () => {});`],
+    ['instance class tagged-template receiver', (capability) =>
+      `import { test } from 'vitest'; class C { register = ${capability}; focus(strings) { this.register.only('focused', () => {}); } } new C().focus\`ticket\`; test('required', () => {});`],
+    ['static class getter', (capability) =>
+      `import { test } from 'vitest'; class C { static register = ${capability}; static get focus() { return this.register; } } C.focus.only('focused', () => {}); test('required', () => {});`],
+    ['instance class getter', (capability) =>
+      `import { test } from 'vitest'; class C { register = ${capability}; get focus() { return this.register; } } new C().focus.only('focused', () => {}); test('required', () => {});`]
   ];
 
   test.each(staticProvenanceCases)(

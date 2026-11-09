@@ -28,6 +28,7 @@ const callName = (node) => nameOf(node) ||
 function inspectJavaScript(filename, source, isLauncher = false) {
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true,
     isLauncher ? ts.ScriptKind.JS : ts.ScriptKind.TS);
+  const hasLocalClasses = /\bclass\b/.test(source);
   const findings = [];
   let launcherCount = 0;
 
@@ -96,6 +97,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const parameterRestArguments = new Map();
 const parameterFunctionArguments = new Map();
 const functionThisArguments = new Map();
+const classMemberThisArguments = new WeakMap();
 const functionArgumentsPlans = new Map();
 const isThisParameter = (parameter) => Boolean(
   parameter && ts.isIdentifier(parameter.name) && parameter.name.text === "this"
@@ -106,6 +108,10 @@ const runtimeParameterIndexOf = (fn, parameter) => {
 };
 const getterReceiverOf = (getter) =>
   ts.isObjectLiteralExpression(getter.parent) ? getter.parent : undefined;
+const thisArgumentsOf = (owner) => [
+  ...(functionThisArguments.get(owner) ?? []),
+  ...(classMemberThisArguments.get(owner) ?? [])
+];
   const requireReferenceOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
@@ -391,10 +397,42 @@ const staticAssignmentNameOf = (input, seen = new Set()) => {
   next.add(binding.node);
   return staticAssignmentNameOf(binding.node.initializer, next);
 };
-const staticUndefinedOf = (input, seen = new Set()) => {
+// A destructuring default applies when any reachable branch is undefined.
+const mayBeUndefinedOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node) return false;
   if (ts.isVoidExpression(node)) return true;
+  if (ts.isBinaryExpression(node)) {
+    const operator = node.operatorToken.kind;
+    if (operator === ts.SyntaxKind.CommaToken) {
+      return mayBeUndefinedOf(node.right, seen);
+    }
+    if ([ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.BarBarToken,
+      ts.SyntaxKind.QuestionQuestionToken].includes(operator)) {
+      const left = staticLogicalValueOf(node.left, seen);
+      if (!left) {
+        return mayBeUndefinedOf(node.left, seen) ||
+          mayBeUndefinedOf(node.right, seen);
+      }
+      const selectsLeft = operator === ts.SyntaxKind.AmpersandAmpersandToken
+        ? !left.truthy
+        : operator === ts.SyntaxKind.BarBarToken
+        ? left.truthy
+        : !left.nullish;
+      return mayBeUndefinedOf(selectsLeft ? node.left : node.right, seen);
+    }
+  }
+  if (ts.isConditionalExpression(node)) {
+    const condition = staticLogicalValueOf(node.condition, seen);
+    if (!condition) {
+      return mayBeUndefinedOf(node.whenTrue, seen) ||
+        mayBeUndefinedOf(node.whenFalse, seen);
+    }
+    return mayBeUndefinedOf(
+      condition.truthy ? node.whenTrue : node.whenFalse, seen
+    );
+  }
   if (!ts.isIdentifier(node)) return false;
   const binding = resolveBinding(node);
   if (!binding) return node.text === "undefined";
@@ -406,7 +444,7 @@ const staticUndefinedOf = (input, seen = new Set()) => {
   }
   const next = new Set(seen);
   next.add(binding.node);
-  return staticUndefinedOf(binding.node.initializer, next);
+  return mayBeUndefinedOf(binding.node.initializer, next);
 };
   const assignmentsByBinding = new Map();
   const destructuredAssignmentsByBinding = new Map();
@@ -954,7 +992,7 @@ const recordNestedDestructuredProperties = (target, source) => {
         return objects;
       }
       if (ts.isFunctionLike(current) && !ts.isArrowFunction(current)) {
-        objects.push(...(functionThisArguments.get(current) ?? [])
+        objects.push(...thisArgumentsOf(current)
           .flatMap((receiver) => objectValueCandidatesOf(receiver, next)));
         return objects;
       }
@@ -1053,12 +1091,82 @@ const functionArgumentsPlanOf = (identifier, seen = new Set()) => {
   }
   return undefined;
 };
+const localClassMemberTargetOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+    return { classNode: node, instance: false };
+  }
+  if (ts.isNewExpression(node)) {
+    const target = localClassMemberTargetOf(node.expression, seen);
+    return target ? { classNode: target.classNode, instance: true } : undefined;
+  }
+  if (!ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node)) return undefined;
+  if (ts.isClassDeclaration(binding.node) || ts.isClassExpression(binding.node)) {
+    return { classNode: binding.node, instance: false };
+  }
+  if ((binding.kind === "variable" || binding.kind === "opaque") &&
+      ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+    const next = new Set(seen);
+    next.add(binding.node);
+    return localClassMemberTargetOf(binding.node.initializer, next);
+  }
+  return undefined;
+};
+const localClassMemberValuesOf = (input, property, seen = new Set()) => {
+  if (!hasLocalClasses) return [];
+  const node = unwrap(input);
+  if (!node) return [];
+  if (node.kind === ts.SyntaxKind.ThisKeyword) {
+    const owner = enclosingFunctionOf(node);
+    const ownerClass = owner?.parent;
+    if (!ownerClass ||
+        (!ts.isClassDeclaration(ownerClass) && !ts.isClassExpression(ownerClass))) {
+      return [];
+    }
+    const next = new Set(seen);
+    next.delete(owner);
+    next.add(node);
+    return thisArgumentsOf(owner).flatMap((receiver) =>
+      localClassMemberValuesOf(receiver, property, next));
+  }
+  const target = localClassMemberTargetOf(node, seen);
+  if (!target) return [];
+  const { classNode, instance } = target;
+  const values = [];
+  for (const member of classNode.members) {
+    if (!("name" in member) ||
+        staticPropertyNameOf(member.name) !== property) continue;
+    const isStatic = (member.modifiers ?? []).some((modifier) =>
+      modifier.kind === ts.SyntaxKind.StaticKeyword);
+    if (isStatic !== !instance) continue;
+    if (ts.isPropertyDeclaration(member) && member.initializer) {
+      values.push(member.initializer);
+    } else if (ts.isMethodDeclaration(member) ||
+               ts.isGetAccessorDeclaration(member)) {
+      const receivers = classMemberThisArguments.get(member) ?? [];
+      if (!receivers.includes(node)) {
+        receivers.push(node);
+        classMemberThisArguments.set(member, receivers);
+      }
+      values.push(member);
+    }
+  }
+  return values;
+};
   const memberValueCandidatesOf = (input, property, seen = new Set()) => {
     const node = unwrap(input);
-    if (!node || seen.has(node)) return [];
+    if (!node) return [];
+    const classSeen = new Set(seen);
+    classSeen.delete(node);
+    const classValues = localClassMemberValuesOf(node, property, classSeen);
+    if (seen.has(node)) return classValues;
     const next = new Set(seen);
     next.add(node);
-    const values = [];
+    const values = [...classValues];
     for (const object of objectValueCandidatesOf(node, seen)) {
       for (const candidate of object.properties) {
         if (ts.isSpreadAssignment(candidate)) {
@@ -1153,7 +1261,7 @@ const arrayRestBindingValueOf = (source, startIndex) => {
 };
   const bindingPatternValuesOf = (pattern, source, targetName, seen = new Set()) => {
     const values = [];
-  const usesDefault = (value) => staticUndefinedOf(value);
+  const usesDefault = (value) => mayBeUndefinedOf(value);
     const candidatesWithDefault = (selected, initializer) =>
       initializer && (selected.length === 0 || selected.some(usesDefault))
         ? [...selected, initializer]
@@ -1304,6 +1412,10 @@ const bindingPatternSourcePropertyOf = (
     const node = unwrap(input);
     if (!node || seen.has(node)) return [];
     if (ts.isFunctionLike(node)) return [node];
+    if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+      const constructor = node.members.find(ts.isConstructorDeclaration);
+      return constructor ? [constructor] : [];
+    }
     const next = new Set(seen);
     next.add(node);
     if (ts.isConditionalExpression(node)) {
@@ -1333,6 +1445,11 @@ return functionReturnExpressionsOf(node.expression, next)
       const bindingNext = new Set(next);
       bindingNext.add(binding.node);
       if (ts.isFunctionLike(binding.node)) return [binding.node];
+      if (ts.isClassDeclaration(binding.node) ||
+          ts.isClassExpression(binding.node)) {
+        const constructor = binding.node.members.find(ts.isConstructorDeclaration);
+        return constructor ? [constructor] : [];
+      }
       if (binding.kind === "opaque" && binding.iterable &&
           ts.isVariableDeclarationList(binding.node)) {
         const declaration = binding.node.declarations.find((candidate) =>
@@ -1426,7 +1543,7 @@ return functionReturnExpressionsOf(node.expression, next)
     if (!owner || seen.has(owner)) return false;
     const next = new Set(seen);
     next.add(owner);
-    return (functionThisArguments.get(owner) ?? [])
+    return thisArgumentsOf(owner)
       .some((value) => processObjectOf(value, next));
   }
   if (ts.isFunctionLike(node)) {
@@ -2213,7 +2330,7 @@ const inspectCapabilityArrayDestructuring = (target, source) => {
     const node = unwrap(input);
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
-    if (!binding || seen.has(binding.node)) return false;
+    if (!binding?.node || seen.has(binding.node)) return false;
     if (constructorDestructuredBindings.has(binding.node)) return true;
     const next = new Set(seen);
     next.add(binding.node);
