@@ -50,7 +50,9 @@
     "test": "vitest run",
     "verify:dist": "npm run build && node scripts/smoke-dist-server.mjs",
     "predev": "node scripts/build-windows-process-host.mjs",
-    "pretest": "node scripts/build-windows-process-host.mjs && node scripts/build-windows-process-host.mjs --test"
+    "pretest": "node scripts/build-windows-process-host.mjs && node scripts/build-windows-process-host.mjs --test",
+    "issue:ready": "node scripts/check-issue-readiness.mjs",
+    "test:issue-readiness": "node --test scripts/tests/issue-readiness-checks.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

@@ -15,6 +15,7 @@ import type { NodeRuntimeResolverOptions } from "../src/services/node-runtime-re
 import { waitForFile, waitForFileLineCount } from "./fixtures/file-event-wait.js";
 import { copyNscbMakefileFixture } from "./fixtures/nscb-makefile.js";
 import { createTempDir } from "./fixtures/temp-dir.js";
+import { createExternalValidationCoordination, createTrustedTestRunner, withTrustedRunnerPath } from "./fixtures/validation-test-tools.js";
 import * as processExec from "../src/services/process-exec.js";
 import { canonicalSha256, type ValidationSourceSnapshot } from "../src/services/validation-evidence.js";
 
@@ -398,45 +399,33 @@ describe("ValidationService", () => {
       localPython: true
     });
     await writeFile(join(root, "justfile"), "test:\n    @echo just-test\n");
-    const bin = await createTempDir("gpt-just-dry-run-bin-");
-    const just = join(bin, "just");
-    await writeFile(just, `#!${process.execPath}\nthrow new Error("dry-run must not execute just");\n`);
-    await chmod(just, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${bin}${delimiter}${previousPath ?? ""}`;
+    const fake = await createTrustedTestRunner("just", 'throw new Error("dry run must not execute the selected runner");', { dryRunOnly: true });
     const processSpy = vi.spyOn(processExec, "runProcessWithTail");
 
     try {
-      const result = await service(root, {
-        validation_profiles: { test: { runner: "just", target: "test" } }
-      }).validate({ repo_id: "fixture", profile: "test", dry_run: true });
-
-      expect(result.commands).toMatchObject([{
-        profile: "test",
-        script: "just:test",
-        command: "just test",
-        executable: "just",
-        status: "skipped"
-      }]);
-      expect(processSpy).not.toHaveBeenCalled();
+      await withTrustedRunnerPath(fake.bin, async () => {
+        const result = await service(root, {
+          validation_profiles: { test: { runner: "just", target: "test" } }
+        }).validate({ repo_id: "fixture", profile: "test", dry_run: true });
+        expect(result.commands).toMatchObject([{
+          profile: "test",
+          script: "just:test",
+          command: "just test",
+          executable: process.platform === "win32" ? fake.executable : "just",
+          status: "skipped"
+        }]);
+        expect(processSpy).not.toHaveBeenCalled();
+      });
     } finally {
       processSpy.mockRestore();
-      restoreEnv({ PATH: previousPath });
     }
   });
 
-  test("executes a declared just profile directly with a single target argument", async () => {
-    const bin = await createTempDir("gpt-just-bin-");
-    const just = join(bin, "just");
-    await writeFile(
-      just,
-      `#!${process.execPath}\nconsole.log("x".repeat(5000));\nconsole.log("args:" + process.argv.slice(2).join("|"));\n`
-    );
-    await chmod(just, 0o755);
+  test.skipIf(process.platform === "win32")("executes a declared just profile directly with a single target argument", async () => {
+    const fake = await createTrustedTestRunner("just",
+      'console.log("x".repeat(5000));\nconsole.log("args:" + process.argv.slice(2).join("|"));');
 
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${bin}${delimiter}${previousPath ?? ""}`;
-    try {
+    await withTrustedRunnerPath(fake.bin, async () => {
       const root = await fixtureRepo({});
       await writeFile(join(root, "justfile"), "smoke:\n    @echo smoke\n");
       const result = await service(root, {
@@ -451,9 +440,7 @@ describe("ValidationService", () => {
       });
       expect(result.commands[0]?.stdout_tail).toContain("smoke");
       expect(result.commands[0]?.stdout_tail?.length).toBeLessThanOrEqual(4000);
-    } finally {
-      process.env.PATH = previousPath;
-    }
+    });
   });
 
   test("forwards HOME and XDG_CONFIG_HOME to validation children while keeping the environment allowlisted", async () => {
@@ -1837,9 +1824,7 @@ describe("ValidationService", () => {
 
   test("allows overlapping validations and preserves each receipt", async () => {
     const root = await fixtureRepo({ scripts: { smoke: "node concurrent-validation.cjs" } });
-    const coordinationDir = await createTempDir("gpt-validation-overlap-control-");
-    const startedPath = join(coordinationDir, "started.txt");
-    const releasePath = join(coordinationDir, "release.txt");
+    const { startedPath, releasePath } = await createExternalValidationCoordination();
     const runner = [
       'const { appendFileSync, existsSync, watch } = require("node:fs");',
       'const { basename, dirname } = require("node:path");',
@@ -1884,11 +1869,12 @@ describe("ValidationService", () => {
           validation_id: result.value.validation_id
         };
       }
-      const reason = result.reason as { code?: unknown; name?: unknown } | null;
+      const reason = result.reason as { code?: unknown; name?: unknown; syscall?: unknown } | null;
       return {
         status: result.status,
         error_name: reason && typeof reason.name === "string" ? reason.name : "unknown",
-        error_code: reason && typeof reason.code === "string" ? reason.code : "UNCLASSIFIED_ERROR"
+        error_code: reason && typeof reason.code === "string" ? reason.code : "UNCLASSIFIED_ERROR",
+        error_syscall: reason && typeof reason.syscall === "string" ? reason.syscall : "unknown"
       };
     });
     expect(safeSettledSummary).toEqual([
