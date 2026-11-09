@@ -277,7 +277,10 @@ test("accepts ordinary helper arguments and member factories", () => {
   test("terminates reflective container cycles without overflowing", () => {
     const source = [
       "const tools = Object.assign(tools, { read: Object.getOwnPropertyDescriptors });",
-      "const methods = [methods];"
+      "const methods = [methods];",
+      "const holder: any = {}; holder.value = holder.value;",
+      "holder.value.getBuiltinModule('node:child_process').exec('id');",
+      "const app: any = {}; app.global = app.global; app.global.eval('process');"
     ].join("\n");
     expect(() => inspectSupervisorSource("src/services/windows-process-host.ts", source))
       .not.toThrow();
@@ -769,5 +772,51 @@ test.each([
     expect(inspectSupervisorSource("src/services/node-runtime-resolver.ts",
       "import { execFile } from 'node:child_process'; execFile('node.exe', ['--version']);" +
       "spawn('node.exe', ['-e', 'console.log(1)'], { stdio: 'pipe' });")).toEqual([]);
+  });
+
+  test.each([
+    ["fixed-array hole", "function load(ignored, runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...[, process]).exec('id');"],
+    ["identifier rest parameter", "function load(...args) { return args[1].getBuiltinModule('node:child_process'); } load(null, process).exec('id');"],
+    ["rest parameter after fixed argument", "function load(prefix, ...args) { return args[0].getBuiltinModule('node:child_process'); } load(null, process).exec('id');"],
+    ["destructured rest parameter", "function load(...[runtime]) { return runtime.getBuiltinModule('node:child_process'); } load(process).exec('id');"],
+    ["array-rest binding", "function load([...rest]) { return rest[0].getBuiltinModule('node:child_process'); } load([process]).exec('id');"],
+    ["object-rest binding", "function load({ ignored, ...rest }) { return rest.runtime.getBuiltinModule('node:child_process'); } load({ ignored: null, runtime: process }).exec('id');"],
+    ["opaque spread before capability", "declare const args: any[]; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(...args, process).exec('id');"],
+    ["helper call", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load.call(null, process).exec('id');"],
+    ["helper apply", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load.apply(null, [process]).exec('id');"],
+    ["helper bind", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load.bind(null, process)().exec('id');"],
+    ["Reflect.apply helper", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } Reflect.apply(load, null, [process]).exec('id');"],
+    ["member factory argument", "const make = (_unused: unknown) => process; const tools = { make }; tools.make(1).getBuiltinModule('node:child_process').exec('id');"],
+    ["getter factory", "const tools = { get make() { return process; } }; tools.make().getBuiltinModule('node:child_process').exec('id');"],
+    ["getter global factory", "const tools = { get make() { return globalThis; } }; tools.make().eval('process').exec('id');"],
+    ["factory carrier", "const tools = { make: () => ({ runtime: process }) }; tools.make().runtime.getBuiltinModule('node:child_process').exec('id');"],
+    ["destructured factory carrier", "const make = () => ({ runtime: process }); const { runtime } = make(); runtime.getBuiltinModule('node:child_process').exec('id');"],
+    ["Object.assign call", "const copy = globalThis.Object.assign.call(Object, {}, process); copy.getBuiltinModule('node:child_process').exec('id');"],
+    ["Object.assign apply", "const copy = globalThis.Object.assign.apply(Object, [{}, process]); copy.getBuiltinModule('node:child_process').exec('id');"],
+    ["Object.assign bind", "const copy = globalThis.Object.assign.bind(Object, {}, process)(); copy.getBuiltinModule('node:child_process').exec('id');"],
+    ["Object.assign static spread", "const copy = globalThis.Object.assign.call(Object, ...[{}, process]); copy.getBuiltinModule('node:child_process').exec('id');"]
+  ])('rejects bounded process provenance through %s', (_name, source) => {
+    expect(inspectSupervisorSource('src/services/windows-process-host.ts', source))
+      .not.toEqual([]);
+  });
+
+  test("accepts ordinary holes, rests, helpers, factories, and opaque spreads without process capability", () => {
+    const source = [
+      "declare const args: any[];",
+      "const processLike = { getBuiltinModule() { return undefined; } };",
+      "function pick([, value]) { return value.length; } pick([null, 'abc']);",
+      "function inspect(...values) { return values[0]?.length; } inspect(null, 'ok');",
+      "function inspectTail(prefix, ...values) { return values[0]?.length; } inspectTail(null, 'ok');",
+      "function inspectRest([...values]) { return values.length; } inspectRest(['ok']);",
+      "function inspectObject({ ignored, ...rest }) { return rest.value; } inspectObject({ ignored: null, value: 1 });",
+      "function load(runtime) { return runtime.getBuiltinModule(); } load(...args, processLike);",
+      "load.call(null, processLike); load.apply(null, [processLike]); load.bind(null, processLike)(); Reflect.apply(load, null, [processLike]);",
+      "const make = (_unused: unknown) => processLike; const tools = { make }; tools.make(1).getBuiltinModule();",
+      "const getters = { get make() { return processLike; } }; getters.make().getBuiltinModule();",
+      "const carrier = { make: () => ({ runtime: processLike }) }; carrier.make().runtime.getBuiltinModule();",
+      "globalThis.Object.assign.call(Object, {}, processLike).getBuiltinModule();",
+      "globalThis.Object.assign.call(Object, ...[{}, processLike]).getBuiltinModule();"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
   });
 });

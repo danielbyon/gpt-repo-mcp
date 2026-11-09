@@ -507,6 +507,7 @@ function createWindowsTestBindingResolver(file) {
   const destructuredAssignmentsByBinding = new Map();
 const assignmentsByMemberPath = new Map();
   const parameterRunnerArguments = new Map();
+  const parameterRestArguments = new Map();
 const assignmentMemberAccess = (node) => {
   node = unwrap(node);
   if (ts.isPropertyAccessExpression(node)) {
@@ -686,8 +687,11 @@ const possibleVitestNamespaceOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node) return false;
   if (isDynamicVitestNamespace(node)) return true;
-  if (objectAssignCall(node)) {
-    return node.arguments.slice(1).flatMap((source) =>
+  const assignArguments = ts.isCallExpression(node)
+    ? intrinsicInvocationArgumentsOf(node, ["Object"], ["assign"], seen)
+    : undefined;
+  if (assignArguments) {
+    return assignArguments.slice(1).flatMap((source) =>
       ts.isSpreadElement(source)
         ? expandedArgumentValuesOf(source.expression, seen)
         : [source]).some((source) => possibleVitestNamespaceOf(source, seen));
@@ -713,10 +717,13 @@ const possibleVitestNamespaceOf = (input, seen = new Set()) => {
       ts.isSpreadAssignment(property) && possibleVitestNamespaceOf(property.expression, seen));
   }
   if (!ts.isIdentifier(node)) {
+if (seen.has(node)) return false;
+const next = new Set(seen);
+next.add(node);
     const member = resolvedAccess(node);
     return Boolean(member && member.method !== undefined &&
-      objectPropertyValuesOf(member.receiver, member.method, seen).some((value) =>
-        possibleVitestNamespaceOf(value, seen)));
+objectPropertyValuesOf(member.receiver, member.method, next).some((value) =>
+possibleVitestNamespaceOf(value, next)));
   }
   const binding = resolveBinding(node);
   if (binding?.kind === "import") {
@@ -778,6 +785,90 @@ const expressionValuesOf = (input, seen = new Set()) => {
     }
   return [node];
 };
+const fixedSpreadValuesOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isConditionalExpression(node)) {
+    const whenTrue = fixedSpreadValuesOf(node.whenTrue, next);
+    const whenFalse = fixedSpreadValuesOf(node.whenFalse, next);
+    return whenTrue && whenFalse ? [...whenTrue, ...whenFalse] : undefined;
+  }
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return fixedSpreadValuesOf(node.right, next);
+  }
+  const values = [];
+  for (const value of expressionValuesOf(node, next)) {
+    if (!ts.isArrayLiteralExpression(value)) return undefined;
+    for (const element of value.elements) {
+      if (ts.isOmittedExpression(element)) {
+        values.push(undefined);
+        continue;
+      }
+      if (ts.isSpreadElement(element)) {
+        const expanded = fixedSpreadValuesOf(element.expression, next);
+        if (!expanded) return undefined;
+        values.push(...expanded);
+      } else {
+        values.push(unwrap(element));
+      }
+    }
+  }
+  return values;
+};
+const fixedCallArgumentPlanOf = (argumentsList) => {
+  const before = [];
+  const after = [];
+  let unknownIndex;
+  for (const argument of argumentsList) {
+    const target = unknownIndex === undefined ? before : after;
+    if (!ts.isSpreadElement(argument)) {
+      target.push(unwrap(argument));
+      continue;
+    }
+    const expanded = fixedSpreadValuesOf(argument.expression);
+    if (expanded) target.push(...expanded);
+    else if (unknownIndex === undefined) unknownIndex = before.length;
+  }
+  return { before, after, unknownIndex };
+};
+const callArgumentCandidatesAt = (plan, index) => {
+  const targetIndex = (plan.offset ?? 0) + index;
+  if (targetIndex < plan.before.length) return [plan.before[targetIndex]];
+  if (plan.unknownIndex === undefined) return [];
+  return plan.after.slice(0, targetIndex - plan.before.length + 1);
+};
+const mergeCallArgumentPlans = (first, second) => {
+  if (first.unknownIndex === undefined) {
+    const before = [...first.before, ...second.before];
+    const unknownIndex = second.unknownIndex === undefined
+      ? undefined : before.length - second.before.length + second.unknownIndex;
+    return { before, after: [...second.after], unknownIndex };
+  }
+  return {
+    before: [...first.before],
+    after: [...first.after, ...second.before, ...second.after],
+    unknownIndex: first.unknownIndex
+  };
+};
+const callArgumentPlansEqual = (left, right) =>
+  (left.offset ?? 0) === (right.offset ?? 0) &&
+  left.unknownIndex === right.unknownIndex &&
+  left.before.length === right.before.length &&
+  left.after.length === right.after.length &&
+  left.before.every((value, index) => value === right.before[index]) &&
+  left.after.every((value, index) => value === right.after[index]);
+const argumentArrayPlanOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return { before: [], after: [], unknownIndex: 0 };
+  if (ts.isArrayLiteralExpression(node)) return fixedCallArgumentPlanOf(node.elements);
+  const expanded = fixedSpreadValuesOf(node, seen);
+  return expanded
+    ? { before: expanded, after: [], unknownIndex: undefined }
+    : { before: [], after: [], unknownIndex: 0 };
+};
 const expandedArgumentValuesOf = (input, seen = new Set()) => {
   const values = [];
   for (const value of expressionValuesOf(input, seen)) {
@@ -818,6 +909,15 @@ const containerValuesOf = (input, seen = new Set()) => {
         }
         continue;
       }
+    if (ts.isCallExpression(value)) {
+      const returned = functionReturnExpressionsOf(value.expression, next);
+      if (returned.length > 0) {
+        for (const item of returned) {
+          values.push(...containerValuesOf(item, next));
+        }
+        continue;
+      }
+    }
     const member = resolvedAccess(value);
     if (!member || member.method === undefined) continue;
       for (const candidate of objectPropertyValuesOf(member.receiver, member.method, next)) {
@@ -828,6 +928,32 @@ const containerValuesOf = (input, seen = new Set()) => {
 };
 const objectPropertyValuesOf = (input, key, seen = new Set()) => {
     const values = restPropertyValuesOf(input, key, seen);
+  const reference = unwrap(input);
+  if (reference && ts.isIdentifier(reference)) {
+    const binding = resolveBinding(reference);
+    if (binding?.kind === "opaque" && ts.isParameter(binding.node) &&
+        !seen.has(binding.node)) {
+      const next = new Set(seen);
+      next.add(binding.node);
+      if (ts.isIdentifier(binding.node.name) && binding.node.dotDotDotToken &&
+          /^\d+$/.test(key)) {
+        for (const plan of parameterRestArguments.get(binding.node) ?? []) {
+          values.push(...callArgumentCandidatesAt(plan, Number(key)).filter(Boolean));
+        }
+      } else if (!ts.isIdentifier(binding.node.name)) {
+        const sources = [
+          ...(parameterRunnerArguments.get(binding.node) ?? [])
+        ];
+        for (const source of sources) {
+          for (const container of destructuredSourceValuesOf(
+            binding.node.name, source, reference.text
+          )) {
+            values.push(...objectPropertyValuesOf(container, key, next));
+          }
+        }
+      }
+    }
+  }
   for (const container of containerValuesOf(input, seen)) {
     if (ts.isObjectLiteralExpression(container)) {
       for (const property of container.properties) {
@@ -837,6 +963,7 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
           if (ts.isPropertyAssignment(property)) values.push(property.initializer);
           else if (ts.isShorthandPropertyAssignment(property)) values.push(property.name);
             else if (ts.isMethodDeclaration(property)) values.push(property);
+        else if (ts.isGetAccessorDeclaration(property)) values.push(property);
         }
       }
     } else if (ts.isArrayLiteralExpression(container) && /^\d+$/.test(key)) {
@@ -1163,6 +1290,12 @@ collectResolvedAssignments(file);
       methods.some((method) => patternSelectsProperty(
         declaration.name, node.text, method)));
   };
+  function intrinsicArgumentValuesOf(argumentsList, seen) {
+    return argumentsList.flatMap((argument) =>
+      ts.isSpreadElement(argument)
+        ? expandedArgumentValuesOf(argument.expression, seen)
+        : [argument]);
+  }
   function boundIntrinsicArgumentsOf(
     input, receiverNames, methods, seen = new Set()
   ) {
@@ -1187,8 +1320,7 @@ collectResolvedAssignments(file);
         !globalIntrinsicMethodOf(
           wrapper.receiver, receiverNames, methods, next
         )) return undefined;
-    return node.arguments.slice(1)
-      .filter((argument) => !ts.isSpreadElement(argument));
+    return intrinsicArgumentValuesOf(node.arguments.slice(1), next);
   }
   function intrinsicInvocationArgumentsOf(
     input, receiverNames, methods, seen = new Set()
@@ -1196,7 +1328,7 @@ collectResolvedAssignments(file);
     const node = unwrap(input);
     if (!node || !ts.isCallExpression(node)) return undefined;
     if (globalIntrinsicMethodOf(node.expression, receiverNames, methods, seen)) {
-      return node.arguments.filter((argument) => !ts.isSpreadElement(argument));
+      return intrinsicArgumentValuesOf(node.arguments, seen);
     }
     const boundArguments = boundIntrinsicArgumentsOf(
       node.expression, receiverNames, methods, seen
@@ -1204,7 +1336,7 @@ collectResolvedAssignments(file);
     if (boundArguments) {
       return [
         ...boundArguments,
-        ...node.arguments.filter((argument) => !ts.isSpreadElement(argument))
+        ...intrinsicArgumentValuesOf(node.arguments, seen)
       ];
     }
     const wrapper = resolvedAccess(unwrap(node.expression));
@@ -1213,8 +1345,7 @@ collectResolvedAssignments(file);
       return undefined;
     }
     if (wrapper.method === "call") {
-      return node.arguments.slice(1)
-        .filter((argument) => !ts.isSpreadElement(argument));
+      return intrinsicArgumentValuesOf(node.arguments.slice(1), seen);
     }
     if (!node.arguments[1]) return [];
     return expandedArgumentValuesOf(node.arguments[1], seen);
@@ -1499,23 +1630,26 @@ if (candidate) return candidate;
 return undefined;
   }
   if (!ts.isIdentifier(node)) {
+if (seen.has(node)) return undefined;
+const next = new Set(seen);
+next.add(node);
     const member = resolvedAccess(node);
     if (member && ["concurrent", "fails", "sequential"].includes(member.method)) {
-      return possibleTestRunnerOf(member.receiver, names, seen);
+return possibleTestRunnerOf(member.receiver, names, next);
     }
     if (member && names.includes(member.method) &&
         (vitestNamespaceOf(member.receiver) || possibleVitestNamespaceOf(member.receiver))) {
       return member.method;
     }
     if (member) {
-      for (const property of objectPropertyValuesOf(member.receiver, member.method)) {
-        const candidate = possibleTestRunnerOf(property, names, seen);
+for (const property of objectPropertyValuesOf(member.receiver, member.method, next)) {
+const candidate = possibleTestRunnerOf(property, names, next);
         if (candidate) return candidate;
       }
     }
 const stored = assignmentsByMemberPath.get(assignmentReferenceKey(node)) ?? [];
 for (const value of stored) {
-const candidate = possibleTestRunnerOf(value, names, seen);
+const candidate = possibleTestRunnerOf(value, names, next);
 if (candidate) return candidate;
 }
     return testRunnerOf(node, names);
@@ -1748,13 +1882,12 @@ if (candidate) return candidate;
         (possibleVitestNamespaceOf(node.arguments[0]) ||
          testRunnerContainerOf(node.arguments[0], names, seen));
     }
-    if (factory?.method === "assign" &&
-        globalIntrinsicOf(factory.receiver, ["Object"])) {
-      return node.arguments.flatMap((argument) =>
-        ts.isSpreadElement(argument)
-          ? expandedArgumentValuesOf(argument.expression, seen)
-          : [argument]
-      ).some((argument) => testRunnerContainerOf(argument, names, seen));
+const assignArguments = intrinsicInvocationArgumentsOf(
+  node, ["Object"], ["assign"], seen
+);
+if (assignArguments) {
+  return assignArguments.slice(1).some((argument) =>
+    testRunnerContainerOf(argument, names, seen));
     }
     if (factory?.method === "create" &&
         globalIntrinsicOf(factory.receiver, ["Object"])) {
@@ -1866,49 +1999,6 @@ if (candidate) return candidate;
   // Follow direct calls to local helpers so runner identity reaches their
   // parameters. Repeating finite parameter/argument pairs handles short
   // helper chains without creating a repository-wide call graph.
-  const fixedSpreadValuesOf = (input, seen = new Set()) => {
-    const node = unwrap(input);
-    if (!node || seen.has(node)) return undefined;
-    const next = new Set(seen);
-    next.add(node);
-    if (ts.isConditionalExpression(node)) {
-      const whenTrue = fixedSpreadValuesOf(node.whenTrue, next);
-      const whenFalse = fixedSpreadValuesOf(node.whenFalse, next);
-      return whenTrue && whenFalse ? [...whenTrue, ...whenFalse] : undefined;
-    }
-    if (ts.isBinaryExpression(node) &&
-        node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
-      return fixedSpreadValuesOf(node.right, next);
-    }
-    const values = [];
-    for (const value of expressionValuesOf(node, next)) {
-      if (!ts.isArrayLiteralExpression(value)) return undefined;
-      for (const element of value.elements) {
-        if (ts.isOmittedExpression(element)) continue;
-        if (ts.isSpreadElement(element)) {
-          const expanded = fixedSpreadValuesOf(element.expression, next);
-          if (!expanded) return undefined;
-          values.push(...expanded);
-        } else {
-          values.push(unwrap(element));
-        }
-      }
-    }
-    return values;
-  };
-  const fixedCallArgumentsOf = (argumentsList) => {
-    const values = [];
-    for (const argument of argumentsList) {
-      if (!ts.isSpreadElement(argument)) {
-        values.push(unwrap(argument));
-        continue;
-      }
-      const expanded = fixedSpreadValuesOf(argument.expression);
-      if (!expanded) return values;
-      values.push(...expanded);
-    }
-    return values;
-  };
   const containsRunnerValueOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node || seen.has(node)) return false;
@@ -1938,18 +2028,95 @@ if (candidate) return candidate;
     }
     return false;
   };
+const localInvocationOf = (call) => {
+  const callee = unwrap(call.expression);
+  if (ts.isCallExpression(callee)) {
+    const bind = resolvedAccess(unwrap(callee.expression));
+    if (bind?.method === "bind") {
+      const functions = localFunctionValuesOf(bind.receiver);
+      if (functions.length > 0) {
+        return {
+          functions,
+          plan: mergeCallArgumentPlans(
+            fixedCallArgumentPlanOf(callee.arguments.slice(1)),
+            fixedCallArgumentPlanOf(call.arguments)
+          )
+        };
+      }
+    }
+  }
+  const directFunctions = localFunctionValuesOf(callee);
+  if (directFunctions.length > 0) {
+    return { functions: directFunctions, plan: fixedCallArgumentPlanOf(call.arguments) };
+  }
+  const wrapper = resolvedAccess(callee);
+  if (wrapper && ["apply", "call"].includes(wrapper.method)) {
+    const functions = localFunctionValuesOf(wrapper.receiver);
+    if (functions.length > 0) {
+      return {
+        functions,
+        plan: wrapper.method === "call"
+          ? fixedCallArgumentPlanOf(call.arguments.slice(1))
+          : argumentArrayPlanOf(call.arguments[1])
+      };
+    }
+  }
+  if (wrapper?.method === "apply" && globalIntrinsicOf(wrapper.receiver, ["Reflect"])) {
+    const functions = localFunctionValuesOf(call.arguments[0]);
+    if (functions.length > 0) {
+      return { functions, plan: argumentArrayPlanOf(call.arguments[2]) };
+    }
+  }
+  return undefined;
+};
+const recordRestArgumentsOf = (parameter, plan, offset = 0) => {
+  const positionedPlan = offset === 0 ? plan : { ...plan, offset };
+  if (ts.isIdentifier(parameter.name)) {
+    const plans = parameterRestArguments.get(parameter) ?? [];
+    if (plans.some((stored) => callArgumentPlansEqual(stored, positionedPlan))) return false;
+    plans.push(positionedPlan);
+    parameterRestArguments.set(parameter, plans);
+    return true;
+  }
+  if (!ts.isArrayBindingPattern(parameter.name)) return false;
+  let changed = false;
+  for (let index = 0; index < parameter.name.elements.length; index += 1) {
+    const element = parameter.name.elements[index];
+    if (!ts.isBindingElement(element)) continue;
+    const candidates = callArgumentCandidatesAt(positionedPlan, index)
+      .filter((candidate) => candidate && containsRunnerValueOf(candidate));
+    const names = ts.isIdentifier(element.name)
+      ? [element.name.text] : collectBoundNames(element.name);
+    for (const name of names) {
+      const key = `${parameter.pos}:${name}`;
+      const values = destructuredAssignmentsByBinding.get(key) ?? [];
+      for (const candidate of candidates) {
+        if (values.includes(candidate)) continue;
+        values.push(candidate);
+        changed = true;
+      }
+      destructuredAssignmentsByBinding.set(key, values);
+    }
+  }
+  return changed;
+};
   let parameterRunnerArgumentsChanged = true;
   while (parameterRunnerArgumentsChanged) {
     parameterRunnerArgumentsChanged = false;
     const collectParameterRunnerArguments = (node) => {
       if (ts.isCallExpression(node)) {
-        for (const fn of localFunctionValuesOf(node.expression)) {
-          const callArguments = fixedCallArgumentsOf(node.arguments);
-          for (let index = 0;
-            index < Math.min(fn.parameters.length, callArguments.length);
-            index += 1) {
+      const invocation = localInvocationOf(node);
+      for (const fn of invocation?.functions ?? []) {
+        for (let index = 0; index < fn.parameters.length; index += 1) {
             const parameter = fn.parameters[index];
-            const argument = callArguments[index];
+          if (parameter.dotDotDotToken) {
+            parameterRunnerArgumentsChanged = recordRestArgumentsOf(
+              parameter, invocation.plan, index
+            ) || parameterRunnerArgumentsChanged;
+            break;
+          }
+          for (const argument of callArgumentCandidatesAt(invocation.plan, index)) {
+            if (!argument) continue;
             const boundNames = ts.isIdentifier(parameter.name)
               ? []
               : collectBoundNames(parameter.name);
@@ -1971,6 +2138,7 @@ if (candidate) return candidate;
             parameterRunnerArguments.set(parameter, values);
             parameterRunnerArgumentsChanged = true;
           }
+          }
         }
       }
       ts.forEachChild(node, collectParameterRunnerArguments);
@@ -1979,7 +2147,7 @@ if (candidate) return candidate;
   }
 return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
-resolveBinding, resolvedAccess, staticStringOf };
+    intrinsicInvocationArgumentsOf, resolveBinding, resolvedAccess, staticStringOf };
 }
 
 /**
@@ -1992,8 +2160,8 @@ export function collectWindowsTestTitles(filename, source) {
   if (file.parseDiagnostics.length) throw new Error("Cannot parse Vitest declarations");
   const titles = [];
 const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
-possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
-resolveBinding, resolvedAccess, staticStringOf } =
+possibleVitestNamespaceOf, testRunnerContainerOf,
+    intrinsicInvocationArgumentsOf, resolveBinding, resolvedAccess, staticStringOf } =
     createWindowsTestBindingResolver(file);
 
   // Exclusive declarations anywhere in the file remain fail-closed, including
@@ -2055,12 +2223,13 @@ const member = resolvedAccess(node);
       throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
     }
     if (ts.isCallExpression(node)) {
-const reflective = resolvedAccess(unwrap(node.expression));
-      if (reflective?.method === "get" &&
-          globalIntrinsicOf(reflective.receiver, ["Reflect"])) {
-const property = staticStringOf(node.arguments[1]);
+    const reflectiveArguments = intrinsicInvocationArgumentsOf(
+      node, ["Reflect"], ["get"]
+    );
+    if (reflectiveArguments) {
+      const property = staticStringOf(reflectiveArguments[1]);
         const runner = possibleTestRunnerOf(
-          node.arguments[0], ["test", "it", "describe"]);
+        reflectiveArguments[0], ["test", "it", "describe"]);
         if (runner && (property === undefined || property === "only")) {
           throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
         }

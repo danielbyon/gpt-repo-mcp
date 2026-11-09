@@ -402,9 +402,13 @@ describe("Windows qualification scope guard", () => {
       .toEqual([{ title: "required", enabled: true }]);
   });
 
-  test("terminates local runner-return cycles without inventing a runner", () => {
+  test("terminates local runner-return and member cycles without inventing a runner", () => {
     expect(collectWindowsTestTitles("fixture.ts",
       "const makeRunner = () => makeRunner(); makeRunner().only('extra', () => {}); " +
+      "const holder: any = {}; holder.value = holder.value; " +
+      "holder.value.only('extra', () => {}); " +
+      "const namespace: any = {}; namespace.test = namespace.test; " +
+      "namespace.test.only('extra', () => {}); " +
       "test('required', () => {});"))
       .toEqual([{ title: "required", enabled: true }]);
   });
@@ -694,5 +698,57 @@ describe("Windows qualification scope guard", () => {
     delete workflow.on.pull_request;
     expect(inspect(workflow)).toContain(
       "CI must run for every pull request without event filters");
+  });
+
+  test.each([
+    ["fixed-array hole", "import { test } from 'vitest'; function focus(ignored, register) { register.only('focused', () => {}); } focus(...[, test]);"],
+    ["identifier rest parameter", "import { test } from 'vitest'; function focus(...args) { const [register] = args; register.only('focused', () => {}); } focus(test);"],
+    ["rest parameter after fixed argument", "import { test } from 'vitest'; function focus(prefix, ...args) { args[0].only('focused', () => {}); } focus(null, test);"],
+    ["destructured rest parameter", "import { test } from 'vitest'; function focus(...[register]) { register.only('focused', () => {}); } focus(test);"],
+    ["array-rest binding", "import { test } from 'vitest'; function focus([...rest]) { rest[0].only('focused', () => {}); } focus([test]);"],
+    ["opaque spread before capability", "import { test } from 'vitest'; declare const args: any[]; function focus(register) { register.only('focused', () => {}); } focus(...args, test);"],
+    ["helper call", "import { test } from 'vitest'; function focus(register) { register.only('focused', () => {}); } focus.call(null, test);"],
+    ["helper apply", "import { test } from 'vitest'; function focus(register) { register.only('focused', () => {}); } focus.apply(null, [test]);"],
+    ["helper bind", "import { test } from 'vitest'; function focus(register) { register.only('focused', () => {}); } focus.bind(null, test)();"],
+    ["Reflect.apply helper", "import { test } from 'vitest'; function focus(register) { register.only('focused', () => {}); } Reflect.apply(focus, null, [test]);"],
+    ["Reflect.get call", "import { test } from 'vitest'; globalThis.Reflect.get.call(null, test, 'only')('focused', () => {});"],
+    ["Reflect.get apply", "import { test } from 'vitest'; globalThis.Reflect.get.apply(null, [test, 'only'])('focused', () => {});"],
+    ["Reflect.get bind", "import { test } from 'vitest'; globalThis.Reflect.get.bind(null, test, 'only')()('focused', () => {});"],
+    ["Reflect.get static spread", "import { test } from 'vitest'; globalThis.Reflect.get(...[test, 'only'])('focused', () => {});"],
+    ["Object.assign call", "import { test } from 'vitest'; globalThis.Object.assign.call(Object, {}, test).only('focused', () => {});"],
+    ["Object.assign apply", "import { test } from 'vitest'; globalThis.Object.assign.apply(Object, [{}, test]).only('focused', () => {});"],
+    ["Object.assign bind", "import { test } from 'vitest'; globalThis.Object.assign.bind(Object, {}, test)().only('focused', () => {});"],
+    ["Object.assign static spread", "import { test } from 'vitest'; globalThis.Object.assign.call(Object, ...[{}, test]).only('focused', () => {});"],
+    ["member factory argument", "import { test } from 'vitest'; const make = (_unused: unknown) => test; const tools = { make }; tools.make(1).only('focused', () => {});"],
+    ["getter factory", "import { test } from 'vitest'; const tools = { get make() { return test; } }; tools.make().only('focused', () => {});"],
+    ["factory carrier", "import { test } from 'vitest'; const tools = { make: () => ({ runtime: test }) }; tools.make().runtime.only('focused', () => {});"],
+    ["destructured factory carrier", "import { test } from 'vitest'; const make = () => ({ runtime: test }); const { runtime } = make(); runtime.only('focused', () => {});"]
+  ])('rejects bounded Vitest provenance through %s', (_name, source) => {
+    expect(() => collectWindowsTestTitles('fixture.ts', source))
+      .toThrow(/Exclusive or dynamically selected Vitest/);
+  });
+
+  test("accepts ordinary holes, rests, helpers, factories, and opaque spreads without test capability", () => {
+    const source = [
+      "import { test } from 'vitest';",
+      "declare const args: any[];",
+      "const testLike = { only() {} };",
+      "function pick([, value]: [null, string]) { return value.length; } pick([null, 'value']);",
+      "function inspect(...values: any[]) { return values[0]?.length; } inspect(null, 'value');",
+      "function inspectTail(prefix: any, ...values: any[]) { return values[0]?.length; } inspectTail(null, 'value');",
+      "function inspectRest([...values]: any[]) { return values.length; } inspectRest(['value']);",
+      "function focus(register: any) { register.only('not a registration', () => {}); } focus(...args, testLike);",
+      "focus.call(null, testLike); focus.apply(null, [testLike]); focus.bind(null, testLike)(); Reflect.apply(focus, null, [testLike]);",
+      "globalThis.Reflect.get.call(null, test, 'length')('value');",
+      "globalThis.Reflect.get(...[{ value: 1 }, 'value']);",
+      "globalThis.Object.assign.call(Object, {}, { value: testLike }).value.only('safe', () => {});",
+      "globalThis.Object.assign.call(Object, ...[{}, { value: testLike }]).value.only('safe', () => {});",
+      "const make = (_unused: unknown) => testLike; const tools = { make }; tools.make(1).only('safe', () => {});",
+      "const getters = { get make() { return testLike; } }; getters.make().only('safe', () => {});",
+      "const carrier = { make: () => ({ runtime: testLike }) }; carrier.make().runtime.only('safe', () => {});",
+      "test('required', () => {});"
+    ].join('\n');
+    expect(collectWindowsTestTitles('fixture.ts', source))
+      .toEqual([{ title: 'required', enabled: true }]);
   });
 });

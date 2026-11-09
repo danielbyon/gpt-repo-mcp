@@ -93,6 +93,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const parameterProcessArguments = new Map();
   const parameterGlobalArguments = new Map();
   const parameterRequireArguments = new Map();
+  const parameterRestArguments = new Map();
   const requireReferenceOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
@@ -797,7 +798,7 @@ const assignmentMemberPathKey = (receiver, property) => {
     for (const value of resolvedValuesOf(node, next)) {
       if (ts.isArrayLiteralExpression(value)) {
         values.push(...value.elements.flatMap((element) =>
-          ts.isOmittedExpression(element) ? [] : expandedSpreadValuesOf(element, next)));
+          ts.isOmittedExpression(element) ? [undefined] : expandedSpreadValuesOf(element, next)));
       } else {
         values.push(value);
       }
@@ -816,14 +817,15 @@ const assignmentMemberPathKey = (receiver, property) => {
         continue;
       }
       if (ts.isCallExpression(value)) {
-        const factory = memberAccess(unwrap(value.expression));
-        if (factory?.property === "assign" &&
-            globalPrototypeObjectOf(factory.receiver, next)) {
-          for (const argument of value.arguments) {
-            for (const expanded of expandedSpreadValuesOf(argument, next)) {
-              objects.push(...objectValueCandidatesOf(expanded, next));
-            }
+      const copiedArguments = objectAssignInvocationArgumentsOf(value, next);
+      if (copiedArguments) {
+        for (const argument of copiedArguments) {
+          objects.push(...objectValueCandidatesOf(argument, next));
           }
+        continue;
+      }
+      for (const returned of functionReturnExpressionsOf(value.expression, next)) {
+        objects.push(...objectValueCandidatesOf(returned, next));
         }
         continue;
       }
@@ -857,6 +859,7 @@ const assignmentMemberPathKey = (receiver, property) => {
         if (ts.isPropertyAssignment(candidate)) values.push(candidate.initializer);
         if (ts.isShorthandPropertyAssignment(candidate)) values.push(candidate.name);
       if (ts.isMethodDeclaration(candidate)) values.push(candidate);
+      if (ts.isGetAccessorDeclaration(candidate)) values.push(candidate);
       }
     }
     for (const value of resolvedValuesOf(node, next)) {
@@ -865,6 +868,11 @@ const assignmentMemberPathKey = (receiver, property) => {
       if (indexed && !ts.isOmittedExpression(indexed) && !ts.isSpreadElement(indexed)) {
         values.push(indexed);
       }
+    }
+    if (ts.isIdentifier(node)) {
+      values.push(...destructuredParameterValueCandidatesOf(
+        node, property, next
+      ));
     }
     const key = assignmentMemberPathKey(node, property);
   if (key !== undefined) {
@@ -1014,21 +1022,19 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     if (ts.isCallExpression(node)) {
       if (processModuleRequire(node)) return true;
-    const copyFactory = memberAccess(unwrap(node.expression));
-    if (copyFactory && globalPrototypeObjectOf(copyFactory.receiver)) {
-      const copiedArguments = copyFactory.property === "assign"
-        ? node.arguments
-        : copyFactory.property === "create" ? node.arguments.slice(0, 1) : [];
-      if (copiedArguments.some((value) => processObjectOf(value, seen))) return true;
-    }
+  const copiedArguments = objectAssignInvocationArgumentsOf(node, seen);
+  if (copiedArguments?.some((value) => processObjectOf(value, seen))) return true;
+  const createFactory = memberAccess(unwrap(node.expression));
+  if (createFactory?.property === "create" &&
+      globalPrototypeObjectOf(createFactory.receiver, seen) &&
+      node.arguments[0] && processObjectOf(node.arguments[0], seen)) return true;
       const callee = unwrap(node.expression);
       const binding = ts.isIdentifier(callee) ? resolveBinding(callee) : undefined;
       if (binding && seen.has(binding.node)) return false;
       const next = new Set(seen);
       if (binding) next.add(binding.node);
-      return node.arguments.length === 0 &&
-        functionReturnExpressionsOf(node.expression)
-          .some((value) => processObjectOf(value, next));
+  return functionReturnExpressionsOf(node.expression)
+    .some((value) => processObjectOf(value, next));
     }
     if (ts.isObjectLiteralExpression(node)) {
     return node.properties.some((property) => {
@@ -1039,16 +1045,19 @@ const assignmentMemberPathKey = (receiver, property) => {
     });
     }
     if (!ts.isIdentifier(node)) {
+      if (seen.has(node)) return false;
+      const next = new Set(seen);
+      next.add(node);
       const member = memberAccess(node);
-      if (member?.property === "process") return globalObjectOf(member.receiver);
-    if (member && memberValueCandidatesOf(member.receiver, member.property, seen)
-      .some((value) => processObjectOf(value, seen))) return true;
+      if (member?.property === "process") return globalObjectOf(member.receiver, next);
+      if (member && memberValueCandidatesOf(member.receiver, member.property, next)
+        .some((value) => processObjectOf(value, next))) return true;
       if (ts.isElementAccessExpression(node)) {
         const key = assignmentReferenceKey(node);
         if (key !== undefined && (assignmentsByMemberPath.get(key) ?? [])
-          .some((value) => processObjectOf(value, seen))) return true;
+          .some((value) => processObjectOf(value, next))) return true;
       }
-      return member?.property === "default" && processObjectOf(member.receiver, seen);
+      return member?.property === "default" && processObjectOf(member.receiver, next);
     }
     const binding = resolveBinding(node);
     if (!binding) return node.text === "process";
@@ -1134,16 +1143,18 @@ const assignmentMemberPathKey = (receiver, property) => {
       if (binding && seen.has(binding.node)) return false;
       const next = new Set(seen);
       if (binding) next.add(binding.node);
-      return node.arguments.length === 0 &&
-        functionReturnExpressionsOf(node.expression)
-          .some((value) => globalObjectOf(value, next));
+  return functionReturnExpressionsOf(node.expression)
+    .some((value) => globalObjectOf(value, next));
     }
-    const member = memberAccess(node);
+if (seen.has(node)) return false;
+const memberSeen = new Set(seen);
+memberSeen.add(node);
+const member = memberAccess(node);
     if (member?.property === "globalThis" || member?.property === "global") {
-      return globalObjectOf(member.receiver, seen);
+return globalObjectOf(member.receiver, memberSeen);
     }
-  if (member && memberValueCandidatesOf(member.receiver, member.property, seen)
-    .some((value) => globalObjectOf(value, seen))) return true;
+if (member && memberValueCandidatesOf(member.receiver, member.property, memberSeen)
+  .some((value) => globalObjectOf(value, memberSeen))) return true;
   if (ts.isObjectLiteralExpression(node)) {
     return node.properties.some((property) => {
       if (ts.isSpreadAssignment(property)) return globalObjectOf(property.expression, seen);
@@ -1155,7 +1166,7 @@ const assignmentMemberPathKey = (receiver, property) => {
     if (ts.isElementAccessExpression(node)) {
       const key = assignmentReferenceKey(node);
       if (key !== undefined && (assignmentsByMemberPath.get(key) ?? [])
-        .some((value) => globalObjectOf(value, seen))) return true;
+  .some((value) => globalObjectOf(value, memberSeen))) return true;
     }
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
@@ -1778,6 +1789,46 @@ const reflectiveReadOf = (input, seen = new Set()) => {
     return Boolean(member && ["Object", "Reflect"].includes(member.property) &&
       globalObjectOf(member.receiver, seen));
   };
+const isObjectAssignMethodOf = (input, seen = new Set()) => {
+  const method = memberAccess(unwrap(input));
+  return Boolean(method?.property === "assign" &&
+    globalPrototypeObjectOf(method.receiver, seen));
+};
+const boundObjectAssignArgumentsOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  if (!ts.isCallExpression(node)) return undefined;
+  const method = memberAccess(unwrap(node.expression));
+  if (method?.property !== "bind" ||
+      !isObjectAssignMethodOf(method.receiver, seen)) return undefined;
+  return node.arguments.slice(1);
+};
+const expandedInvocationArgumentsOf = (argumentsList, seen = new Set()) =>
+  argumentsList.flatMap((argument) => ts.isSpreadElement(argument)
+    ? expandedSpreadValuesOf(argument.expression, seen)
+    : [argument]);
+const objectAssignInvocationArgumentsOf = (call, seen = new Set()) => {
+  const callee = unwrap(call.expression);
+  if (isObjectAssignMethodOf(callee, seen)) {
+    return expandedInvocationArgumentsOf(call.arguments, seen);
+  }
+  const boundArguments = boundObjectAssignArgumentsOf(callee, seen);
+  if (boundArguments) {
+    return [
+      ...expandedInvocationArgumentsOf(boundArguments, seen),
+      ...expandedInvocationArgumentsOf(call.arguments, seen)
+    ];
+  }
+  const wrapper = memberAccess(callee);
+  if (!wrapper || !["apply", "call"].includes(wrapper.property) ||
+      !isObjectAssignMethodOf(wrapper.receiver, seen)) return undefined;
+  if (wrapper.property === "call") {
+    return expandedInvocationArgumentsOf(call.arguments.slice(1), seen);
+  }
+  return call.arguments[1]
+    ? expandedSpreadValuesOf(call.arguments[1], seen)
+    : [];
+};
   const getPrototypeOfFunctionOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     const method = memberAccess(node);
@@ -2267,8 +2318,11 @@ const reflectiveReadOf = (input, seen = new Set()) => {
     const values = [];
     for (const value of resolvedValuesOf(node, next)) {
       if (!ts.isArrayLiteralExpression(value)) return undefined;
-      for (const element of value.elements) {
-        if (ts.isOmittedExpression(element)) continue;
+    for (const element of value.elements) {
+      if (ts.isOmittedExpression(element)) {
+        values.push(undefined);
+        continue;
+      }
         if (ts.isSpreadElement(element)) {
           const expanded = fixedSpreadValuesOf(element.expression, next);
           if (!expanded) return undefined;
@@ -2280,21 +2334,101 @@ const reflectiveReadOf = (input, seen = new Set()) => {
     }
     return values;
   };
-  const fixedCallArgumentsOf = (argumentsList) => {
-    const values = [];
-    for (const argument of argumentsList) {
-      if (!ts.isSpreadElement(argument)) {
-        values.push(unwrap(argument));
-        continue;
-      }
-      const expanded = fixedSpreadValuesOf(argument.expression);
-      if (!expanded) return values;
-      values.push(...expanded);
+const fixedCallArgumentPlanOf = (argumentsList) => {
+  const before = [];
+  const after = [];
+  let unknownIndex;
+  for (const argument of argumentsList) {
+    const target = unknownIndex === undefined ? before : after;
+    if (!ts.isSpreadElement(argument)) {
+      target.push(unwrap(argument));
+      continue;
     }
-    return values;
+    const expanded = fixedSpreadValuesOf(argument.expression);
+    if (expanded) target.push(...expanded);
+    else if (unknownIndex === undefined) unknownIndex = before.length;
+  }
+  return { before, after, unknownIndex };
+};
+const callArgumentCandidatesAt = (plan, index) => {
+  const targetIndex = (plan.offset ?? 0) + index;
+  if (targetIndex < plan.before.length) return [plan.before[targetIndex]];
+  if (plan.unknownIndex === undefined) return [];
+  return plan.after.slice(0, targetIndex - plan.before.length + 1);
+};
+const mergeCallArgumentPlans = (first, second) => {
+  if (first.unknownIndex === undefined) {
+    const before = [...first.before, ...second.before];
+    const unknownIndex = second.unknownIndex === undefined
+      ? undefined : before.length - second.before.length + second.unknownIndex;
+    return { before, after: [...second.after], unknownIndex };
+  }
+  return {
+    before: [...first.before],
+    after: [...first.after, ...second.before, ...second.after],
+    unknownIndex: first.unknownIndex
   };
+};
+const callArgumentPlansEqual = (left, right) =>
+  (left.offset ?? 0) === (right.offset ?? 0) &&
+  left.unknownIndex === right.unknownIndex &&
+  left.before.length === right.before.length &&
+  left.after.length === right.after.length &&
+  left.before.every((value, index) => value === right.before[index]) &&
+  left.after.every((value, index) => value === right.after[index]);
+const argumentArrayPlanOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return { before: [], after: [], unknownIndex: 0 };
+  if (ts.isArrayLiteralExpression(node)) return fixedCallArgumentPlanOf(node.elements);
+  const expanded = fixedSpreadValuesOf(node, seen);
+  return expanded
+    ? { before: expanded, after: [], unknownIndex: undefined }
+    : { before: [], after: [], unknownIndex: 0 };
+};
+const localInvocationOf = (call) => {
+  const callee = unwrap(call.expression);
+  if (ts.isCallExpression(callee)) {
+    const bind = memberAccess(unwrap(callee.expression));
+    if (bind?.property === "bind") {
+      const functions = localFunctionValuesOf(bind.receiver);
+      if (functions.length > 0) {
+        return {
+          functions,
+          plan: mergeCallArgumentPlans(
+            fixedCallArgumentPlanOf(callee.arguments.slice(1)),
+            fixedCallArgumentPlanOf(call.arguments)
+          )
+        };
+      }
+    }
+  }
+  const directFunctions = localFunctionValuesOf(callee);
+  if (directFunctions.length > 0) {
+    return { functions: directFunctions, plan: fixedCallArgumentPlanOf(call.arguments) };
+  }
+  const wrapper = memberAccess(callee);
+  if (wrapper && ["apply", "call"].includes(wrapper.property)) {
+    const functions = localFunctionValuesOf(wrapper.receiver);
+    if (functions.length > 0) {
+      return {
+        functions,
+        plan: wrapper.property === "call"
+          ? fixedCallArgumentPlanOf(call.arguments.slice(1))
+          : argumentArrayPlanOf(call.arguments[1])
+      };
+    }
+  }
+  if (wrapper?.property === "apply" && globalReflectOf(wrapper.receiver)) {
+    const functions = localFunctionValuesOf(call.arguments[0]);
+    if (functions.length > 0) {
+      return { functions, plan: argumentArrayPlanOf(call.arguments[2]) };
+    }
+  }
+  return undefined;
+};
   const bindingNamesOf = (pattern, names = []) => {
     for (const element of pattern.elements) {
+    if (!ts.isBindingElement(element)) continue;
       if (ts.isIdentifier(element.name)) {
         names.push(element.name.text);
       } else {
@@ -2303,10 +2437,64 @@ const reflectiveReadOf = (input, seen = new Set()) => {
     }
     return names;
   };
+const destructuredParameterValueCandidatesOf = (reference, property, seen) => {
+  const binding = resolveBinding(reference);
+  if (binding?.kind !== "parameter" || !ts.isParameter(binding.node) ||
+      seen.has(binding.node)) return [];
+  const next = new Set(seen);
+  next.add(binding.node);
+  if (ts.isIdentifier(binding.node.name) && binding.node.dotDotDotToken) {
+    if (!/^\d+$/.test(property)) return [];
+    return (parameterRestArguments.get(binding.node) ?? []).flatMap((plan) =>
+      callArgumentCandidatesAt(plan, Number(property)));
+  }
+  if (ts.isIdentifier(binding.node.name)) return [];
+  const sources = [
+    ...(parameterProcessArguments.get(binding.node) ?? []),
+    ...(parameterGlobalArguments.get(binding.node) ?? []),
+    ...(parameterRequireArguments.get(binding.node) ?? [])
+  ];
+  const containers = sources.flatMap((source) =>
+    bindingPatternValuesOf(
+      binding.node.name, source, reference.text, next
+    ));
+  return containers.flatMap((container) =>
+    memberValueCandidatesOf(container, property, next));
+};
+const hasRestBindingOf = (pattern) =>
+  (ts.isObjectBindingPattern(pattern) || ts.isArrayBindingPattern(pattern)) &&
+  pattern.elements.some((element) => ts.isBindingElement(element) &&
+    (Boolean(element.dotDotDotToken) || hasRestBindingOf(element.name)));
+const containerCarriesCapabilityOf = (input, predicate, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  if (predicate(node)) return true;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isArrayLiteralExpression(node)) {
+    return node.elements.some((element) => !ts.isOmittedExpression(element) &&
+      containerCarriesCapabilityOf(
+        ts.isSpreadElement(element) ? element.expression : element, predicate, next
+      ));
+  }
+  if (!ts.isObjectLiteralExpression(node)) return false;
+  return node.properties.some((property) =>
+    ts.isPropertyAssignment(property)
+      ? containerCarriesCapabilityOf(property.initializer, predicate, next)
+      : ts.isShorthandPropertyAssignment(property)
+        ? containerCarriesCapabilityOf(property.name, predicate, next)
+        : ts.isSpreadAssignment(property) &&
+          containerCarriesCapabilityOf(property.expression, predicate, next));
+};
   const carriesParameterCapabilityOf = (parameter, argument, predicate) => {
     if (ts.isIdentifier(parameter.name)) return predicate(argument);
-    return bindingNamesOf(parameter.name).some((name) =>
-      bindingPatternValuesOf(parameter.name, argument, name).some(predicate));
+  if (bindingNamesOf(parameter.name).some((name) =>
+    bindingPatternValuesOf(parameter.name, argument, name)
+      .some((value) => predicate(value)))) {
+    return true;
+  }
+  return hasRestBindingOf(parameter.name) &&
+    containerCarriesCapabilityOf(argument, predicate);
   };
   const recordParameterArgument = (store, parameter, argument) => {
     const values = store.get(parameter) ?? [];
@@ -2315,18 +2503,49 @@ const reflectiveReadOf = (input, seen = new Set()) => {
     store.set(parameter, values);
     return true;
   };
+const recordCapabilityArgumentsOf = (parameter, plan, offset = 0) => {
+  const positionedPlan = offset === 0 ? plan : { ...plan, offset };
+  if (ts.isIdentifier(parameter.name)) {
+    const plans = parameterRestArguments.get(parameter) ?? [];
+    if (!plans.some((stored) => callArgumentPlansEqual(stored, positionedPlan))) {
+      plans.push(positionedPlan);
+      parameterRestArguments.set(parameter, plans);
+    }
+    return;
+  }
+  if (!ts.isArrayBindingPattern(parameter.name)) return;
+  for (let index = 0; index < parameter.name.elements.length; index += 1) {
+    const element = parameter.name.elements[index];
+    if (!ts.isBindingElement(element)) continue;
+    const candidates = callArgumentCandidatesAt(positionedPlan, index);
+    for (const name of ts.isIdentifier(element.name)
+      ? [element.name.text] : bindingNamesOf(element.name)) {
+      const values = candidates.flatMap((candidate) => !candidate ? [] :
+        ts.isIdentifier(element.name) ? [candidate]
+          : bindingPatternValuesOf(element.name, candidate, name, new Set()));
+      if (values.length === 0) continue;
+      const key = `${parameter.pos}:${name}`;
+      const stored = destructuredAssignmentsByBinding.get(key) ?? [];
+      stored.push(...values);
+      destructuredAssignmentsByBinding.set(key, stored);
+    }
+  }
+};
   let capabilityArgumentsChanged = true;
   while (capabilityArgumentsChanged) {
     capabilityArgumentsChanged = false;
     const collect = (node) => {
       if (ts.isCallExpression(node)) {
-        for (const fn of localFunctionValuesOf(node.expression)) {
-          const callArguments = fixedCallArgumentsOf(node.arguments);
-          for (let index = 0;
-            index < Math.min(fn.parameters.length, callArguments.length);
-            index += 1) {
+      const invocation = localInvocationOf(node);
+      for (const fn of invocation?.functions ?? []) {
+        for (let index = 0; index < fn.parameters.length; index += 1) {
             const parameter = fn.parameters[index];
-            const argument = callArguments[index];
+          if (parameter.dotDotDotToken) {
+        recordCapabilityArgumentsOf(parameter, invocation.plan, index);
+            break;
+          }
+          for (const argument of callArgumentCandidatesAt(invocation.plan, index)) {
+            if (!argument) continue;
             if (carriesParameterCapabilityOf(
               parameter, argument, processObjectOf
             )) {
@@ -2348,6 +2567,7 @@ const reflectiveReadOf = (input, seen = new Set()) => {
                 parameterRequireArguments, parameter, argument
               ) || capabilityArgumentsChanged;
             }
+          }
           }
         }
       }
