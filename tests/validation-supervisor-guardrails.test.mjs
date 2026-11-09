@@ -212,6 +212,57 @@ test.each([
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
   });
 
+test.each([
+  ["process helper argument",
+    "function load(runtime: typeof process) { return runtime.getBuiltinModule('node:child_process'); } load(process).exec('cmd.exe');",
+    /process\.getBuiltinModule/],
+  ["require helper argument",
+    "function load(factory) { return factory('node:child_process'); } const cp = load(require); cp.exec('cmd.exe');",
+    /child_process require/],
+  ["chained process helper arguments",
+    "function inner(runtime) { return runtime.getBuiltinModule('node:child_process'); } function outer(runtime) { return inner(runtime); } outer(process).exec('cmd.exe');",
+    /process\.getBuiltinModule/],
+  ["chained require helper arguments",
+    "function inner(factory) { return factory('node:child_process'); } function outer(factory) { return inner(factory); } outer(require).exec('cmd.exe');",
+    /child_process require/],
+  ["process helper before empty spread",
+    "function load(runtime, ignored) { return runtime.getBuiltinModule('node:child_process'); } load(process, ...[]).exec('cmd.exe');",
+    /process\.getBuiltinModule/],
+  ["require helper before empty spread",
+    "function load(factory, ignored) { return factory('node:child_process'); } load(require, ...[]).exec('cmd.exe');",
+    /child_process require/],
+  ["process helper through fixed array spread",
+    "function load(runtime, ignored) { return runtime.getBuiltinModule('node:child_process'); } load(...[process, null]).exec('cmd.exe');",
+    /process\.getBuiltinModule/],
+  ["global helper argument",
+    "function evaluate(runtime) { return runtime.eval('process'); } evaluate(globalThis);",
+    /global dynamic evaluation/],
+  ["member-held process factory",
+    "const make = () => process; const tools = { make }; tools.make().getBuiltinModule('node:child_process').exec('id');",
+    /process\.getBuiltinModule/],
+  ["member-held global factory",
+    "const make = () => globalThis; const tools = { make }; tools.make().eval('process');",
+    /global dynamic evaluation/]
+])("rejects capability provenance through %s", (_name, source, finding) => {
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual(expect.arrayContaining([expect.stringMatching(finding)]));
+});
+
+test("accepts ordinary helper arguments and member factories", () => {
+  const source = [
+    "function read(runtime) { return runtime.getBuiltinModule(); }",
+    "read({ getBuiltinModule() { return undefined; } });",
+    "const make = () => ({ safe: true });",
+    "const tools = { make };",
+    "tools.make().safe;",
+    "const methodTools = { make() { return { safe: true }; } };",
+    "methodTools.make().safe;",
+    "import { spawn } from 'node:child_process';",
+    "spawn('node.exe', ['--version'], { stdio: 'pipe' });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
+});
+
   test("terminates reflective container cycles without overflowing", () => {
     const source = [
       "const tools = Object.assign(tools, { read: Object.getOwnPropertyDescriptors });",
@@ -571,7 +622,8 @@ test.each([
   ["assigned member require", "const holder = {}; holder.load = require; const cp = holder.load('node:child_process'); cp.exec('id');"],
   ["computed assigned member require", "const key = 'load'; const holder = {}; holder[key] = require; holder.load('node:child_process').exec('id');"],
   ["conditional assigned member require", "const holder = {}; holder.load = true ? require : () => {}; holder.load('node:child_process').exec('id');"],
-  ["factory-returned require", "const holder = { load: () => require }; const cp = holder.load()('node:child_process'); cp.exec('id');"]
+  ["factory-returned require", "const holder = { load: () => require }; const cp = holder.load()('node:child_process'); cp.exec('id');"],
+  ["helper parameter require", "function load(factory) { return factory('node:child_process'); } const cp = load(require); cp.exec('id');"]
 ])("rejects indirect require through %s inside POSIX_GROUP_LAUNCHER", (_name, body) => {
   const quoted = "const POSIX_GROUP_LAUNCHER = String.raw" + String.fromCharCode(96) +
     body + String.fromCharCode(96) + ";";

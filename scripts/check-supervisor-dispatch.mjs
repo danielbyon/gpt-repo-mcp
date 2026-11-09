@@ -90,34 +90,49 @@ function inspectJavaScript(filename, source, isLauncher = false) {
            ts.isNonNullExpression(node))) node = node.expression;
     return node;
   };
-  const requireReferenceOf = (input) => {
+  const parameterProcessArguments = new Map();
+  const parameterGlobalArguments = new Map();
+  const parameterRequireArguments = new Map();
+  const requireReferenceOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
-    if (ts.isIdentifier(node)) return node.text === "require" && !resolveBinding(node);
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      if (binding?.kind === "parameter" && ts.isParameter(binding.node)) {
+        if (seen.has(binding.node)) return false;
+        const next = new Set(seen);
+        next.add(binding.node);
+        return (parameterRequireArguments.get(binding.node) ?? [])
+          .some((value) => requireReferenceOf(value, next));
+      }
+      return node.text === "require" && !binding;
+    }
   if (ts.isPropertyAccessExpression(node)) {
     const property = node.name.text;
     if (property === "require") return globalObjectOf(node.expression);
     return ["call", "apply", "bind"].includes(property) &&
-      requireReferenceOf(node.expression);
+      requireReferenceOf(node.expression, seen);
   }
   if (ts.isElementAccessExpression(node)) {
     const property = moduleLiteral(node.argumentExpression);
     if (property === "require") return globalObjectOf(node.expression);
     return ["call", "apply", "bind"].includes(property) &&
-      requireReferenceOf(node.expression);
+      requireReferenceOf(node.expression, seen);
   }
   if (ts.isConditionalExpression(node)) {
-    return requireReferenceOf(node.whenTrue) || requireReferenceOf(node.whenFalse);
+    return requireReferenceOf(node.whenTrue, seen) ||
+      requireReferenceOf(node.whenFalse, seen);
   }
     if (!ts.isBinaryExpression(node)) return false;
     const operator = node.operatorToken.kind;
     if (operator === ts.SyntaxKind.CommaToken) {
-      return requireReferenceOf(node.right);
+      return requireReferenceOf(node.right, seen);
     }
     if (operator === ts.SyntaxKind.AmpersandAmpersandToken ||
         operator === ts.SyntaxKind.BarBarToken ||
         operator === ts.SyntaxKind.QuestionQuestionToken) {
-      return requireReferenceOf(node.left) || requireReferenceOf(node.right);
+      return requireReferenceOf(node.left, seen) ||
+        requireReferenceOf(node.right, seen);
     }
     return false;
   };
@@ -914,14 +929,55 @@ const assignmentMemberPathKey = (receiver, property) => {
       return bindingDefaultMatches(element.name, predicate);
     });
   };
+  const localFunctionValuesOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return [];
+    if (ts.isFunctionLike(node)) return [node];
+    const next = new Set(seen);
+    next.add(node);
+    if (ts.isConditionalExpression(node)) {
+      return [
+        ...localFunctionValuesOf(node.whenTrue, next),
+        ...localFunctionValuesOf(node.whenFalse, next)
+      ];
+    }
+    if (ts.isBinaryExpression(node) && [
+      ts.SyntaxKind.CommaToken,
+      ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.BarBarToken,
+      ts.SyntaxKind.QuestionQuestionToken
+    ].includes(node.operatorToken.kind)) {
+      return [
+        ...localFunctionValuesOf(node.left, next),
+        ...localFunctionValuesOf(node.right, next)
+      ];
+    }
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      if (!binding?.node || seen.has(binding.node)) return [];
+      const bindingNext = new Set(next);
+      bindingNext.add(binding.node);
+      if (ts.isFunctionLike(binding.node)) return [binding.node];
+      if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+          ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+        return localFunctionValuesOf(binding.node.initializer, bindingNext);
+      }
+      return [];
+    }
+    const member = memberAccess(node);
+    if (!member) return [];
+    return memberValueCandidatesOf(member.receiver, member.property, next)
+      .flatMap((value) => localFunctionValuesOf(value, next));
+  };
   const functionReturnExpressionsOf = (input, seen = new Set()) => {
     const node = unwrap(input);
-    if (!node) return [];
-    if (ts.isArrowFunction(node)) {
-      if (!ts.isBlock(node.body)) return [node.body];
-    }
-    if (ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node) ||
-        ts.isArrowFunction(node)) {
+    if (!node || seen.has(node)) return [];
+    const next = new Set(seen);
+    next.add(node);
+    if (ts.isFunctionLike(node)) {
+      if (ts.isArrowFunction(node) && !ts.isBlock(node.body)) {
+        return [node.body];
+      }
       const values = [];
       const visit = (child) => {
         if (ts.isFunctionLike(child) && child !== node) return;
@@ -931,20 +987,8 @@ const assignmentMemberPathKey = (receiver, property) => {
       if (node.body) visit(node.body);
       return values;
     }
-    if (!ts.isIdentifier(node)) return [];
-    const binding = resolveBinding(node);
-    if (!binding || seen.has(binding.node)) return [];
-    const next = new Set(seen);
-    next.add(binding.node);
-    if (ts.isFunctionDeclaration(binding.node) || ts.isFunctionExpression(binding.node) ||
-        ts.isArrowFunction(binding.node)) {
-      return functionReturnExpressionsOf(binding.node, next);
-    }
-    if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
-        ts.isIdentifier(binding.node.name) && binding.node.initializer) {
-      return functionReturnExpressionsOf(binding.node.initializer, next);
-    }
-    return [];
+    return localFunctionValuesOf(node, seen).flatMap((value) =>
+      functionReturnExpressionsOf(value, next));
   };
   // Follow local aliases and object spreads that preserve process capabilities.
   const processObjectOf = (input, seen = new Set()) => {
@@ -1037,7 +1081,9 @@ const assignmentMemberPathKey = (receiver, property) => {
   }
   if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
     if (ts.isIdentifier(binding.node.name)) {
-      return [binding.node.initializer,
+        return [
+          ...(parameterProcessArguments.get(binding.node) ?? []),
+          binding.node.initializer,
         ...(assignmentsByBinding.get(binding.node) ?? [])]
         .filter(Boolean)
         .some((value) => processObjectOf(value, next));
@@ -1132,7 +1178,9 @@ const assignmentMemberPathKey = (receiver, property) => {
   }
   if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
     if (ts.isIdentifier(binding.node.name)) {
-      return [binding.node.initializer,
+        return [
+          ...(parameterGlobalArguments.get(binding.node) ?? []),
+          binding.node.initializer,
         ...(assignmentsByBinding.get(binding.node) ?? [])]
         .filter(Boolean)
         .some((value) => globalObjectOf(value, next));
@@ -2187,6 +2235,94 @@ const reflectiveReadOf = (input, seen = new Set()) => {
     }
     ts.forEachChild(node, visit);
   };
+
+  // Seed direct local calls with their known capability arguments. Repeating
+  // the finite parameter/argument pairs handles short helper chains without
+  // creating a repository-wide call graph.
+  const fixedSpreadValuesOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return undefined;
+    const next = new Set(seen);
+    next.add(node);
+    if (ts.isConditionalExpression(node)) {
+      const whenTrue = fixedSpreadValuesOf(node.whenTrue, next);
+      const whenFalse = fixedSpreadValuesOf(node.whenFalse, next);
+      return whenTrue && whenFalse ? [...whenTrue, ...whenFalse] : undefined;
+    }
+    if (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+      return fixedSpreadValuesOf(node.right, next);
+    }
+    const values = [];
+    for (const value of resolvedValuesOf(node, next)) {
+      if (!ts.isArrayLiteralExpression(value)) return undefined;
+      for (const element of value.elements) {
+        if (ts.isOmittedExpression(element)) continue;
+        if (ts.isSpreadElement(element)) {
+          const expanded = fixedSpreadValuesOf(element.expression, next);
+          if (!expanded) return undefined;
+          values.push(...expanded);
+        } else {
+          values.push(unwrap(element));
+        }
+      }
+    }
+    return values;
+  };
+  const fixedCallArgumentsOf = (argumentsList) => {
+    const values = [];
+    for (const argument of argumentsList) {
+      if (!ts.isSpreadElement(argument)) {
+        values.push(unwrap(argument));
+        continue;
+      }
+      const expanded = fixedSpreadValuesOf(argument.expression);
+      if (!expanded) return values;
+      values.push(...expanded);
+    }
+    return values;
+  };
+  const recordParameterArgument = (store, parameter, argument) => {
+    const values = store.get(parameter) ?? [];
+    if (values.includes(argument)) return false;
+    values.push(argument);
+    store.set(parameter, values);
+    return true;
+  };
+  let capabilityArgumentsChanged = true;
+  while (capabilityArgumentsChanged) {
+    capabilityArgumentsChanged = false;
+    const collect = (node) => {
+      if (ts.isCallExpression(node)) {
+        for (const fn of localFunctionValuesOf(node.expression)) {
+          const callArguments = fixedCallArgumentsOf(node.arguments);
+          for (let index = 0;
+            index < Math.min(fn.parameters.length, callArguments.length);
+            index += 1) {
+            const parameter = fn.parameters[index];
+            const argument = callArguments[index];
+            if (processObjectOf(argument)) {
+              capabilityArgumentsChanged = recordParameterArgument(
+                parameterProcessArguments, parameter, argument
+              ) || capabilityArgumentsChanged;
+            }
+            if (globalObjectOf(argument)) {
+              capabilityArgumentsChanged = recordParameterArgument(
+                parameterGlobalArguments, parameter, argument
+              ) || capabilityArgumentsChanged;
+            }
+            if (requireReferenceOf(argument)) {
+              capabilityArgumentsChanged = recordParameterArgument(
+                parameterRequireArguments, parameter, argument
+              ) || capabilityArgumentsChanged;
+            }
+          }
+        }
+      }
+      ts.forEachChild(node, collect);
+    };
+    collect(file);
+  }
   visit(file);
   if (!isLauncher && filename === "src/services/process-exec.ts" && launcherCount !== 1) {
     findings.push(filename + ": expected exactly one audited POSIX_GROUP_LAUNCHER declaration");

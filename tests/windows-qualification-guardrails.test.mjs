@@ -585,6 +585,17 @@ describe("Windows qualification scope guard", () => {
     ["computed descriptor access", "import { test } from 'vitest'; const key = 'read'; const tools = { [key]: Object.getOwnPropertyDescriptors }; const holder: any = { test }; const value = tools[key](holder).test.value; value.only('focused', () => {});"],
 ["numeric computed runner assignment", "import { test } from 'vitest'; const holder: any = {}; holder[1 + 2] = test; holder[3].only('focused', () => {});"],
 ["comma computed runner assignment", "import { test } from 'vitest'; const holder: any = {}; holder[(0, 1)] = test; holder[1].only('focused', () => {});"],
+  ["runner helper argument", "import { test } from 'vitest'; function focus(register: typeof test) { register.only('focused', () => {}); } focus(test);"],
+  ["chained runner helper arguments", "import { test } from 'vitest'; function inner(register: typeof test) { register.only('focused', () => {}); } function outer(register: typeof test) { inner(register); } outer(test);"],
+  ["runner helper before empty spread", "import { test } from 'vitest'; function focus(register: typeof test, ignored: unknown) { register.only('focused', () => {}); } focus(test, ...[]);"],
+  ["runner helper through fixed array spread", "import { test } from 'vitest'; function focus(register: typeof test, ignored: unknown) { register.only('focused', () => {}); } focus(...[test, null]);"],
+  ["globalThis Reflect.get", "import { test } from 'vitest'; globalThis.Reflect.get(test, 'only')('focused', () => {});"],
+  ["globalThis Object descriptor", "import { test } from 'vitest'; const holder: any = { test }; globalThis.Object.getOwnPropertyDescriptor(holder, 'test').value.only('focused', () => {});"],
+  ["globalThis Object descriptor bag", "import { test } from 'vitest'; const holder: any = { test }; globalThis.Object.getOwnPropertyDescriptors(holder).test.value.only('focused', () => {});"],
+  ["globalThis Object assign", "import { test } from 'vitest'; globalThis.Object.assign({}, test).only('focused', () => {});"],
+  ["member-held runner factory", "import { test } from 'vitest'; const make = () => test; const tools = { make }; tools.make().only('focused', () => {});"],
+  ["method-held runner factory", "import { test } from 'vitest'; const tools = { make() { return test; } }; tools.make().only('focused', () => {});"],
+  ["assigned member-held runner factory", "import { test } from 'vitest'; const tools: any = {}; tools.make = () => test; tools.make().only('focused', () => {});"],
     ["computed dynamic namespace", "const V = await import('vi' + 'test'); V.test.only('focused', () => {});"]
   ])("rejects exclusive registration through %s", (_name, source) => {
     expect(() => collectWindowsTestTitles("fixture.ts", source))
@@ -609,9 +620,37 @@ describe("Windows qualification scope guard", () => {
       "const safeTools = Object.assign({}, { read: Object.getOwnPropertyDescriptors });",
       "const safeCycle = Object.assign(safeCycle, { helper: true });",
 "const reflectedLength = Reflect.get(test, 'length');",
+      "const globalReflectedLength = globalThis.Reflect.get(test, 'length');",
+      "const globalDescriptorValue = globalThis.Object.getOwnPropertyDescriptor(holder, 'test').value;",
+      "const globalAssignedValue = globalThis.Object.assign({}, { value: 1 });",
 "const numericMetadata: any = {}; numericMetadata[1 + 2] = true;",
       "test('required', () => {});"
     ].join("\n"))).toEqual([{ title: "required", enabled: true }]);
+  });
+
+  test("keeps globalThis and local member provenance bounded", () => {
+    const source = [
+      "import { test } from 'vitest';",
+      "const globalThis = {",
+      "  Object: { getOwnPropertyDescriptor() { return { value: { only() {} } }; }, assign() { return { only() {} }; } },",
+      "  Reflect: { get() { return { only() {} }; } },",
+      "  Math: { max() { return 0; } }",
+      "};",
+      "globalThis.Reflect.get({ value: 1 }, 'value');",
+      "globalThis.Object.getOwnPropertyDescriptor({ value: 1 }, 'value').value;",
+      "globalThis.Object.assign({}, { value: 1 });",
+      "globalThis.Math.max(1, 2);",
+      "function inspect(register: typeof test) { return register.length; }",
+      "inspect(test);",
+      "const make = () => ({ safe: true });",
+      "const tools = { make };",
+      "tools.make().safe;",
+      "const methodTools = { make() { return { safe: true }; } };",
+      "methodTools.make().safe;",
+      "test('required', () => {});"
+    ].join("\n");
+    expect(collectWindowsTestTitles("fixture.ts", source))
+      .toEqual([{ title: "required", enabled: true }]);
   });
 
   test("parses unfiltered mandatory files for exclusive registration", () => {

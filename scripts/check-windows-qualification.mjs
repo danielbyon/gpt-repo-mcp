@@ -506,6 +506,7 @@ function createWindowsTestBindingResolver(file) {
   const runnerAssignmentsByBinding = new Map();
   const destructuredAssignmentsByBinding = new Map();
 const assignmentsByMemberPath = new Map();
+  const parameterRunnerArguments = new Map();
 const assignmentMemberAccess = (node) => {
   node = unwrap(node);
   if (ts.isPropertyAccessExpression(node)) {
@@ -835,6 +836,7 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
         } else if (assignmentKey(property.name) === key) {
           if (ts.isPropertyAssignment(property)) values.push(property.initializer);
           else if (ts.isShorthandPropertyAssignment(property)) values.push(property.name);
+            else if (ts.isMethodDeclaration(property)) values.push(property);
         }
       }
     } else if (ts.isArrayLiteralExpression(container) && /^\d+$/.test(key)) {
@@ -992,7 +994,9 @@ collectResolvedAssignments(file);
     if (!node) return false;
     if (ts.isIdentifier(node)) {
       const binding = resolveBinding(node);
-      if (!binding) return node.text === "Object";
+      if (!binding) {
+        return ["Object", "global", "globalThis"].includes(node.text);
+      }
       if (binding.kind !== "variable" || !binding.constant ||
           !binding.node.initializer || seen.has(binding.node)) return false;
       const next = new Set(seen);
@@ -1313,14 +1317,55 @@ collectResolvedAssignments(file);
   };
   return patternSource(declaration.name, source);
   };
-const functionReturnExpressionsOf = (input, seen = new Set()) => {
+  const localFunctionValuesOf = (input, seen = new Set()) => {
   const node = unwrap(input);
-  if (!node) return [];
-  if (ts.isArrowFunction(node)) {
-    if (!ts.isBlock(node.body)) return [node.body];
+    if (!node || seen.has(node)) return [];
+    if (ts.isFunctionLike(node)) return [node];
+    const next = new Set(seen);
+    next.add(node);
+    if (ts.isConditionalExpression(node)) {
+      return [
+        ...localFunctionValuesOf(node.whenTrue, next),
+        ...localFunctionValuesOf(node.whenFalse, next)
+      ];
   }
-  if (ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node) ||
-      ts.isArrowFunction(node)) {
+    if (ts.isBinaryExpression(node) && [
+      ts.SyntaxKind.CommaToken,
+      ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.BarBarToken,
+      ts.SyntaxKind.QuestionQuestionToken
+    ].includes(node.operatorToken.kind)) {
+      return [
+        ...localFunctionValuesOf(node.left, next),
+        ...localFunctionValuesOf(node.right, next)
+      ];
+    }
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBinding(node);
+      if (!binding?.node || seen.has(binding.node)) return [];
+      const bindingNext = new Set(next);
+      bindingNext.add(binding.node);
+      if (ts.isFunctionLike(binding.node)) return [binding.node];
+      if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
+          ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+        return localFunctionValuesOf(binding.node.initializer, bindingNext);
+      }
+      return [];
+    }
+    const member = resolvedAccess(node);
+    if (!member || member.method === undefined) return [];
+    return objectPropertyValuesOf(member.receiver, member.method, next)
+      .flatMap((value) => localFunctionValuesOf(value, next));
+  };
+  const functionReturnExpressionsOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return [];
+    const next = new Set(seen);
+    next.add(node);
+    if (ts.isFunctionLike(node)) {
+      if (ts.isArrowFunction(node) && !ts.isBlock(node.body)) {
+        return [node.body];
+      }
     const values = [];
     const visit = (child) => {
       if (ts.isFunctionLike(child) && child !== node) return;
@@ -1330,20 +1375,8 @@ const functionReturnExpressionsOf = (input, seen = new Set()) => {
     if (node.body) visit(node.body);
     return values;
   }
-  if (!ts.isIdentifier(node)) return [];
-  const binding = resolveBinding(node);
-  if (!binding || seen.has(binding.node)) return [];
-  const next = new Set(seen);
-  next.add(binding.node);
-  if (ts.isFunctionDeclaration(binding.node) || ts.isFunctionExpression(binding.node) ||
-      ts.isArrowFunction(binding.node)) {
-    return functionReturnExpressionsOf(binding.node, next);
-  }
-  if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
-      ts.isIdentifier(binding.node.name) && binding.node.initializer) {
-    return functionReturnExpressionsOf(binding.node.initializer, next);
-  }
-  return [];
+    return localFunctionValuesOf(node, seen).flatMap((value) =>
+      functionReturnExpressionsOf(value, next));
 };
   const possibleTestRunnerOf = (input, names, seen = new Set()) => {
     const node = unwrap(input);
@@ -1430,7 +1463,12 @@ if (candidate) return candidate;
       ts.isIdentifier(binding.node.name) && !seen.has(binding.node)) {
     const next = new Set(seen);
     next.add(binding.node);
-    for (const value of assignmentsByBinding.get(binding.node) ?? []) {
+      const values = [
+        binding.node.initializer,
+        ...(parameterRunnerArguments.get(binding.node) ?? []),
+        ...(assignmentsByBinding.get(binding.node) ?? [])
+      ];
+      for (const value of values) {
       const candidate = possibleTestRunnerOf(value, names, next);
       if (candidate) return candidate;
     }
@@ -1739,6 +1777,79 @@ if (candidate) return candidate;
       ts.forEachChild(node, visitAliasChains);
     };
     visitAliasChains(file);
+  }
+  // Follow direct calls to local helpers so runner identity reaches their
+  // parameters. Repeating finite parameter/argument pairs handles short
+  // helper chains without creating a repository-wide call graph.
+  const fixedSpreadValuesOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return undefined;
+    const next = new Set(seen);
+    next.add(node);
+    if (ts.isConditionalExpression(node)) {
+      const whenTrue = fixedSpreadValuesOf(node.whenTrue, next);
+      const whenFalse = fixedSpreadValuesOf(node.whenFalse, next);
+      return whenTrue && whenFalse ? [...whenTrue, ...whenFalse] : undefined;
+    }
+    if (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+      return fixedSpreadValuesOf(node.right, next);
+    }
+    const values = [];
+    for (const value of expressionValuesOf(node, next)) {
+      if (!ts.isArrayLiteralExpression(value)) return undefined;
+      for (const element of value.elements) {
+        if (ts.isOmittedExpression(element)) continue;
+        if (ts.isSpreadElement(element)) {
+          const expanded = fixedSpreadValuesOf(element.expression, next);
+          if (!expanded) return undefined;
+          values.push(...expanded);
+        } else {
+          values.push(unwrap(element));
+        }
+      }
+    }
+    return values;
+  };
+  const fixedCallArgumentsOf = (argumentsList) => {
+    const values = [];
+    for (const argument of argumentsList) {
+      if (!ts.isSpreadElement(argument)) {
+        values.push(unwrap(argument));
+        continue;
+      }
+      const expanded = fixedSpreadValuesOf(argument.expression);
+      if (!expanded) return values;
+      values.push(...expanded);
+    }
+    return values;
+  };
+  let parameterRunnerArgumentsChanged = true;
+  while (parameterRunnerArgumentsChanged) {
+    parameterRunnerArgumentsChanged = false;
+    const collectParameterRunnerArguments = (node) => {
+      if (ts.isCallExpression(node)) {
+        for (const fn of localFunctionValuesOf(node.expression)) {
+          const callArguments = fixedCallArgumentsOf(node.arguments);
+          for (let index = 0;
+            index < Math.min(fn.parameters.length, callArguments.length);
+            index += 1) {
+            const parameter = fn.parameters[index];
+            const argument = callArguments[index];
+            if (!possibleTestRunnerOf(
+              argument, ["test", "it", "describe"]
+            )) continue;
+            const values = parameterRunnerArguments.get(parameter) ?? [];
+            if (values.includes(argument)) continue;
+            values.push(argument);
+            parameterRunnerArguments.set(parameter, values);
+            parameterRunnerArgumentsChanged = true;
+          }
+        }
+      }
+      ts.forEachChild(node, collectParameterRunnerArguments);
+    };
+    collectParameterRunnerArguments(file);
   }
 return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
