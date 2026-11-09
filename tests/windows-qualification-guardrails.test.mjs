@@ -787,6 +787,14 @@ describe("Windows qualification scope guard", () => {
   const staticProvenanceCases = [
     ['conditional spread alternatives', (capability) =>
       `import { test } from 'vitest'; declare const condition: boolean; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(condition ? [safe] : [${capability}]));`],
+    ['logical AND spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(true && [${capability}]));`],
+    ['logical OR spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(false || [${capability}]));`],
+    ['nullish spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(null ?? [${capability}]));`],
+    ['zero BigInt logical OR spread alternatives', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(0n || [${capability}]));`],
     ['nested unknown spread followed by capability', (capability) =>
       `import { test } from 'vitest'; declare const args: any[]; function focus(register) { register.only('focused', () => {}); } focus(...[...args, ${capability}]);`],
     ['unknown prefix indexed capability', (capability) =>
@@ -801,6 +809,12 @@ describe("Windows qualification scope guard", () => {
       `import { test } from 'vitest'; const create = Object.create; const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
     ['destructured Object.create', (capability) =>
       `import { test } from 'vitest'; const { create } = Object; const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['assigned destructured Object.create', (capability) =>
+      `import { test } from 'vitest'; let create; ({ create } = Object); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['returned Object.create from local helper', (capability) =>
+      `import { test } from 'vitest'; function wrap(prototype) { return Object.create(prototype); } wrap({ runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['defaulted helper parameter supplied Object.create capability', (capability) =>
+      `import { test } from 'vitest'; function wrap(prototype = {}) { return Object.create(prototype); } wrap({ runtime: ${capability} }).runtime.only('focused', () => {});`],
     ['member-held Object.create', (capability) =>
       `import { test } from 'vitest'; const tools = { create: Object.create }; const args = tools.create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
     ['getter-held Object.create', (capability) =>
@@ -831,6 +845,10 @@ describe("Windows qualification scope guard", () => {
       `import { test } from 'vitest'; const assign = Object.assign; assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
     ['destructured Object.assign', (capability) =>
       `import { test } from 'vitest'; const { assign } = Object; assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['assigned destructured Object.assign', (capability) =>
+      `import { test } from 'vitest'; let assign; ({ assign } = Object); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['returned Object.assign from local helper', (capability) =>
+      `import { test } from 'vitest'; function copy(source) { return Object.assign({}, source); } copy({ runtime: ${capability} }).runtime.only('focused', () => {});`],
     ['member-held Object.assign', (capability) =>
       `import { test } from 'vitest'; const tools = { assign: Object.assign }; tools.assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
     ['getter-held Object.assign', (capability) =>
@@ -854,7 +872,21 @@ describe("Windows qualification scope guard", () => {
     ['generic bind Reflect.apply Object.assign', (capability) =>
       `import { test } from 'vitest'; const assign = Reflect.apply(Function.prototype.bind, Object.assign, [Object]); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
     ['generic bind Reflect.apply Object.assign captured source', (capability) =>
-      `import { test } from 'vitest'; const assign = Reflect.apply(Function.prototype.bind, Object.assign, [Object, {}, { runtime: ${capability} }]); assign().runtime.only('focused', () => {});`]
+      `import { test } from 'vitest'; const assign = Reflect.apply(Function.prototype.bind, Object.assign, [Object, {}, { runtime: ${capability} }]); assign().runtime.only('focused', () => {});`],
+    ['Object.create apply with unknown prefix', (capability) =>
+      `import { test } from 'vitest'; declare const args: any[]; const created = Object.create.apply(Object, [...args, { runtime: ${capability} }]); created.runtime.only('focused', () => {});`],
+    ['detached Object.create bind', (capability) =>
+      `import { test } from 'vitest'; const bind = Object.create.bind; const create = bind(Object); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['detached Object.assign bind', (capability) =>
+      `import { test } from 'vitest'; const bind = Object.assign.bind; const assign = bind(Object); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['later-assigned stored helper bind', (capability) =>
+      `import { test } from 'vitest'; function focus(register) { register.only('focused', () => {}); } let bound; bound = focus.bind(null); bound(${capability});`],
+    ['alternative stored helper bind assignments', (capability) =>
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } let bound; bound = focus.bind(null, safe); bound = focus.bind(null); bound(${capability});`],
+    ['later-assigned member-held Object.create', (capability) =>
+      `import { test } from 'vitest'; const tools = {}; tools.create = Object.create; const args = tools.create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['later-assigned member-held Object.assign', (capability) =>
+      `import { test } from 'vitest'; const tools = {}; tools.assign = Object.assign; tools.assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`]
   ];
 
   test.each(staticProvenanceCases)(
@@ -870,7 +902,21 @@ describe("Windows qualification scope guard", () => {
       )).not.toThrow();
     });
 
-  test("accepts ordinary holes, rests, helpers, factories, and opaque spreads without test capability", () => {
+  test.each([
+    ['logical AND', '[test] && [safe]'],
+    ['logical OR', 'false || [safe]'],
+    ['nullish coalescing', 'null ?? [safe]']
+  ])('accepts statically unreachable %s spread operand', (_name, spread) => {
+    expect(collectWindowsTestTitles('fixture.ts',
+      `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(${spread}));`)) .toEqual([]);
+  });
+
+test("accepts non-call Object.create.apply member access", () => {
+  const source = "import { test } from 'vitest'; const values = [Object.create.apply.foo]; values[0].only('focused', () => {});";
+  expect(collectWindowsTestTitles('fixture.ts', source)).toEqual([]);
+});
+
+test("accepts ordinary holes, rests, helpers, factories, and opaque spreads without test capability", () => {
     const source = [
       "import { test } from 'vitest';",
       "declare const args: any[];",

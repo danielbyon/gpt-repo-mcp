@@ -381,6 +381,7 @@ const staticAssignmentNameOf = (input, seen = new Set()) => {
 };
   const assignmentsByBinding = new Map();
   const destructuredAssignmentsByBinding = new Map();
+const destructuredPropertyAssignmentsByBinding = new Map();
   const assignmentPropertyName = (name) => {
     if (!name) return undefined;
     if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) {
@@ -475,14 +476,24 @@ const assignmentMemberPathKey = (receiver, property) => {
     (usesDirectBinding ? assignmentsByBinding : destructuredAssignmentsByBinding)
       .set(key, assignments);
   };
+const recordDestructuredPropertyAssignment = (target, source, property) => {
+  if (!ts.isIdentifier(target) || property === undefined) return;
+  const binding = resolveBinding(target);
+  if (!binding?.node) return;
+  const assignments = destructuredPropertyAssignmentsByBinding.get(binding.node) ?? [];
+  if (!assignments.some((assignment) => assignment.source === source &&
+      assignment.property === property)) {
+    assignments.push({ source, property });
+    destructuredPropertyAssignmentsByBinding.set(binding.node, assignments);
+  }
+};
   const collectAssignments = (node) => {
     if (ts.isBinaryExpression(node) &&
         aliasAssignmentKinds.has(node.operatorToken.kind)) {
       const target = unwrap(node.left);
       if (ts.isIdentifier(target) || assignmentMemberAccess(target)) {
         recordAssignment(target, node.right);
-      } else if (ts.isObjectLiteralExpression(target) &&
-                 ts.isObjectLiteralExpression(unwrap(node.right))) {
+    } else if (ts.isObjectLiteralExpression(target)) {
         const source = unwrap(node.right);
         for (const property of target.properties) {
           const key = ts.isShorthandPropertyAssignment(property)
@@ -495,6 +506,10 @@ const assignmentMemberPathKey = (receiver, property) => {
             : ts.isPropertyAssignment(property) && ts.isIdentifier(property.initializer)
               ? property.initializer
               : undefined;
+        if (targetName && key !== undefined) {
+          recordDestructuredPropertyAssignment(targetName, source, key);
+        }
+        if (!ts.isObjectLiteralExpression(source)) continue;
           const sourceProperty = key === undefined ? undefined : source.properties.find((item) =>
             assignmentPropertyName(item.name) === key);
           const value = sourceProperty && ts.isPropertyAssignment(sourceProperty)
@@ -813,7 +828,35 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     return objects;
   }
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (binding?.kind === "parameter" && ts.isParameter(binding.node) &&
+        !next.has(binding.node)) {
+      const parameterNext = new Set(next);
+      parameterNext.add(binding.node);
+      for (const argument of [
+        ...(parameterProcessArguments.get(binding.node) ?? []),
+        ...(parameterGlobalArguments.get(binding.node) ?? [])
+      ]) {
+        objects.push(...objectValueCandidatesOf(argument, parameterNext));
+      }
+    }
+  }
     for (const value of resolvedValuesOf(node, next)) {
+    if (ts.isIdentifier(value)) {
+      const binding = resolveBinding(value);
+      if (binding?.kind === "parameter" && ts.isParameter(binding.node) &&
+          !next.has(binding.node)) {
+        const parameterNext = new Set(next);
+        parameterNext.add(binding.node);
+        for (const argument of [
+          ...(parameterProcessArguments.get(binding.node) ?? []),
+          ...(parameterGlobalArguments.get(binding.node) ?? [])
+        ]) {
+          objects.push(...objectValueCandidatesOf(argument, parameterNext));
+        }
+      }
+    }
       if (value.kind === ts.SyntaxKind.ThisKeyword) {
         objects.push(...objectValueCandidatesOf(value, next));
         continue;
@@ -1614,6 +1657,7 @@ const reflectiveReadOf = (input, seen = new Set()) => {
         const defaultValue = ts.isShorthandPropertyAssignment(property)
           ? property.objectAssignmentInitializer
           : patternDefault;
+    recordDestructuredPropertyAssignment(targetValue, source, key);
         const resolvedValues = selected.length > 0
           ? selected
           : defaultValue ? [defaultValue] : [];
@@ -1988,6 +2032,11 @@ const staticMethodReferenceOf = (
   if (!ts.isIdentifier(node)) return false;
   const binding = resolveBinding(node);
   if (!binding?.node || seen.has(binding.node)) return false;
+  const bindingNext = new Set(next);
+  bindingNext.add(binding.node);
+  if ((destructuredPropertyAssignmentsByBinding.get(binding.node) ?? [])
+    .some((assignment) => assignment.property === property &&
+      ownerOf(assignment.source, bindingNext))) return true;
   if (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) {
     if (!ts.isIdentifier(binding.node.name)) {
       return Boolean(binding.node.initializer &&
@@ -2077,13 +2126,26 @@ const objectCreatePrototypeValuesOf = (call, seen = new Set()) => {
   const plan = staticMethodInvocationPlanOf(
     call, "create", globalPrototypeObjectOf, seen
   );
-  return plan ? callArgumentCandidatesAt(plan, 0).filter(Boolean) : [];
+if (plan) return callArgumentCandidatesAt(plan, 0).filter(Boolean);
+if (seen.has(call)) return [];
+const next = new Set(seen);
+next.add(call);
+return [...new Set(functionReturnExpressionsOf(call.expression, next)
+  .filter((value) => ts.isCallExpression(value))
+  .flatMap((value) => objectCreatePrototypeValuesOf(value, next)))];
 };
 const objectAssignInvocationArgumentsOf = (call, seen = new Set()) => {
   const plan = staticMethodInvocationPlanOf(
     call, "assign", globalPrototypeObjectOf, seen
   );
-  return plan ? [...plan.before, ...plan.after].filter(Boolean) : undefined;
+if (plan) return [...plan.before, ...plan.after].filter(Boolean);
+if (seen.has(call)) return undefined;
+const next = new Set(seen);
+next.add(call);
+const returnedArguments = functionReturnExpressionsOf(call.expression, next)
+  .filter((value) => ts.isCallExpression(value))
+  .flatMap((value) => objectAssignInvocationArgumentsOf(value, next) ?? []);
+return returnedArguments.length > 0 ? returnedArguments : undefined;
 };
   const getPrototypeOfFunctionOf = (input, seen = new Set()) => {
     const node = unwrap(input);
@@ -2619,6 +2681,35 @@ const objectAssignInvocationArgumentsOf = (call, seen = new Set()) => {
     }
     return values;
   };
+const staticLogicalValueOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return undefined;
+  if (node.kind === ts.SyntaxKind.TrueKeyword) return { truthy: true, nullish: false };
+  if (node.kind === ts.SyntaxKind.FalseKeyword) return { truthy: false, nullish: false };
+  if (node.kind === ts.SyntaxKind.NullKeyword) return { truthy: false, nullish: true };
+  if (ts.isNumericLiteral(node)) {
+    return { truthy: Number(node.text) !== 0, nullish: false };
+  }
+  if (ts.isBigIntLiteral(node)) {
+    return { truthy: BigInt(node.text.slice(0, -1)) !== 0n, nullish: false };
+  }
+  if (ts.isStringLiteralLike(node)) {
+    return { truthy: node.text.length > 0, nullish: false };
+  }
+  if (ts.isArrayLiteralExpression(node) || ts.isObjectLiteralExpression(node) ||
+      ts.isFunctionLike(node)) return { truthy: true, nullish: false };
+  if (ts.isPrefixUnaryExpression(node) &&
+      node.operator === ts.SyntaxKind.ExclamationToken && !seen.has(node)) {
+    const value = staticLogicalValueOf(node.operand, new Set([...seen, node]));
+    return value ? { truthy: !value.truthy, nullish: false } : undefined;
+  }
+  if (!ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (binding?.kind !== "variable" || !binding.constant ||
+      !binding.node.initializer || seen.has(binding.node)) return undefined;
+  return staticLogicalValueOf(binding.node.initializer,
+    new Set([...seen, binding.node]));
+};
 const fixedSpreadPlansOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return [];
@@ -2634,6 +2725,25 @@ const fixedSpreadPlansOf = (input, seen = new Set()) => {
   if (ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
     return fixedSpreadPlansOf(node.right, next);
+  }
+  if (ts.isBinaryExpression(node) && [
+    ts.SyntaxKind.AmpersandAmpersandToken,
+    ts.SyntaxKind.BarBarToken,
+    ts.SyntaxKind.QuestionQuestionToken
+  ].includes(node.operatorToken.kind)) {
+    const leftValue = staticLogicalValueOf(node.left, next);
+    if (leftValue) {
+      const selectRight = node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+        ? leftValue.truthy
+        : node.operatorToken.kind === ts.SyntaxKind.BarBarToken
+        ? !leftValue.truthy
+        : leftValue.nullish;
+      return fixedSpreadPlansOf(selectRight ? node.right : node.left, next);
+    }
+    return [
+      ...fixedSpreadPlansOf(node.left, next),
+      ...fixedSpreadPlansOf(node.right, next)
+    ];
   }
   if (ts.isArrayLiteralExpression(node)) {
     let plans = [{ before: [], after: [], unknownIndex: undefined }];
@@ -3056,10 +3166,26 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
     const binding = resolveBinding(node);
     if (binding?.kind === "variable" &&
         ts.isVariableDeclaration(binding.node) &&
-        ts.isIdentifier(binding.node.name) && binding.node.initializer) {
-      return storedBindInvocationOf(
-        binding.node.initializer, invocationPlan, next
-      );
+        ts.isIdentifier(binding.node.name)) {
+      const declarationNext = new Set(next);
+      declarationNext.add(binding.node);
+      const values = [
+        binding.node.initializer,
+        ...(assignmentsByBinding.get(binding.node) ?? [])
+      ].filter(Boolean);
+      const candidates = [];
+      for (const value of values) {
+        const candidate = storedBindInvocationOf(
+          value, invocationPlan, declarationNext
+        );
+        if (candidate) candidates.push(candidate);
+      }
+        if (candidates.length > 0) {
+          return {
+            alternatives: candidates.flatMap((candidate) =>
+              candidate.alternatives ?? [candidate])
+          };
+      }
     }
     return undefined;
   }
@@ -3322,17 +3448,20 @@ const recordParameterFunctions = (parameter, functions) => {
     const collect = (node) => {
       if (ts.isCallExpression(node)) {
       const invocation = localInvocationOf(node);
-      for (const fn of invocation?.functions ?? []) {
+      const alternatives = invocation?.alternatives ?? [invocation].filter(Boolean);
+      for (const alternative of alternatives) {
+      const { functions, plan } = alternative;
+      for (const fn of functions) {
         capabilityArgumentsChanged = recordPlan(
-          functionArgumentsPlans, fn, invocation.plan
+          functionArgumentsPlans, fn, plan
         ) || capabilityArgumentsChanged;
         for (let index = 0; index < fn.parameters.length; index += 1) {
             const parameter = fn.parameters[index];
           if (parameter.dotDotDotToken) {
-        recordCapabilityArgumentsOf(parameter, invocation.plan, index);
+            recordCapabilityArgumentsOf(parameter, plan, index);
             break;
           }
-          for (const argument of callArgumentCandidatesAt(invocation.plan, index)) {
+          for (const argument of callArgumentCandidatesAt(plan, index)) {
             if (!argument) continue;
             capabilityArgumentsChanged = recordParameterFunctions(
               parameter, localFunctionValuesOf(argument)
@@ -3359,6 +3488,7 @@ const recordParameterFunctions = (parameter, functions) => {
               ) || capabilityArgumentsChanged;
             }
           }
+      }
           }
         }
       }
