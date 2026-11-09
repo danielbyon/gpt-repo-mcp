@@ -2912,6 +2912,29 @@ const globalCapabilitySourceOf = (input, seen = new Set()) => {
         ? expandedArgumentValuesOf(argument.expression, seen)
         : [argument]);
   }
+  function fixedCallArgumentCandidatesOf(argumentsList, index) {
+    const plan = fixedCallArgumentPlanOf(argumentsList);
+    if (plan.unknownAll || plan.unknownIndex !== undefined) return undefined;
+    const candidates = callArgumentCandidatesAt(plan, index);
+    return candidates.length > 0 ? candidates : [];
+  }
+  function expandedCallArgumentValuesOf(argumentsList, index, seen) {
+    const candidates = fixedCallArgumentCandidatesOf(argumentsList, index);
+    if (!candidates) return undefined;
+    return candidates.flatMap((value) =>
+      expandedArgumentValuesOf(value, seen));
+  }
+  function applicationArgumentPlanAtCallPositionOf(argumentsList, index, seen) {
+    const candidates = fixedCallArgumentCandidatesOf(argumentsList, index);
+    if (!candidates) return undefined;
+    if (candidates.length === 0) {
+      return { before: [], after: [], unknownIndex: undefined };
+    }
+    const plans = candidates.map((value) => argumentArrayPlanOf(value, seen));
+    if (plans.some((plan) => plan.unknownAll ||
+        plan.unknownIndex !== undefined)) return undefined;
+    return plans.reduce((left, right) => mergeCallArgumentPlans(left, right));
+  }
 function intrinsicArgumentPlanValuesOf(plan) {
   const values = [...plan.before];
   if (plan.unknownAll || plan.unknownIndex !== undefined) {
@@ -2925,27 +2948,32 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
   let target;
   let applicationArguments;
   if (reflectApplyReferenceOf(node.expression, seen)) {
-    target = node.arguments[0];
-    applicationArguments = node.arguments[2];
+    const targets = fixedCallArgumentCandidatesOf(node.arguments, 0);
+    if (!targets || targets.length !== 1) return undefined;
+    [target] = targets;
+    const applicationPlan = applicationArgumentPlanAtCallPositionOf(
+      node.arguments, 2, seen
+    );
+    if (!applicationPlan) return undefined;
+    applicationArguments = intrinsicArgumentPlanValuesOf(applicationPlan);
   } else {
     const wrapper = resolvedAccess(unwrap(node.expression));
     if (!wrapper || !["apply", "call"].includes(wrapper.method) ||
         !reflectApplyReferenceOf(wrapper.receiver, seen)) return undefined;
     const reflectedArguments = wrapper.method === "call"
-      ? node.arguments.slice(1)
-      : fixedSpreadValuesOf(node.arguments[1], seen);
+      ? intrinsicArgumentValuesOf(node.arguments.slice(1), seen)
+      : expandedCallArgumentValuesOf(node.arguments, 1, seen);
     if (!reflectedArguments) return undefined;
     target = reflectedArguments[0];
-    applicationArguments = reflectedArguments[2];
+    applicationArguments = reflectedArguments[2]
+      ? intrinsicArgumentPlanValuesOf(
+        argumentArrayPlanOf(reflectedArguments[2], seen)
+      ) : [];
   }
   if (!target) return undefined;
   return {
     target,
-    arguments: applicationArguments
-      ? intrinsicArgumentPlanValuesOf(
-        argumentArrayPlanOf(applicationArguments, seen)
-      )
-      : []
+    arguments: applicationArguments ?? []
   };
 }
   function boundIntrinsicArgumentsOf(
@@ -2993,20 +3021,20 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
       ) && globalIntrinsicMethodOf(
         node.arguments[0], receiverNames, methods, next
       )) {
-    const plan = wrapper.method === "call"
-      ? fixedCallArgumentPlanOf(node.arguments.slice(1))
-      : argumentArrayPlanOf(node.arguments[1], next);
-    return intrinsicArgumentPlanValuesOf(dropLeadingCallArgument(plan));
+    const bindArguments = wrapper.method === "call"
+      ? intrinsicArgumentValuesOf(node.arguments.slice(1), next)
+      : expandedCallArgumentValuesOf(node.arguments, 1, next);
+    return bindArguments?.slice(1);
   }
   if (wrapper && ["apply", "call"].includes(wrapper.method) &&
       genericBindMethodOf(wrapper.receiver, next) &&
       globalIntrinsicMethodOf(
         node.arguments[0], receiverNames, methods, next
       )) {
-    const plan = wrapper.method === "call"
-      ? fixedCallArgumentPlanOf(node.arguments.slice(1))
-      : argumentArrayPlanOf(node.arguments[1], next);
-    return intrinsicArgumentPlanValuesOf(dropLeadingCallArgument(plan));
+    const bindArguments = wrapper.method === "call"
+      ? intrinsicArgumentValuesOf(node.arguments.slice(1), next)
+      : expandedCallArgumentValuesOf(node.arguments, 1, next);
+    return bindArguments?.slice(1);
   }
   if (reflectApplyReferenceOf(node.expression, next) &&
       intrinsicBindMethodOf(
@@ -3014,18 +3042,74 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
       ) && globalIntrinsicMethodOf(
         node.arguments[1], receiverNames, methods, next
       )) {
-    const plan = argumentArrayPlanOf(node.arguments[2], next);
-    return intrinsicArgumentPlanValuesOf(dropLeadingCallArgument(plan));
+    const bindArguments = expandedCallArgumentValuesOf(
+      node.arguments, 2, next
+    );
+    return bindArguments?.slice(1);
   }
   if (reflectApplyReferenceOf(node.expression, next) &&
       genericBindMethodOf(node.arguments[0], next) &&
       globalIntrinsicMethodOf(
         node.arguments[1], receiverNames, methods, next
       )) {
-    const plan = argumentArrayPlanOf(node.arguments[2], next);
-    return intrinsicArgumentPlanValuesOf(dropLeadingCallArgument(plan));
+    const bindArguments = expandedCallArgumentValuesOf(
+      node.arguments, 2, next
+    );
+    return bindArguments?.slice(1);
   }
   return undefined;
+  }
+  function intrinsicMethodWrapperOf(
+    input, wrapperMethod, receiverNames, methods, seen = new Set()
+  ) {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return false;
+    const next = new Set(seen);
+    next.add(node);
+    if (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+      return intrinsicMethodWrapperOf(
+        node.right, wrapperMethod, receiverNames, methods, next
+      );
+    }
+    const member = resolvedAccess(node);
+    if (member) {
+      if (member.method === wrapperMethod && globalIntrinsicMethodOf(
+        member.receiver, receiverNames, methods, next
+      )) return true;
+      if (objectPropertyValuesOf(member.receiver, member.method, next)
+        .some((value) => intrinsicMethodWrapperOf(
+          value, wrapperMethod, receiverNames, methods, next
+        ))) return true;
+    }
+    if (ts.isCallExpression(node)) {
+      return functionReturnExpressionsOf(node.expression, next)
+        .some((value) => intrinsicMethodWrapperOf(
+          value, wrapperMethod, receiverNames, methods, next
+        ));
+    }
+    if (!ts.isIdentifier(node)) return false;
+    const binding = resolveBinding(node);
+    const declaration = binding?.node &&
+      (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node))
+      ? binding.node : undefined;
+    if (!declaration || seen.has(declaration)) return false;
+    const bindingNext = new Set(next);
+    bindingNext.add(declaration);
+    if ((destructuredPropertyAssignmentsByBinding.get(declaration) ?? [])
+      .some((assignment) => assignment.property === wrapperMethod &&
+        globalIntrinsicMethodOf(
+          assignment.source, receiverNames, methods, bindingNext
+        ))) return true;
+    if ([declaration.initializer,
+      ...(assignmentsByBinding.get(declaration) ?? [])].some((value) => value &&
+      intrinsicMethodWrapperOf(
+        value, wrapperMethod, receiverNames, methods, bindingNext
+      ))) return true;
+    return destructuredValuesOf(declaration, node.text).some((value) =>
+      intrinsicMethodWrapperOf(
+        value, wrapperMethod, receiverNames, methods, bindingNext
+      ));
   }
   function intrinsicInvocationArgumentsOf(
     input, receiverNames, methods, seen = new Set()
@@ -3043,6 +3127,37 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
       return [...(boundArguments ?? []), ...reflected.arguments];
     }
   }
+    const wrapper = resolvedAccess(unwrap(node.expression));
+    if (wrapper && ["apply", "call"].includes(wrapper.method)) {
+      for (const wrapperMethod of ["apply", "call"]) {
+        if (!intrinsicMethodWrapperOf(
+          wrapper.receiver, wrapperMethod, receiverNames, methods, seen
+        )) continue;
+        if (!globalIntrinsicMethodOf(
+          node.arguments[0], receiverNames, methods, seen
+        )) return undefined;
+        const methodArguments = wrapper.method === "call"
+          ? intrinsicArgumentValuesOf(node.arguments.slice(1), seen)
+          : expandedCallArgumentValuesOf(node.arguments, 1, seen);
+        if (!methodArguments) return undefined;
+        if (wrapperMethod === "apply") {
+          return methodArguments[1]
+            ? expandedArgumentValuesOf(methodArguments[1], seen) : [];
+        }
+        return methodArguments.slice(1);
+      }
+      const boundArguments = boundIntrinsicArgumentsOf(
+        wrapper.receiver, receiverNames, methods, seen
+      );
+      if (boundArguments !== undefined) {
+        const invocationArguments = wrapper.method === "call"
+          ? intrinsicArgumentValuesOf(node.arguments.slice(1), seen)
+          : expandedCallArgumentValuesOf(node.arguments, 1, seen);
+        if (invocationArguments) {
+          return [...boundArguments, ...invocationArguments];
+        }
+      }
+    }
     const boundArguments = boundIntrinsicArgumentsOf(
       node.expression, receiverNames, methods, seen
     );
@@ -3054,7 +3169,6 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
         ...intrinsicArgumentValuesOf(node.arguments, seen)
       ];
     }
-    const wrapper = resolvedAccess(unwrap(node.expression));
     if (!wrapper || !["apply", "call"].includes(wrapper.method) ||
         !globalIntrinsicMethodOf(wrapper.receiver, receiverNames, methods, seen)) {
       return undefined;
@@ -3063,7 +3177,7 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
       return intrinsicArgumentValuesOf(node.arguments.slice(1), seen);
     }
     if (!node.arguments[1]) return [];
-    return expandedArgumentValuesOf(node.arguments[1], seen);
+    return expandedCallArgumentValuesOf(node.arguments, 1, seen);
   }
   function patternSelectsProperty(pattern, targetName, property) {
     if (ts.isObjectBindingPattern(pattern)) {

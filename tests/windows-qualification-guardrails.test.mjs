@@ -349,6 +349,14 @@ describe("Windows qualification scope guard", () => {
   });
 
 test.each([
+  ["Array.of apply through nested fixed spread", "import { test } from 'vitest'; Array.of.apply(Array, ...[[test]])[0].only('focused', () => {});"],
+  ["Reflect.apply through nested fixed spread", "import { test } from 'vitest'; Reflect.apply(Array.of, Array, ...[[test]])[0].only('focused', () => {});"],
+  ["bound Array.of apply through nested fixed spread", "import { test } from 'vitest'; const bound = Array.of.bind(Array); bound.apply(Array, ...[[test]])[0].only('focused', () => {});"],
+  ["Reflect.apply call through nested fixed spread", "import { test } from 'vitest'; Reflect.apply.call(Reflect, Array.of, Array, ...[[test]])[0].only('focused', () => {});"],
+  ["Reflect.apply apply through fixed spread", "import { test } from 'vitest'; Reflect.apply.apply(Reflect, ...[[Array.of, Array, [test]]])[0].only('focused', () => {});"],
+  ["Reflect.apply through fixed target spread", "import { test } from 'vitest'; Reflect.apply(...[Array.of], Array, [test])[0].only('focused', () => {});"],
+  ["destructured Array.of apply", "import { test } from 'vitest'; const { apply } = Array.of; apply.call(Array.of, Array, ...[[test]])[0].only('focused', () => {});"],
+  ["member-held Array.of apply", "import { test } from 'vitest'; const tools = { apply: Array.of.apply }; tools.apply.call(Array.of, Array, [test])[0].only('focused', () => {});"],
   ["for-of array binding", "import { test } from 'vitest'; for (const register of [test]) { register.only('focused', () => {}); }",],
   ["for-of object destructuring", "import { test } from 'vitest'; for (const { register } of [{ register: test }]) { register.only('focused', () => {}); }"],
   ["for-of array destructuring", "import { test } from 'vitest'; for (const [register] of [[test]]) { register.only('focused', () => {}); }"],
@@ -390,6 +398,12 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
     "Array.of(safe)[0].only('safe', () => {});",
     "function safeSpread(...values: any[]) { values[0].only('safe', () => {}); } safeSpread(...Array.of.call(Array, safe));",
     "const make = Array.of.bind(Array); safeSpread(...make(safe));",
+    "Array.of.apply(Array, ...[[safe]])[0].only('safe', () => {});",
+    "Reflect.apply(Array.of, Array, ...[[safe]])[0].only('safe', () => {});",
+    "const bounded = Array.of.bind(Array); bounded.apply(Array, ...[[safe]])[0].only('safe', () => {});",
+    "Reflect.apply.call(Reflect, Array.of, Array, ...[[safe]])[0].only('safe', () => {});",
+    "const { apply } = Array.of; apply.call(Array.of, Array, [[safe]])[0][0].only('safe', () => {});",
+    "const applyTools = { apply: Array.of.apply }; applyTools.apply.call(Array.of, Array, [safe])[0].only('safe', () => {});",
     "function safeIterated(this: any) { this.only('safe', () => {}); } for (const fn of [safeIterated]) fn.call(safe);",
     "function safeDualCall(this: any) { this.only('safe', () => {}); } safeDualCall.call.call(safeDualCall, safe);",
     "function safeGeneric(this: any) { this.only('safe', () => {}); } const { call: invoke } = Function.prototype; invoke.call(safeGeneric, safe);",
@@ -1350,5 +1364,5 @@ test("accepts ordinary holes, rests, helpers, factories, and opaque spreads with
     ].join('\n');
     expect(collectWindowsTestTitles('fixture.ts', source))
       .toEqual([{ title: 'required', enabled: true }]);
-  });
+}, 20_000);
 });

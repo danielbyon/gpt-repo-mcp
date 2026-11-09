@@ -177,6 +177,16 @@ test.each([
   ["Array.of apply element", "Array.of.apply(Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
   ["Reflect.apply Array.of element", "Reflect.apply(Array.of, Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
   ["bound Array.of element", "const make = Array.of.bind(Array); make(process)[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["Array.of apply through nested fixed spread", "Array.of.apply(Array, ...[[process]])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["Reflect.apply through nested fixed spread", "Reflect.apply(Array.of, Array, ...[[process]])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["bound Array.of apply through nested fixed spread", "const bound = Array.of.bind(Array); bound.apply(Array, ...[[process]])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["Reflect.apply call through nested fixed spread", "Reflect.apply.call(Reflect, Array.of, Array, ...[[process]])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["Reflect.apply apply through fixed spread", "Reflect.apply.apply(Reflect, ...[[Array.of, Array, [process]]])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["Reflect.apply through fixed target spread", "Reflect.apply(...[Array.of], Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["destructured Array.of apply", "const { apply } = Array.of; apply.call(Array.of, Array, ...[[process]])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["member-held Array.of apply", "const tools = { apply: Array.of.apply }; tools.apply.call(Array.of, Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["for-of destructured getBuiltinModule", "for (const { getBuiltinModule: load } of [process]) { load('node:child_process').exec('id'); }"],
+  ["for-of Array.of destructured getBuiltinModule", "for (const { getBuiltinModule: load } of Array.of(process)) { load('node:child_process').exec('id'); }"],
   ["explicit this receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } load.call(process).exec('id');"],
   ["for-of function receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } for (const fn of [load]) fn.call(process).exec('id');"],
   ["for-of Array.of function receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } for (const fn of Array.of(load)) fn.call(process).exec('id');"],
@@ -198,6 +208,14 @@ test.each([
     .some((finding) => finding.includes("process.getBuiltinModule"))).toBe(true);
 });
 
+test.each([
+  ["eval", "for (const { eval: run } of [globalThis]) run('process');"],
+  ["process", "for (const { process: runtime } of [globalThis]) runtime.getBuiltinModule('node:child_process');"],
+  ["Function", "for (const { Function: make } of [globalThis]) make('return 1')();"],
+  ["require", "for (const { require: load } of [globalThis]) load('node:child_process');"]
+])("rejects for-of destructured global %s capability", (_name, source) => {
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
+});
 test.each([
   ["Object.assign", "const copy = Object.assign({}, process); copy.getBuiltinModule('node:child_process').exec('id');"],
   ["Object.create", "const copy = Object.create(process); copy.getBuiltinModule('node:child_process').exec('id');"]
@@ -239,6 +257,14 @@ test.each([
   "Array.of(processLike)[0].getBuiltinModule();",
     "Array.of.call(Array, processLike)[0].getBuiltinModule();",
     "const make = Array.of.bind(Array); make(processLike)[0].getBuiltinModule();",
+    "for (const { getBuiltinModule: safeLoad } of [processLike]) safeLoad();",
+    "for (const { eval: safeEval } of [{ eval() {} }]) safeEval('safe');",
+    "Array.of.apply(Array, ...[[processLike]])[0].getBuiltinModule();",
+    "Reflect.apply(Array.of, Array, ...[[processLike]])[0].getBuiltinModule();",
+    "const bounded = Array.of.bind(Array); bounded.apply(Array, ...[[processLike]])[0].getBuiltinModule();",
+    "Reflect.apply.call(Reflect, Array.of, Array, ...[[processLike]])[0].getBuiltinModule();",
+    "const { apply } = Array.of; apply.call(Array.of, Array, [[processLike]])[0][0].getBuiltinModule();",
+    "const applyTools = { apply: Array.of.apply }; applyTools.apply.call(Array.of, Array, [processLike])[0].getBuiltinModule();",
     "function iteratedSafe(this: any) { return this.getBuiltinModule(); } for (const fn of [iteratedSafe]) fn.call(processLike);",
     "function dualCallSafe(this: any) { return this.getBuiltinModule(); } dualCallSafe.call.call(dualCallSafe, processLike);",
   "{ const Array = { of(...values: any[]) { return values; } }; Array.of(processLike)[0].getBuiltinModule(); }",

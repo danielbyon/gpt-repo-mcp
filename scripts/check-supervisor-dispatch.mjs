@@ -2212,6 +2212,61 @@ const staticMethodReferenceOf = (
   }
   return false;
 };
+const staticMethodWrapperReferenceOf = (
+  input, wrapperProperty, property, ownerOf, seen = new Set()
+) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return staticMethodWrapperReferenceOf(
+      node.right, wrapperProperty, property, ownerOf, next
+    );
+  }
+  const member = memberAccess(node);
+  if (member) {
+    if (member.property === wrapperProperty &&
+        staticMethodReferenceOf(member.receiver, property, ownerOf, next)) {
+      return true;
+    }
+    if (memberValueCandidatesOf(member.receiver, member.property, next)
+      .some((value) => staticMethodWrapperReferenceOf(
+        value, wrapperProperty, property, ownerOf, next
+      ))) return true;
+  }
+  if (ts.isCallExpression(node)) {
+    return functionReturnExpressionsOf(node.expression, next)
+      .some((value) => staticMethodWrapperReferenceOf(
+        value, wrapperProperty, property, ownerOf, next
+      ));
+  }
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node)) return false;
+  const bindingNext = new Set(next);
+  bindingNext.add(binding.node);
+  if ((destructuredPropertyAssignmentsByBinding.get(binding.node) ?? [])
+    .some((assignment) => assignment.property === wrapperProperty &&
+      staticMethodReferenceOf(
+        assignment.source, property, ownerOf, bindingNext
+      ))) return true;
+  if (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) {
+    if (!ts.isIdentifier(binding.node.name)) {
+      return bindingPatternValuesOf(
+        binding.node.name, binding.node.initializer, node.text, bindingNext
+      ).some((value) => staticMethodWrapperReferenceOf(
+        value, wrapperProperty, property, ownerOf, bindingNext
+      ));
+    }
+    return activeBindingValuesOf(binding.node, node)
+      .some((value) => staticMethodWrapperReferenceOf(
+        value, wrapperProperty, property, ownerOf, bindingNext
+      ));
+  }
+  return false;
+};
 const globalCapabilitySourceOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
@@ -2811,6 +2866,27 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
         node.initializer) {
       inspectCapabilityArrayDestructuring(node.name, node.initializer);
     }
+    if (ts.isForOfStatement(node)) {
+      const targets = ts.isVariableDeclarationList(node.initializer)
+        ? node.initializer.declarations.map((declaration) => declaration.name)
+        : [unwrap(node.initializer)];
+      const iterated = fixedSpreadValuesOf(node.expression);
+      for (const target of targets) {
+        if (ts.isObjectBindingPattern(target) ||
+            ts.isObjectLiteralExpression(target)) {
+          if (iterated?.some((value) => processObjectOf(value))) {
+            inspectProcessDestructuring(target);
+          }
+          if (iterated?.some((value) =>
+            globalObjectOf(value) || globalCapabilitySourceOf(value))) {
+            inspectGlobalDestructuring(target);
+          }
+        } else if (ts.isArrayBindingPattern(target) ||
+                   ts.isArrayLiteralExpression(target)) {
+          inspectCapabilityArrayDestructuring(target, node.expression);
+        }
+      }
+    }
     if (ts.isVariableDeclaration(node) && node.initializer &&
         (ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name))) {
       inspectRequireDestructuring(node.name, node.initializer);
@@ -2890,6 +2966,77 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
     }
     return values;
   };
+const fixedBoundStaticArgumentsOf = (input, property, ownerOf, seen) => {
+  const plan = boundStaticMethodPrefixPlanOf(input, property, ownerOf, seen);
+  if (!plan || plan.unknownAll || plan.unknownIndex !== undefined) return undefined;
+  return [...plan.before, ...plan.after].filter(Boolean);
+};
+const fixedArrayOfInvocationArgumentsOf = (call, seen) => {
+  const argumentsList = expandedStaticArgumentsOf(call.arguments, seen);
+  if (!argumentsList) return undefined;
+
+  const invokedArgumentsOf = (invocationArguments) => {
+    if (!invocationArguments) return undefined;
+    const target = invocationArguments[0];
+    const applicationArguments = invocationArguments[2];
+    const applicationValues = applicationArguments
+      ? fixedSpreadValuesOf(applicationArguments, seen) : [];
+    if (!applicationValues) return undefined;
+    if (target && staticMethodReferenceOf(
+      target, "of", globalArrayObjectOf, seen
+    )) return applicationValues;
+    if (!target) return undefined;
+    const boundArguments = fixedBoundStaticArgumentsOf(
+      target, "of", globalArrayObjectOf, seen
+    );
+    return boundArguments
+      ? [...boundArguments, ...applicationValues] : undefined;
+  };
+
+  if (reflectApplyReferenceOf(call.expression, seen)) {
+    return invokedArgumentsOf(argumentsList);
+  }
+
+  const wrapper = memberAccess(unwrap(call.expression));
+  if (wrapper && ["apply", "call"].includes(wrapper.property)) {
+    const receiverArguments = wrapper.property === "call"
+      ? argumentsList.slice(1)
+      : argumentsList[1]
+        ? fixedSpreadValuesOf(argumentsList[1], seen) : [];
+    if (!receiverArguments) return undefined;
+    for (const wrapperMethod of ["apply", "call"]) {
+      if (!staticMethodWrapperReferenceOf(
+        wrapper.receiver, wrapperMethod, "of", globalArrayObjectOf, seen
+      )) continue;
+      if (!argumentsList[0] || !staticMethodReferenceOf(
+        argumentsList[0], "of", globalArrayObjectOf, seen
+      )) return undefined;
+      return wrapperMethod === "apply"
+        ? receiverArguments[1]
+          ? fixedSpreadValuesOf(receiverArguments[1], seen) : []
+        : receiverArguments.slice(1);
+    }
+    if (reflectApplyReferenceOf(wrapper.receiver, seen)) {
+      return invokedArgumentsOf(receiverArguments);
+    }
+    if (staticMethodReferenceOf(
+      wrapper.receiver, "of", globalArrayObjectOf, seen
+    )) return receiverArguments;
+    const boundArguments = fixedBoundStaticArgumentsOf(
+      wrapper.receiver, "of", globalArrayObjectOf, seen
+    );
+    if (boundArguments) return [...boundArguments, ...receiverArguments];
+  }
+
+  if (staticMethodReferenceOf(
+    call.expression, "of", globalArrayObjectOf, seen
+  )) return argumentsList;
+  const boundArguments = fixedBoundStaticArgumentsOf(
+    call.expression, "of", globalArrayObjectOf, seen
+  );
+  return boundArguments
+    ? [...boundArguments, ...argumentsList] : undefined;
+};
   const fixedSpreadValuesOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node || seen.has(node)) return undefined;
@@ -2974,6 +3121,8 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
       return fixedSpreadValuesOf(node.right, next);
     }
   if (ts.isCallExpression(node)) {
+  const arrayOfInvocation = fixedArrayOfInvocationArgumentsOf(node, next);
+  if (arrayOfInvocation) return arrayOfInvocation;
     if (reflectApplyReferenceOf(node.expression, next) &&
         staticMethodReferenceOf(
           node.arguments[0], "of", globalArrayObjectOf, next
