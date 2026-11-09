@@ -94,6 +94,8 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const parameterGlobalArguments = new Map();
   const parameterRequireArguments = new Map();
   const parameterRestArguments = new Map();
+const parameterFunctionArguments = new Map();
+const functionArgumentsPlans = new Map();
   const requireReferenceOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
@@ -841,6 +843,19 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     return objects;
   };
+const enclosingFunctionOf = (node) => {
+  let current = node?.parent;
+  while (current &&
+         !(ts.isFunctionLike(current) && !ts.isArrowFunction(current))) {
+    current = current.parent;
+  }
+  return current;
+};
+const functionArgumentsPlanOf = (identifier) => {
+  if (!ts.isIdentifier(identifier) || identifier.text !== "arguments" ||
+    resolveBinding(identifier)) return undefined;
+  return functionArgumentsPlans.get(enclosingFunctionOf(identifier));
+};
   const memberValueCandidatesOf = (input, property, seen = new Set()) => {
     const node = unwrap(input);
     if (!node || seen.has(node)) return [];
@@ -870,6 +885,11 @@ const assignmentMemberPathKey = (receiver, property) => {
       }
     }
     if (ts.isIdentifier(node)) {
+    if (/^\d+$/.test(property)) {
+      for (const plan of functionArgumentsPlanOf(node) ?? []) {
+        values.push(...callArgumentCandidatesAt(plan, Number(property)));
+      }
+    }
       values.push(...destructuredParameterValueCandidatesOf(
         node, property, next
       ));
@@ -973,6 +993,12 @@ const assignmentMemberPathKey = (receiver, property) => {
       const bindingNext = new Set(next);
       bindingNext.add(binding.node);
       if (ts.isFunctionLike(binding.node)) return [binding.node];
+    if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
+      const functions = parameterFunctionArguments.get(binding.node) ?? [];
+      if (functions.length > 0) {
+        return functions.flatMap((value) => localFunctionValuesOf(value, bindingNext));
+      }
+    }
       if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
           ts.isIdentifier(binding.node.name) && binding.node.initializer) {
         return localFunctionValuesOf(binding.node.initializer, bindingNext);
@@ -1241,6 +1267,41 @@ const globalReflectOf = (input, seen = new Set()) => {
   }
   const member = memberAccess(node);
   return member?.property === "Reflect" && globalObjectOf(member.receiver, seen);
+};
+const reflectApplyReferenceOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return false;
+  const member = memberAccess(node);
+  if (member?.property === "apply" && globalReflectOf(member.receiver, seen)) return true;
+  if (member && !seen.has(node)) {
+    const next = new Set(seen);
+    next.add(node);
+    const receiver = unwrap(member.receiver);
+    const binding = ts.isIdentifier(receiver) ? resolveBinding(receiver) : undefined;
+    const container = binding?.kind === "variable" && binding.constant &&
+      ts.isVariableDeclaration(binding.node) && binding.node.initializer
+      ? unwrap(binding.node.initializer) : receiver;
+    if (ts.isObjectLiteralExpression(container)) {
+      for (const property of container.properties) {
+        if (!("name" in property) ||
+            staticPropertyNameOf(property.name) !== member.property) continue;
+        const value = ts.isPropertyAssignment(property)
+          ? property.initializer
+          : ts.isShorthandPropertyAssignment(property) ? property.name : undefined;
+        if (value && reflectApplyReferenceOf(value, next)) return true;
+      }
+    }
+  }
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node) ||
+    !(ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) ||
+    !ts.isIdentifier(binding.node.name)) return false;
+  const next = new Set(seen);
+  next.add(binding.node);
+  return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+    .filter(Boolean)
+    .some((value) => reflectApplyReferenceOf(value, next));
 };
 const globalStringOf = (input, seen = new Set()) => {
   const node = unwrap(input);
@@ -2315,6 +2376,13 @@ const objectAssignInvocationArgumentsOf = (call, seen = new Set()) => {
         node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
       return fixedSpreadValuesOf(node.right, next);
     }
+  if (ts.isCallExpression(node)) {
+    const returned = functionReturnExpressionsOf(node.expression, next);
+    if (returned.length === 0) return undefined;
+    const expanded = returned.map((value) => fixedSpreadValuesOf(value, next));
+    if (expanded.some((value) => value === undefined)) return undefined;
+    return expanded.flat();
+  }
     const values = [];
     for (const value of resolvedValuesOf(node, next)) {
       if (!ts.isArrayLiteralExpression(value)) return undefined;
@@ -2351,12 +2419,26 @@ const fixedCallArgumentPlanOf = (argumentsList) => {
   return { before, after, unknownIndex };
 };
 const callArgumentCandidatesAt = (plan, index) => {
+  if (plan.unknownAll) return plan.after;
   const targetIndex = (plan.offset ?? 0) + index;
   if (targetIndex < plan.before.length) return [plan.before[targetIndex]];
   if (plan.unknownIndex === undefined) return [];
   return plan.after.slice(0, targetIndex - plan.before.length + 1);
 };
 const mergeCallArgumentPlans = (first, second) => {
+  if (first.unknownAll || second.unknownAll) {
+    return {
+      before: [],
+      after: [
+        ...first.before,
+        ...first.after,
+        ...second.before,
+        ...second.after
+      ],
+      unknownIndex: 0,
+      unknownAll: true
+    };
+  }
   if (first.unknownIndex === undefined) {
     const before = [...first.before, ...second.before];
     const unknownIndex = second.unknownIndex === undefined
@@ -2371,6 +2453,7 @@ const mergeCallArgumentPlans = (first, second) => {
 };
 const callArgumentPlansEqual = (left, right) =>
   (left.offset ?? 0) === (right.offset ?? 0) &&
+  Boolean(left.unknownAll) === Boolean(right.unknownAll) &&
   left.unknownIndex === right.unknownIndex &&
   left.before.length === right.before.length &&
   left.after.length === right.after.length &&
@@ -2380,13 +2463,150 @@ const argumentArrayPlanOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node) return { before: [], after: [], unknownIndex: 0 };
   if (ts.isArrayLiteralExpression(node)) return fixedCallArgumentPlanOf(node.elements);
+  if (ts.isObjectLiteralExpression(node)) {
+    const entries = new Map();
+    const uncertainValues = [];
+    let length;
+    let lengthIsStatic = true;
+    let shapeIsStatic = true;
+    const recordUncertainValuesOf = (input, unknownSeen = new Set()) => {
+      const candidate = unwrap(input);
+      if (!candidate || unknownSeen.has(candidate)) return;
+      const next = new Set(unknownSeen);
+      next.add(candidate);
+      const objects = objectValueCandidatesOf(candidate, next);
+      if (objects.length === 0) {
+        uncertainValues.push(candidate);
+        return;
+      }
+      for (const object of objects) {
+        for (const property of object.properties) {
+          if (ts.isSpreadAssignment(property)) {
+            recordUncertainValuesOf(property.expression, next);
+            continue;
+          }
+          if (!("name" in property)) continue;
+          const key = staticPropertyNameOf(property.name);
+          const propertyValue = ts.isPropertyAssignment(property)
+            ? property.initializer
+            : ts.isShorthandPropertyAssignment(property)
+              ? property.name : undefined;
+          const index = Number(key);
+          if (propertyValue && (key === undefined ||
+              (Number.isSafeInteger(index) && index >= 0 &&
+               String(index) === key))) {
+            uncertainValues.push(unwrap(propertyValue));
+          }
+        }
+      }
+    };
+    const applyObjectLiteral = (object, objectSeen) => {
+      for (const property of object.properties) {
+        if (ts.isSpreadAssignment(property)) {
+          applyContainer(property.expression, objectSeen);
+          continue;
+        }
+        if (!("name" in property)) {
+          shapeIsStatic = false;
+          continue;
+        }
+        const key = staticPropertyNameOf(property.name);
+        const value = ts.isPropertyAssignment(property)
+          ? property.initializer
+          : ts.isShorthandPropertyAssignment(property) ? property.name : undefined;
+        if (key === undefined || (!value &&
+            (ts.isMethodDeclaration(property) ||
+             ts.isGetAccessorDeclaration(property)))) {
+          shapeIsStatic = false;
+          if (value) uncertainValues.push(unwrap(value));
+          continue;
+        }
+        if (key === "length") {
+          const candidate = value && staticNumericNameOf(unwrap(value));
+          if (candidate === undefined || !Number.isSafeInteger(candidate) ||
+              candidate < 0 || candidate > 1024) lengthIsStatic = false;
+          else {
+            length = candidate;
+            lengthIsStatic = true;
+          }
+          continue;
+        }
+        const index = Number(key);
+        if (value && Number.isSafeInteger(index) && index >= 0 &&
+            String(index) === key) entries.set(index, unwrap(value));
+      }
+    };
+    const applyContainer = (input, containerSeen = new Set()) => {
+      const candidate = unwrap(input);
+      if (!candidate || containerSeen.has(candidate)) {
+        shapeIsStatic = false;
+        if (candidate) uncertainValues.push(candidate);
+        return;
+      }
+      const next = new Set(containerSeen);
+      next.add(candidate);
+      const values = [...resolvedValuesOf(candidate, next)];
+      if (values.length !== 1) {
+        shapeIsStatic = false;
+        recordUncertainValuesOf(candidate, next);
+        return;
+      }
+      const value = unwrap(values[0]);
+      if (ts.isObjectLiteralExpression(value)) {
+        applyObjectLiteral(value, next);
+        return;
+      }
+      if (ts.isArrayLiteralExpression(value)) {
+        for (let index = 0; index < value.elements.length; index += 1) {
+          const element = value.elements[index];
+          if (ts.isOmittedExpression(element)) continue;
+          if (ts.isSpreadElement(element)) {
+            shapeIsStatic = false;
+            recordUncertainValuesOf(element.expression, next);
+          } else {
+            entries.set(index, unwrap(element));
+          }
+        }
+        return;
+      }
+      shapeIsStatic = false;
+      recordUncertainValuesOf(candidate, next);
+    };
+    applyObjectLiteral(node, new Set([node]));
+    if (!shapeIsStatic || !lengthIsStatic || uncertainValues.length > 0) {
+        return {
+          before: [],
+          after: [
+            ...[...entries.entries()].sort(([left], [right]) => left - right)
+              .map(([, value]) => value),
+            ...uncertainValues
+          ],
+          unknownIndex: 0,
+          unknownAll: true
+        };
+    }
+    const before = Array.from({ length: length ?? 0 }, () => undefined);
+    for (const [index, value] of entries) {
+      if (index < before.length) before[index] = value;
+    }
+    return { before, after: [], unknownIndex: undefined };
+  }
   const expanded = fixedSpreadValuesOf(node, seen);
   return expanded
     ? { before: expanded, after: [], unknownIndex: undefined }
     : { before: [], after: [], unknownIndex: 0 };
 };
+const reflectApplyInvocationOf = (argumentsList, seen = new Set()) => {
+  const functions = localFunctionValuesOf(argumentsList[0], seen);
+  if (functions.length === 0) return undefined;
+  return { functions, plan: argumentArrayPlanOf(argumentsList[2], seen) };
+};
 const localInvocationOf = (call) => {
   const callee = unwrap(call.expression);
+  if (reflectApplyReferenceOf(callee)) {
+    const reflected = reflectApplyInvocationOf(call.arguments);
+    if (reflected) return reflected;
+  }
   if (ts.isCallExpression(callee)) {
     const bind = memberAccess(unwrap(callee.expression));
     if (bind?.property === "bind") {
@@ -2407,6 +2627,12 @@ const localInvocationOf = (call) => {
     return { functions: directFunctions, plan: fixedCallArgumentPlanOf(call.arguments) };
   }
   const wrapper = memberAccess(callee);
+  if (wrapper?.property === "bind") {
+    const functions = localFunctionValuesOf(wrapper.receiver);
+    if (functions.length > 0) {
+      return { functions, plan: fixedCallArgumentPlanOf(call.arguments.slice(1)) };
+    }
+  }
   if (wrapper && ["apply", "call"].includes(wrapper.property)) {
     const functions = localFunctionValuesOf(wrapper.receiver);
     if (functions.length > 0) {
@@ -2417,11 +2643,13 @@ const localInvocationOf = (call) => {
           : argumentArrayPlanOf(call.arguments[1])
       };
     }
-  }
-  if (wrapper?.property === "apply" && globalReflectOf(wrapper.receiver)) {
-    const functions = localFunctionValuesOf(call.arguments[0]);
-    if (functions.length > 0) {
-      return { functions, plan: argumentArrayPlanOf(call.arguments[2]) };
+    if (reflectApplyReferenceOf(wrapper.receiver)) {
+      const reflectedArguments = wrapper.property === "call"
+        ? call.arguments.slice(1)
+        : fixedSpreadValuesOf(call.arguments[1]);
+      const reflected = reflectedArguments &&
+        reflectApplyInvocationOf(reflectedArguments);
+      if (reflected) return reflected;
     }
   }
   return undefined;
@@ -2531,6 +2759,24 @@ const recordCapabilityArgumentsOf = (parameter, plan, offset = 0) => {
     }
   }
 };
+const recordPlan = (store, key, plan) => {
+  const plans = store.get(key) ?? [];
+  if (plans.some((stored) => callArgumentPlansEqual(stored, plan))) return false;
+  plans.push(plan);
+  store.set(key, plans);
+  return true;
+};
+const recordParameterFunctions = (parameter, functions) => {
+  const stored = parameterFunctionArguments.get(parameter) ?? [];
+  let changed = false;
+  for (const fn of functions) {
+    if (stored.includes(fn)) continue;
+    stored.push(fn);
+    changed = true;
+  }
+  parameterFunctionArguments.set(parameter, stored);
+  return changed;
+};
   let capabilityArgumentsChanged = true;
   while (capabilityArgumentsChanged) {
     capabilityArgumentsChanged = false;
@@ -2538,6 +2784,9 @@ const recordCapabilityArgumentsOf = (parameter, plan, offset = 0) => {
       if (ts.isCallExpression(node)) {
       const invocation = localInvocationOf(node);
       for (const fn of invocation?.functions ?? []) {
+        capabilityArgumentsChanged = recordPlan(
+          functionArgumentsPlans, fn, invocation.plan
+        ) || capabilityArgumentsChanged;
         for (let index = 0; index < fn.parameters.length; index += 1) {
             const parameter = fn.parameters[index];
           if (parameter.dotDotDotToken) {
@@ -2546,6 +2795,9 @@ const recordCapabilityArgumentsOf = (parameter, plan, offset = 0) => {
           }
           for (const argument of callArgumentCandidatesAt(invocation.plan, index)) {
             if (!argument) continue;
+            capabilityArgumentsChanged = recordParameterFunctions(
+              parameter, localFunctionValuesOf(argument)
+            ) || capabilityArgumentsChanged;
             if (carriesParameterCapabilityOf(
               parameter, argument, processObjectOf
             )) {
