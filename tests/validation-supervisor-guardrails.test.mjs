@@ -173,7 +173,19 @@ test.each([
   ["for-of array binding", "for (const runtime of [process]) { runtime.getBuiltinModule('node:child_process').exec('id'); }"],
   ["Array.of element", "Array.of(process)[0].getBuiltinModule('node:child_process').exec('id');"],
   ["aliased Array.of element", "const make = Array.of; make(process)[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["Array.of call element", "Array.of.call(Array, process)[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["Array.of apply element", "Array.of.apply(Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["Reflect.apply Array.of element", "Reflect.apply(Array.of, Array, [process])[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["bound Array.of element", "const make = Array.of.bind(Array); make(process)[0].getBuiltinModule('node:child_process').exec('id');"],
   ["explicit this receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } load.call(process).exec('id');"],
+  ["for-of function receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } for (const fn of [load]) fn.call(process).exec('id');"],
+  ["for-of Array.of function receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } for (const fn of Array.of(load)) fn.call(process).exec('id');"],
+  ["dual call receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } load.call.call(load, process).exec('id');"],
+  ["generic call receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } Function.prototype.call.call(load, process).exec('id');"],
+  ["generic apply call receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } Function.prototype.apply.call(load, process, []).exec('id');"],
+  ["aliased generic call receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const invoke = Function.prototype.call; invoke.call(load, process).exec('id');"],
+  ["destructured generic call receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const { call: invoke } = Function.prototype; invoke.call(load, process).exec('id');"],
+  ["member-held generic call receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const holder = { invoke: Function.prototype.call }; holder.invoke.call(load, process).exec('id');"],
   ["immediate bound this receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } load.bind(process)().exec('id');"],
   ["stored bound this receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const bound = load.bind(process); bound().exec('id');"],
   ["stored bound this through call", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const bound = load.bind(process); bound.call(null).exec('id');"],
@@ -182,7 +194,8 @@ test.each([
   ["alternate spread bind receiver", "declare const condition: boolean; function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const receiver = condition ? { getBuiltinModule() {} } : process; load.bind(...[receiver])().exec('id');"],
   ["runtime argument after explicit this", "function load(this: unknown, runtime: typeof process) { return runtime.getBuiltinModule('node:child_process'); } load.call(null, process).exec('id');"]
 ])("rejects process provenance through %s", (_name, source) => {
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+    .some((finding) => finding.includes("process.getBuiltinModule"))).toBe(true);
 });
 
 test.each([
@@ -224,6 +237,10 @@ test.each([
       "plainGet({ value: 1 }, 'value');",
   "for (const runtime of [processLike]) runtime.getBuiltinModule();",
   "Array.of(processLike)[0].getBuiltinModule();",
+    "Array.of.call(Array, processLike)[0].getBuiltinModule();",
+    "const make = Array.of.bind(Array); make(processLike)[0].getBuiltinModule();",
+    "function iteratedSafe(this: any) { return this.getBuiltinModule(); } for (const fn of [iteratedSafe]) fn.call(processLike);",
+    "function dualCallSafe(this: any) { return this.getBuiltinModule(); } dualCallSafe.call.call(dualCallSafe, processLike);",
   "{ const Array = { of(...values: any[]) { return values; } }; Array.of(processLike)[0].getBuiltinModule(); }",
   "function receiverSafe(this: any) { return this.getBuiltinModule(); } receiverSafe.call(processLike);",
   "const boundReceiverSafe = receiverSafe.bind(processLike); boundReceiverSafe();",
