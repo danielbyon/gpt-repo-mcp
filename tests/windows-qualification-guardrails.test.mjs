@@ -15,6 +15,10 @@ function windowsStep(workflow, name) {
   return step;
 }
 
+// Populate the parser cache before Vitest applies the per-test timeout. The
+// first repository inspection parses several large test files.
+inspect(load());
+
 describe("Windows qualification scope guard", () => {
 
   test.each(["if", "continue-on-error"])("rejects a disabled Windows job via %s", (key) => {
