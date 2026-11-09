@@ -509,41 +509,6 @@ const assignmentReferenceKey = (input, seen = new Set()) => {
   if (seen.has(binding.node)) return `binding:${binding.node.pos}`;
   const next = new Set(seen);
   next.add(binding.node);
-  if (binding.kind === "variable" && ts.isBindingElement(binding.node)) {
-    const referenceStart = node.pos;
-    const destructuredValues = (destructuredPropertyAssignmentsByBinding.get(
-      binding.node
-    ) ?? []).flatMap((assignment) => destructuredObjectPropertyValuesOf(
-      assignment.source, assignment.property, next
-    ));
-    const assignments = [
-      ...destructuredValues,
-      ...(assignmentsByBinding.get(binding.node) ?? [])
-    ]
-      .filter((value) => value.pos <= referenceStart ||
-        enclosingFunctionOf(value) !== enclosingFunctionOf(node));
-    const keys = assignments.map((value) => assignmentReferenceKey(value, next));
-    const uniqueKeys = [...new Set(keys)];
-    if (assignments.length > 0 && keys.length === assignments.length &&
-        uniqueKeys.length === 1 && uniqueKeys[0] !== undefined) {
-      return uniqueKeys[0];
-    }
-  }
-  if ((binding.kind === "variable" || binding.kind === "opaque") &&
-      ts.isVariableDeclaration(binding.node) &&
-      !ts.isIdentifier(binding.node.name) && binding.node.initializer) {
-    const referenceStart = node.pos;
-    const values = bindingPatternValuesOf(
-      binding.node.name, binding.node.initializer, node.text, next
-    ).filter((value) => value.pos <= referenceStart ||
-      enclosingFunctionOf(value) !== enclosingFunctionOf(node));
-    const keys = values.map((value) => assignmentReferenceKey(value, next));
-    const uniqueKeys = [...new Set(keys)];
-    if (values.length > 0 && keys.length === values.length &&
-        uniqueKeys.length === 1 && uniqueKeys[0] !== undefined) {
-      return uniqueKeys[0];
-    }
-  }
   if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
       ts.isIdentifier(binding.node.name) && binding.node.initializer &&
       (ts.isIdentifier(unwrap(binding.node.initializer)) ||
@@ -3373,6 +3338,19 @@ const workerReferenceMatchesKeysOf = (
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
   if (targetKeys.has(assignmentReferenceKey(node))) return true;
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if ((binding?.kind === "variable" || binding?.kind === "opaque") &&
+        ts.isVariableDeclaration(binding.node) && binding.node.initializer &&
+        !ts.isIdentifier(binding.node.name)) {
+      const next = new Set(seen);
+      next.add(node);
+      next.add(binding.node);
+      return bindingPatternValuesOf(
+        binding.node.name, binding.node.initializer, node.text, next
+      ).some((value) => workerReferenceMatchesKeysOf(value, targetKeys, next));
+    }
+  }
   const member = assignmentMemberAccess(node);
   if (!member) return false;
   const next = new Set(seen);
