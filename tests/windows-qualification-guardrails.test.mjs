@@ -870,6 +870,19 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
     ["destructured Reflect.apply", "import { test } from 'vitest'; const { apply } = Reflect; function focus(register) { register.only('focused', () => {}); } apply(focus, null, [test]);"],
     ["getter-held Reflect.apply", "import { test } from 'vitest'; const tools = { get invoke() { return Reflect.apply; } }; function focus(register) { register.only('focused', () => {}); } tools.invoke(focus, null, [test]);"],
     ["stored bound Reflect.apply", "import { test } from 'vitest'; const invoke = Reflect.apply.bind(null, function focus(register) { register.only('focused', () => {}); }, null); invoke([test]);"],
+    ["fixed bound Reflect.apply receiver", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } Reflect.apply.bind(null, focus, { register: test })([]);"],
+    ["deferred bound Reflect.apply receiver", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } const invoke = Reflect.apply.bind(null, focus); invoke({ register: test }, []);"],
+    ["spread-bound Reflect.apply receiver", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } Reflect.apply.bind(...[null, focus, { register: test }])([]);"],
+    ["member-held bound Reflect.apply receiver", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } const invoke = Reflect.apply.bind(null, focus); const tools = { invoke }; tools.invoke({ register: test }, []);"],
+    ["inline member-held bound Reflect.apply receiver", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } const tools = { invoke: Reflect.apply.bind(null, focus) }; tools.invoke({ register: test }, []);"],
+    ["assigned member-held bound Reflect.apply receiver", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } const tools: any = {}; tools.invoke = Reflect.apply.bind(null, focus); tools.invoke({ register: test }, []);"],
+    ["nested rest runner binding", "import { test } from 'vitest'; const [[...[{ register }]]] = [[{ register: test }]]; register.only('focused', () => {});"],
+    ["nested rest runner for-of", "import { test } from 'vitest'; for (const [[...[{ register }]]] of [[[{ register: test }]]]) { register.only('focused', () => {}); }"],
+    ["nested rest runner parameter", "import { test } from 'vitest'; function focus(...[, { register }]) { register.only('focused', () => {}); } focus(null, { register: test });"],
+    ["explicit undefined object default", "import { test } from 'vitest'; const { register = test } = { register: undefined }; register.only('focused', () => {});"],
+    ["void object default", "import { test } from 'vitest'; const { register = test } = { register: void 0 }; register.only('focused', () => {});"],
+    ["explicit undefined array default", "import { test } from 'vitest'; const [register = test] = [undefined]; register.only('focused', () => {});"],
+    ["stored Array.of result", "import { test } from 'vitest'; const args = Array.of(test); args[0].only('focused', () => {});"],
     ["Reflect.get call", "import { test } from 'vitest'; globalThis.Reflect.get.call(null, test, 'only')('focused', () => {});"],
     ["Reflect.get apply", "import { test } from 'vitest'; globalThis.Reflect.get.apply(null, [test, 'only'])('focused', () => {});"],
     ["Reflect.get bind", "import { test } from 'vitest'; globalThis.Reflect.get.bind(null, test, 'only')()('focused', () => {});"],
@@ -1418,4 +1431,17 @@ test("accepts ordinary holes, rests, helpers, factories, and opaque spreads with
     expect(collectWindowsTestTitles('fixture.ts', source))
       .toEqual([{ title: 'required', enabled: true }]);
 }, 20_000);
+test.each([
+["member-held bound Reflect.apply receiver", "import { testLike } from 'vitest'; function focus(this: any) { this.register.only('safe', () => {}); } const invoke = Reflect.apply.bind(null, focus); const tools = { invoke }; tools.invoke({ register: testLike }, []);"],
+["spread-bound Reflect.apply receiver", "import { testLike } from 'vitest'; const noop = () => {}; const invoke = Reflect.apply.bind(...[null, noop, null]); invoke([testLike]);"],
+["nested rest runner binding", "import { testLike } from 'vitest'; const [[...[{ register }]]] = [[{ register: testLike }]]; register.only('safe', () => {});"],
+["nested rest runner for-of", "import { testLike } from 'vitest'; for (const [[...[{ register }]]] of [[[{ register: testLike }]]]) { register.only('safe', () => {}); }"],
+["nested rest runner parameter", "import { testLike } from 'vitest'; function focus(...[, { register }]) { register.only('safe', () => {}); } focus(null, { register: testLike });"],
+["explicit undefined object default", "import { testLike } from 'vitest'; const { register = testLike } = { register: undefined }; register.only('safe', () => {});"],
+["explicit undefined array default", "import { testLike } from 'vitest'; const [register = testLike] = [undefined]; register.only('safe', () => {});"],
+["stored Array.of result", "import { testLike } from 'vitest'; const args = Array.of(testLike); args[0].only('safe', () => {});"]
+])('accepts bounded safe provenance through %s', (_name, source) => {
+const titles = collectWindowsTestTitles('fixture.ts', source);
+expect(titles).toEqual([]);
+});
 });

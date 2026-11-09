@@ -2237,6 +2237,15 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
     for (const plan of functionArgumentsPlanOf(reference) ?? []) {
       values.push(...callArgumentCandidatesAt(plan, Number(key)));
     }
+    for (const value of expressionValuesOf(reference, seen)) {
+      if (!ts.isCallExpression(value)) continue;
+      const arrayOfArguments = intrinsicInvocationArgumentsOf(
+        value, ["Array"], ["of"], seen
+      );
+      if (arrayOfArguments?.[Number(key)]) {
+        values.push(arrayOfArguments[Number(key)]);
+      }
+    }
   }
   if (reference && ts.isCallExpression(reference) && /^\d+$/.test(key)) {
     const arrayOfArguments = intrinsicInvocationArgumentsOf(
@@ -2266,6 +2275,12 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
           /^\d+$/.test(key)) {
         for (const plan of parameterRestArguments.get(binding.node) ?? []) {
           values.push(...callArgumentCandidatesAt(plan, Number(key)).filter(Boolean));
+        }
+      } else if (binding.node.dotDotDotToken) {
+        for (const plan of parameterRestArguments.get(binding.node) ?? []) {
+          values.push(...destructuredPlanValuesOf(
+            binding.node.name, plan, reference.text
+          ));
         }
       } else if (!ts.isIdentifier(binding.node.name)) {
         const sources = [
@@ -2311,6 +2326,44 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
 // Resolve the source value selected for one identifier in an assignment pattern.
   const destructuredSourceValuesOf = (pattern, source, targetName) => {
   const values = [];
+    const usesDefault = (value) => {
+      const candidate = unwrap(value);
+      return ts.isVoidExpression(candidate) ||
+        (ts.isIdentifier(candidate) && candidate.text === "undefined" &&
+          !resolveBinding(candidate));
+    };
+    const candidatesWithDefault = (selected, initializer) =>
+      initializer && (selected.length === 0 || selected.some(usesDefault))
+        ? [...selected, initializer]
+        : selected;
+    const visitArrayRestPattern = (restPattern, restSource, startIndex) => {
+      for (let offset = 0; offset < restPattern.elements.length; offset += 1) {
+        const element = restPattern.elements[offset];
+        if (ts.isOmittedExpression(element)) continue;
+        const index = startIndex + offset;
+        if (element.dotDotDotToken) {
+          if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+            values.push(restSource);
+          } else if (ts.isObjectBindingPattern(element.name) ||
+            ts.isArrayBindingPattern(element.name)) {
+            visitArrayRestPattern(element.name, restSource, index);
+          }
+          break;
+        }
+        const selected = objectPropertyValuesOf(restSource, String(index));
+        const candidates = candidatesWithDefault(
+          selected, element.initializer
+        );
+        if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+          values.push(...candidates);
+        } else if (ts.isObjectBindingPattern(element.name) ||
+          ts.isArrayBindingPattern(element.name)) {
+          for (const candidate of candidates) {
+            visitPattern(element.name, candidate);
+          }
+        }
+      }
+    };
   const visitPattern = (pattern, source) => {
     if (ts.isObjectBindingPattern(pattern)) {
       for (const element of pattern.elements) {
@@ -2325,9 +2378,7 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
           ? assignmentKey(element.propertyName)
           : ts.isIdentifier(element.name) ? element.name.text : undefined;
         const selected = key === undefined ? [] : objectPropertyValuesOf(source, key);
-        const candidates = selected.length > 0
-          ? selected
-          : element.initializer ? [element.initializer] : [];
+        const candidates = candidatesWithDefault(selected, element.initializer);
         if (ts.isIdentifier(element.name) && element.name.text === targetName) {
           values.push(...candidates);
         } else if (ts.isObjectBindingPattern(element.name) ||
@@ -2338,11 +2389,16 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
     } else if (ts.isArrayBindingPattern(pattern)) {
       for (let index = 0; index < pattern.elements.length; index += 1) {
         const element = pattern.elements[index];
-        if (!ts.isBindingElement(element) || element.dotDotDotToken) continue;
+        if (!ts.isBindingElement(element)) continue;
+        if (element.dotDotDotToken) {
+          if (ts.isObjectBindingPattern(element.name) ||
+            ts.isArrayBindingPattern(element.name)) {
+            visitArrayRestPattern(element.name, source, index);
+          }
+          continue;
+        }
         const selected = objectPropertyValuesOf(source, String(index));
-        const candidates = selected.length > 0
-          ? selected
-          : element.initializer ? [element.initializer] : [];
+        const candidates = candidatesWithDefault(selected, element.initializer);
         if (ts.isIdentifier(element.name) && element.name.text === targetName) {
           values.push(...candidates);
         } else if (ts.isObjectBindingPattern(element.name) ||
@@ -2353,6 +2409,37 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
     }
   };
     visitPattern(pattern, source);
+  return values;
+};
+const destructuredPlanValuesOf = (pattern, plan, targetName) => {
+  if (!ts.isArrayBindingPattern(pattern)) return [];
+  const values = [];
+  const visitArrayPlan = (arrayPattern, arrayPlan, startIndex) => {
+    for (let offset = 0; offset < arrayPattern.elements.length; offset += 1) {
+      const element = arrayPattern.elements[offset];
+      if (ts.isOmittedExpression(element)) continue;
+      const index = startIndex + offset;
+      if (element.dotDotDotToken) {
+        if (ts.isObjectBindingPattern(element.name) ||
+          ts.isArrayBindingPattern(element.name)) {
+          visitArrayPlan(element.name, arrayPlan, index);
+        }
+        break;
+      }
+      const candidates = callArgumentCandidatesAt(arrayPlan, index);
+      if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+        values.push(...candidates);
+      } else if (ts.isObjectBindingPattern(element.name) ||
+        ts.isArrayBindingPattern(element.name)) {
+        for (const candidate of candidates) {
+          values.push(...destructuredSourceValuesOf(
+            element.name, candidate, targetName
+          ));
+        }
+      }
+    }
+  };
+  visitArrayPlan(pattern, plan, 0);
   return values;
 };
   const destructuredValuesOf = (declaration, targetName) => {
@@ -3074,8 +3161,28 @@ function boundIntrinsicWrapperMethodOf(
   if (!node || seen.has(node)) return undefined;
   const next = new Set(seen);
   next.add(node);
+  const member = resolvedAccess(node);
+  if (member) {
+    for (const value of objectPropertyValuesOf(
+      member.receiver, member.method, next
+    )) {
+      const method = boundIntrinsicWrapperMethodOf(
+        value, receiverNames, methods, next
+      );
+      if (method) return method;
+    }
+  }
   if (ts.isIdentifier(node)) {
     const binding = resolveBinding(node);
+    if (binding?.node && (ts.isVariableDeclaration(binding.node) ||
+      ts.isParameter(binding.node)) && !ts.isIdentifier(binding.node.name) &&
+      binding.node.initializer) {
+      return destructuredSourceValuesOf(
+        binding.node.name, binding.node.initializer, node.text
+      ).some((value) => boundIntrinsicWrapperMethodOf(
+        value, receiverNames, methods, next
+      ));
+    }
     const declaration = binding?.kind === "variable" &&
       ts.isVariableDeclaration(binding.node) &&
       ts.isIdentifier(binding.node.name) ? binding.node : undefined;
@@ -4218,6 +4325,16 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
     }
     return undefined;
   }
+  const member = resolvedAccess(node);
+  if (member) {
+    const alternatives = objectPropertyValuesOf(
+      member.receiver, member.method, next
+    ).flatMap((value) => {
+      const candidate = storedBindInvocationOf(value, invocationPlan, next);
+      return candidate ? candidate.alternatives ?? [candidate] : [];
+    });
+    if (alternatives.length > 0) return { alternatives };
+  }
   if (ts.isBinaryExpression(node) && [
     ts.SyntaxKind.AmpersandAmpersandToken,
     ts.SyntaxKind.BarBarToken,
@@ -4250,12 +4367,13 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
   if (!ts.isCallExpression(node)) return undefined;
   const bind = bindMethodReferenceOf(node.expression, next);
   if (bind?.method === "bind") {
+    const bindPlan = fixedCallArgumentPlanOf(node.arguments);
     const plan = mergeCallArgumentPlans(
-      fixedCallArgumentPlanOf(node.arguments.slice(1)),
+      dropLeadingCallArgument(bindPlan),
       invocationPlan
     );
-    const thisArguments = callArgumentCandidatesAt(
-      fixedCallArgumentPlanOf(node.arguments), 0
+    const bindThisArguments = callArgumentCandidatesAt(
+      bindPlan, 0
     );
     if (reflectApplyReferenceOf(bind.receiver, next)) {
       const functions = callArgumentCandidatesAt(plan, 0)
@@ -4269,13 +4387,13 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
             ? applicationPlans.reduce((left, right) =>
               mergeCallArgumentPlans(left, right))
             : { before: [], after: [], unknownIndex: 0 },
-          thisArguments
+          thisArguments: callArgumentCandidatesAt(plan, 1)
         };
       }
     }
     const functions = localFunctionValuesOf(bind.receiver, next);
     if (functions.length > 0) {
-      return { functions, plan, thisArguments };
+      return { functions, plan, thisArguments: bindThisArguments };
     }
   }
   const bindWrapper = resolvedAccess(unwrap(node.expression));
@@ -4516,15 +4634,17 @@ const localInvocationOf = (call) => {
 };
 const recordRestArgumentsOf = (parameter, plan, offset = 0) => {
   const positionedPlan = offset === 0 ? plan : { ...plan, offset };
-  if (ts.isIdentifier(parameter.name)) {
-    const plans = parameterRestArguments.get(parameter) ?? [];
-    if (plans.some((stored) => callArgumentPlansEqual(stored, positionedPlan))) return false;
+  let changed = false;
+  const plans = parameterRestArguments.get(parameter) ?? [];
+  if (!plans.some((stored) => callArgumentPlansEqual(stored, positionedPlan))) {
     plans.push(positionedPlan);
     parameterRestArguments.set(parameter, plans);
-    return true;
+    changed = true;
   }
-  if (!ts.isArrayBindingPattern(parameter.name)) return false;
-  let changed = false;
+  if (ts.isIdentifier(parameter.name)) {
+    return changed;
+  }
+  if (!ts.isArrayBindingPattern(parameter.name)) return changed;
   for (let index = 0; index < parameter.name.elements.length; index += 1) {
     const element = parameter.name.elements[index];
     if (!ts.isBindingElement(element)) continue;

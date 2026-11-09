@@ -1056,8 +1056,16 @@ if (ts.isGetAccessorDeclaration(candidate)) {
       }
     }
     for (const value of resolvedValuesOf(node, next)) {
-      if (!ts.isArrayLiteralExpression(value) || !/^\d+$/.test(property)) continue;
-      values.push(...fixedIndexedValuesOf(value, Number(property)));
+      if (!/^\d+$/.test(property)) continue;
+      if (ts.isArrayLiteralExpression(value)) {
+        values.push(...fixedIndexedValuesOf(value, Number(property)));
+        continue;
+      }
+      if (ts.isCallExpression(value)) {
+        const argumentsList = fixedArrayOfInvocationArgumentsOf(value, next);
+        const indexed = argumentsList?.[Number(property)];
+        if (indexed) values.push(indexed);
+      }
     }
     if (ts.isIdentifier(node)) {
     if (/^\d+$/.test(property)) {
@@ -1094,6 +1102,57 @@ if (ts.isGetAccessorDeclaration(candidate)) {
   };
   const bindingPatternValuesOf = (pattern, source, targetName, seen = new Set()) => {
     const values = [];
+    const usesDefault = (value) => {
+      const candidate = unwrap(value);
+      return ts.isVoidExpression(candidate) ||
+        (ts.isIdentifier(candidate) && candidate.text === "undefined" &&
+          !resolveBinding(candidate));
+    };
+    const candidatesWithDefault = (selected, initializer) =>
+      initializer && (selected.length === 0 || selected.some(usesDefault))
+        ? [...selected, initializer]
+        : selected;
+    const arrayRestValuesOf = (restPattern, restSource, startIndex) => {
+      const restValues = [];
+      for (let offset = 0; offset < restPattern.elements.length; offset += 1) {
+        const element = restPattern.elements[offset];
+        if (ts.isOmittedExpression(element)) continue;
+        const index = startIndex + offset;
+        if (element.dotDotDotToken) {
+          if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+            restValues.push(restSource);
+          } else if (ts.isObjectBindingPattern(element.name) ||
+            ts.isArrayBindingPattern(element.name)) {
+            restValues.push(...arrayRestValuesOf(
+              element.name, restSource, index
+            ));
+          }
+          break;
+        }
+        const selected = memberValueCandidatesOf(
+          restSource, String(index), seen
+        );
+        for (const candidate of fixedIndexedValuesOf(
+          restSource, index, seen
+        )) {
+          if (!selected.includes(candidate)) selected.push(candidate);
+        }
+        const candidates = candidatesWithDefault(
+          selected, element.initializer
+        );
+        if (ts.isIdentifier(element.name) && element.name.text === targetName) {
+          restValues.push(...candidates);
+        } else if (ts.isObjectBindingPattern(element.name) ||
+          ts.isArrayBindingPattern(element.name)) {
+          for (const candidate of candidates) {
+            restValues.push(...bindingPatternValuesOf(
+              element.name, candidate, targetName, seen
+            ));
+          }
+        }
+      }
+      return restValues;
+    };
     if (ts.isObjectBindingPattern(pattern)) {
       for (const element of pattern.elements) {
         const key = element.propertyName
@@ -1106,9 +1165,7 @@ if (ts.isGetAccessorDeclaration(candidate)) {
           continue;
         }
         const selected = key === undefined ? [] : memberValueCandidatesOf(source, key, seen);
-        const candidates = selected.length > 0
-          ? selected
-          : element.initializer ? [element.initializer] : [];
+        const candidates = candidatesWithDefault(selected, element.initializer);
         if (ts.isIdentifier(element.name) && element.name.text === targetName) {
           values.push(...candidates);
         } else if (ts.isObjectBindingPattern(element.name) ||
@@ -1127,6 +1184,9 @@ if (ts.isGetAccessorDeclaration(candidate)) {
         if (element.dotDotDotToken) {
           if (ts.isIdentifier(element.name) && element.name.text === targetName) {
             values.push(source);
+          } else if (ts.isObjectBindingPattern(element.name) ||
+            ts.isArrayBindingPattern(element.name)) {
+            values.push(...arrayRestValuesOf(element.name, source, index));
           }
           continue;
         }
@@ -1134,9 +1194,7 @@ if (ts.isGetAccessorDeclaration(candidate)) {
         for (const candidate of fixedIndexedValuesOf(source, index, seen)) {
           if (!selected.includes(candidate)) selected.push(candidate);
         }
-        const candidates = selected.length > 0
-          ? selected
-          : element.initializer ? [element.initializer] : [];
+        const candidates = candidatesWithDefault(selected, element.initializer);
         if (ts.isIdentifier(element.name) && element.name.text === targetName) {
           values.push(...candidates);
         } else if (ts.isObjectBindingPattern(element.name) ||
@@ -1164,6 +1222,64 @@ const bindingPatternSelectsPropertyOf = (pattern, targetName, property) => {
     }
     return bindingPatternSelectsPropertyOf(element.name, targetName, property);
   });
+};
+const bindingPatternSourcePropertyOf = (
+  pattern, source, targetName, property, seen = new Set()
+) => {
+  const sources = [];
+  const visitArrayPattern = (arrayPattern, arraySource, startIndex) => {
+    for (let offset = 0; offset < arrayPattern.elements.length; offset += 1) {
+      const element = arrayPattern.elements[offset];
+      if (ts.isOmittedExpression(element)) continue;
+      const index = startIndex + offset;
+      if (element.dotDotDotToken) {
+        if (ts.isObjectBindingPattern(element.name) ||
+          ts.isArrayBindingPattern(element.name)) {
+          visitArrayPattern(element.name, arraySource, index);
+        }
+        break;
+      }
+      const selected = memberValueCandidatesOf(
+        arraySource, String(index), seen
+      );
+      for (const candidate of fixedIndexedValuesOf(
+        arraySource, index, seen
+      )) {
+        if (!selected.includes(candidate)) selected.push(candidate);
+      }
+      if (ts.isObjectBindingPattern(element.name) ||
+        ts.isArrayBindingPattern(element.name)) {
+        for (const candidate of selected) {
+          visitPattern(element.name, candidate);
+        }
+      }
+    }
+  };
+  const visitPattern = (candidatePattern, candidateSource) => {
+    if (ts.isObjectBindingPattern(candidatePattern)) {
+      for (const element of candidatePattern.elements) {
+        if (!ts.isBindingElement(element) || element.dotDotDotToken) continue;
+        const key = element.propertyName
+          ? staticPropertyNameOf(element.propertyName)
+          : ts.isIdentifier(element.name) ? element.name.text : undefined;
+        if (ts.isIdentifier(element.name) && element.name.text === targetName &&
+          key === property) {
+          sources.push(candidateSource);
+        }
+        if (key === undefined || (!ts.isObjectBindingPattern(element.name) &&
+          !ts.isArrayBindingPattern(element.name))) continue;
+        for (const candidate of memberValueCandidatesOf(
+          candidateSource, key, seen
+        )) {
+          visitPattern(element.name, candidate);
+        }
+      }
+    } else if (ts.isArrayBindingPattern(candidatePattern)) {
+      visitArrayPattern(candidatePattern, candidateSource, 0);
+    }
+  };
+  visitPattern(pattern, source);
+  return sources;
 };
   const bindingDefaultMatches = (pattern, predicate) => {
     if (!ts.isObjectBindingPattern(pattern) && !ts.isArrayBindingPattern(pattern)) {
@@ -2338,6 +2454,12 @@ const staticMethodWrapperReferenceOf = (
         ))) return true;
   if (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) {
     if (!ts.isIdentifier(binding.node.name)) {
+      if (binding.node.initializer && bindingPatternSourcePropertyOf(
+        binding.node.name, binding.node.initializer, node.text,
+        wrapperProperty, bindingNext
+      ).some((source) => staticMethodReferenceOf(
+        source, property, ownerOf, bindingNext
+      ))) return true;
       return bindingPatternValuesOf(
         binding.node.name, binding.node.initializer, node.text, bindingNext
       ).some((value) => staticMethodWrapperReferenceOf(
@@ -3070,8 +3192,24 @@ const boundStaticMethodWrapperMethodOf = (input, seen = new Set()) => {
   if (!node || seen.has(node)) return undefined;
   const next = new Set(seen);
   next.add(node);
+  const member = memberAccess(node);
+  if (member) {
+    for (const value of memberValueCandidatesOf(
+      member.receiver, member.property, next
+    )) {
+      const method = boundStaticMethodWrapperMethodOf(value, next);
+      if (method) return method;
+    }
+  }
   if (ts.isIdentifier(node)) {
     const binding = resolveBinding(node);
+    if (binding?.node && (ts.isVariableDeclaration(binding.node) ||
+      ts.isParameter(binding.node)) && !ts.isIdentifier(binding.node.name) &&
+      binding.node.initializer) {
+      return bindingPatternValuesOf(
+        binding.node.name, binding.node.initializer, node.text, next
+      ).some((value) => boundStaticMethodWrapperMethodOf(value, next));
+    }
     if (binding?.kind === "variable" &&
         ts.isVariableDeclaration(binding.node) &&
         ts.isIdentifier(binding.node.name) && binding.node.initializer) {
@@ -4339,6 +4477,16 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
     }
     return undefined;
   }
+  const member = memberAccess(node);
+  if (member) {
+    const alternatives = memberValueCandidatesOf(
+      member.receiver, member.property, next
+    ).flatMap((value) => {
+      const candidate = storedBindInvocationOf(value, invocationPlan, next);
+      return candidate ? candidate.alternatives ?? [candidate] : [];
+    });
+    if (alternatives.length > 0) return { alternatives };
+  }
     if (ts.isConditionalExpression(node)) {
       const alternatives = [node.whenTrue, node.whenFalse].flatMap((value) => {
         const candidate = storedBindInvocationOf(
@@ -4377,12 +4525,13 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
   if (!ts.isCallExpression(node)) return undefined;
   const bind = bindMethodReferenceOf(node.expression, next);
   if (bind?.property === "bind") {
+    const bindPlan = fixedCallArgumentPlanOf(node.arguments);
     const plan = mergeCallArgumentPlans(
-      fixedCallArgumentPlanOf(node.arguments.slice(1)),
+      dropLeadingCallArgument(bindPlan),
       invocationPlan
     );
-    const thisArguments = callArgumentCandidatesAt(
-      fixedCallArgumentPlanOf(node.arguments), 0
+    const bindThisArguments = callArgumentCandidatesAt(
+      bindPlan, 0
     );
     if (reflectApplyReferenceOf(bind.receiver, next)) {
       const functions = callArgumentCandidatesAt(plan, 0)
@@ -4396,13 +4545,13 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
             ? applicationPlans.reduce((left, right) =>
               mergeCallArgumentPlans(left, right))
             : { before: [], after: [], unknownIndex: 0 },
-          thisArguments
+          thisArguments: callArgumentCandidatesAt(plan, 1)
         };
       }
     }
     const functions = localFunctionValuesOf(bind.receiver, next);
     if (functions.length > 0) {
-      return { functions, plan, thisArguments };
+      return { functions, plan, thisArguments: bindThisArguments };
     }
   }
   const bindWrapper = memberAccess(unwrap(node.expression));
