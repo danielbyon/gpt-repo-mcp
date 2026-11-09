@@ -390,6 +390,14 @@ const staticAssignmentNameOf = (input, seen = new Set()) => {
     const right = staticAssignmentNameOf(node.right, seen);
     return left !== undefined && right !== undefined ? left + right : undefined;
   }
+  if (ts.isCallExpression(node) && !node.questionDotToken &&
+      node.arguments.length === 1) {
+    const callee = unwrap(node.expression);
+    if (ts.isIdentifier(callee) && callee.text === "String" &&
+        !resolveBinding(callee)) {
+      return staticAssignmentNameOf(node.arguments[0], seen);
+    }
+  }
   if (!ts.isIdentifier(node)) return undefined;
   const binding = resolveBinding(node);
   if (binding?.kind !== "variable" || !binding.constant ||
@@ -3075,16 +3083,25 @@ const workerNamespaceOf = (input, seen = new Set()) => {
     return Boolean(named && ts.isNamespaceImport(named) &&
       named.name.text === node.text);
   }
+  if ((binding.kind === "variable" || binding.kind === "opaque") &&
+      ts.isVariableDeclaration(binding.node) && binding.node.initializer &&
+      ts.isObjectBindingPattern(binding.node.name)) {
+    const rest = binding.node.name.elements.find((element) =>
+      element.dotDotDotToken && ts.isIdentifier(element.name) &&
+      element.name.text === node.text);
+    if (rest && workerNamespaceOf(binding.node.initializer, seen)) return true;
+  }
   return false;
 };
-const workerMemberOf = (input, seen = new Set()) => {
+const workerMemberOf = (input, property, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
-  if (workerNamespaceOf(node, seen)) return true;
+  if (property === "Worker" && workerNamespaceOf(node, seen)) return true;
   const next = new Set(seen);
   next.add(node);
-  if (memberValueCandidatesOf(node, "Worker", seen)
+  if (memberValueCandidatesOf(node, property, seen)
       .some((value) => workerConstructorOf(value, seen))) return true;
+  if (property !== "Worker") return false;
   return objectValueCandidatesOf(node, seen).some((object) =>
     object.properties.some((property) =>
       ts.isSpreadAssignment(property) &&
@@ -3101,10 +3118,10 @@ const workerConstructorOf = (input, seen = new Set()) => {
       .some((value) => workerConstructorOf(value, next));
   }
   const member = memberAccess(node);
-  if (member?.property === "Worker") {
+  if (member) {
     const next = new Set(seen);
     next.add(node);
-    return workerMemberOf(member.receiver, next);
+    return workerMemberOf(member.receiver, member.property, next);
   }
   if (ts.isCallExpression(node)) {
     const next = new Set(seen);
@@ -3123,10 +3140,9 @@ const workerConstructorOf = (input, seen = new Set()) => {
   const next = new Set(seen);
   next.add(binding.node);
   if (ts.isIdentifier(binding.node.name)) return false;
-  if (!bindingPatternSelectsPropertyOf(
+  if (binding.node.initializer && bindingPatternSelectsPropertyOf(
     binding.node.name, node.text, "Worker"
-  )) return false;
-  if (binding.node.initializer &&
+  ) &&
       workerNamespaceOf(binding.node.initializer, next)) return true;
   const values = [
     ...bindingPatternValuesOf(
@@ -3164,6 +3180,51 @@ const inspectKnownWorkerOptionMutations = (
       inspectWorkerEvalValue(value, value, unproven);
     }
   };
+  const inspectDescriptorValue = (call, descriptor) => {
+    const values = memberValueCandidatesOf(descriptor, "value", seen);
+    if (values.length === 0) add(call, unproven);
+    for (const value of values) {
+      inspectWorkerEvalValue(value, value, unproven);
+    }
+  };
+  const inspectNamedDescriptorMutation = (call, name, descriptor) => {
+    const property = staticStringOf(name) ?? staticPropertyNameOf(name);
+    if (property === undefined) {
+      add(call, unproven);
+    } else if (property === "eval") {
+      inspectDescriptorValue(call, descriptor);
+    }
+  };
+  const inspectDescriptorMap = (call, descriptors) => {
+    const maps = objectValueCandidatesOf(descriptors, seen);
+    if (maps.length === 0) add(call, unproven);
+    for (const map of maps) {
+      for (const property of map.properties) {
+        if (ts.isSpreadAssignment(property)) {
+          add(call, unproven);
+          continue;
+        }
+        if (!("name" in property)) {
+          add(call, unproven);
+          continue;
+        }
+        let descriptors;
+        if (ts.isPropertyAssignment(property)) {
+          descriptors = [property.initializer];
+        } else if (ts.isShorthandPropertyAssignment(property)) {
+          descriptors = [property.name];
+        } else if (ts.isGetAccessorDeclaration(property)) {
+          descriptors = functionReturnExpressionsOf(property, seen);
+          if (descriptors.length === 0) add(call, unproven);
+        } else {
+          continue;
+        }
+        for (const descriptor of descriptors) {
+          inspectNamedDescriptorMutation(call, property.name, descriptor);
+        }
+      }
+    }
+  };
   if (!workerCallExpressions) {
     workerCallExpressions = [];
     const collect = (node) => {
@@ -3192,29 +3253,47 @@ const inspectKnownWorkerOptionMutations = (
           }
         }
       }
+      const prototypePlan = staticMethodInvocationPlanOf(
+        node, "setPrototypeOf", globalObjectOf, seen
+      ) ?? staticMethodInvocationPlanOf(
+        node, "setPrototypeOf", globalPrototypeObjectOf, seen
+      );
+      if (prototypePlan &&
+          callArgumentCandidatesAt(prototypePlan, 0).some(targetsOptions)) {
+        const prototypes = callArgumentCandidatesAt(prototypePlan, 1);
+        if (prototypes.length === 0) add(node, unproven);
+        for (const prototype of prototypes) {
+          inspectWorkerOptions(prototype, seen, reference, false);
+        }
+      }
+      const definePropertiesPlan = staticMethodInvocationPlanOf(
+        node, "defineProperties", globalObjectOf, seen
+      ) ?? staticMethodInvocationPlanOf(
+        node, "defineProperties", globalPrototypeObjectOf, seen
+      );
+      if (definePropertiesPlan &&
+          callArgumentCandidatesAt(definePropertiesPlan, 0).some(targetsOptions)) {
+        const descriptors = callArgumentCandidatesAt(definePropertiesPlan, 1);
+        if (descriptors.length === 0) add(node, unproven);
+        for (const descriptor of descriptors) {
+          inspectDescriptorMap(node, descriptor);
+        }
+      }
       const definePlan = staticMethodInvocationPlanOf(
         node, "defineProperty", globalObjectOf, seen
       ) ?? staticMethodInvocationPlanOf(
         node, "defineProperty", globalPrototypeObjectOf, seen
+      ) ?? staticMethodInvocationPlanOf(
+        node, "defineProperty", globalReflectOf, seen
       );
       if (definePlan && callArgumentCandidatesAt(definePlan, 0).some(targetsOptions)) {
         const names = callArgumentCandidatesAt(definePlan, 1);
         if (names.length === 0) add(node, unproven);
+        const descriptors = callArgumentCandidatesAt(definePlan, 2);
+        if (descriptors.length === 0) add(node, unproven);
         for (const name of names) {
-          const property = staticStringOf(name);
-          if (property === undefined) {
-            add(node, unproven);
-            continue;
-          }
-          if (property !== "eval") continue;
-          const descriptors = callArgumentCandidatesAt(definePlan, 2);
-          if (descriptors.length === 0) add(node, unproven);
           for (const descriptor of descriptors) {
-            const values = memberValueCandidatesOf(descriptor, "value", seen);
-            if (values.length === 0) add(descriptor, unproven);
-            for (const value of values) {
-              inspectWorkerEvalValue(value, value, unproven);
-            }
+            inspectNamedDescriptorMutation(node, name, descriptor);
           }
         }
       }
@@ -3226,6 +3305,8 @@ const inspectWorkerOptions = (
   const options = unwrap(input);
   // Worker treats a missing options argument as eval: false.
   if (!options || seen.has(options)) return;
+  if (ts.isIdentifier(options) && options.text === "undefined" &&
+      !resolveBinding(options)) return;
   const next = new Set(seen);
   next.add(options);
   const unproven = "worker_threads inline-evaluation options are unproven";
@@ -3251,6 +3332,11 @@ const inspectWorkerOptions = (
     for (const property of object.properties) {
       if (!("name" in property)) {
         inspectWorkerOptions(property.expression, next, reference, false);
+        continue;
+      }
+      if (ts.isPropertyAssignment(property) &&
+          staticPropertyNameOf(property.name) === "__proto__") {
+        inspectWorkerOptions(property.initializer, next, reference, false);
         continue;
       }
       const name = staticPropertyNameOf(property.name);
@@ -3438,6 +3524,19 @@ const inspectWorkerConstruction = (call) => {
     if (ts.isNewExpression(node) && workerConstructorOf(node.expression)) {
       inspectWorkerConstruction(node);
     }
+  if (ts.isCallExpression(node) &&
+      reflectConstructReferenceOf(node.expression) &&
+      node.arguments[0] && workerConstructorOf(node.arguments[0])) {
+    const plan = argumentArrayPlanOf(node.arguments[1]);
+    const options = callArgumentCandidatesAt(plan, 1);
+    if (options.length === 0 && plan.unknownIndex !== undefined &&
+        plan.unknownIndex <= 1) {
+      add(node, "worker_threads inline-evaluation options are unproven");
+    }
+    for (const option of options) {
+      inspectWorkerOptions(option, new Set(), node);
+    }
+  }
     const member = memberAccess(node);
     if (member?.property === "getBuiltinModule" && processObjectOf(member.receiver)) {
       add(node, "process.getBuiltinModule is forbidden in supervisor source");
