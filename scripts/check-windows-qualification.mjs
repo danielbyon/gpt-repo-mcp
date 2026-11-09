@@ -4559,7 +4559,8 @@ argument, ["test", "it", "describe"]
 collectBroadArrayMutations(file);
 return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
-    intrinsicInvocationArgumentsOf, resolveBinding, resolvedAccess, staticStringOf };
+    intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, objectPropertyValuesOf,
+    resolveBinding, resolvedAccess, staticStringOf };
 }
 
 /**
@@ -4573,7 +4574,8 @@ export function collectWindowsTestTitles(filename, source) {
   const titles = [];
 const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf,
-    intrinsicInvocationArgumentsOf, resolveBinding, resolvedAccess, staticStringOf } =
+  intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, objectPropertyValuesOf,
+  resolveBinding, resolvedAccess, staticStringOf } =
     createWindowsTestBindingResolver(file);
 
   // Exclusive declarations anywhere in the file remain fail-closed, including
@@ -4624,6 +4626,80 @@ possibleVitestNamespaceOf, testRunnerContainerOf,
       }
       }
   };
+const inspectExclusivePatternFromValues = (pattern, values) => {
+  pattern = unwrap(pattern);
+  if (!pattern || values.length === 0) return;
+  if (ts.isObjectBindingPattern(pattern) ||
+      ts.isObjectLiteralExpression(pattern)) {
+    const sourceIsRunner = values.some((value) =>
+      possibleTestRunnerOf(value, ["test", "it", "describe"]) ||
+      possibleVitestNamespaceOf(value));
+    for (const property of pattern.properties ?? pattern.elements) {
+      if (ts.isBindingElement(property)) {
+        const propertyNode = property.propertyName;
+        const name = propertyNode
+          ? ts.isComputedPropertyName(propertyNode)
+            ? literal(propertyNode.expression)
+            : ts.isIdentifier(propertyNode) ? propertyNode.text
+              : literal(propertyNode)
+          : ts.isIdentifier(property.name) ? property.name.text : undefined;
+        if (sourceIsRunner && (property.dotDotDotToken ||
+            (propertyNode && name === undefined) || name === "only")) {
+          throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+        }
+        if (name !== undefined && (ts.isObjectBindingPattern(property.name) ||
+            ts.isArrayBindingPattern(property.name))) {
+          inspectExclusivePatternFromValues(
+            property.name,
+            values.flatMap((value) => objectPropertyValuesOf(value, name))
+          );
+        }
+        continue;
+      }
+      if (ts.isPropertyAssignment(property)) {
+        const name = ts.isComputedPropertyName(property.name)
+          ? literal(property.name.expression)
+          : ts.isIdentifier(property.name) ? property.name.text
+            : literal(property.name);
+        if (sourceIsRunner && (name === undefined || name === "only")) {
+          throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+        }
+        if (name !== undefined && (ts.isObjectBindingPattern(property.initializer) ||
+            ts.isArrayBindingPattern(property.initializer) ||
+            ts.isObjectLiteralExpression(property.initializer) ||
+            ts.isArrayLiteralExpression(property.initializer))) {
+          inspectExclusivePatternFromValues(
+            property.initializer,
+            values.flatMap((value) => objectPropertyValuesOf(value, name))
+          );
+        }
+      } else if (ts.isShorthandPropertyAssignment(property)) {
+        if (sourceIsRunner && property.name.text === "only") {
+          throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+        }
+      } else if (sourceIsRunner && ts.isSpreadAssignment(property)) {
+        throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+      }
+    }
+    return;
+  }
+  if (ts.isArrayBindingPattern(pattern) || ts.isArrayLiteralExpression(pattern)) {
+    const elements = pattern.elements;
+    for (let index = 0; index < elements.length; index += 1) {
+      const element = elements[index];
+      if (ts.isOmittedExpression(element)) continue;
+      if (ts.isSpreadElement(element)) continue;
+      const nested = ts.isBindingElement(element) ? element.name : element;
+      if (ts.isObjectBindingPattern(nested) || ts.isArrayBindingPattern(nested) ||
+          ts.isObjectLiteralExpression(nested) || ts.isArrayLiteralExpression(nested)) {
+        inspectExclusivePatternFromValues(
+          nested,
+          values.flatMap((value) => objectPropertyValuesOf(value, String(index)))
+        );
+      }
+    }
+  }
+};
   const checkExclusive = (node) => {
     if (ts.isParameter(node) && node.initializer &&
         possibleTestRunnerOf(node.initializer, ["test", "it", "describe"])) {
@@ -4675,6 +4751,15 @@ const member = resolvedAccess(node);
         }
       }
     }
+ if (ts.isForOfStatement(node)) {
+   const targets = ts.isVariableDeclarationList(node.initializer)
+     ? node.initializer.declarations.map((declaration) => declaration.name)
+     : [unwrap(node.initializer)];
+   const iterated = fixedSpreadValuesOf(node.expression) ?? [];
+   for (const target of targets) {
+     inspectExclusivePatternFromValues(target, iterated);
+   }
+ }
     if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
         node.initializer &&
         (possibleTestRunnerOf(node.initializer, ["test", "it", "describe"]) ||
