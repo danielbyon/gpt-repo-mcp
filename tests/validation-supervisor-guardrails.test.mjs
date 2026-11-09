@@ -5,10 +5,13 @@ import { describe, expect, test } from "vitest";
 import { inspectSupervisorSource, inspectSupervisorSources, SUPERVISOR_SOURCES } from "../scripts/check-supervisor-dispatch.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
+// Parse the production inventory outside Vitest's per-test timeout. This check
+// scans the complete supervisor sources before the smaller fixture cases run.
+const productionFindings = inspectSupervisorSources();
 
 describe("validation supervisor direct-execution guard", () => {
   test("accepts the production supervisor source inventory", () => {
-    expect(inspectSupervisorSources()).toEqual([]);
+    expect(productionFindings).toEqual([]);
     expect(SUPERVISOR_SOURCES).toContain("src/services/windows-process-host.ts");
     expect(SUPERVISOR_SOURCES).toContain("src/services/process-exec.ts");
     for (const path of SUPERVISOR_SOURCES) {
@@ -85,7 +88,8 @@ describe("validation supervisor direct-execution guard", () => {
   ["destructured constructor capability", "const { constructor: ctor } = globalThis; ctor.constructor(\"return 42\")();"],
   ["destructured constructor default", "const { constructor: ctor = globalThis.constructor } = {}; ctor.constructor(\"return 42\")();"],
   ["comma global object alias", "const runtime = (0, globalThis); runtime.eval('process');"],
-    ["object-destructured global object", "const { runtime } = { runtime: globalThis }; runtime.eval('process');"],
+  ["object-destructured global object", "const { runtime } = { runtime: globalThis }; runtime.eval('process');"],
+  ["Object.create global object", "const runtime = Object.create(globalThis); runtime.eval('process');"],
     ["mutable process object alias", "let runtime = process; runtime.getBuiltinModule('node:child_process').exec('node -v');"]
   ])("rejects an unaudited loading route: %s", (_case, source) => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
@@ -269,7 +273,34 @@ test("accepts ordinary helper arguments and member factories", () => {
     "const methodTools = { make() { return { safe: true }; } };",
     "methodTools.make().safe;",
     "import { spawn } from 'node:child_process';",
-    "spawn('node.exe', ['--version'], { stdio: 'pipe' });"
+    "spawn('node.exe', ['--version'], { stdio: 'pipe' });",
+    "const mirror = Object.create({ eval() { return undefined; } });",
+    "mirror.eval('noop');",
+    "const safeTools = { get runtime() { return processLike; } };",
+    "function readSafe(runtime) { return runtime.getBuiltinModule(); }",
+    "readSafe(safeTools.runtime);",
+    "const nestedSafe = () => () => processLike;",
+    "nestedSafe()().getBuiltinModule();",
+    "const innerSafe = nestedSafe();",
+    "innerSafe().getBuiltinModule();",
+    "function loadSafe(runtime) { return runtime.getBuiltinModule(); }",
+    "const helperTools = { get load() { return loadSafe; } };",
+    "helperTools.load(processLike).getBuiltinModule();",
+    "const carrierTools = { get carrier() { return { runtime: processLike }; } };",
+    "carrierTools.carrier.runtime.getBuiltinModule();",
+    "const objectTools = { get ctor() { return globalThis.Object; } };",
+    "objectTools.ctor.create({ safe: true });",
+    "const safeBind = loadSafe.bind;",
+    "const safeBound = safeBind(null);",
+    "safeBound(processLike);",
+    "const safeBindTools = { get bind() { return loadSafe.bind; } };",
+    "const getterSafeBound = safeBindTools.bind(null);",
+    "getterSafeBound(processLike);",
+    "function getSafeBind() { return loadSafe.bind; }",
+    "const returnedSafeBound = getSafeBind()(null);",
+    "returnedSafeBound(processLike);",
+    "const reflectedSafeBound = Reflect.apply(loadSafe.bind, loadSafe, [null]);",
+    "reflectedSafeBound(processLike);"
   ].join("\n");
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
 });
@@ -791,7 +822,11 @@ test.each([
     ["helper apply overriding spread argument", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load.apply(null, { 0: processLike, ...{ 0: process }, length: 1 }).exec('id');"],
     ["helper bind", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load.bind(null, process)().exec('id');"],
     ["stored helper bind", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = load.bind(null, process); bound().exec('id');"],
-    ["stored helper bind later argument", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = load.bind(null); bound(process).exec('id');"],
+  ["stored helper bind later argument", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = load.bind(null); bound(process).exec('id');"],
+  ["aliased stored helper bind later argument", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bind = load.bind; const bound = bind(null); bound(process).exec('id');"],
+  ["Reflect-created stored helper bind later argument", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = Reflect.apply(load.bind, load, [null]); bound(process).exec('id');"],
+  ["getter-held helper bind later argument", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const tools = { get bind() { return load.bind; } }; const bound = tools.bind(null); bound(process).exec('id');"],
+  ["function-returned helper bind later argument", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } function getBind() { return load.bind; } const bound = getBind()(null); bound(process).exec('id');"],
     ["stored helper bind apply", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = load.bind(null); bound.apply(null, [process]).exec('id');"],
     ["Reflect.apply helper", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } Reflect.apply(load, null, [process]).exec('id');"],
     ["Reflect.apply call", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } Reflect.apply.call(null, load, null, [process]).exec('id');"],
@@ -813,7 +848,15 @@ test.each([
     ["stored bound Reflect.apply", "const invoke = Reflect.apply.bind(null, function load(runtime) { return runtime.getBuiltinModule('node:child_process'); }, null); invoke([process]).exec('id');"],
     ["member factory argument", "const make = (_unused: unknown) => process; const tools = { make }; tools.make(1).getBuiltinModule('node:child_process').exec('id');"],
     ["getter factory", "const tools = { get make() { return process; } }; tools.make().getBuiltinModule('node:child_process').exec('id');"],
-    ["getter global factory", "const tools = { get make() { return globalThis; } }; tools.make().eval('process').exec('id');"],
+  ["getter global factory", "const tools = { get make() { return globalThis; } }; tools.make().eval('process').exec('id');"],
+  ["getter-held process capability", "const tools = { get runtime() { return process; } }; tools.runtime.getBuiltinModule('node:child_process').exec('id');"],
+  ["getter-backed helper argument", "const tools = { get runtime() { return process; } }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(tools.runtime).exec('id');"],
+  ["getter-held helper function", "const tools = { get load() { return (runtime) => { return runtime.getBuiltinModule('node:child_process'); }; } }; tools.load(process).exec('id');"],
+  ["getter-returned capability carrier", "const tools = { get carrier() { return { runtime: process }; } }; tools.carrier.runtime.getBuiltinModule('node:child_process').exec('id');"],
+  ["nested local function returns", "const make = () => () => process; make()().getBuiltinModule('node:child_process').exec('id');"],
+  ["aliased nested local function returns", "const make = () => () => process; const inner = make(); inner().getBuiltinModule('node:child_process').exec('id');"],
+  ["getter-held Object constructor", "const tools = { get ctor() { return globalThis.Object; } }; tools.ctor.create(process).getBuiltinModule('node:child_process').exec('id');"],
+  ["reflected Function.prototype.bind", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = Reflect.apply(Function.prototype.bind, load, [null]); bound(process).exec('id');"],
     ["factory carrier", "const tools = { make: () => ({ runtime: process }) }; tools.make().runtime.getBuiltinModule('node:child_process').exec('id');"],
     ["destructured factory carrier", "const make = () => ({ runtime: process }); const { runtime } = make(); runtime.getBuiltinModule('node:child_process').exec('id');"],
     ["Object.assign call", "const copy = globalThis.Object.assign.call(Object, {}, process); copy.getBuiltinModule('node:child_process').exec('id');"],
