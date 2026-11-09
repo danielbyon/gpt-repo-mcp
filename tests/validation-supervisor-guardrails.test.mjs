@@ -530,6 +530,10 @@ test.each([
     "import { Worker as Thread } from 'node:worker_threads'; " +
     "const WorkerConstructor = Thread; new WorkerConstructor('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
+  ["mutable constructor alias",
+    "import { Worker as Thread } from 'node:worker_threads'; " +
+    "let WorkerConstructor = Thread; new WorkerConstructor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
   ["namespace constructor",
     "import * as threads from 'node:worker_threads'; " +
     "new threads.Worker('worker.js', { eval: true });",
@@ -588,6 +592,8 @@ test("accepts worker construction without inline evaluation", () => {
     "import * as threads from 'node:worker_threads';",
     "const WorkerConstructor = NamedWorker;",
     "new WorkerConstructor(new URL('./worker.mjs', import.meta.url));",
+    "let MutableWorkerConstructor = NamedWorker;",
+    "new MutableWorkerConstructor('./worker.mjs', { eval: false });",
     "new NamedWorker('./worker.mjs');",
     "new NamedWorker('./worker.mjs', { type: 'module' });",
     "const safeOptions = { eval: false };",

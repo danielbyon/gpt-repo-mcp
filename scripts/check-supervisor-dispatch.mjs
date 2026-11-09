@@ -3061,15 +3061,16 @@ const workerConstructorOf = (input, seen = new Set()) => {
     return importedExport(binding, node.text) === "Worker";
   }
   if (!ts.isVariableDeclaration(binding.node) ||
-      !ts.isVariableDeclarationList(binding.node.parent) ||
-      !(binding.node.parent.flags & ts.NodeFlags.Const) ||
       !binding.node.initializer) return false;
   const next = new Set(seen);
   next.add(binding.node);
   if (ts.isIdentifier(binding.node.name)) {
-    return workerConstructorOf(binding.node.initializer, next);
+    return activeBindingValuesOf(binding.node, node)
+      .some((value) => workerConstructorOf(value, next));
   }
-  if (!ts.isObjectBindingPattern(binding.node.name)) return false;
+  if (!ts.isVariableDeclarationList(binding.node.parent) ||
+      !(binding.node.parent.flags & ts.NodeFlags.Const) ||
+      !ts.isObjectBindingPattern(binding.node.name)) return false;
   const element = binding.node.name.elements.find((item) =>
     ts.isIdentifier(item.name) && item.name.text === node.text &&
     !item.dotDotDotToken && !item.initializer);
