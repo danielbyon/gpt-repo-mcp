@@ -4161,10 +4161,14 @@ if (candidate) return candidate;
     const descriptorArguments = intrinsicInvocationArgumentsOf(
       node, ["Object"], ["getOwnPropertyDescriptor"], seen
     );
-    if (descriptorArguments && selectedName === "value") {
+    if (descriptorArguments &&
+        (selectedName === "value" || selectedName === "get")) {
       const property = staticStringOf(descriptorArguments[1], seen);
+      const selected = selectedName === "get"
+        ? property === undefined || property === "only"
+        : property === undefined || names.includes(property);
       return Boolean(descriptorArguments[0]) &&
-        (property === undefined || names.includes(property)) &&
+        selected &&
         testRunnerContainerOf(descriptorArguments[0], names, seen);
     }
     const bagArguments = intrinsicInvocationArgumentsOf(
@@ -5025,7 +5029,7 @@ argument, ["test", "it", "describe"]
   }
 collectBroadArrayMutations(file);
 return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
-possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
+possibleVitestNamespaceOf, selectedExtractionContainerOf, testRunnerContainerOf, globalIntrinsicOf,
     intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, fixedIndexedValuesOf,
     objectPropertyValuesOf,
   resolveBinding, resolvedAccess, staticStringOf, mayBeUndefinedOf };
@@ -5041,7 +5045,7 @@ export function collectWindowsTestTitles(filename, source) {
   if (file.parseDiagnostics.length) throw new Error("Cannot parse Vitest declarations");
   const titles = [];
 const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
-possibleVitestNamespaceOf, testRunnerContainerOf,
+possibleVitestNamespaceOf, selectedExtractionContainerOf, testRunnerContainerOf,
     intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, fixedIndexedValuesOf,
     objectPropertyValuesOf,
   resolveBinding, resolvedAccess, staticStringOf, mayBeUndefinedOf } =
@@ -5226,7 +5230,22 @@ const inspectExclusiveArrayPatternValues = (pattern, values) => {
     if (rest) break;
   }
 };
-const checkExclusive = (node) => {
+  // Vitest exposes "only" through a getter, so invoking that descriptor
+  // accessor selects exclusive tests even without a direct member reference.
+  const isExclusiveDescriptorGetterCall = (node) => {
+    if (!ts.isCallExpression(node)) return false;
+    const invoked = resolvedAccess(node.expression);
+    const getter = invoked?.method === "get"
+      ? invoked
+      : invoked && ["apply", "call"].includes(invoked.method)
+        ? resolvedAccess(invoked.receiver)
+        : undefined;
+    if (getter?.method !== "get") return false;
+    return selectedExtractionContainerOf(
+      getter.receiver, "get", ["test", "it", "describe"]
+    );
+  };
+  const checkExclusive = (node) => {
     if (ts.isParameter(node) && node.initializer &&
         possibleTestRunnerOf(node.initializer, ["test", "it", "describe"])) {
       throw new Error("Exclusive or dynamically selected Vitest tests unaudited.");
@@ -5242,6 +5261,9 @@ const checkExclusive = (node) => {
       : [];
     inspectExclusiveArrayPatternValues(node.name, values);
   }
+    if (isExclusiveDescriptorGetterCall(node)) {
+      throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
+    }
 const member = resolvedAccess(node);
     if (member && (member.method === undefined || member.method === "only") &&
         testRunnerContainerOf(member.receiver, ["test", "it", "describe"])) {

@@ -791,6 +791,17 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
       .toThrow(/Exclusive or dynamically selected Vitest/);
   });
 
+  test.each([
+    ["descriptor getter call", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); descriptor?.get?.call(test);"],
+    ["descriptor getter apply", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); descriptor?.get?.apply(test, []);"],
+    ["descriptor getter invocation", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); descriptor?.get?.();"]
+  ])("rejects descriptor accessor exclusive registration through %s", (_name, source) => {
+    const fixture = "import { test } from 'vitest'; " + source +
+      " (() => {})('focused', () => {});";
+    expect(() => collectWindowsTestTitles("fixture.ts", fixture))
+      .toThrow(/Exclusive or dynamically selected Vitest/);
+  });
+
   test("accepts ordinary objects containing test-named values", () => {
     expect(collectWindowsTestTitles("fixture.ts", [
       "import { test } from 'vitest';",
@@ -798,6 +809,8 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
       "Reflect.get(holder, 'test');",
       "Object.getOwnPropertyDescriptor(holder, 'test').value;",
       "Object.getOwnPropertyDescriptors(holder).test.value;",
+      "const ordinaryDescriptor = Object.getOwnPropertyDescriptor(holder, 'test'); ordinaryDescriptor?.get?.call(holder);",
+      "Object.getOwnPropertyDescriptor(test, 'length')?.get?.call(test);",
       "Object.values(holder)[0];",
       "Object.entries(holder)[0][1];",
       "Object.fromEntries(Object.entries(holder)).test;",

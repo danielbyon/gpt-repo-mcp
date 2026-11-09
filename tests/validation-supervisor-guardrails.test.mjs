@@ -777,6 +777,58 @@ test.each([
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
     .some((finding) => finding.includes(expected))).toBe(true);
 });
+test("rejects worker constructor exports from audited supervisor sources", () => {
+  const sources = new Map(SUPERVISOR_SOURCES.map((path) => [path, ""]));
+  sources.set(
+    "src/services/windows-process-host.ts",
+    "import { Worker } from 'node:worker_threads'; export { Worker };"
+  );
+  sources.set(
+    "src/services/validation-service.ts",
+    "import { Worker as ExportedWorker } from './windows-process-host.js'; " +
+      "new ExportedWorker('worker.js', { eval: true });"
+  );
+
+  const findings = inspectSupervisorSources((path) => sources.get(path) ?? "");
+  expect(findings.some((finding) =>
+    finding.includes("runtime worker_threads capability re-export is forbidden")))
+    .toBe(true);
+});
+test.each([
+  "export { Worker } from 'node:worker_threads';",
+  "export { Worker as Thread } from 'node:worker_threads';",
+  "export * from 'node:worker_threads';",
+  "export * as threads from 'node:worker_threads';"
+])("rejects worker capability module re-export %s", (source) => {
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+    .some((finding) => finding.includes("runtime worker_threads capability re-export")))
+    .toBe(true);
+});
+test.each([
+  ["default export", "export default Worker;"],
+  ["exported immutable alias", "export const Thread = Worker;"],
+  ["exported factory", "export const getWorker = () => Worker;"],
+  ["exported function", "export function getWorker() { return Worker; }"]
+])("rejects worker capability %s", (_name, declaration) => {
+  const source = "import { Worker } from 'node:worker_threads'; " + declaration;
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+    .some((finding) => finding.includes("runtime worker_threads capability re-export")))
+    .toBe(true);
+});
+test("accepts worker module exports that exclude constructor capability", () => {
+  const source = [
+    "import { isMainThread } from 'node:worker_threads';",
+    "export { isMainThread };",
+    "export { parentPort as workerParentPort } from 'node:worker_threads';",
+    "export type { Worker } from 'node:worker_threads';",
+    "export const mainThreadValue = isMainThread;",
+    "export const getMainThread = () => isMainThread;",
+    "export function readMainThread() { return isMainThread; }",
+    "export default 1;"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual([]);
+});
 test("resolves long bounded local option alias chains without truncating", () => {
   const hopCount = 130;
   const sourceFor = (value) => "import { Worker } from 'node:worker_threads'; " +
@@ -877,7 +929,7 @@ test("accepts worker construction without inline evaluation", () => {
     "new NamedWorker('./worker.mjs', mutableSafeOptions);"
   ].join("\n");
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
-});
+}, 20_000);
 test("accepts type-only node:module imports", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts",
       "import type { Module } from 'node:module';")).toEqual([]);

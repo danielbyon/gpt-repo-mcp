@@ -1027,6 +1027,9 @@ function staticStringAtInspectionOf(input, seen = new Set()) {
       !(statement.modifiers ?? []).some((modifier) =>
         modifier.kind === ts.SyntaxKind.ExportKeyword);
   };
+const hasExportModifier = (node) =>
+  (node.modifiers ?? []).some((modifier) =>
+    modifier.kind === ts.SyntaxKind.ExportKeyword);
   const memberAccess = (node) => {
     if (ts.isPropertyAccessExpression(node)) {
       return { receiver: node.expression, property: node.name.text };
@@ -3284,6 +3287,12 @@ const workerConstructorOf = (input, seen = new Set()) => {
   ];
   return values.some((value) => workerConstructorOf(value, next));
 };
+// Verified Worker capability must not escape the fixed supervisor inventory.
+const workerCapabilityOf = (input, seen = new Set()) => {
+  if (workerConstructorOf(input, seen) || workerNamespaceOf(input, seen)) return true;
+  return functionReturnExpressionsOf(input, seen).some((value) =>
+    workerConstructorOf(value, seen) || workerNamespaceOf(value, seen));
+};
 // Only a statically false eval option is safe. Retrieved spreads use the same
 // provenance rules; computed names and unresolved values fail closed.
 const inspectWorkerEvalValue = (value, findingNode, unproven) => {
@@ -3629,6 +3638,13 @@ const inspectWorkerConstruction = (call) => {
         if (!typeOnly && DYNAMIC_EVALUATION_MODULES.has(module)) {
           add(node, "runtime dynamic-evaluation re-export is forbidden");
         }
+    // Named, namespace, and star exports can all expose Worker.
+    const exportsWorker = !clause || !ts.isNamedExports(clause) ||
+      clause.elements.some((element) => !element.isTypeOnly &&
+        (element.propertyName?.text ?? element.name.text) === "Worker");
+    if (!typeOnly && WORKER_MODULES.has(module) && exportsWorker) {
+      add(node, "runtime worker_threads capability re-export is forbidden");
+    }
         if (!typeOnly && ["node:process", "process"].includes(module)) {
           add(node, "runtime process capability re-export is forbidden");
         }
@@ -3643,9 +3659,24 @@ const inspectWorkerConstruction = (call) => {
       if (processObjectOf(node.propertyName ?? node.name)) {
         add(node, "runtime process capability re-export is forbidden");
       }
+    if (workerCapabilityOf(node.propertyName ?? node.name)) {
+      add(node, "runtime worker_threads capability re-export is forbidden");
+    }
     }
       return;
     }
+if (ts.isExportAssignment(node) && workerCapabilityOf(node.expression)) {
+  add(node, "runtime worker_threads capability re-export is forbidden");
+}
+if (ts.isFunctionDeclaration(node) && hasExportModifier(node) &&
+    workerCapabilityOf(node)) {
+  add(node, "runtime worker_threads capability re-export is forbidden");
+}
+if (ts.isVariableDeclaration(node) && node.initializer &&
+    ts.isVariableStatement(node.parent.parent) && hasExportModifier(node.parent.parent) &&
+    workerCapabilityOf(node.initializer)) {
+  add(node, "runtime worker_threads capability re-export is forbidden");
+}
     if (ts.isImportDeclaration(node)) {
       const module = moduleLiteral(node.moduleSpecifier);
       if (SHELL_MODULES.has(module) && hasRuntimeImport(node)) {
