@@ -353,6 +353,12 @@ test.each([
   ["Array.of element", "import { test } from 'vitest'; Array.of(test)[0].only('focused', () => {});"],
   ["aliased Array.of element", "import { test } from 'vitest'; const make = Array.of; make(test)[0].only('focused', () => {});"],
   ["object method this receiver", "import { test } from 'vitest'; const tools = { register: test, focus() { this.register.only('focused', () => {}); } }; tools.focus();"],
+  ["immediate bound this receiver", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } focus.bind({ register: test })();"],
+  ["stored bound this receiver", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } const bound = focus.bind({ register: test }); bound();"],
+  ["stored bound this through call", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } const bound = focus.bind({ register: test }); bound.call(null);"],
+  ["stored bound this through apply", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } const bound = focus.bind({ register: test }); bound.apply(null, []);"],
+  ["spread bind receiver", "import { test } from 'vitest'; function focus(this: any) { this.register.only('focused', () => {}); } const receiver = { register: test }; focus.bind(...[receiver])();"],
+  ["alternate spread bind receiver", "import { test } from 'vitest'; declare const condition: boolean; function focus(this: any) { this.register.only('focused', () => {}); } const receiver = condition ? { register: { only() {} } } : { register: test }; focus.bind(...[receiver])();"],
   ["runtime argument after explicit this", "function focus(this: unknown, register: typeof test) { register.only('focused', () => {}); } focus.call(null, test);"]
 ])("rejects exclusive selectors through %s", (_name, source) => {
   expect(() => collectWindowsTestTitles("fixture.ts", source + " test('required', () => {});"))
@@ -369,6 +375,8 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
     "const uninvoked = { register: test, focus() { this.register.only('not registration', () => {}); } };",
     "const tools = { register: safe, focus() { this.register.only('safe', () => {}); } };",
     "tools.focus();",
+    "function boundFocus(this: any) { this.only('safe', () => {}); } const boundFocusCall = boundFocus.bind(safe); boundFocusCall();",
+    "boundFocus.bind(...[safe])();",
     "function positionalSafe(this: unknown, register: any) { register.only('safe', () => {}); } positionalSafe.call(null, safe);",
     "test('required', () => {});"
   ].join("\n");

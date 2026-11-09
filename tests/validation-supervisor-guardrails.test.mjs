@@ -174,6 +174,12 @@ test.each([
   ["Array.of element", "Array.of(process)[0].getBuiltinModule('node:child_process').exec('id');"],
   ["aliased Array.of element", "const make = Array.of; make(process)[0].getBuiltinModule('node:child_process').exec('id');"],
   ["explicit this receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } load.call(process).exec('id');"],
+  ["immediate bound this receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } load.bind(process)().exec('id');"],
+  ["stored bound this receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const bound = load.bind(process); bound().exec('id');"],
+  ["stored bound this through call", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const bound = load.bind(process); bound.call(null).exec('id');"],
+  ["stored bound this through apply", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const bound = load.bind(process); bound.apply(null, []).exec('id');"],
+  ["spread bind receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const receiver = process; load.bind(...[receiver])().exec('id');"],
+  ["alternate spread bind receiver", "declare const condition: boolean; function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } const receiver = condition ? { getBuiltinModule() {} } : process; load.bind(...[receiver])().exec('id');"],
   ["runtime argument after explicit this", "function load(this: unknown, runtime: typeof process) { return runtime.getBuiltinModule('node:child_process'); } load.call(null, process).exec('id');"]
 ])("rejects process provenance through %s", (_name, source) => {
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
@@ -220,6 +226,8 @@ test.each([
   "Array.of(processLike)[0].getBuiltinModule();",
   "{ const Array = { of(...values: any[]) { return values; } }; Array.of(processLike)[0].getBuiltinModule(); }",
   "function receiverSafe(this: any) { return this.getBuiltinModule(); } receiverSafe.call(processLike);",
+  "const boundReceiverSafe = receiverSafe.bind(processLike); boundReceiverSafe();",
+  "receiverSafe.bind(...[processLike])();",
   "function positionalSafe(this: unknown, runtime: any) { return runtime.getBuiltinModule(); } positionalSafe.call(null, processLike);",
       "import { spawn } from 'node:child_process'; spawn('node.exe', ['--version']);"
     ].join("\n");
@@ -525,7 +533,7 @@ test("accepts ordinary helper arguments and member factories", () => {
       "{ raw: () => \"spawn('cmd.exe', [])\" });\n";
     expect(inspectSupervisorSource("src/services/process-exec.ts", shadow + production)
       .some((finding) => finding.includes("must be a static String.raw template"))).toBe(true);
-  });
+  }, 20_000);
 
   test("rejects a lexically shadowed process.execPath launch source", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts",

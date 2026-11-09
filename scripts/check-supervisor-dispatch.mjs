@@ -3867,7 +3867,7 @@ const reflectApplyInvocationOf = (argumentsList, seen = new Set()) => {
   return {
     functions,
     plan: argumentArrayPlanOf(argumentsList[2], seen),
-    thisArgument: argumentsList[1]
+    thisArguments: [argumentsList[1]].filter(Boolean)
   };
 };
 const bindMethodReferenceOf = (input, seen = new Set()) => {
@@ -4038,6 +4038,9 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
       fixedCallArgumentPlanOf(node.arguments.slice(1)),
       invocationPlan
     );
+    const thisArguments = callArgumentCandidatesAt(
+      fixedCallArgumentPlanOf(node.arguments), 0
+    );
     if (reflectApplyReferenceOf(bind.receiver, next)) {
       const functions = callArgumentCandidatesAt(plan, 0)
         .flatMap((value) => localFunctionValuesOf(value, next));
@@ -4049,13 +4052,14 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
           plan: applicationPlans.length > 0
             ? applicationPlans.reduce((left, right) =>
               mergeCallArgumentPlans(left, right))
-            : { before: [], after: [], unknownIndex: 0 }
+            : { before: [], after: [], unknownIndex: 0 },
+          thisArguments
         };
       }
     }
     const functions = localFunctionValuesOf(bind.receiver, next);
     if (functions.length > 0) {
-      return { functions, plan };
+      return { functions, plan, thisArguments };
     }
   }
   const bindWrapper = memberAccess(unwrap(node.expression));
@@ -4074,7 +4078,8 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
         functions,
         plan: mergeCallArgumentPlans(
           dropLeadingCallArgument(bindArguments), invocationPlan
-        )
+        ),
+        thisArguments: callArgumentCandidatesAt(bindArguments, 0)
       };
     }
   }
@@ -4086,12 +4091,14 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
       : reflectedBind?.property === "bind"
         ? localFunctionValuesOf(reflectedBind.receiver, next) : [];
     if (functions.length > 0) {
+      const bindArguments = argumentArrayPlanOf(node.arguments[2], next);
       return {
         functions,
         plan: mergeCallArgumentPlans(
-          dropLeadingCallArgument(argumentArrayPlanOf(node.arguments[2], next)),
+          dropLeadingCallArgument(bindArguments),
           invocationPlan
-        )
+        ),
+        thisArguments: callArgumentCandidatesAt(bindArguments, 0)
       };
     }
   }
@@ -4117,7 +4124,8 @@ const localInvocationOf = (call) => {
           plan: mergeCallArgumentPlans(
             fixedCallArgumentPlanOf(callee.arguments.slice(1)),
             fixedCallArgumentPlanOf(call.arguments)
-          )
+          ),
+        thisArguments: [callee.arguments[0]].filter(Boolean)
         };
       }
     }
@@ -4127,14 +4135,18 @@ const localInvocationOf = (call) => {
   return {
     functions: directFunctions,
     plan: fixedCallArgumentPlanOf(call.arguments),
-    thisArgument: memberAccess(callee)?.receiver
+    thisArguments: [memberAccess(callee)?.receiver].filter(Boolean)
   };
   }
   const wrapper = memberAccess(callee);
   if (wrapper?.property === "bind") {
     const functions = localFunctionValuesOf(wrapper.receiver);
     if (functions.length > 0) {
-      return { functions, plan: fixedCallArgumentPlanOf(call.arguments.slice(1)) };
+      return {
+        functions,
+        plan: fixedCallArgumentPlanOf(call.arguments.slice(1)),
+        thisArguments: [call.arguments[0]].filter(Boolean)
+      };
     }
   }
   if (wrapper && ["apply", "call"].includes(wrapper.property)) {
@@ -4145,7 +4157,7 @@ const localInvocationOf = (call) => {
         plan: wrapper.property === "call"
           ? fixedCallArgumentPlanOf(call.arguments.slice(1))
         : argumentArrayPlanOf(call.arguments[1]),
-      thisArgument: call.arguments[0]
+      thisArguments: [call.arguments[0]].filter(Boolean)
       };
     }
     const boundInvocation = storedBindInvocationOf(
@@ -4298,14 +4310,14 @@ const recordParameterFunctions = (parameter, functions) => {
       const invocation = localInvocationOf(node);
       const alternatives = invocation?.alternatives ?? [invocation].filter(Boolean);
       for (const alternative of alternatives) {
-      const { functions, plan, thisArgument } = alternative;
+      const { functions, plan, thisArguments = [] } = alternative;
       for (const fn of functions) {
         capabilityArgumentsChanged = recordPlan(
           functionArgumentsPlans, fn, plan
         ) || capabilityArgumentsChanged;
-        if (thisArgument) {
+        for (const receiver of thisArguments) {
           capabilityArgumentsChanged = recordParameterArgument(
-            functionThisArguments, fn, thisArgument
+            functionThisArguments, fn, receiver
           ) || capabilityArgumentsChanged;
         }
         for (let index = 0; index < fn.parameters.length; index += 1) {
