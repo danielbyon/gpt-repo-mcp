@@ -170,6 +170,16 @@ describe("validation supervisor direct-execution guard", () => {
   });
 
 test.each([
+  ["for-of array binding", "for (const runtime of [process]) { runtime.getBuiltinModule('node:child_process').exec('id'); }"],
+  ["Array.of element", "Array.of(process)[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["aliased Array.of element", "const make = Array.of; make(process)[0].getBuiltinModule('node:child_process').exec('id');"],
+  ["explicit this receiver", "function load(this: typeof process) { return this.getBuiltinModule('node:child_process'); } load.call(process).exec('id');"],
+  ["runtime argument after explicit this", "function load(this: unknown, runtime: typeof process) { return runtime.getBuiltinModule('node:child_process'); } load.call(null, process).exec('id');"]
+])("rejects process provenance through %s", (_name, source) => {
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
+});
+
+test.each([
   ["Object.assign", "const copy = Object.assign({}, process); copy.getBuiltinModule('node:child_process').exec('id');"],
   ["Object.create", "const copy = Object.create(process); copy.getBuiltinModule('node:child_process').exec('id');"]
 ])("rejects process capability copies through %s", (_name, source) => {
@@ -206,6 +216,11 @@ test.each([
       "plainDescriptors({ value: 1 });",
       "const { get: plainGet } = Reflect;",
       "plainGet({ value: 1 }, 'value');",
+  "for (const runtime of [processLike]) runtime.getBuiltinModule();",
+  "Array.of(processLike)[0].getBuiltinModule();",
+  "{ const Array = { of(...values: any[]) { return values; } }; Array.of(processLike)[0].getBuiltinModule(); }",
+  "function receiverSafe(this: any) { return this.getBuiltinModule(); } receiverSafe.call(processLike);",
+  "function positionalSafe(this: unknown, runtime: any) { return runtime.getBuiltinModule(); } positionalSafe.call(null, processLike);",
       "import { spawn } from 'node:child_process'; spawn('node.exe', ['--version']);"
     ].join("\n");
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);

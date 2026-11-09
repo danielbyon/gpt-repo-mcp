@@ -348,6 +348,34 @@ describe("Windows qualification scope guard", () => {
       .toThrow(/Exclusive or dynamically selected Vitest/);
   });
 
+test.each([
+  ["for-of array binding", "import { test } from 'vitest'; for (const register of [test]) { register.only('focused', () => {}); }",],
+  ["Array.of element", "import { test } from 'vitest'; Array.of(test)[0].only('focused', () => {});"],
+  ["aliased Array.of element", "import { test } from 'vitest'; const make = Array.of; make(test)[0].only('focused', () => {});"],
+  ["object method this receiver", "import { test } from 'vitest'; const tools = { register: test, focus() { this.register.only('focused', () => {}); } }; tools.focus();"],
+  ["runtime argument after explicit this", "function focus(this: unknown, register: typeof test) { register.only('focused', () => {}); } focus.call(null, test);"]
+])("rejects exclusive selectors through %s", (_name, source) => {
+  expect(() => collectWindowsTestTitles("fixture.ts", source + " test('required', () => {});"))
+    .toThrow(/Exclusive or dynamically selected Vitest/);
+});
+
+test("accepts safe iteration, Array.of, and receiver-held test-like values", () => {
+  const source = [
+    "import { test } from 'vitest';",
+    "const safe = { only() {} };",
+    "for (const register of [safe]) register.only('safe', () => {});",
+    "Array.of(safe)[0].only('safe', () => {});",
+    "{ const Array = { of(...values: any[]) { return values; } }; Array.of(safe)[0].only('safe', () => {}); }",
+    "const uninvoked = { register: test, focus() { this.register.only('not registration', () => {}); } };",
+    "const tools = { register: safe, focus() { this.register.only('safe', () => {}); } };",
+    "tools.focus();",
+    "function positionalSafe(this: unknown, register: any) { register.only('safe', () => {}); } positionalSafe.call(null, safe);",
+    "test('required', () => {});"
+  ].join("\n");
+  expect(collectWindowsTestTitles("fixture.ts", source))
+    .toEqual([{ title: "required", enabled: true }]);
+});
+
   test("recognizes direct Vitest namespace registration", () => {
     expect(collectWindowsTestTitles("fixture.ts",
       "import * as V from 'vitest'; V.test('required', () => {});"))

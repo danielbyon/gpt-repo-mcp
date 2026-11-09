@@ -95,7 +95,15 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const parameterRequireArguments = new Map();
   const parameterRestArguments = new Map();
 const parameterFunctionArguments = new Map();
+const functionThisArguments = new Map();
 const functionArgumentsPlans = new Map();
+const isThisParameter = (parameter) => Boolean(
+  parameter && ts.isIdentifier(parameter.name) && parameter.name.text === "this"
+);
+const runtimeParameterIndexOf = (fn, parameter) => {
+  const index = fn.parameters.indexOf(parameter);
+  return index >= 0 && isThisParameter(fn.parameters[0]) ? index - 1 : index;
+};
 const getterReceiverOf = (getter) =>
   ts.isObjectLiteralExpression(getter.parent) ? getter.parent : undefined;
   const requireReferenceOf = (input, seen = new Set()) => {
@@ -294,7 +302,11 @@ const matches = declarations(scopeStatements);
         const initializer = scope.initializer;
         if (initializer && ts.isVariableDeclarationList(initializer) &&
             initializer.declarations.some((declaration) => declaresName(declaration.name, text))) {
-          return { kind: "opaque", node: initializer };
+      return {
+        kind: "opaque",
+        node: initializer,
+        iterable: ts.isForOfStatement(scope) ? scope.expression : undefined
+      };
         }
       }
       if (ts.isFunctionLike(scope)) {
@@ -1057,6 +1069,22 @@ if (ts.isGetAccessorDeclaration(candidate)) {
       ));
     }
     if (ts.isCallExpression(node) && /^\d+$/.test(property)) {
+    if (staticMethodReferenceOf(
+      node.expression, "of", globalArrayObjectOf, next
+    )) {
+      const expanded = [];
+      for (const argument of node.arguments) {
+        if (!ts.isSpreadElement(argument)) {
+          expanded.push(unwrap(argument));
+          continue;
+        }
+        const spread = fixedSpreadValuesOf(argument.expression, next);
+        if (!spread) return values;
+        expanded.push(...spread);
+      }
+      const indexed = expanded[Number(property)];
+      if (indexed) values.push(indexed);
+    }
       for (const returned of functionReturnExpressionsOf(node.expression, next)) {
         for (const plan of functionArgumentsPlanOf(returned, next) ?? []) {
           values.push(...callArgumentCandidatesAt(plan, Number(property)));
@@ -1240,6 +1268,18 @@ return functionReturnExpressionsOf(node.expression, next)
     return returnedValues
       .some((value) => processObjectOf(value, next));
   }
+  if (node.kind === ts.SyntaxKind.ThisKeyword) {
+    let owner = node.parent;
+    while (owner &&
+        !(ts.isFunctionLike(owner) && !ts.isArrowFunction(owner))) {
+      owner = owner.parent;
+    }
+    if (!owner || seen.has(owner)) return false;
+    const next = new Set(seen);
+    next.add(owner);
+    return (functionThisArguments.get(owner) ?? [])
+      .some((value) => processObjectOf(value, next));
+  }
   if (ts.isFunctionLike(node)) {
     const returnedValues = functionReturnExpressionsOf(node, seen);
     const next = new Set(seen);
@@ -1308,6 +1348,20 @@ return functionReturnExpressionsOf(node.expression, next)
   if (seen.has(binding.node)) return false;
   const next = new Set(seen);
   next.add(binding.node);
+  if (binding.kind === "opaque" && binding.iterable &&
+      ts.isVariableDeclarationList(binding.node)) {
+    const declaration = binding.node.declarations.find((candidate) =>
+      declaresName(candidate.name, node.text));
+    const iterated = fixedSpreadValuesOf(binding.iterable, next);
+    if (declaration && iterated) {
+      const candidates = ts.isIdentifier(declaration.name)
+        ? iterated
+        : iterated.flatMap((source) => bindingPatternValuesOf(
+          declaration.name, source, node.text, next
+        ));
+      return candidates.some((candidate) => processObjectOf(candidate, next));
+    }
+  }
   if ((binding.kind === "variable" || binding.kind === "opaque") &&
       ts.isVariableDeclaration(binding.node)) {
     if (ts.isIdentifier(binding.node.name)) {
@@ -2897,6 +2951,21 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
       return fixedSpreadValuesOf(node.right, next);
     }
   if (ts.isCallExpression(node)) {
+    if (staticMethodReferenceOf(
+      node.expression, "of", globalArrayObjectOf, next
+    )) {
+      const values = [];
+      for (const argument of node.arguments) {
+        if (!ts.isSpreadElement(argument)) {
+          values.push(unwrap(argument));
+          continue;
+        }
+        const expanded = fixedSpreadValuesOf(argument.expression, next);
+        if (!expanded) return undefined;
+        values.push(...expanded);
+      }
+      return values;
+    }
     const returned = functionReturnExpressionsOf(node.expression, next);
     if (returned.length === 0) return undefined;
     const expanded = returned.map((value) => fixedSpreadValuesOf(value, next));
@@ -2978,7 +3047,7 @@ const arrayBindingsOf = (input, seen = new Set()) => {
   if (binding.kind === "parameter" && ts.isParameter(binding.node) &&
       ts.isIdentifier(binding.node.name)) {
     const fn = binding.node.parent;
-    const index = fn.parameters.indexOf(binding.node);
+  const index = runtimeParameterIndexOf(fn, binding.node);
     const plans = functionArgumentsPlans.get(fn) ?? [];
     return plans.flatMap((plan) => callArgumentCandidatesAt(plan, index)
       .flatMap((value) => arrayBindingsOf(value, next)));
@@ -3009,7 +3078,7 @@ const arrayMutationValueCarriesCapability = (
     const binding = resolveBinding(node);
     if (binding?.kind === "parameter" && ts.isParameter(binding.node) &&
         binding.node.parent === invocation.fn) {
-      const index = invocation.fn.parameters.indexOf(binding.node);
+    const index = runtimeParameterIndexOf(invocation.fn, binding.node);
       return callArgumentCandidatesAt(invocation.plan, index).some((value) =>
         arrayMutationValueCarriesCapability(value, next, invocation));
     }
@@ -3084,7 +3153,7 @@ const arrayMutationValuesCarryCapabilityForTarget = (target, values) => {
     return undefined;
   }
   const fn = binding.node.parent;
-  const index = fn.parameters.indexOf(binding.node);
+const index = runtimeParameterIndexOf(fn, binding.node);
   if (index < 0) return false;
   return (functionArgumentsPlans.get(fn) ?? []).some((plan) => {
     const targetArguments = callArgumentCandidatesAt(plan, index);
@@ -3795,7 +3864,11 @@ const argumentArrayPlanOf = (input, seen = new Set()) => {
 const reflectApplyInvocationOf = (argumentsList, seen = new Set()) => {
   const functions = localFunctionValuesOf(argumentsList[0], seen);
   if (functions.length === 0) return undefined;
-  return { functions, plan: argumentArrayPlanOf(argumentsList[2], seen) };
+  return {
+    functions,
+    plan: argumentArrayPlanOf(argumentsList[2], seen),
+    thisArgument: argumentsList[1]
+  };
 };
 const bindMethodReferenceOf = (input, seen = new Set()) => {
   const node = unwrap(input);
@@ -4051,7 +4124,11 @@ const localInvocationOf = (call) => {
   }
   const directFunctions = localFunctionValuesOf(callee);
   if (directFunctions.length > 0) {
-    return { functions: directFunctions, plan: fixedCallArgumentPlanOf(call.arguments) };
+  return {
+    functions: directFunctions,
+    plan: fixedCallArgumentPlanOf(call.arguments),
+    thisArgument: memberAccess(callee)?.receiver
+  };
   }
   const wrapper = memberAccess(callee);
   if (wrapper?.property === "bind") {
@@ -4067,7 +4144,8 @@ const localInvocationOf = (call) => {
         functions,
         plan: wrapper.property === "call"
           ? fixedCallArgumentPlanOf(call.arguments.slice(1))
-          : argumentArrayPlanOf(call.arguments[1])
+        : argumentArrayPlanOf(call.arguments[1]),
+      thisArgument: call.arguments[0]
       };
     }
     const boundInvocation = storedBindInvocationOf(
@@ -4220,18 +4298,25 @@ const recordParameterFunctions = (parameter, functions) => {
       const invocation = localInvocationOf(node);
       const alternatives = invocation?.alternatives ?? [invocation].filter(Boolean);
       for (const alternative of alternatives) {
-      const { functions, plan } = alternative;
+      const { functions, plan, thisArgument } = alternative;
       for (const fn of functions) {
         capabilityArgumentsChanged = recordPlan(
           functionArgumentsPlans, fn, plan
         ) || capabilityArgumentsChanged;
+        if (thisArgument) {
+          capabilityArgumentsChanged = recordParameterArgument(
+            functionThisArguments, fn, thisArgument
+          ) || capabilityArgumentsChanged;
+        }
         for (let index = 0; index < fn.parameters.length; index += 1) {
             const parameter = fn.parameters[index];
+          if (isThisParameter(parameter)) continue;
+          const runtimeIndex = runtimeParameterIndexOf(fn, parameter);
           if (parameter.dotDotDotToken) {
-            recordCapabilityArgumentsOf(parameter, plan, index);
+            recordCapabilityArgumentsOf(parameter, plan, runtimeIndex);
             break;
           }
-          for (const argument of callArgumentCandidatesAt(plan, index)) {
+          for (const argument of callArgumentCandidatesAt(plan, runtimeIndex)) {
             if (!argument) continue;
             capabilityArgumentsChanged = recordParameterFunctions(
               parameter, localFunctionValuesOf(argument)

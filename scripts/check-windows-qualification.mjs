@@ -412,7 +412,11 @@ function createWindowsTestBindingResolver(file) {
       if ((ts.isForStatement(scope) || ts.isForOfStatement(scope) || ts.isForInStatement(scope)) &&
           scope.initializer && ts.isVariableDeclarationList(scope.initializer) &&
           scope.initializer.declarations.some((declaration) => declaresName(declaration.name, name))) {
-        return { kind: "opaque", node: scope.initializer };
+      return {
+        kind: "opaque",
+        node: scope.initializer,
+        iterable: ts.isForOfStatement(scope) ? scope.expression : undefined
+      };
       }
       if (ts.isFunctionLike(scope)) {
         if (hasHoistedVar(scope, name)) return { kind: "opaque", node: scope };
@@ -519,7 +523,15 @@ const assignmentsByMemberPath = new Map();
   const parameterRestArguments = new Map();
   const parameterFunctionArguments = new Map();
   const parameterArraySources = new Map();
+const functionThisArguments = new Map();
   const functionArgumentsPlans = new Map();
+const isThisParameter = (parameter) => Boolean(
+  parameter && ts.isIdentifier(parameter.name) && parameter.name.text === "this"
+);
+const runtimeParameterIndexOf = (fn, parameter) => {
+  const index = fn.parameters.indexOf(parameter);
+  return index >= 0 && isThisParameter(fn.parameters[0]) ? index - 1 : index;
+};
   const getterReceiverOf = (getter) =>
     ts.isObjectLiteralExpression(getter.parent) ? getter.parent : undefined;
 const assignmentMemberAccess = (node) => {
@@ -973,6 +985,10 @@ const fixedSpreadValuesOf = (input, seen = new Set()) => {
     return whenTrue && whenFalse ? [...whenTrue, ...whenFalse] : undefined;
   }
   if (ts.isCallExpression(node)) {
+    const arrayOfArguments = intrinsicInvocationArgumentsOf(
+      node, ["Array"], ["of"], next
+    );
+    if (arrayOfArguments) return arrayOfArguments;
     const returned = functionReturnExpressionsOf(node.expression, next);
     if (returned.length === 0) return undefined;
     const expanded = returned.map((value) => fixedSpreadValuesOf(value, next));
@@ -1099,7 +1115,7 @@ const arrayMutationValueCarriesRunner = (
     const binding = resolveBinding(node);
     if (binding?.node && ts.isParameter(binding.node) &&
         binding.node.parent === invocation.fn) {
-      const index = invocation.fn.parameters.indexOf(binding.node);
+    const index = runtimeParameterIndexOf(invocation.fn, binding.node);
       return callArgumentCandidatesAt(invocation.plan, index).some((value) =>
         arrayMutationValueCarriesRunner(value, next, invocation));
     }
@@ -1165,7 +1181,7 @@ const arrayMutationValuesCarryRunnerForTarget = (target, values) => {
   const binding = resolveBinding(node);
   if (!binding?.node || !ts.isParameter(binding.node)) return undefined;
   const fn = binding.node.parent;
-  const index = fn.parameters.indexOf(binding.node);
+const index = runtimeParameterIndexOf(fn, binding.node);
   if (index < 0) return false;
   return (functionArgumentsPlans.get(fn) ?? []).some((plan) => {
     const targetArguments = callArgumentCandidatesAt(plan, index);
@@ -2095,7 +2111,12 @@ if (node.kind === ts.SyntaxKind.ThisKeyword) {
       if (receiver) values.push(...containerValuesOf(receiver, next));
       return values;
     }
-    if (ts.isFunctionLike(current) && !ts.isArrowFunction(current)) return [];
+      if (ts.isFunctionLike(current) && !ts.isArrowFunction(current)) {
+        const receivers = functionThisArguments.get(current) ?? [];
+        values.push(...receivers.flatMap((receiver) =>
+          containerValuesOf(receiver, next)));
+        return values;
+      }
     current = current.parent;
   }
   return values;
@@ -2212,6 +2233,12 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
     }
   }
   if (reference && ts.isCallExpression(reference) && /^\d+$/.test(key)) {
+    const arrayOfArguments = intrinsicInvocationArgumentsOf(
+      reference, ["Array"], ["of"], seen
+    );
+    if (arrayOfArguments?.[Number(key)]) {
+      values.push(arrayOfArguments[Number(key)]);
+    }
     for (const returned of functionReturnExpressionsOf(reference.expression, seen)) {
       for (const plan of functionArgumentsPlanOf(returned, seen) ?? []) {
         values.push(...callArgumentCandidatesAt(plan, Number(key)));
@@ -3433,6 +3460,16 @@ if (candidate) return candidate;
     return testRunnerOf(node, names);
   }
     const binding = resolveBinding(node);
+  if (binding?.kind === "opaque" && binding.iterable &&
+      ts.isVariableDeclarationList(binding.node) && !seen.has(binding.node)) {
+    const next = new Set(seen);
+    next.add(binding.node);
+    const iterated = fixedSpreadValuesOf(binding.iterable, next) ?? [];
+    for (const value of iterated) {
+      const candidate = possibleTestRunnerOf(value, names, next);
+      if (candidate) return candidate;
+    }
+  }
     const declaredCandidate = binding?.kind !== "import" && binding?.node
       ? destructuredBindingCandidate(binding.node, node.text, names)
       : undefined;
@@ -3811,7 +3848,11 @@ if (assignArguments) {
 const reflectApplyInvocationOf = (argumentsList, seen = new Set()) => {
   const functions = localFunctionValuesOf(argumentsList[0], seen);
   if (functions.length === 0) return undefined;
-  return { functions, plan: argumentArrayPlanOf(argumentsList[2], seen) };
+return {
+  functions,
+  plan: argumentArrayPlanOf(argumentsList[2], seen),
+  thisArgument: argumentsList[1]
+};
 };
 const bindMethodReferenceOf = (input, seen = new Set()) => {
   const node = unwrap(input);
@@ -4063,7 +4104,11 @@ const localInvocationOf = (call) => {
   }
   const directFunctions = localFunctionValuesOf(callee);
   if (directFunctions.length > 0) {
-    return { functions: directFunctions, plan: fixedCallArgumentPlanOf(call.arguments) };
+    return {
+      functions: directFunctions,
+      plan: fixedCallArgumentPlanOf(call.arguments),
+      thisArgument: resolvedAccess(callee)?.receiver
+    };
   }
   const wrapper = resolvedAccess(callee);
   if (wrapper?.method === "bind") {
@@ -4079,7 +4124,8 @@ const localInvocationOf = (call) => {
         functions,
         plan: wrapper.method === "call"
           ? fixedCallArgumentPlanOf(call.arguments.slice(1))
-          : argumentArrayPlanOf(call.arguments[1])
+        : argumentArrayPlanOf(call.arguments[1]),
+      thisArgument: call.arguments[0]
       };
     }
     const boundInvocation = storedBindInvocationOf(
@@ -4149,6 +4195,13 @@ const recordParameterFunctions = (parameter, functions) => {
   parameterFunctionArguments.set(parameter, stored);
   return changed;
 };
+const recordFunctionThisArgument = (fn, argument) => {
+  const stored = functionThisArguments.get(fn) ?? [];
+  if (stored.includes(argument)) return false;
+  stored.push(argument);
+  functionThisArguments.set(fn, stored);
+  return true;
+};
 collectResolvedAssignments(file);
 collectAssignments(file);
   collectArrayMutations(file);
@@ -4160,20 +4213,27 @@ collectAssignments(file);
       const invocation = localInvocationOf(node);
       const alternatives = invocation?.alternatives ?? [invocation].filter(Boolean);
       for (const alternative of alternatives) {
-      const { functions, plan } = alternative;
+      const { functions, plan, thisArgument } = alternative;
       for (const fn of functions) {
         parameterRunnerArgumentsChanged = recordPlan(
           functionArgumentsPlans, fn, plan
         ) || parameterRunnerArgumentsChanged;
+        if (thisArgument) {
+          parameterRunnerArgumentsChanged = recordFunctionThisArgument(
+            fn, thisArgument
+          ) || parameterRunnerArgumentsChanged;
+        }
         for (let index = 0; index < fn.parameters.length; index += 1) {
             const parameter = fn.parameters[index];
+        if (isThisParameter(parameter)) continue;
+        const runtimeIndex = runtimeParameterIndexOf(fn, parameter);
           if (parameter.dotDotDotToken) {
             parameterRunnerArgumentsChanged = recordRestArgumentsOf(
-              parameter, plan, index
+            parameter, plan, runtimeIndex
             ) || parameterRunnerArgumentsChanged;
             break;
           }
-          for (const argument of callArgumentCandidatesAt(plan, index)) {
+        for (const argument of callArgumentCandidatesAt(plan, runtimeIndex)) {
             if (!argument) continue;
             parameterRunnerArgumentsChanged = recordParameterFunctions(
               parameter, localFunctionValuesOf(argument)
