@@ -503,6 +503,13 @@ function createWindowsTestBindingResolver(file) {
     ts.SyntaxKind.AmpersandAmpersandEqualsToken
   ]);
   const assignmentsByBinding = new Map();
+const activeBindingValuesOf = (declaration, reference) => {
+  const referenceStart = reference.getStart(file);
+  return [declaration.initializer,
+    ...(assignmentsByBinding.get(declaration) ?? [])]
+    .filter((value) => value && (value.getStart(file) <= referenceStart ||
+      enclosingFunctionOf(value) !== enclosingFunctionOf(reference)));
+};
   const runnerAssignmentsByBinding = new Map();
   const destructuredAssignmentsByBinding = new Map();
   const destructuredPropertyAssignmentsByBinding = new Map();
@@ -511,6 +518,7 @@ const assignmentsByMemberPath = new Map();
   const parameterRunnerArguments = new Map();
   const parameterRestArguments = new Map();
   const parameterFunctionArguments = new Map();
+  const parameterArraySources = new Map();
   const functionArgumentsPlans = new Map();
   const getterReceiverOf = (getter) =>
     ts.isObjectLiteralExpression(getter.parent) ? getter.parent : undefined;
@@ -780,8 +788,7 @@ const expressionValuesOf = (input, seen = new Set()) => {
   if (binding.kind === "variable" &&
       ts.isVariableDeclaration(binding.node) &&
       ts.isIdentifier(binding.node.name)) {
-    return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
-      .filter(Boolean)
+    return activeBindingValuesOf(binding.node, node)
       .flatMap((value) => expressionValuesOf(value, next));
   }
     if (binding.kind === "parameter" &&
@@ -791,6 +798,88 @@ const expressionValuesOf = (input, seen = new Set()) => {
       return expressionValuesOf(binding.node.initializer, next);
     }
   return [node];
+};
+const staticArrayIndex = (input) => {
+  const node = typeof input === "string" ? undefined : unwrap(input);
+  const index = typeof input === "string"
+    ? input
+    : node && ts.isPrefixUnaryExpression(node) &&
+      node.operator === ts.SyntaxKind.MinusToken &&
+      ts.isNumericLiteral(unwrap(node.operand))
+    ? `-${unwrap(node.operand).text}`
+    : staticStringOf(input);
+  if (index === undefined || !/^-?(?:0|[1-9]\d*)$/.test(index)) {
+    return undefined;
+  }
+  const value = Number(index);
+  return Number.isSafeInteger(value) ? value : undefined;
+};
+const staticArrayIndexText = (input) => {
+  const index = staticArrayIndex(input);
+  return index === undefined ? undefined : String(index);
+};
+// Replay only mutations with static positions or ranges. An unknown position
+// leaves values unchanged so a later capability check stays conservative.
+const arrayValuesAfterMutation = (values, mutation, additions) => {
+  const next = [...values];
+  const { kind } = mutation;
+  if (kind === "push") {
+    next.push(...additions);
+    return next;
+  }
+  if (kind === "unshift") {
+    next.unshift(...additions);
+    return next;
+  }
+  if (kind === "set") {
+    const index = staticArrayIndex(mutation.index);
+    if (index === undefined || index < 0) return next;
+    while (next.length < index) next.push(undefined);
+    next[index] = additions[0];
+    return next;
+  }
+  if (kind === "splice") {
+    const index = staticArrayIndex(mutation.index);
+    const deleteCount = mutation.deleteCount === "rest"
+      ? next.length - index
+      : staticArrayIndex(mutation.deleteCount);
+    if (index === undefined || deleteCount === undefined) return next;
+    next.splice(index, deleteCount, ...additions);
+    return next;
+  }
+  if (kind === "pop") {
+    next.pop();
+    return next;
+  }
+  if (kind === "shift") {
+    next.shift();
+    return next;
+  }
+  if (kind === "fill") {
+    const start = mutation.values.length > 1
+      ? staticArrayIndex(mutation.values[1]) : 0;
+    const end = mutation.values.length > 2
+      ? staticArrayIndex(mutation.values[2]) : next.length;
+    if (start === undefined || end === undefined) return next;
+    next.fill(additions[0], start, end);
+    return next;
+  }
+  if (kind === "copyWithin") {
+    const target = mutation.values.length > 0
+      ? staticArrayIndex(mutation.values[0]) : 0;
+    const start = mutation.values.length > 1
+      ? staticArrayIndex(mutation.values[1]) : 0;
+    const end = mutation.values.length > 2
+      ? staticArrayIndex(mutation.values[2]) : next.length;
+    if (target === undefined || start === undefined || end === undefined) {
+      return next;
+    }
+    next.copyWithin(target, start, end);
+    return next;
+  }
+  if (kind === "reverse") return next.reverse();
+  if (kind === "sort") return next.sort();
+  return next;
 };
 const fixedSpreadValuesOf = (input, seen = new Set()) => {
   const node = unwrap(input);
@@ -814,14 +903,40 @@ const fixedSpreadValuesOf = (input, seen = new Set()) => {
     if (binding?.kind === "variable" &&
         ts.isVariableDeclaration(binding.node) &&
         ts.isIdentifier(binding.node.name) && binding.node.initializer &&
-        ts.isArrayLiteralExpression(unwrap(binding.node.initializer))) {
+        (ts.isArrayLiteralExpression(unwrap(binding.node.initializer)) ||
+         isArraySourceOf(unwrap(binding.node.initializer)))) {
       const usageStart = node.getStart(file);
       const mutations = (arrayMutationValuesByBinding.get(binding.node) ?? [])
         .filter((mutation) => mutation.start <= usageStart);
+      const activeArrayValues = activeBindingValuesOf(binding.node, node)
+        .filter((value) => arraySourceOf(value));
+      if (activeArrayValues.length > 1) {
+        if (activeArrayValues.length > 32) return undefined;
+        const values = [];
+        for (const value of activeArrayValues) {
+          const expanded = fixedSpreadValuesOf(
+            value, new Set([...next, binding.node])
+          );
+          if (expanded === undefined) return undefined;
+          values.push(...expanded);
+        }
+        for (const mutation of mutations) {
+          for (const value of mutation.values) {
+            values.push(ts.isSpreadElement(value)
+              ? value.expression : unwrap(value));
+          }
+        }
+        return values;
+      }
+      if (mutations.length === 0) {
+        const mutationSeen = new Set(next);
+        mutationSeen.add(binding.node);
+        return fixedSpreadValuesOf(binding.node.initializer, mutationSeen);
+      }
       if (mutations.length > 0) {
         const mutationSeen = new Set(next);
         mutationSeen.add(binding.node);
-        const values = fixedSpreadValuesOf(
+    let values = fixedSpreadValuesOf(
           binding.node.initializer, mutationSeen
         );
         if (!values) return undefined;
@@ -832,21 +947,7 @@ const fixedSpreadValuesOf = (input, seen = new Set()) => {
                 value.expression, mutationSeen
               ) ?? [value.expression]
               : [unwrap(value)]);
-          if (mutation.kind === "push") values.push(...additions);
-          else if (mutation.kind === "unshift") values.unshift(...additions);
-          else if (mutation.kind === "set") {
-            const index = mutation.index === undefined
-              ? values.length : Number(mutation.index);
-            values[index] = additions[0];
-          } else {
-            const index = mutation.index === undefined
-              ? 0 : Number(mutation.index);
-        const deleteCount = mutation.deleteCount === "rest"
-          ? values.length - index
-          : mutation.deleteCount === undefined
-          ? 0 : Number(mutation.deleteCount);
-        values.splice(index, deleteCount, ...additions);
-          }
+      values = arrayValuesAfterMutation(values, mutation, additions);
         }
         return values;
       }
@@ -878,6 +979,23 @@ const fixedSpreadValuesOf = (input, seen = new Set()) => {
     if (expanded.some((value) => value === undefined)) return undefined;
     return expanded.flat();
   }
+  if (ts.isNewExpression(node) && isArraySourceOf(node)) {
+    const argumentsList = node.arguments ?? [];
+    if (argumentsList.length === 0) return [];
+    if (argumentsList.length === 1 &&
+        ts.isNumericLiteral(unwrap(argumentsList[0]))) return [];
+    const values = [];
+    for (const argument of argumentsList) {
+      if (!ts.isSpreadElement(argument)) {
+        values.push(unwrap(argument));
+        continue;
+      }
+      const expanded = fixedSpreadValuesOf(argument.expression, next);
+      if (!expanded) return undefined;
+      values.push(...expanded);
+    }
+    return values;
+  }
   const values = [];
   for (const value of expressionValuesOf(node, next)) {
     if (!ts.isArrayLiteralExpression(value)) return undefined;
@@ -907,10 +1025,7 @@ const arrayBindingOf = (input, seen = new Set()) => {
   if (binding.kind === "variable" &&
     ts.isVariableDeclaration(binding.node) &&
     ts.isIdentifier(binding.node.name)) {
-    const values = [
-      binding.node.initializer,
-      ...(assignmentsByBinding.get(binding.node) ?? [])
-    ].filter(Boolean);
+    const values = activeBindingValuesOf(binding.node, node);
     for (const value of values) {
       const initializer = unwrap(value);
       if (ts.isArrayLiteralExpression(initializer)) return binding.node;
@@ -922,30 +1037,111 @@ const arrayBindingOf = (input, seen = new Set()) => {
   }
   return undefined;
 };
-const arrayMutationValueCarriesRunner = (input, seen = new Set()) => {
+const isArraySourceOf = (node) => ts.isArrayLiteralExpression(node) ||
+  (ts.isNewExpression(node) && globalIntrinsicOf(node.expression, ["Array"]));
+const arraySourceOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  if (isArraySourceOf(node)) return node;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isCallExpression(node)) {
+    for (const value of functionReturnExpressionsOf(node.expression, next)) {
+      const resolved = arraySourceOf(value, next);
+      if (resolved) return resolved;
+    }
+    return undefined;
+  }
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (!binding?.node) return undefined;
+    if (ts.isParameter(binding.node)) {
+      for (const source of parameterArraySources.get(binding.node) ?? []) {
+        const resolved = arraySourceOf(source, next);
+        if (resolved) return resolved;
+      }
+      return undefined;
+    }
+    if (binding.kind === "variable" &&
+        ts.isVariableDeclaration(binding.node) &&
+        ts.isIdentifier(binding.node.name)) {
+      const values = activeBindingValuesOf(binding.node, node);
+      for (const value of values) {
+        const resolved = arraySourceOf(value, next);
+        if (resolved) return resolved;
+      }
+    }
+    return undefined;
+  }
+  const member = resolvedAccess(node);
+  if (!member || member.method === undefined) return undefined;
+  for (const value of objectPropertyValuesOf(
+    member.receiver, member.method, next
+  )) {
+    const resolved = arraySourceOf(value, next);
+    if (resolved) return resolved;
+  }
+  return undefined;
+};
+const arrayMutationValueCarriesRunner = (
+  input, seen = new Set(), invocation = undefined
+) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
   const next = new Set(seen);
   next.add(node);
   if (ts.isSpreadElement(node)) {
-    return arrayMutationValueCarriesRunner(node.expression, next);
+    return arrayMutationValueCarriesRunner(
+      node.expression, next, invocation
+    );
+  }
+  if (invocation && ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (binding?.node && ts.isParameter(binding.node) &&
+        binding.node.parent === invocation.fn) {
+      const index = invocation.fn.parameters.indexOf(binding.node);
+      return callArgumentCandidatesAt(invocation.plan, index).some((value) =>
+        arrayMutationValueCarriesRunner(value, next, invocation));
+    }
   }
   if (testRunnerOf(node, ["test", "it", "describe"]) ||
       containsRunnerValueOf(node, next)) return true;
   if (ts.isConditionalExpression(node)) {
-    return arrayMutationValueCarriesRunner(node.whenTrue, next) ||
-      arrayMutationValueCarriesRunner(node.whenFalse, next);
+    return arrayMutationValueCarriesRunner(
+      node.whenTrue, next, invocation
+    ) || arrayMutationValueCarriesRunner(
+      node.whenFalse, next, invocation
+    );
   }
   if (ts.isArrayLiteralExpression(node)) {
     return node.elements.some((element) =>
       !ts.isOmittedExpression(element) &&
-      arrayMutationValueCarriesRunner(element, next));
+      arrayMutationValueCarriesRunner(element, next, invocation));
+  }
+  if (ts.isObjectLiteralExpression(node)) {
+    return node.properties.some((property) =>
+      ts.isPropertyAssignment(property)
+        ? arrayMutationValueCarriesRunner(
+          property.initializer, next, invocation
+        )
+        : ts.isShorthandPropertyAssignment(property)
+        ? arrayMutationValueCarriesRunner(property.name, next, invocation)
+        : ts.isSpreadAssignment(property) &&
+          arrayMutationValueCarriesRunner(
+            property.expression, next, invocation
+          ));
   }
   if (!ts.isIdentifier(node)) return false;
   const binding = resolveBinding(node);
+  if (binding?.node && ts.isParameter(binding.node)) {
+    return (parameterRunnerArguments.get(binding.node) ?? [])
+      .some((value) => arrayMutationValueCarriesRunner(value, next));
+  }
   return Boolean(binding?.kind === "variable" &&
-    ts.isVariableDeclaration(binding.node) && binding.node.initializer &&
-    arrayMutationValueCarriesRunner(binding.node.initializer, next));
+    ts.isVariableDeclaration(binding.node) &&
+    activeBindingValuesOf(binding.node, node)
+      .some((value) => value &&
+        arrayMutationValueCarriesRunner(value, next, invocation)));
 };
 const arrayMutationIsConditional = (input) => {
   for (let node = input.parent; node; node = node.parent) {
@@ -963,6 +1159,36 @@ const arrayMutationIsConditional = (input) => {
   }
   return false;
 };
+const arrayMutationValuesCarryRunnerForTarget = (target, values) => {
+  const node = unwrap(target);
+  if (!node || !ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (!binding?.node || !ts.isParameter(binding.node)) return undefined;
+  const fn = binding.node.parent;
+  const index = fn.parameters.indexOf(binding.node);
+  if (index < 0) return false;
+  return (functionArgumentsPlans.get(fn) ?? []).some((plan) => {
+    const targetArguments = callArgumentCandidatesAt(plan, index);
+    if (!targetArguments.some((argument) => arraySourceOf(argument))) {
+      return false;
+    }
+    return values.some((value) => arrayMutationValueCarriesRunner(
+      value, new Set(), { fn, plan }
+    ));
+  });
+};
+// Rebuild an array from its initial value and recorded mutations.
+const replayedArrayValuesOf = (initializer, mutations) => {
+  let values = fixedSpreadValuesOf(initializer) ?? [];
+  for (const mutation of mutations) {
+    const additions = mutation.values.flatMap((value) =>
+      ts.isSpreadElement(value)
+        ? fixedSpreadValuesOf(value.expression) ?? [value.expression]
+        : [unwrap(value)]);
+    values = arrayValuesAfterMutation(values, mutation, additions);
+  }
+  return values;
+};
 const collectArrayMutations = (node) => {
   if (ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
@@ -970,25 +1196,30 @@ const collectArrayMutations = (node) => {
     const target = unwrap(node.left);
     const binding = arrayBindingOf(target.expression);
     if (binding) {
-      const mutations = arrayMutationValuesByBinding.get(binding) ?? [];
-      const previousValues = [
-        binding.initializer,
-        ...mutations.flatMap((mutation) => mutation.values)
-      ].filter(Boolean);
-      if (arrayMutationValueCarriesRunner(node.right) ||
-          (arrayMutationIsConditional(node) && previousValues.some(
-            (value) => arrayMutationValueCarriesRunner(value)
-          ))) {
+        const mutations = arrayMutationValuesByBinding.get(binding) ?? [];
+        const previousValues = replayedArrayValuesOf(
+          binding.initializer, mutations
+        );
+        const mutation = {
+          kind: "set",
+          start: node.getStart(file),
+          index: staticArrayIndexText(target.argumentExpression),
+          values: [unwrap(node.right)]
+        };
+        const nextValues = arrayValuesAfterMutation(
+          previousValues, mutation, mutation.values
+        );
+        if (arrayMutationValueCarriesRunner(node.right) ||
+            nextValues.some((value) =>
+              arrayMutationValueCarriesRunner(value)) ||
+            (arrayMutationIsConditional(node) && previousValues.some(
+              (value) => arrayMutationValueCarriesRunner(value)
+            ))) {
         throw new Error(
           "Exclusive or dynamically selected Vitest tests are unaudited."
         );
       }
-      mutations.push({
-        kind: "set",
-        start: node.getStart(file),
-        index: staticStringOf(target.argumentExpression),
-        values: [unwrap(node.right)]
-      });
+        mutations.push(mutation);
       arrayMutationValuesByBinding.set(binding, mutations);
     }
   }
@@ -1002,11 +1233,46 @@ const collectArrayMutations = (node) => {
     if (binding) {
       const kind = member.method;
       const mutations = arrayMutationValuesByBinding.get(binding) ?? [];
-      const previousValues = [
-        binding.initializer,
-        ...mutations.flatMap((mutation) => mutation.values)
-      ].filter(Boolean);
-      if (!["push", "unshift", "splice"].includes(kind)) {
+        const previousValues = replayedArrayValuesOf(
+          binding.initializer, mutations
+        );
+        const replayValues = kind === "splice"
+          ? node.arguments.slice(2) : node.arguments;
+        const replayMutation = {
+          kind,
+          start: node.getStart(file),
+          index: kind === "splice"
+            ? node.arguments.length > 0
+              ? staticArrayIndexText(node.arguments[0]) : "0"
+            : undefined,
+          deleteCount: kind === "splice" && node.arguments.length > 1
+            ? staticStringOf(node.arguments[1])
+            : kind === "splice" ? "rest" : undefined,
+          values: replayValues
+        };
+        const replayAdditions = replayValues.flatMap((value) =>
+          ts.isSpreadElement(value)
+            ? fixedSpreadValuesOf(value.expression) ?? [value.expression]
+            : [unwrap(value)]);
+        const nextValues = arrayValuesAfterMutation(
+          previousValues, replayMutation, replayAdditions
+        );
+        if (["pop", "shift", "splice", "fill"].includes(kind)) {
+          const deletesValues = ["pop", "shift", "fill"].includes(kind) ||
+            replayMutation.deleteCount === "rest" ||
+            replayMutation.deleteCount === undefined ||
+            Number(replayMutation.deleteCount) > 0;
+          if ((deletesValues && previousValues.some((value) =>
+            arrayMutationValueCarriesRunner(value))) ||
+              nextValues.some((value) =>
+                arrayMutationValueCarriesRunner(value))) {
+            throw new Error(
+              "Exclusive or dynamically selected Vitest tests are unaudited."
+            );
+          }
+          mutations.push(replayMutation);
+          arrayMutationValuesByBinding.set(binding, mutations);
+        } else if (!["push", "unshift", "splice"].includes(kind)) {
         if (node.arguments.some((value) =>
           arrayMutationValueCarriesRunner(value)) ||
             previousValues.some((value) =>
@@ -1045,7 +1311,7 @@ const collectArrayMutations = (node) => {
         kind,
         start: node.getStart(file),
         index: kind === "splice"
-          ? staticStringOf(node.arguments[0]) : undefined,
+          ? staticArrayIndexText(node.arguments[0]) : undefined,
         deleteCount,
         values
       });
@@ -1054,6 +1320,297 @@ const collectArrayMutations = (node) => {
     }
   }
   ts.forEachChild(node, collectArrayMutations);
+};
+const arrayMutationMethods = new Set([
+  "push", "unshift", "splice", "fill", "copyWithin",
+  "reverse", "sort", "pop", "shift"
+]);
+  const arrayMethodReferenceOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return undefined;
+    const next = new Set(seen);
+    next.add(node);
+    const member = resolvedAccess(node);
+    if (member && arrayMutationMethods.has(member.method)) {
+      const prototype = resolvedAccess(unwrap(member.receiver));
+      const registeredOnPrototype = prototype?.method === "prototype" &&
+        globalIntrinsicOf(prototype.receiver, ["Array"]);
+      for (const value of objectPropertyValuesOf(
+        member.receiver, member.method, next
+      )) {
+        const resolved = arrayMethodReferenceOf(value, next);
+        if (resolved) return resolved;
+      }
+    if (registeredOnPrototype || arraySourceOf(member.receiver, next)) {
+      return {
+        kind: member.method,
+        receiver: registeredOnPrototype ? undefined : member.receiver
+      };
+    }
+    }
+    if (!ts.isIdentifier(node)) return undefined;
+    const binding = resolveBinding(node);
+    const declaration = binding?.node &&
+      ts.isVariableDeclaration(binding.node) ? binding.node : undefined;
+    if (!declaration) return undefined;
+    const destructuredMethod = (
+      destructuredPropertyAssignmentsByBinding.get(declaration) ?? []
+    ).find((assignment) => arrayMutationMethods.has(assignment.property));
+    if (destructuredMethod) {
+      return {
+        kind: destructuredMethod.property,
+        receiver: destructuredMethod.source
+      };
+    }
+    if (!ts.isIdentifier(declaration.name)) {
+      if (!ts.isObjectBindingPattern(declaration.name) ||
+          !declaration.initializer) return undefined;
+      const entry = declaration.name.elements.find((element) =>
+        ts.isIdentifier(element.name) && element.name.text === node.text);
+      const kind = entry && assignmentKey(entry.propertyName ?? entry.name);
+      return kind && arrayMutationMethods.has(kind)
+        ? { kind, receiver: declaration.initializer }
+        : undefined;
+    }
+  return activeBindingValuesOf(declaration, node)
+      .map((value) => arrayMethodReferenceOf(value, next))
+      .find(Boolean);
+  };
+const boundArrayInvocationsOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return [];
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isCallExpression(node)) {
+    const wrapper = resolvedAccess(unwrap(node.expression));
+    if (wrapper?.method !== "bind") return [];
+    const previouslyBound = boundArrayInvocationsOf(
+      wrapper.receiver, next
+    );
+    if (previouslyBound.length > 0) {
+      return previouslyBound.map((bound) => ({
+        ...bound,
+        values: [...bound.values, ...node.arguments.slice(1)]
+      }));
+    }
+    const method = arrayMethodReferenceOf(wrapper.receiver);
+    const source = arraySourceOf(node.arguments[0] ?? method?.receiver, next);
+    return method && source
+      ? [{
+        kind: method.kind,
+        source,
+        target: node.arguments[0] ?? method.receiver,
+        values: node.arguments.slice(1)
+      }]
+      : [];
+  }
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    const declaration = binding?.node &&
+      ts.isVariableDeclaration(binding.node) ? binding.node : undefined;
+    if (!declaration || !ts.isIdentifier(declaration.name)) return [];
+  return activeBindingValuesOf(declaration, node)
+      .flatMap((value) => boundArrayInvocationsOf(value, next));
+  }
+  const member = resolvedAccess(node);
+  if (!member || member.method === undefined) return [];
+  return objectPropertyValuesOf(member.receiver, member.method, next)
+    .flatMap((value) => boundArrayInvocationsOf(value, next));
+};
+const arrayMutationArgumentsAreUnproven = (argumentsList) =>
+  argumentsList.some((value) => ts.isSpreadElement(value) &&
+    fixedSpreadValuesOf(value.expression) === undefined);
+const arrayMutationInvocationsOf = (call) => {
+  const invocations = [];
+  const direct = arrayMethodReferenceOf(call.expression);
+  const directSource = direct?.receiver && arraySourceOf(direct.receiver);
+  if (direct && directSource) {
+    invocations.push({
+      ...direct,
+      source: directSource,
+        target: direct.receiver,
+      values: call.arguments,
+      unprovenArguments: arrayMutationArgumentsAreUnproven(call.arguments)
+    });
+  }
+  const wrapper = resolvedAccess(unwrap(call.expression));
+  if (wrapper && ["apply", "call"].includes(wrapper.method)) {
+    const method = arrayMethodReferenceOf(wrapper.receiver);
+    const source = arraySourceOf(call.arguments[0]);
+      const omittedApply = wrapper.method === "apply" &&
+        call.arguments.length < 2;
+      const values = wrapper.method === "call"
+      ? call.arguments.slice(1)
+        : omittedApply ? [] : fixedSpreadValuesOf(call.arguments[1]);
+    if (method && source) {
+      invocations.push({
+        ...method,
+        source,
+        target: call.arguments[0],
+        values: values ?? [],
+        unprovenArguments: (!omittedApply && !values) ||
+          arrayMutationArgumentsAreUnproven(call.arguments.slice(1))
+      });
+    }
+  }
+  if (reflectApplyReferenceOf(call.expression)) {
+    const method = arrayMethodReferenceOf(call.arguments[0]);
+    const source = arraySourceOf(call.arguments[1]);
+    const values = fixedSpreadValuesOf(call.arguments[2]);
+    if (method && source) {
+      invocations.push({
+        ...method,
+        source,
+        target: call.arguments[1],
+        values: values ?? [],
+        unprovenArguments: !values
+      });
+    }
+  }
+  for (const bound of boundArrayInvocationsOf(call.expression)) {
+    invocations.push({
+      ...bound,
+        target: bound.target,
+      values: [...bound.values, ...call.arguments],
+      unprovenArguments: arrayMutationArgumentsAreUnproven([
+        ...bound.values,
+        ...call.arguments
+      ])
+    });
+  }
+  return invocations;
+};
+const broadArrayMutations = new Map();
+const arrayInitialValuesOf = (source) => {
+  if (ts.isArrayLiteralExpression(source)) {
+    return source.elements.map((element) => ts.isSpreadElement(element)
+      ? element : ts.isOmittedExpression(element) ? element : unwrap(element));
+  }
+  return isArraySourceOf(source) ? fixedSpreadValuesOf(source) ?? [] : [];
+};
+const currentArrayValuesOf = (source) => {
+  let values = [...arrayInitialValuesOf(source)];
+  for (const mutation of broadArrayMutations.get(source) ?? []) {
+    const additions = mutation.values.flatMap((value) =>
+      ts.isSpreadElement(value)
+        ? fixedSpreadValuesOf(value.expression) ?? [value.expression]
+        : [unwrap(value)]);
+    values = arrayValuesAfterMutation(values, mutation, additions);
+  }
+  return values;
+};
+const collectBroadArrayMutations = (node) => {
+  if (ts.isBinaryExpression(node) && [
+    ts.SyntaxKind.EqualsToken,
+    ts.SyntaxKind.AmpersandAmpersandEqualsToken,
+    ts.SyntaxKind.BarBarEqualsToken,
+    ts.SyntaxKind.QuestionQuestionEqualsToken
+  ].includes(node.operatorToken.kind) &&
+      ts.isElementAccessExpression(unwrap(node.left))) {
+    const target = unwrap(node.left);
+    const source = arraySourceOf(target.expression);
+    if (source) {
+      const previousValues = currentArrayValuesOf(source);
+      const conditional = node.operatorToken.kind !== ts.SyntaxKind.EqualsToken ||
+        arrayMutationIsConditional(node);
+        const writeCarriesRunner =
+          arrayMutationValuesCarryRunnerForTarget(
+            target.expression, [unwrap(node.right)]
+          ) ?? arrayMutationValueCarriesRunner(node.right);
+        const previousValuesCarryRunner =
+          arrayMutationValuesCarryRunnerForTarget(
+            target.expression, previousValues
+          ) ?? previousValues.some((value) =>
+            arrayMutationValueCarriesRunner(value));
+        if (writeCarriesRunner ||
+          (conditional && previousValuesCarryRunner)) {
+        throw new Error(
+          "Exclusive or dynamically selected Vitest tests unaudited."
+        );
+      }
+      const mutations = broadArrayMutations.get(source) ?? [];
+      mutations.push({
+        kind: "set",
+        index: staticArrayIndexText(target.argumentExpression),
+        values: [unwrap(node.right)]
+      });
+      broadArrayMutations.set(source, mutations);
+    }
+  }
+  if (ts.isCallExpression(node)) {
+    const assignedArguments = objectAssignArgumentsOf(node);
+    if (assignedArguments?.length > 1 &&
+        arraySourceOf(assignedArguments[0]) &&
+        (arrayMutationValuesCarryRunnerForTarget(
+          assignedArguments[0], assignedArguments.slice(1)
+        ) ?? assignedArguments.slice(1).some((value) =>
+          arrayMutationValueCarriesRunner(value)))) {
+      throw new Error(
+        "Exclusive or dynamically selected Vitest tests are unaudited."
+      );
+    }
+    const reflectedSetArguments = intrinsicInvocationArgumentsOf(
+      node, ["Reflect"], ["set"]
+    );
+    if (reflectedSetArguments?.length >= 3 &&
+        arraySourceOf(reflectedSetArguments[0]) &&
+        (arrayMutationValuesCarryRunnerForTarget(
+          reflectedSetArguments[0], [reflectedSetArguments[2]]
+        ) ?? arrayMutationValueCarriesRunner(reflectedSetArguments[2]))) {
+      throw new Error(
+        "Exclusive or dynamically selected Vitest tests are unaudited."
+      );
+    }
+    for (const invocation of arrayMutationInvocationsOf(node)) {
+      const { kind, source } = invocation;
+      const previousValues = currentArrayValuesOf(source);
+      const values = kind === "splice"
+        ? invocation.values.slice(2) : invocation.values;
+      const index = kind === "splice"
+        ? invocation.values.length > 0
+          ? staticArrayIndexText(invocation.values[0]) : "0"
+        : undefined;
+      const deleteCount = kind === "splice"
+        ? invocation.values.length > 1
+          ? staticStringOf(invocation.values[1]) : "rest"
+        : undefined;
+      const mutation = { kind, index, deleteCount, values };
+      const additions = values.flatMap((value) =>
+        ts.isSpreadElement(value)
+          ? fixedSpreadValuesOf(value.expression) ?? [value.expression]
+          : [unwrap(value)]);
+      const nextValues = arrayValuesAfterMutation(
+        previousValues, mutation, additions
+      );
+      const valuesCarryRunner = arrayMutationValuesCarryRunnerForTarget(
+        invocation.target, values
+      ) ?? values.some((value) => arrayMutationValueCarriesRunner(value));
+      const previousValuesCarryRunner =
+        arrayMutationValuesCarryRunnerForTarget(
+          invocation.target, previousValues
+        ) ?? previousValues.some((value) =>
+          arrayMutationValueCarriesRunner(value));
+      const nextValuesCarryRunner = arrayMutationValuesCarryRunnerForTarget(
+        invocation.target, nextValues
+      ) ?? nextValues.some((value) =>
+        arrayMutationValueCarriesRunner(value));
+      const conditional = arrayMutationIsConditional(node);
+      const deletesValues = ["pop", "shift", "fill"].includes(kind) ||
+        (kind === "splice" && (deleteCount === "rest" ||
+          deleteCount === undefined || Number(deleteCount) > 0));
+      if (invocation.unprovenArguments || valuesCarryRunner ||
+          nextValuesCarryRunner ||
+          ((conditional || deletesValues) && previousValuesCarryRunner)) {
+        throw new Error(
+          "Exclusive or dynamically selected Vitest tests are unaudited."
+        );
+      }
+      const mutations = broadArrayMutations.get(source) ?? [];
+      mutations.push(mutation);
+      broadArrayMutations.set(source, mutations);
+    }
+  }
+  ts.forEachChild(node, collectBroadArrayMutations);
 };
 const staticLogicalValueOf = (input, seen = new Set()) => {
   const node = unwrap(input);
@@ -1072,6 +1629,19 @@ const staticLogicalValueOf = (input, seen = new Set()) => {
   }
   if (ts.isArrayLiteralExpression(node) || ts.isObjectLiteralExpression(node) ||
       ts.isFunctionLike(node)) return { truthy: true, nullish: false };
+  if (ts.isCallExpression(node)) {
+    const bind = resolvedAccess(unwrap(node.expression));
+    const bindKey = assignmentReferenceKey(node.expression);
+    const bindOverridden = bindKey !== undefined &&
+      (assignmentsByMemberPath.get(bindKey)?.length ?? 0) > 0;
+    if (!bindOverridden && bind?.method === "bind" &&
+        (localFunctionValuesOf(bind.receiver, seen).length > 0 ||
+         globalIntrinsicMethodOf(
+           bind.receiver, ["Object"], ["assign", "create"], seen
+         ))) {
+      return { truthy: true, nullish: false };
+    }
+  }
   if (ts.isPrefixUnaryExpression(node) &&
       node.operator === ts.SyntaxKind.ExclamationToken && !seen.has(node)) {
     const value = staticLogicalValueOf(node.operand, new Set([...seen, node]));
@@ -1140,46 +1710,46 @@ const fixedSpreadPlansOf = (input, seen = new Set()) => {
     }
     return plans;
   }
+  if (ts.isNewExpression(node) && isArraySourceOf(node)) {
+    const values = fixedSpreadValuesOf(node, seen);
+    return values
+      ? [{ before: values, after: [], unknownIndex: undefined }]
+      : [{ before: [], after: [], unknownIndex: 0 }];
+  }
   if (ts.isIdentifier(node)) {
     const binding = resolveBinding(node);
     if (binding?.kind === "variable" &&
         ts.isVariableDeclaration(binding.node) &&
         ts.isIdentifier(binding.node.name) && binding.node.initializer &&
-    ts.isArrayLiteralExpression(unwrap(binding.node.initializer))) {
+        (ts.isArrayLiteralExpression(unwrap(binding.node.initializer)) ||
+         isArraySourceOf(unwrap(binding.node.initializer)))) {
       const usageStart = node.getStart(file);
       const mutations = (arrayMutationValuesByBinding.get(binding.node) ?? [])
         .filter((mutation) => mutation.start <= usageStart);
+    const activeArrayValues = activeBindingValuesOf(binding.node, node)
+      .filter((value) => arraySourceOf(value));
+    if (activeArrayValues.length > 1) {
+      const values = fixedSpreadValuesOf(node, seen);
+      return values
+        ? [{ before: [], after: values, unknownAll: true }]
+        : [{ before: [], after: [], unknownIndex: 0 }];
+    }
+      if (mutations.length === 0) {
+        const mutationSeen = new Set(next);
+        mutationSeen.add(binding.node);
+        return fixedSpreadPlansOf(binding.node.initializer, mutationSeen);
+      }
     if (mutations.length > 0) {
-      const mutationSeen = new Set(next);
-      mutationSeen.add(binding.node);
-      const values = fixedSpreadValuesOf(
-        binding.node.initializer, mutationSeen
+      const values = replayedArrayValuesOf(
+        binding.node.initializer, mutations
       );
-      if (!values) return [];
-      for (const mutation of mutations) {
-        const additions = mutation.values.flatMap((value) =>
-          ts.isSpreadElement(value)
-            ? fixedSpreadValuesOf(
-              value.expression, mutationSeen
-            ) ?? [value.expression]
-            : [unwrap(value)]);
-        if (mutation.kind === "push") values.push(...additions);
-        else if (mutation.kind === "unshift") values.unshift(...additions);
-        else if (mutation.kind === "set") {
-          const index = mutation.index === undefined
-            ? values.length : Number(mutation.index);
-          values[index] = additions[0];
-        } else {
-          const index = mutation.index === undefined ? 0 : Number(mutation.index);
-        const deleteCount = mutation.deleteCount === "rest"
-          ? values.length - index
-          : mutation.deleteCount === undefined
-          ? 0 : Number(mutation.deleteCount);
-        values.splice(index, deleteCount, ...additions);
-        }
-        }
       return [{ before: values, after: [], unknownIndex: undefined }];
       }
+    }
+    if (binding?.kind === "variable" &&
+        ts.isVariableDeclaration(binding.node) && binding.node.initializer) {
+      const plans = fixedSpreadPlansOf(binding.node.initializer, next);
+      if (plans.length > 0) return plans;
     }
     const values = expressionValuesOf(node, next).filter((value) => value !== node);
     return values.flatMap((value) => fixedSpreadPlansOf(value, next)).slice(0, 32);
@@ -1839,6 +2409,59 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
     }
     return values;
   };
+const capabilityPropertyValuesOf = (input, key, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return [];
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (binding?.node && (ts.isVariableDeclaration(binding.node) ||
+        ts.isParameter(binding.node))) {
+      const values = [binding.node.initializer,
+        ...(assignmentsByBinding.get(binding.node) ?? [])].filter(Boolean);
+      for (const value of values) {
+        const resolved = capabilityPropertyValuesOf(value, key, next);
+        if (resolved.length > 0) return resolved;
+      }
+    }
+    return globalIntrinsicOf(node, ["Object"], next) &&
+      ["create", "assign"].includes(key) ? [node] : [];
+  }
+  if (ts.isObjectLiteralExpression(node)) {
+    const values = [];
+    for (const property of node.properties) {
+      if (ts.isSpreadAssignment(property)) {
+        values.push(...capabilityPropertyValuesOf(
+          property.expression, key, next
+        ));
+      } else if (assignmentKey(property.name) === key) {
+        if (ts.isPropertyAssignment(property)) values.push(property.initializer);
+        if (ts.isShorthandPropertyAssignment(property)) values.push(property.name);
+      }
+    }
+    return values;
+  }
+  const createArguments = intrinsicInvocationArgumentsOf(
+    node, ["Object"], ["create"], next
+  );
+  if (createArguments?.[0]) {
+    return capabilityPropertyValuesOf(createArguments[0], key, next);
+  }
+  const assignArguments = intrinsicInvocationArgumentsOf(
+    node, ["Object"], ["assign"], next
+  );
+  if (assignArguments) {
+    return assignArguments.flatMap((argument) => {
+      const values = ts.isSpreadElement(argument)
+        ? expandedArgumentValuesOf(argument.expression, next)
+        : [argument];
+      return values.flatMap((value) =>
+        capabilityPropertyValuesOf(value, key, next));
+    });
+  }
+  return [];
+};
 const recordResolvedAssignments = (target, source) => {
   target = unwrap(target);
   if (assignmentMemberAccess(target) ||
@@ -1848,6 +2471,54 @@ const recordResolvedAssignments = (target, source) => {
   }
   if (ts.isIdentifier(target)) {
     recordAssignment(target, source);
+    return;
+  }
+  if (ts.isObjectBindingPattern(target)) {
+    for (const element of target.elements) {
+      const key = element.propertyName
+        ? assignmentKey(element.propertyName)
+        : ts.isIdentifier(element.name) ? element.name.text : undefined;
+      if (key === undefined) {
+        if (globalCapabilitySourceOf(source)) {
+          throw new Error(
+            "Exclusive or dynamically selected Vitest tests unaudited."
+          );
+        }
+        continue;
+      }
+      const targetValue = element.name;
+      if (ts.isIdentifier(targetValue)) {
+        const binding = resolveBinding(targetValue);
+        if (binding?.node) {
+          const assignments = destructuredPropertyAssignmentsByBinding
+            .get(binding.node) ?? [];
+          if (!assignments.some((assignment) => assignment.source === source &&
+              assignment.property === key)) {
+            assignments.push({ source, property: key });
+            destructuredPropertyAssignmentsByBinding.set(binding.node, assignments);
+          }
+        }
+      }
+      const selected = objectPropertyValuesOf(source, key);
+      const capabilityValues = selected.length > 0
+        ? selected : capabilityPropertyValuesOf(source, key);
+      const resolvedValues = capabilityValues.length > 0
+        ? capabilityValues : element.initializer ? [element.initializer] : [];
+      for (const value of resolvedValues) {
+        recordResolvedAssignments(targetValue, value);
+      }
+    }
+    return;
+  }
+  if (ts.isArrayBindingPattern(target)) {
+    for (let index = 0; index < target.elements.length; index += 1) {
+      const element = target.elements[index];
+      if (!ts.isBindingElement(element) || element.dotDotDotToken) continue;
+      const selected = objectPropertyValuesOf(source, String(index));
+      for (const value of selected) {
+        recordResolvedAssignments(element.name, value);
+      }
+    }
     return;
   }
   if (ts.isObjectLiteralExpression(target)) {
@@ -1896,9 +2567,11 @@ const recordResolvedAssignments = (target, source) => {
           }
         }
       }
-      const selected = objectPropertyValuesOf(source, key);
-      const resolvedValues = selected.length > 0
-        ? selected
+    const selected = objectPropertyValuesOf(source, key);
+    const capabilityValues = selected.length > 0
+      ? selected : capabilityPropertyValuesOf(source, key);
+    const resolvedValues = capabilityValues.length > 0
+      ? capabilityValues
         : defaultValue ? [defaultValue] : [];
       for (const value of resolvedValues) {
         recordResolvedAssignments(targetValue, value);
@@ -1922,6 +2595,12 @@ const recordResolvedAssignments = (target, source) => {
   }
 };
 const collectResolvedAssignments = (node) => {
+  if (ts.isVariableDeclaration(node) && node.initializer &&
+      (ts.isObjectBindingPattern(node.name) ||
+       ts.isArrayBindingPattern(node.name))) {
+    recordResolvedAssignments(node.name, node.initializer);
+    collectDestructuredPropertyAssignments(node.name, node.initializer);
+  }
   if (ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
     const target = unwrap(node.left);
@@ -2036,11 +2715,24 @@ const collectResolvedAssignments = (node) => {
     if (!node || seen.has(node)) return false;
     const next = new Set(seen);
     next.add(node);
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return intrinsicBindMethodOf(node.right, receiverNames, methods, next);
+  }
     const member = resolvedAccess(node);
     if (member?.method === "bind" &&
         globalIntrinsicMethodOf(
           member.receiver, receiverNames, methods, next
         )) return true;
+  if (ts.isCallExpression(node)) {
+    const reflected = intrinsicInvocationArgumentsOf(
+      node, ["Reflect"], ["get"], next
+    );
+    if (reflected && staticStringOf(reflected[1], next) === "bind" &&
+        globalIntrinsicMethodOf(reflected[0], receiverNames, methods, next)) {
+      return true;
+    }
+  }
     if (!ts.isIdentifier(node)) return false;
     const binding = resolveBinding(node);
     const declaration = binding?.node &&
@@ -2049,12 +2741,21 @@ const collectResolvedAssignments = (node) => {
     if (!declaration || seen.has(declaration)) return false;
     const bindingNext = new Set(next);
     bindingNext.add(declaration);
+  if (ts.isIdentifier(declaration.name)) {
     return [declaration.initializer,
       ...(assignmentsByBinding.get(declaration) ?? [])]
       .filter(Boolean)
       .some((value) => intrinsicBindMethodOf(
         value, receiverNames, methods, bindingNext
       ));
+  }
+  if (globalIntrinsicMethodOf(
+    declaration.initializer, receiverNames, methods, bindingNext
+  ) && patternSelectsProperty(declaration.name, node.text, "bind")) {
+    return true;
+  }
+  return destructuredValuesOf(declaration, node.text).some((value) =>
+    intrinsicBindMethodOf(value, receiverNames, methods, bindingNext));
   }
   const globalIntrinsicMethodOf = (input, receiverNames, methods, seen = new Set()) => {
     const node = unwrap(input);
@@ -2125,13 +2826,15 @@ const globalCapabilitySourceOf = (input, seen = new Set()) => {
   if (!node || seen.has(node)) return false;
   const next = new Set(seen);
   next.add(node);
-  if (globalIntrinsicOf(node, ["Object"], next) ||
-      globalIntrinsicMethodOf(node, ["Object"], ["create", "assign"], next)) {
+  if (globalIntrinsicOf(node, ["Object"], seen) ||
+      globalIntrinsicMethodOf(node, ["Object"], ["create", "assign"], seen)) {
     return true;
   }
-  const member = resolvedAccess(node);
-  if (member && ["create", "assign"].includes(member.method) &&
-      ts.isIdentifier(member.receiver) && member.receiver.text === "Object") {
+  const invocationArguments = intrinsicInvocationArgumentsOf(
+    node, ["Object"], ["create", "assign"], next
+  );
+  if (invocationArguments?.some((value) =>
+    globalCapabilitySourceOf(value, next))) {
     return true;
   }
   if (ts.isConditionalExpression(node)) {
@@ -2163,10 +2866,11 @@ const globalCapabilitySourceOf = (input, seen = new Set()) => {
   }
   if (!ts.isIdentifier(node)) return false;
   const binding = resolveBinding(node);
+  const usageStart = node.getStart(file);
   return Boolean(binding?.node && (ts.isVariableDeclaration(binding.node) ||
     ts.isParameter(binding.node)) && !seen.has(binding.node) &&
     [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
-      .filter(Boolean)
+    .filter((value) => value && value.getStart(file) <= usageStart)
       .some((value) => globalCapabilitySourceOf(value, next)));
 };
   function intrinsicArgumentValuesOf(argumentsList, seen) {
@@ -2787,7 +3491,8 @@ if (candidate) return candidate;
       ts.isIdentifier(binding.node.name)) {
       const next = new Set(seen);
       next.add(binding.node);
-      const values = [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
+  const values = fixedSpreadValuesOf(node) ??
+    [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])];
       for (const value of values) {
         const candidate = value && possibleTestRunnerOf(value, names, next);
         if (candidate) return candidate;
@@ -2853,8 +3558,9 @@ if (candidate) return candidate;
       if (!declaration || seen.has(binding.node)) return false;
       const bindingNext = new Set(seen);
       bindingNext.add(binding.node);
-      const values = ts.isIdentifier(declaration.name)
-        ? [declaration.initializer, ...(assignmentsByBinding.get(declaration) ?? [])]
+        const values = ts.isIdentifier(declaration.name)
+          ? fixedSpreadValuesOf(node) ??
+            [declaration.initializer, ...(assignmentsByBinding.get(declaration) ?? [])]
         : declaration.initializer
           ? destructuredValuesOf(declaration, node.text) : [];
       return values.some((value) => value &&
@@ -3110,6 +3816,10 @@ const reflectApplyInvocationOf = (argumentsList, seen = new Set()) => {
 const bindMethodReferenceOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return undefined;
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return bindMethodReferenceOf(node.right, seen);
+  }
   if (ts.isGetAccessorDeclaration(node)) {
     const returnedValues = functionReturnExpressionsOf(node, seen);
     const next = new Set(seen);
@@ -3135,6 +3845,12 @@ const bindMethodReferenceOf = (input, seen = new Set()) => {
   if (ts.isCallExpression(node)) {
     const next = new Set(seen);
     next.add(node);
+    const reflected = intrinsicInvocationArgumentsOf(
+      node, ["Reflect"], ["get"], next
+    );
+    if (reflected && staticStringOf(reflected[1], next) === "bind") {
+      return { receiver: reflected[0], method: "bind" };
+    }
     for (const value of functionReturnExpressionsOf(node.expression, next)) {
       const resolved = bindMethodReferenceOf(value, next);
       if (resolved) return resolved;
@@ -3143,15 +3859,26 @@ const bindMethodReferenceOf = (input, seen = new Set()) => {
   }
   if (!ts.isIdentifier(node)) return undefined;
   const binding = resolveBinding(node);
-  if (binding?.kind !== "variable" ||
-      !ts.isVariableDeclaration(binding.node) ||
-      !ts.isIdentifier(binding.node.name) || !binding.node.initializer) {
-    return undefined;
-  }
+  const declaration = binding?.node &&
+    (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node))
+    ? binding.node : undefined;
+  if (!declaration || !declaration.initializer) return undefined;
   const next = new Set(seen);
   next.add(node);
   next.add(binding.node);
-  return bindMethodReferenceOf(binding.node.initializer, next);
+  if (ts.isIdentifier(binding.node.name)) {
+    return bindMethodReferenceOf(binding.node.initializer, next);
+  }
+  if (globalIntrinsicMethodOf(
+    binding.node.initializer, ["Object"], ["create", "assign"], next
+  ) && patternSelectsProperty(binding.node.name, node.text, "bind")) {
+    return { receiver: binding.node.initializer, method: "bind" };
+  }
+  for (const value of destructuredValuesOf(binding.node, node.text)) {
+    const resolved = bindMethodReferenceOf(value, next);
+    if (resolved) return resolved;
+  }
+  return undefined;
 };
 function genericBindMethodOf(input, seen = new Set()) {
   const node = unwrap(input);
@@ -3213,6 +3940,26 @@ const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
       }
     }
     return undefined;
+  }
+  if (ts.isBinaryExpression(node) && [
+    ts.SyntaxKind.AmpersandAmpersandToken,
+    ts.SyntaxKind.BarBarToken,
+    ts.SyntaxKind.QuestionQuestionToken
+  ].includes(node.operatorToken.kind)) {
+    const leftValue = staticLogicalValueOf(node.left, next);
+    const selectRight = node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+      ? leftValue?.truthy
+      : node.operatorToken.kind === ts.SyntaxKind.BarBarToken
+      ? leftValue ? !leftValue.truthy : undefined
+      : leftValue?.nullish;
+    const selected = leftValue
+      ? [selectRight ? node.right : node.left]
+      : [node.left, node.right];
+    const alternatives = selected.flatMap((value) => {
+      const candidate = storedBindInvocationOf(value, invocationPlan, next);
+      return candidate ? candidate.alternatives ?? [candidate] : [];
+    });
+    if (alternatives.length > 0) return { alternatives };
   }
   if (ts.isConditionalExpression(node)) {
     const alternatives = [node.whenTrue, node.whenFalse].flatMap((value) => {
@@ -3431,6 +4178,15 @@ collectAssignments(file);
             parameterRunnerArgumentsChanged = recordParameterFunctions(
               parameter, localFunctionValuesOf(argument)
             ) || parameterRunnerArgumentsChanged;
+            const arraySource = arraySourceOf(argument);
+            if (arraySource) {
+              const sources = parameterArraySources.get(parameter) ?? [];
+              if (!sources.includes(arraySource)) {
+                sources.push(arraySource);
+                parameterArraySources.set(parameter, sources);
+                parameterRunnerArgumentsChanged = true;
+              }
+            }
             const boundNames = ts.isIdentifier(parameter.name)
               ? []
               : collectBoundNames(parameter.name);
@@ -3460,6 +4216,7 @@ argument, ["test", "it", "describe"]
     };
     collectParameterRunnerArguments(file);
   }
+collectBroadArrayMutations(file);
 return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, testRunnerContainerOf, globalIntrinsicOf,
     intrinsicInvocationArgumentsOf, resolveBinding, resolvedAccess, staticStringOf };

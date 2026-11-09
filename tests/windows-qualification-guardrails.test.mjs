@@ -951,11 +951,22 @@ test.each([
       ['apply read', `const args = []; args.push(test); focus.apply(null, args);`],
       ['later safe write', `const args = []; args.push(test); args[0] = { only() {} }; focus(...args);`],
       ['splice deletion', `const args = [safe, test]; args.splice(0, 1); focus(...args);`],
-      ['splice deletion to end', `const args = [safe, test]; args.splice(0); focus(...args);`],
+      ['negative splice deletion', `const args = [test, safe]; args.splice(-1, 1); focus(...args);`],
       ['read before safe write', `const args = [test]; focus(...args); args[0] = { only() {} };`],
       ['fill insertion', `const args = [safe]; args.fill(test); focus(...args);`],
       ['copyWithin reorder', `const args = [test, safe]; args.copyWithin(1, 0); focus(...args);`],
       ['reverse reorder', `const args = [test, safe]; args.reverse(); focus(...args);`],
+  ['unshift insertion', `const args = []; args.unshift(test); focus(...args);`],
+  ['sort reorder', `const args = [test, safe]; args.sort(); focus(...args);`],
+  ['pop deletion', `const args = [test, safe]; args.pop(); focus(...args);`],
+      ['pop removes runner safely', `const args = [safe, test]; args.pop(); focus(...args);`],
+      ['shift removes runner safely', `const args = [test, safe]; args.shift(); focus(...args);`],
+      ['splice removes runner safely', `const args = [test, safe]; args.splice(0, 1); focus(...args);`],
+      ['splice removes all values', `const args = [safe, test]; args.splice(0); focus(...args);`],
+      ['negative splice removes runner', `const args = [safe, test]; args.splice(-1, 1); focus(...args);`],
+      ['fill replaces runner', `const args = [test]; args.fill(safe); focus(...args);`],
+      ['alternative array source with runner', `declare const condition: boolean; let args = [safe]; if (condition) args = [test]; focus(...args);`],
+      ['alternative array source before safe push', `declare const condition: boolean; let args = [safe]; if (condition) args = [test]; args.push(safe); focus(...args);`],
       ['conditional safe write', `declare const condition: boolean; const args = [test]; if (condition) args[0] = safe; focus(...args);`]
 ])('rejects capability-bearing mutable array %s', (_name, mutation) => {
   const source = `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } ${mutation}`;
@@ -975,9 +986,173 @@ test.each([
       ['fill', `const args = []; args.fill(safe); focus(...args);`],
       ['copyWithin', `const args = [safe, safe]; args.copyWithin(1, 0); focus(...args);`],
       ['reverse', `const args = [safe, safe]; args.reverse(); focus(...args);`],
+  ['unshift', `const args = []; args.unshift(safe); focus(...args);`],
+  ['sort', `const args = [safe, safe]; args.sort(); focus(...args);`],
+  ['pop', `const args = [safe]; args.pop(); focus(...args);`],
+  ['shift', `const args = [safe]; args.shift(); focus(...args);`],
+  ['assignment replaces runner', `const args = [test]; args[0] = safe; focus(...args);`],
+  ['assignment replays before safe push', `const args = [test]; args[0] = safe; args.push(safe); focus(...args);`],
+  ['alternative safe array sources', `declare const condition: boolean; let args = [safe]; if (condition) args = [safe]; focus(...args);`],
+  ['alternative safe array sources before safe push', `declare const condition: boolean; let args = [safe]; if (condition) args = [safe]; args.push(safe); focus(...args);`],
       ['conditional write', `declare const condition: boolean; const args = [safe]; if (condition) args[0] = safe; focus(...args);`]
 ])('accepts safe mutable array %s', (_name, mutation) => {
   const source = `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } ${mutation}`;
+  expect(collectWindowsTestTitles('fixture.ts', source)).toEqual([]);
+});
+
+test.each([
+  ['logical OR assignment', `const args = []; args[0] ||= test; focus(...args);`],
+  ['logical AND assignment', `const args = []; args[0] &&= test; focus(...args);`],
+  ['nullish assignment', `const args = []; args[0] ??= test; focus(...args);`],
+  ['logical OR preserves prior runner', `const args = [test]; args[0] ||= safe; focus(...args);`],
+  ['logical AND preserves prior runner', `const args = [test]; args[0] &&= safe; focus(...args);`],
+  ['nullish assignment preserves prior runner', `const args = [test]; args[0] ??= safe; focus(...args);`],
+  ['push call', `const args = []; args.push.call(args, test); focus(...args);`],
+  ['push apply', `const args = []; args.push.apply(args, [test]); focus(...args);`],
+  ['Reflect.apply push', `const args = []; Reflect.apply(args.push, args, [test]); focus(...args);`],
+  ['Array.prototype push apply', `const args = []; Array.prototype.push.apply(args, [test]); focus(...args);`],
+  ['Array.prototype push call', `const args = []; Array.prototype.push.call(args, test); focus(...args);`],
+  ['bound push', `const args = []; const push = args.push.bind(args); push(test); focus(...args);`],
+  ['rebound push', `const args = []; const push = args.push.bind(args).bind({}); push(test); focus(...args);`],
+    ['unbound member alias', `const args = []; const push = args.push; push.call(args, test); focus(...args);`],
+    ['destructured member alias', `const args = []; const { push } = args; push.call(args, test); focus(...args);`],
+    ['unproven apply values', `declare const values: any[]; const args = []; args.push.apply(args, values); focus(...args);`],
+    ['unproven spread values', `declare const values: any[]; const args = []; args.push(...values); focus(...args);`],
+    ['helper-returned array', `const args = []; const get = () => args; get().push(test); focus(...args);`],
+    ['helper-returned alias', `const args = []; function get() { return args; } const alias = get(); alias.push(test); focus(...args);`],
+    ['Object.assign array write', `const args = []; Object.assign(args, { 0: test, length: 1 }); focus(...args);`],
+    ['Reflect.set array write', `const args = []; Reflect.set(args, 0, test); focus(...args);`],
+  ['member-held bound push', `const args = []; const methods = { push: args.push.bind(args) }; methods.push(test); focus(...args);`],
+  ['helper push', `const args = []; function put(list, value) { list.push(value); } put(args, test); focus(...args);`],
+  ['helper unshift', `const args = []; function put(list, value) { list.unshift(value); } put(args, test); focus(...args);`],
+  ['helper splice', `const args = []; function put(list, value) { list.splice(0, 0, value); } put(args, test); focus(...args);`],
+  ['helper index write', `const args = []; function put(list, value) { list[0] = value; } put(args, test); focus(...args);`],
+  ['helper alias', `const args = []; function put(list, value) { const alias = list; alias.push(value); } put(args, test); focus(...args);`],
+  ['object-held array', `const holder = { args: [] }; holder.args.push(test); focus(...holder.args);`],
+  ['new Array index write', `const args = new Array(); args[0] = test; focus(...args);`]
+  , ['sized new Array index write', `const args = new Array(1); args[0] = test; focus(...args);`]
+  , ['new Array initial runner', `const args = new Array(test); focus(...args);`]
+])('rejects capability-bearing indirect array mutation %s', (_name, mutation) => {
+  const source = `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } ${mutation}`;
+  expect(() => collectWindowsTestTitles('fixture.ts', source))
+    .toThrow(/Exclusive or dynamically selected Vitest/);
+});
+
+test.each([
+  ['logical OR assignment', `const args = []; args[0] ||= safe; focus(...args);`],
+  ['logical AND assignment', `const args = []; args[0] &&= safe; focus(...args);`],
+  ['nullish assignment', `const args = []; args[0] ??= safe; focus(...args);`],
+  ['index write', `const args = []; args[0] = safe; focus(...args);`],
+  ['push call', `const args = []; args.push.call(args, safe); focus(...args);`],
+  ['push apply', `const args = []; args.push.apply(args, [safe]); focus(...args);`],
+  ['Reflect.apply push', `const args = []; Reflect.apply(args.push, args, [safe]); focus(...args);`],
+  ['Array.prototype push apply', `const args = []; Array.prototype.push.apply(args, [safe]); focus(...args);`],
+  ['Array.prototype push call', `const args = []; Array.prototype.push.call(args, safe); focus(...args);`],
+  ['bound push', `const args = []; const push = args.push.bind(args); push(safe); focus(...args);`],
+  ['rebound push', `const args = []; const push = args.push.bind(args).bind({}); push(safe); focus(...args);`],
+    ['unbound member alias', `const args = []; const push = args.push; push.call(args, safe); focus(...args);`],
+    ['destructured member alias', `const args = []; const { push } = args; push.call(args, safe); focus(...args);`],
+    ['known apply values', `const values = [safe]; const args = []; args.push.apply(args, values); focus(...args);`],
+    ['known spread values', `const values = [safe]; const args = []; args.push(...values); focus(...args);`],
+    ['helper-returned array', `const args = []; const get = () => args; get().push(safe); focus(...args);`],
+    ['helper-returned alias', `const args = []; function get() { return args; } const alias = get(); alias.push(safe); focus(...args);`],
+    ['Object.assign array write', `const args = []; Object.assign(args, { 0: safe, length: 1 }); focus(...args);`],
+    ['Reflect.set array write', `const args = []; Reflect.set(args, 0, safe); focus(...args);`],
+  ['member-held bound push', `const args = []; const methods = { push: args.push.bind(args) }; methods.push(safe); focus(...args);`],
+  ['helper push', `const args = []; function put(list, value) { list.push(value); } put(args, safe); focus(...args);`],
+  ['helper unshift', `const args = []; function put(list, value) { list.unshift(value); } put(args, safe); focus(...args);`],
+  ['helper splice', `const args = []; function put(list, value) { list.splice(0, 0, value); } put(args, safe); focus(...args);`],
+  ['helper index write', `const args = []; function put(list, value) { list[0] = value; } put(args, safe); focus(...args);`],
+  ['helper alias', `const args = []; function put(list, value) { const alias = list; alias.push(value); } put(args, safe); focus(...args);`],
+  ['object-held array', `const holder = { args: [] }; holder.args.push(safe); focus(...holder.args);`],
+  ['new Array without runner', `const args = new Array(); focus(...args);`],
+  ['new Array safe initial value', `const args = new Array(safe); focus(...args);`],
+  ['unrelated helper arguments', `function put(list, value) { list.push(value); } const args = []; put(args, safe); put({}, test); focus(...args);`],
+  ['custom method named push', `function use(custom) { const args = []; custom.push.call(args, test); focus(...args); } const custom = { push() {} }; use(custom);`],
+  ['omitted apply arguments', `const args = []; args.push.apply(args); focus(...args);`],
+  ['method call before later array assignment', `let args = { push() {} }; args.push.call(args, test); args = []; focus(...args);`],
+  ['prototype bound helper arguments', `function put(list, value) { const push = Array.prototype.push.bind(list); push(value); } const args = []; put(args, safe); put({}, test); focus(...args);`]
+])('accepts safe indirect array mutation %s', (_name, mutation) => {
+  const source = `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } ${mutation}`;
+  expect(collectWindowsTestTitles('fixture.ts', source)).toEqual([]);
+});
+
+test.each([
+  ['nested Object.assign assignment', `let create; ({ outer: { create } } = Object.assign({}, { outer: Object })); create({ runtime: test }).runtime.only('focused', () => {});`],
+  ['nested Object.create assignment', `let create; ({ outer: { create } } = Object.create({ outer: Object })); create({ runtime: test }).runtime.only('focused', () => {});`],
+  ['computed Object.assign declaration', `const key = 'create'; const { outer: { [key]: create } } = Object.assign({}, { outer: Object }); create({ runtime: test }).runtime.only('focused', () => {});`],
+  ['computed Object.create assignment', `const key = 'create'; let create; ({ outer: { [key]: create } } = Object.create({ outer: Object })); create({ runtime: test }).runtime.only('focused', () => {});`]
+])('rejects capability from intrinsic invocation result: %s', (_name, mutation) => {
+  const source = `import { test } from 'vitest'; ${mutation}`;
+  expect(() => collectWindowsTestTitles('fixture.ts', source))
+    .toThrow(/Exclusive or dynamically selected Vitest/);
+});
+
+test.each([
+  ['local Object create', `const Object = { create() {} }; const { create } = Object.create; test('required', () => {});`, [{ title: 'required', enabled: true }]],
+  ['local Object computed destructuring', `const Object = { create() {} }; const key = 'value'; let value; ({ [key]: value } = Object.create); test('required', () => {});`, [{ title: 'required', enabled: true }]],
+  ['local Reflect shadow', `const Reflect = { get() { return {}; } }; const bind = Reflect.get(Object.create, 'bind'); const create = bind.call(Object.create, Object); const args = create({ runtime: test }); args.runtime.only('safe', () => {});`, []],
+  ['later Object assignment', `let Object; let create; const key = 'create'; ({ [key]: create } = Object); Object = globalThis.Object; test('required', () => {});`, [{ title: 'required', enabled: true }]]
+])('ignores non-intrinsic or later capability source: %s', (_name, mutation, expected) => {
+  const source = `import { test } from 'vitest'; ${mutation}`;
+  expect(collectWindowsTestTitles('fixture.ts', source)).toEqual(expected);
+});
+
+test.each([
+  ['destructured bind call', `const { bind } = Object.create; const create = bind.call(Object.create, Object); create({ runtime: test }).runtime.only('focused', () => {});`],
+  ['comma-selected bind apply', `const bind = (0, Object.create.bind); const create = bind.apply(Object.create, [Object]); create({ runtime: test }).runtime.only('focused', () => {});`],
+  ['reflected bind apply', `const bind = Reflect.get(Object.create, 'bind'); const create = Reflect.apply(bind, Object.create, [Object]); create({ runtime: test }).runtime.only('focused', () => {});`],
+    ['aliased Reflect.get bind', `const get = Reflect.get; const bind = get(Object.create, 'bind'); const create = bind.call(Object.create, Object); create({ runtime: test }).runtime.only('focused', () => {});`],
+    ['destructured Reflect.get bind', `const { get } = Reflect; const bind = get(Object.create, 'bind'); const create = bind.call(Object.create, Object); create({ runtime: test }).runtime.only('focused', () => {});`],
+  ['destructured bind call with captured prototype', `const { bind } = Object.create; const create = bind.call(Object.create, Object, { runtime: test }); create().runtime.only('focused', () => {});`],
+  ['destructured bind apply with captured prototype', `const { bind } = Object.create; const create = bind.apply(Object.create, [Object, { runtime: test }]); create().runtime.only('focused', () => {});`],
+  ['reflected bind apply with captured prototype', `const bind = Reflect.get(Object.create, 'bind'); const create = Reflect.apply(bind, Object.create, [Object, { runtime: test }]); create().runtime.only('focused', () => {});`]
+])('rejects detached bind neighbor: %s', (_name, mutation) => {
+  const source = `import { test } from 'vitest'; ${mutation}`;
+  expect(() => collectWindowsTestTitles('fixture.ts', source))
+    .toThrow(/Exclusive or dynamically selected Vitest/);
+});
+
+test.each([
+  ['bind call', `const { bind } = Object.create; const create = bind.call(Object.create, Object, { runtime: safe }); create().runtime.only('safe', () => {});`],
+  ['bind apply', `const { bind } = Object.create; const create = bind.apply(Object.create, [Object, { runtime: safe }]); create().runtime.only('safe', () => {});`],
+  ['reflected bind apply', `const bind = Reflect.get(Object.create, 'bind'); const create = Reflect.apply(bind, Object.create, [Object, { runtime: safe }]); create().runtime.only('safe', () => {});`]
+])('accepts detached bind without runner selection: %s', (_name, mutation) => {
+  const source = `import { test } from 'vitest'; const safe = { only() {} }; ${mutation}`;
+  expect(collectWindowsTestTitles('fixture.ts', source)).toEqual([]);
+});
+
+test.each([
+  ['logical OR', `const chosen = focus.bind(null) || safe.bind(null); chosen(test);`],
+  ['nullish coalescing', `const chosen = focus.bind(null) ?? safe.bind(null); chosen(test);`],
+  ['logical AND branch order', `const chosen = safe.bind(null) && focus.bind(null); chosen(test);`]
+    , ['custom bind result', `const custom = { bind() { return null; } }; const chosen = custom.bind() ?? focus.bind(null); chosen(test);`]
+    , ['overridden function bind', `const safe = () => {}; safe.bind = () => null; const chosen = safe.bind() ?? focus.bind(null); chosen(test);`]
+    , ['unknown condition logical AND', `declare const condition: boolean; const chosen = condition && focus.bind(null); chosen(test);`]
+    , ['unknown condition logical OR', `declare const condition: boolean; const chosen = condition || focus.bind(null); chosen(test);`]
+])('evaluates stored logical helper selection: %s', (_name, mutation) => {
+  const source = `import { test } from 'vitest'; function safe() {} function focus(register) { register.only('focused', () => {}); } ${mutation}`;
+  expect(() => collectWindowsTestTitles('fixture.ts', source))
+    .toThrow(/Exclusive or dynamically selected Vitest/);
+});
+
+test.each([
+  ['logical OR', `const chosen = safe.bind(null) || focus.bind(null); chosen(test);`],
+  ['nullish coalescing', `const chosen = safe.bind(null) ?? focus.bind(null); chosen(test);`],
+  ['logical AND branch order', `const chosen = focus.bind(null) && safe.bind(null); chosen(test);`]
+    , ['false logical AND', `const chosen = false && focus.bind(null); chosen(test);`]
+    , ['true logical OR', `const chosen = true || focus.bind(null); chosen(test);`]
+])('accepts stored safe logical helper selection: %s', (_name, mutation) => {
+  const source = `import { test } from 'vitest'; function safe() {} function focus(register) { register.only('focused', () => {}); } ${mutation}`;
+  expect(collectWindowsTestTitles('fixture.ts', source)).toEqual([]);
+});
+
+test.each([
+  ['logical OR', `[safe] || [test]`],
+  ['logical AND', `[test] && [safe]`],
+  ['nullish coalescing', `[safe] ?? [test]`]
+])('evaluates stored logical array selection: %s', (_name, selection) => {
+  const source = `import { test } from 'vitest'; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } const chosen = ${selection}; focus(...chosen);`;
   expect(collectWindowsTestTitles('fixture.ts', source)).toEqual([]);
 });
 

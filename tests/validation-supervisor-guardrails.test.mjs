@@ -1019,7 +1019,55 @@ const staticProvenanceCases = [
   ['later-assigned member-held Object.create', (capability) =>
     `const tools = {}; tools.create = Object.create; const args = tools.create({ runtime: ${capability} }); args.runtime.getBuiltinModule('node:child_process');`],
   ['later-assigned member-held Object.assign', (capability) =>
-    `const tools = {}; tools.assign = Object.assign; tools.assign({}, { runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`]
+    `const tools = {}; tools.assign = Object.assign; tools.assign({}, { runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
+  ['Object.assign result nested declaration', (capability) =>
+    `const { outer: { create } } = Object.assign({}, { outer: Object }); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['Object.create result nested declaration', (capability) =>
+    `const { outer: { create } } = Object.create({ outer: Object }); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['Object.assign result nested assignment', (capability) =>
+    `let create; ({ outer: { create } } = Object.assign({}, { outer: Object })); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['Object.create computed result declaration', (capability) =>
+    `const key = 'outer'; const { [key]: { create } } = Object.create({ [key]: Object }); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['Object.assign computed result assignment', (capability) =>
+    `const key = 'outer'; let create; ({ [key]: { create } } = Object.assign({}, { [key]: Object })); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['computed Object.create method declaration', (capability) =>
+    `const key = 'create'; const { outer: { [key]: create } } = Object.create({ outer: Object }); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['computed Object.assign method assignment', (capability) =>
+    `const key = 'create'; let create; ({ outer: { [key]: create } } = Object.assign({}, { outer: Object })); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['detached destructured Object.create bind call', (capability) =>
+    `const { bind } = Object.create; const create = bind.call(Object.create, Object); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['detached destructured Object.create bind captured call', (capability) =>
+    `const { bind } = Object.create; const create = bind.call(Object.create, Object, { runtime: ${capability} }); create().getBuiltinModule('node:child_process');`],
+  ['detached comma Object.create bind apply', (capability) =>
+    `const bind = (0, Object.create.bind); const create = bind.apply(Object.create, [Object]); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['detached comma Object.create bind captured apply', (capability) =>
+    `const bind = (0, Object.create.bind); const create = bind.apply(Object.create, [Object, { runtime: ${capability} }]); create().getBuiltinModule('node:child_process');`],
+  ['detached reflected Object.create bind', (capability) =>
+    `const bind = Reflect.get(Object.create, 'bind'); const create = Reflect.apply(bind, Object.create, [Object]); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['detached reflected Object.create bind captured', (capability) =>
+    `const bind = Reflect.get(Object.create, 'bind'); const create = Reflect.apply(bind, Object.create, [Object, { runtime: ${capability} }]); create().getBuiltinModule('node:child_process');`],
+  ['detached aliased Reflect.get bind', (capability) =>
+    `const get = Reflect.get; const bind = get(Object.create, 'bind'); const create = bind.call(Object.create, Object); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['detached destructured Reflect.get bind', (capability) =>
+    `const { get } = Reflect; const bind = get(Object.create, 'bind'); const create = bind.call(Object.create, Object); create({ runtime: ${capability} }).getBuiltinModule('node:child_process');`],
+  ['detached destructured Object.assign bind call', (capability) =>
+    `const { bind } = Object.assign.bind; const assign = bind.call(Object.assign, Object); assign({}, { runtime: ${capability} }).runtime.getBuiltinModule('node:child_process');`],
+  ['stored logical OR bound helper', (capability) =>
+    `const safeBound = () => ({ getBuiltinModule() {} }); function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = load.bind(null) || safeBound.bind(null); bound(${capability}).exec('id');`],
+  ['stored logical nullish bound helper', (capability) =>
+    `const safeBound = () => ({ getBuiltinModule() {} }); function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = load.bind(null) ?? safeBound.bind(null); bound(${capability}).exec('id');`],
+  ['stored logical AND bound helper', (capability) =>
+    `const safeBound = () => ({ getBuiltinModule() {} }); function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = safeBound.bind(null) && load.bind(null); bound(${capability}).exec('id');`],
+  ['unknown condition stored logical AND bind', (capability) =>
+    `declare const condition: boolean; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = condition && load.bind(null); bound(${capability}).exec('id');`],
+  ['unknown condition stored logical OR bind', (capability) =>
+    `declare const condition: boolean; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = condition || load.bind(null); bound(${capability}).exec('id');`],
+  ['stored logical OR array', (capability) =>
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const args = [${capability}] || [safe]; load(...args);`],
+  ['stored logical AND array', (capability) =>
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const args = [safe] && [${capability}]; load(...args);`],
+  ['stored logical nullish array', (capability) =>
+    `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const args = null ?? [${capability}]; load(...args);`]
 ];
 
 const genericBindProvenanceCases = [
@@ -1055,6 +1103,42 @@ test.each(staticProvenanceCases)(
   });
 
 test.each([
+  ['local Object identifier',
+    `const Object = { eval() {} }; let run; ({ eval: run } = Object); run('safe');`],
+  ['local Reflect identifier',
+    `const Reflect = { eval() {} }; let run; ({ eval: run } = Reflect); run('safe');`],
+  ['local Object.assign member',
+    `const Object = { assign: { constructor: null } }; let make; ({ constructor: make } = Object.assign); make('safe');`],
+  ['Object assigned after destructuring',
+    `let Object; let run; ({ eval: run } = Object); Object = globalThis.Object; run('safe');`],
+  ['Reflect assigned after destructuring',
+    `let Reflect; let run; ({ eval: run } = Reflect); Reflect = globalThis.Reflect; run('safe');`],
+  ['declaration from local Object.assign',
+    `const Object = { assign: { constructor: null } }; const { constructor: make } = Object.assign; make('safe');`],
+  ['local eval member with unrelated global source',
+    `const source = { safe: { eval() {} }, unrelated: Object }; const { safe: { eval: run } } = source; run('safe');`]
+])('accepts %s shadowing an intrinsic name', (_name, source) => {
+  expect(inspectSupervisorSource(
+    'src/services/windows-process-host.ts', source
+  )).toEqual([]);
+});
+
+test.each([
+  ['logical OR', `const args = [safe] || [process]; load(...args);`],
+  ['logical AND', `const args = [process] && [safe]; load(...args);`],
+  ['logical nullish', `const args = [safe] ?? [process]; load(...args);`]
+])('accepts unreachable stored %s capability branch', (_name, selection) => {
+  const source = [
+    'const safe = { getBuiltinModule() {} };',
+    "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); }",
+    selection
+  ].join('\n');
+  expect(inspectSupervisorSource(
+    'src/services/windows-process-host.ts', source
+  )).toEqual([]);
+});
+
+test.each([
   ['push', `const args = []; args.push(process); load(...args).exec('id');`],
   ['index assignment', `const args = [undefined]; args[0] = process; load(...args).exec('id');`],
   ['splice insertion', `const args = []; args.splice(0, 0, process); load(...args).exec('id');`],
@@ -1069,7 +1153,40 @@ test.each([
   ['fill insertion', `const args = [safe]; args.fill(process); load(...args);`],
   ['copyWithin reorder', `const args = [process, safe]; args.copyWithin(1, 0); load(...args);`],
   ['reverse reorder', `const args = [process, safe]; args.reverse(); load(...args);`],
-  ['conditional safe write', `declare const condition: boolean; const args = [process]; if (condition) args[0] = safe; load(...args);`]
+  ['conditional safe write', `declare const condition: boolean; const args = [process]; if (condition) args[0] = safe; load(...args);`],
+  ['logical OR element write', `const args = []; args[0] ||= process; load(...args).exec('id');`],
+  ['logical AND element write', `const args = []; args[0] &&= process; load(...args).exec('id');`],
+  ['logical nullish element write', `const args = []; args[0] ??= process; load(...args).exec('id');`],
+  ['logical safe write after capability', `const args = [process]; args[0] &&= safe; load(...args).exec('id');`],
+  ['push.call', `const args = []; args.push.call(args, process); load(...args).exec('id');`],
+  ['push.apply', `const args = []; args.push.apply(args, [process]); load(...args).exec('id');`],
+  ['Reflect.apply push', `const args = []; Reflect.apply(args.push, args, [process]); load(...args).exec('id');`],
+  ['prototype push.apply', `const args = []; Array.prototype.push.apply(args, [process]); load(...args).exec('id');`],
+  ['prototype push.call', `const args = []; Array.prototype.push.call(args, process); load(...args).exec('id');`],
+  ['bound push', `const args = []; const push = args.push.bind(args); push(process); load(...args).exec('id');`],
+  ['rebound push', `const args = []; const push = args.push.bind(args).bind({}); push(process); load(...args).exec('id');`],
+  ['member method alias', `const args = []; const push = args.push; push.call(args, process); load(...args).exec('id');`],
+  ['destructured method alias', `const args = []; const { push } = args; push.call(args, process); load(...args).exec('id');`],
+  ['member-held bound push', `const args = []; const tools = { push: args.push.bind(args) }; tools.push(process); load(...args).exec('id');`],
+  ['unproven apply values', `declare const values: any[]; const args = []; args.push.apply(args, values); load(...args).exec('id');`],
+  ['unproven spread values', `declare const values: any[]; const args = []; args.push(...values); load(...args).exec('id');`],
+  ['helper-returned array', `const args = []; const get = () => args; get().push(process); load(...args).exec('id');`],
+  ['helper-returned alias', `const args = []; function get() { return args; } const alias = get(); alias.push(process); load(...args).exec('id');`],
+  ['Object.assign array write', `const args = []; Object.assign(args, { 0: process, length: 1 }); load(...args).exec('id');`],
+  ['Reflect.set array write', `const args = []; Reflect.set(args, 0, process); load(...args).exec('id');`],
+  ['helper parameter push', `function put(list, value) { list.push(value); } const args = []; put(args, process); load(...args).exec('id');`],
+  ['helper parameter alias push', `function put(list, value) { const alias = list; alias.push(value); } const args = []; put(args, process); load(...args).exec('id');`],
+  ['helper parameter unshift', `function put(list, value) { list.unshift(value); } const args = []; put(args, process); load(...args).exec('id');`],
+  ['helper parameter splice', `function put(list, value) { list.splice(0, 0, value); } const args = []; put(args, process); load(...args).exec('id');`],
+  ['helper parameter index write', `function put(list, value) { list[0] = value; } const args = []; put(args, process); load(...args).exec('id');`],
+  ['helper parameter alias index write', `function put(list, value) { const alias = list; alias[0] = value; } const args = []; put(args, process); load(...args).exec('id');`],
+  ['object-held array push', `const holder = { args: [] }; holder.args.push(process); load(...holder.args).exec('id');`],
+  ['new Array index write', `const args = new Array(); args[0] = process; load(...args).exec('id');`],
+  ['sized new Array index write', `const args = new Array(1); args[0] = process; load(...args).exec('id');`],
+  ['unshift insertion', `const args = [safe]; args.unshift(process); load(...args).exec('id');`],
+  ['sort capability', `const args = [process, safe]; args.sort(); load(...args).exec('id');`],
+  ['pop capability', `const args = [process, safe]; args.pop(); load(...args).exec('id');`],
+  ['shift capability', `const args = [safe, process]; args.shift(); load(...args).exec('id');`]
 ])('rejects capability-bearing mutable array %s', (_name, mutation) => {
   const source = `function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } ${mutation}`;
   expect(inspectSupervisorSource(
@@ -1077,6 +1194,20 @@ test.each([
   )).toEqual(expect.arrayContaining([
     expect.stringMatching(/capability escape through mutable array/)
   ]));
+});
+
+test('rejects capability initialized through new Array arguments', () => {
+  const source = `function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const args = new Array(process); load(...args).exec('id');`;
+  expect(inspectSupervisorSource(
+    'src/services/windows-process-host.ts', source
+  )).not.toEqual([]);
+});
+
+test('rejects capability assigned by a hoisted initializer', () => {
+  const source = `let runtime; initialize(); runtime.getBuiltinModule('node:child_process'); function initialize() { runtime = process; }`;
+  expect(inspectSupervisorSource(
+    'src/services/windows-process-host.ts', source
+  )).not.toEqual([]);
 });
 
 test.each([
@@ -1091,7 +1222,42 @@ test.each([
   ['fill', `const args = []; args.fill(safe); load(...args);`],
   ['copyWithin', `const args = [safe, safe]; args.copyWithin(1, 0); load(...args);`],
   ['reverse', `const args = [safe, safe]; args.reverse(); load(...args);`],
-  ['conditional write', `declare const condition: boolean; const args = [safe]; if (condition) args[0] = safe; load(...args);`]
+  ['conditional write', `declare const condition: boolean; const args = [safe]; if (condition) args[0] = safe; load(...args);`],
+  ['logical OR element write', `const args = []; args[0] ||= safe; load(...args);`],
+  ['logical AND element write', `const args = [safe]; args[0] &&= safe; load(...args);`],
+  ['logical nullish element write', `const args = [undefined]; args[0] ??= safe; load(...args);`],
+  ['push.call', `const args = []; args.push.call(args, safe); load(...args);`],
+  ['push.apply', `const args = []; args.push.apply(args, [safe]); load(...args);`],
+  ['Reflect.apply push', `const args = []; Reflect.apply(args.push, args, [safe]); load(...args);`],
+  ['prototype push.apply', `const args = []; Array.prototype.push.apply(args, [safe]); load(...args);`],
+  ['prototype push.call', `const args = []; Array.prototype.push.call(args, safe); load(...args);`],
+  ['bound push', `const args = []; const push = args.push.bind(args); push(safe); load(...args);`],
+  ['rebound push', `const args = []; const push = args.push.bind(args).bind({}); push(safe); load(...args);`],
+  ['member method alias', `const args = []; const push = args.push; push.call(args, safe); load(...args);`],
+  ['destructured method alias', `const args = []; const { push } = args; push.call(args, safe); load(...args);`],
+  ['member-held bound push', `const args = []; const tools = { push: args.push.bind(args) }; tools.push(safe); load(...args);`],
+  ['known apply values', `const values = [safe]; const args = []; args.push.apply(args, values); load(...args);`],
+  ['known spread values', `const values = [safe]; const args = []; args.push(...values); load(...args);`],
+  ['helper-returned array', `const args = []; const get = () => args; get().push(safe); load(...args);`],
+  ['helper-returned alias', `const args = []; function get() { return args; } const alias = get(); alias.push(safe); load(...args);`],
+  ['Object.assign array write', `const args = []; Object.assign(args, { 0: safe, length: 1 }); load(...args);`],
+  ['Reflect.set array write', `const args = []; Reflect.set(args, 0, safe); load(...args);`],
+  ['helper parameter push', `function put(list, value) { list.push(value); } const args = []; put(args, safe); load(...args);`],
+  ['helper parameter alias push', `function put(list, value) { const alias = list; alias.push(value); } const args = []; put(args, safe); load(...args);`],
+  ['helper parameter unshift', `function put(list, value) { list.unshift(value); } const args = []; put(args, safe); load(...args);`],
+  ['helper parameter splice', `function put(list, value) { list.splice(0, 0, value); } const args = []; put(args, safe); load(...args);`],
+  ['helper parameter index write', `function put(list, value) { list[0] = value; } const args = []; put(args, safe); load(...args);`],
+  ['object-held array push', `const holder = { args: [] }; holder.args.push(safe); load(...holder.args);`],
+  ['new Array index write', `const args = new Array(); args[0] = safe; load(...args);`],
+  ['new Array safe initial value', `const args = new Array(safe); load(...args);`],
+  ['unshift', `const args = [safe]; args.unshift(safe); load(...args);`],
+  ['sort', `const args = [safe, safe]; args.sort(); load(...args);`],
+  ['pop', `const args = [safe, safe]; args.pop(); load(...args);`],
+  ['shift', `const args = [safe, safe]; args.shift(); load(...args);`],
+  ['unrelated helper arguments', `function put(list, value) { list.push(value); } const args = []; put(args, safe); put({}, process); load(...args);`],
+  ['custom method named push', `function use(custom) { const args = []; custom.push.call(args, process); load(...args); } const custom = { push() {} }; use(custom);`],
+  ['omitted apply arguments', `const args = []; args.push.apply(args); load(...args);`],
+  ['method call before later array assignment', `let args = { push() {} }; args.push.call(args, process); args = []; load(...args);`]
 ])('accepts safe mutable array %s', (_name, mutation) => {
   const source = `const safe = { getBuiltinModule() {} }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } ${mutation}`;
   expect(inspectSupervisorSource(
