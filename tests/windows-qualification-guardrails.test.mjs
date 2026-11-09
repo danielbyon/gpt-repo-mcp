@@ -646,6 +646,19 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
       finding.includes("verify:dist must build and smoke-test the distribution"))).toBe(true);
   }, 20_000);
 
+  test("rejects weakened verify:dist script under legacy build contract", () => {
+    const workflow = load();
+    const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    packageJson.scripts["verify:dist"] = "npm run build";
+    const findings = inspectQualificationWorkflow(
+      workflow,
+      (path) => readFileSync(join(root, path), "utf8"),
+      JSON.stringify(packageJson)
+    );
+    expect(findings.some((finding) =>
+      finding.includes("verify:dist must build and smoke-test the distribution"))).toBe(true);
+  }, 20_000);
+
   test("rejects loss of a required Windows suite", () => {
     const workflow = load();
     windowsStep(workflow, "Windows process supervision").run =

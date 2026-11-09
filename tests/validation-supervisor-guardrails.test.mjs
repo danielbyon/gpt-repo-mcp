@@ -630,14 +630,69 @@ test.each([
     "import { Worker } from 'node:worker_threads'; const options = { eval: true }; " +
     "new Worker('worker.js', { ...options });",
     "worker_threads inline evaluation is forbidden"],
+["whole argument-list spread",
+"import { Worker } from 'node:worker_threads'; " +
+"new Worker(...['worker.js', { eval: true }]);",
+"worker_threads inline evaluation is forbidden"],
+["aliased argument-list spread",
+"import { Worker } from 'node:worker_threads'; " +
+"const args = ['worker.js', { eval: true }]; new Worker(...args);",
+"worker_threads inline evaluation is forbidden"],
+["unresolved argument-list spread",
+"import { Worker } from 'node:worker_threads'; declare const args: any[]; " +
+"new Worker(...args);",
+"worker_threads inline-evaluation options are unproven"],
+["known option after unresolved argument-list spread",
+"import { Worker } from 'node:worker_threads'; declare const args: any[]; " +
+"new Worker(...args, { eval: false });",
+"worker_threads inline-evaluation options are unproven"],
   ["mutable evaluation option",
     "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
     "options.eval = true; new Worker('worker.js', options);",
     "worker_threads inline evaluation is forbidden"],
+["joined computed evaluation option",
+"import { Worker } from 'node:worker_threads'; const options = {}; " +
+"const key = ['e', 'v', 'a', 'l'].join(''); options[key] = true; " +
+"new Worker('worker.js', options);",
+"worker_threads inline evaluation is forbidden"],
+["concatenated computed evaluation option",
+"import { Worker } from 'node:worker_threads'; const options = {}; " +
+"options['ev' + 'al'] = true; new Worker('worker.js', options);",
+"worker_threads inline evaluation is forbidden"],
+["unknown computed evaluation option",
+"import { Worker } from 'node:worker_threads'; const options = {}; " +
+"declare const key: string; options[key] = true; new Worker('worker.js', options);",
+"worker_threads inline-evaluation options are unproven"],
   ["aliased mutable evaluation option",
     "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
     "const alias = options; alias.eval = true; new Worker('worker.js', options);",
     "worker_threads inline evaluation is forbidden"],
+["member-held option mutation",
+"import { Worker } from 'node:worker_threads'; const options = {}; " +
+"const holder = { options }; holder.options.eval = true; " +
+"new Worker('worker.js', options);",
+"worker_threads inline evaluation is forbidden"],
+["destructured member-held option mutation",
+"import { Worker } from 'node:worker_threads'; const options = {}; " +
+"const holder = { options }; const { options: alias } = holder; " +
+"alias.eval = true; new Worker('worker.js', options);",
+"worker_threads inline evaluation is forbidden"],
+["inherited prototype mutation",
+"import { Worker } from 'node:worker_threads'; const prototype = {}; " +
+"const options = Object.create(prototype); prototype.eval = true; " +
+"new Worker('worker.js', options);",
+"worker_threads inline evaluation is forbidden"],
+["local option mutator",
+"import { Worker } from 'node:worker_threads'; " +
+"function enable(value) { value.eval = true; } const options = {}; " +
+"enable(options); new Worker('worker.js', options);",
+"worker_threads inline evaluation is forbidden"],
+["chained local option mutator",
+"import { Worker } from 'node:worker_threads'; " +
+"function enable(value) { value.eval = true; } " +
+"function outer(value) { enable(value); } const options = {}; " +
+"outer(options); new Worker('worker.js', options);",
+"worker_threads inline evaluation is forbidden"],
   ["String-selected evaluation option",
     "import { Worker } from 'node:worker_threads'; const options = {}; " +
     "options[String('eval')] = true; new Worker('worker.js', options);",
@@ -683,11 +738,45 @@ test.each([
   ["unresolved evaluation options",
     "import { Worker } from 'node:worker_threads'; declare const options: any; " +
     "new Worker('worker.js', options);",
-    "worker_threads inline-evaluation options are unproven"]
+"worker_threads inline-evaluation options are unproven"],
+["local Worker constructor parameter",
+"import { Worker } from 'node:worker_threads'; " +
+"function launch(Ctor, options) { new Ctor('worker.js', options); } " +
+"launch(Worker, { eval: true });",
+"worker_threads inline evaluation is forbidden"],
+["chained local Worker constructor parameter",
+"import { Worker } from 'node:worker_threads'; " +
+"function launch(Ctor, options) { new Ctor('worker.js', options); } " +
+"function outer(Ctor, options) { launch(Ctor, options); } " +
+"outer(Worker, { eval: true });",
+"worker_threads inline evaluation is forbidden"],
+["local worker namespace parameter",
+"import * as threads from 'node:worker_threads'; " +
+"function launch(namespace, options) { new namespace.Worker('worker.js', options); } " +
+"launch(threads, { eval: true });",
+"worker_threads inline evaluation is forbidden"],
+["String-selected worker member",
+"import * as threads from 'node:worker_threads'; " +
+"new threads[String('Worker')]('worker.js', { eval: true });",
+"worker_threads inline evaluation is forbidden"]
 ])("rejects worker inline evaluation through %s", (_name, source, expected) => {
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
     .some((finding) => finding.includes(expected))).toBe(true);
 });
+test("resolves long bounded local option alias chains without truncating", () => {
+  const hopCount = 130;
+  const sourceFor = (value) => "import { Worker } from 'node:worker_threads'; " +
+    Array.from({ length: hopCount }, (_, index) => index === hopCount - 1
+      ? `function hop${index}(value) { value.eval = ${value}; }`
+      : `function hop${index}(value) { hop${index + 1}(value); }`)
+      .join(" ") +
+    " const options = {}; hop0(options); new Worker('worker.js', options);";
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", sourceFor(true))
+    .some((finding) => finding.includes("worker_threads inline evaluation is forbidden")))
+    .toBe(true);
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", sourceFor(false)))
+    .toEqual([]);
+}, 20_000);
 test("accepts worker construction without inline evaluation", () => {
   const source = [
     "import { Worker as NamedWorker } from 'node:worker_threads';",
@@ -737,6 +826,33 @@ test("accepts worker construction without inline evaluation", () => {
     "Object.setPrototypeOf(mutatedSafeOptions, { eval: false });",
     "mutatedSafeOptions[String('eval')] = false;",
     "new NamedWorker('./worker.mjs', mutatedSafeOptions);",
+"new NamedWorker(...['./worker.mjs', { eval: false }]);",
+"const safeArgumentList = ['./worker.mjs', { eval: false }];",
+"new NamedWorker(...safeArgumentList);",
+"const safeHolderOptions = {}; const safeHolder = { options: safeHolderOptions };",
+"safeHolder.options.eval = false; new NamedWorker('./worker.mjs', safeHolderOptions);",
+"const safeAliasOptions = {}; const safeAliasHolder = { options: safeAliasOptions };",
+"const { options: safeAlias } = safeAliasHolder; safeAlias.eval = false;",
+"new NamedWorker('./worker.mjs', safeAliasOptions);",
+"const safePrototype = {}; const inheritedMutationOptions = Object.create(safePrototype);",
+"safePrototype.eval = false; new NamedWorker('./worker.mjs', inheritedMutationOptions);",
+"function enableSafely(value) { value.eval = false; }",
+"const locallyMutatedOptions = {}; enableSafely(locallyMutatedOptions);",
+"new NamedWorker('./worker.mjs', locallyMutatedOptions);",
+"const joinedSafeOptions = {}; const joinedSafeKey = ['e', 'v', 'a', 'l'].join('');",
+"joinedSafeOptions[joinedSafeKey] = false;",
+"new NamedWorker('./worker.mjs', joinedSafeOptions);",
+"declare const safeExternalKey: string; const safeUnrelatedOptions = {};",
+"safeUnrelatedOptions[safeExternalKey] = true;",
+"new NamedWorker('./worker.mjs', { eval: false });",
+"function launchSafe(Ctor, options) { new Ctor('./worker.mjs', options); }",
+"launchSafe(NamedWorker, { eval: false });",
+"function launchSafeNamespace(namespace, options) {",
+"  new namespace.Worker('./worker.mjs', options);",
+"}",
+"launchSafeNamespace(threads, { eval: false });",
+"new threads[String('Worker')]('./worker.mjs', { eval: false });",
+"new NamedWorker('./worker.mjs', { [String('eval')]: false });",
     "const inlineEvaluation = false;",
     "new threads.Worker('./worker.mjs', { eval: inlineEvaluation });",
     "const mutableSafeOptions = { eval: false };",

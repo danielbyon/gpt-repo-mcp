@@ -97,6 +97,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const parameterRequireArguments = new Map();
   const parameterRestArguments = new Map();
 const parameterFunctionArguments = new Map();
+const parameterValueArguments = new Map();
 const functionThisArguments = new Map();
 const classMemberThisArguments = new WeakMap();
 const functionArgumentsPlans = new Map();
@@ -390,6 +391,8 @@ const staticAssignmentNameOf = (input, seen = new Set()) => {
     const right = staticAssignmentNameOf(node.right, seen);
     return left !== undefined && right !== undefined ? left + right : undefined;
   }
+  const joined = staticJoinedStringOf(node, seen);
+  if (joined !== undefined) return joined;
   if (ts.isCallExpression(node) && !node.questionDotToken &&
       node.arguments.length === 1) {
     const callee = unwrap(node.expression);
@@ -476,6 +479,8 @@ const arrayMutationValuesByBinding = new Map();
     return undefined;
   };
 const assignmentsByMemberPath = new Map();
+const memberAssignmentTargets = [];
+const dynamicMemberAssignments = [];
 const constructorDestructuredBindings = new Set();
 const constructorDestructuredMembers = new Set();
 const assignmentMemberAccess = (node) => {
@@ -504,6 +509,41 @@ const assignmentReferenceKey = (input, seen = new Set()) => {
   if (seen.has(binding.node)) return `binding:${binding.node.pos}`;
   const next = new Set(seen);
   next.add(binding.node);
+  if (binding.kind === "variable" && ts.isBindingElement(binding.node)) {
+    const referenceStart = node.pos;
+    const destructuredValues = (destructuredPropertyAssignmentsByBinding.get(
+      binding.node
+    ) ?? []).flatMap((assignment) => destructuredObjectPropertyValuesOf(
+      assignment.source, assignment.property, next
+    ));
+    const assignments = [
+      ...destructuredValues,
+      ...(assignmentsByBinding.get(binding.node) ?? [])
+    ]
+      .filter((value) => value.pos <= referenceStart ||
+        enclosingFunctionOf(value) !== enclosingFunctionOf(node));
+    const keys = assignments.map((value) => assignmentReferenceKey(value, next));
+    const uniqueKeys = [...new Set(keys)];
+    if (assignments.length > 0 && keys.length === assignments.length &&
+        uniqueKeys.length === 1 && uniqueKeys[0] !== undefined) {
+      return uniqueKeys[0];
+    }
+  }
+  if ((binding.kind === "variable" || binding.kind === "opaque") &&
+      ts.isVariableDeclaration(binding.node) &&
+      !ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+    const referenceStart = node.pos;
+    const values = bindingPatternValuesOf(
+      binding.node.name, binding.node.initializer, node.text, next
+    ).filter((value) => value.pos <= referenceStart ||
+      enclosingFunctionOf(value) !== enclosingFunctionOf(node));
+    const keys = values.map((value) => assignmentReferenceKey(value, next));
+    const uniqueKeys = [...new Set(keys)];
+    if (values.length > 0 && keys.length === values.length &&
+        uniqueKeys.length === 1 && uniqueKeys[0] !== undefined) {
+      return uniqueKeys[0];
+    }
+  }
   if (binding.kind === "variable" && ts.isVariableDeclaration(binding.node) &&
       ts.isIdentifier(binding.node.name) && binding.node.initializer &&
       (ts.isIdentifier(unwrap(binding.node.initializer)) ||
@@ -520,6 +560,12 @@ const assignmentMemberPathKey = (receiver, property) => {
   const recordAssignment = (target, value) => {
   const member = assignmentMemberAccess(target);
   if (member) {
+    memberAssignmentTargets.push({
+      node: target,
+      receiver: member.receiver,
+      property: member.property,
+      value
+    });
     const key = assignmentReferenceKey(target);
     if (key !== undefined) {
       const assignments = assignmentsByMemberPath.get(key) ?? [];
@@ -529,12 +575,11 @@ const assignmentMemberPathKey = (receiver, property) => {
     return;
   }
   if (ts.isElementAccessExpression(target)) {
-    const key = assignmentReferenceKey(target);
-    if (key !== undefined) {
-      const assignments = assignmentsByMemberPath.get(key) ?? [];
-      assignments.push(value);
-      assignmentsByMemberPath.set(key, assignments);
-    }
+    dynamicMemberAssignments.push({
+      node: target,
+      receiver: target.expression,
+      value
+    });
     return;
   }
     if (!ts.isIdentifier(target)) return;
@@ -659,7 +704,8 @@ const recordNestedDestructuredProperties = (target, source) => {
         aliasAssignmentKinds.has(node.operatorToken.kind)) {
       const target = unwrap(node.left);
     recordNestedDestructuredProperties(target, node.right);
-      if (ts.isIdentifier(target) || assignmentMemberAccess(target)) {
+    if (ts.isIdentifier(target) || assignmentMemberAccess(target) ||
+        ts.isElementAccessExpression(target)) {
         recordAssignment(target, node.right);
     } else if (ts.isObjectLiteralExpression(target)) {
         const source = unwrap(node.right);
@@ -788,7 +834,46 @@ const recordNestedDestructuredProperties = (target, source) => {
     return false;
   };
 
-  // Keep literal executable checks effective across immutable local aliases.
+function staticStringArrayOf(input, seen = new Set()) {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isArrayLiteralExpression(node)) {
+    const values = [];
+    for (const element of node.elements) {
+      if (ts.isOmittedExpression(element) || ts.isSpreadElement(element)) {
+        return undefined;
+      }
+      const value = staticStringOf(element, next);
+      if (value === undefined) return undefined;
+      values.push(value);
+    }
+    return values;
+  }
+  if (!ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (binding?.kind !== "variable" || !binding.constant ||
+      !binding.node.initializer || next.has(binding.node)) return undefined;
+  next.add(binding.node);
+  return staticStringArrayOf(binding.node.initializer, next);
+}
+
+function staticJoinedStringOf(input, seen = new Set()) {
+  const node = unwrap(input);
+  if (!node || !ts.isCallExpression(node) || node.questionDotToken ||
+      node.arguments.length > 1) return undefined;
+  const callee = memberAccess(unwrap(node.expression));
+  if (callee?.property !== "join") return undefined;
+  const values = staticStringArrayOf(callee.receiver, seen);
+  if (!values) return undefined;
+  const separator = node.arguments.length === 0
+    ? ","
+    : staticStringOf(node.arguments[0], seen);
+  return separator === undefined ? undefined : values.join(separator);
+}
+
+// Keep literal executable checks effective across immutable local aliases.
   const staticStringOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return undefined;
@@ -826,6 +911,15 @@ const recordNestedDestructuredProperties = (target, source) => {
       .filter((value) => value !== undefined);
     const unique = [...new Set(values)];
     return unique.length === 1 ? unique[0] : undefined;
+  }
+  if (ts.isCallExpression(node) && !node.questionDotToken) {
+    const callee = unwrap(node.expression);
+    if (ts.isIdentifier(callee) && callee.text === "String" &&
+        !resolveBinding(callee) && node.arguments.length === 1) {
+      return staticStringOf(node.arguments[0], seen);
+    }
+    const joined = staticJoinedStringOf(node, seen);
+    if (joined !== undefined) return joined;
   }
     if (!ts.isIdentifier(node)) return undefined;
     const binding = resolveBinding(node);
@@ -3083,6 +3177,15 @@ const workerNamespaceOf = (input, seen = new Set()) => {
     return Boolean(named && ts.isNamespaceImport(named) &&
       named.name.text === node.text);
   }
+  if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
+    const parameterNext = new Set(seen);
+    parameterNext.add(binding.node);
+    return (parameterValueArguments.get(binding.node) ?? []).some((value) =>
+      (ts.isIdentifier(binding.node.name) ? [value] :
+        bindingPatternValuesOf(
+          binding.node.name, value, node.text, parameterNext
+        )).some((candidate) => workerNamespaceOf(candidate, parameterNext)));
+  }
   if ((binding.kind === "variable" || binding.kind === "opaque") &&
       ts.isVariableDeclaration(binding.node) && binding.node.initializer &&
       ts.isObjectBindingPattern(binding.node.name)) {
@@ -3135,6 +3238,15 @@ const workerConstructorOf = (input, seen = new Set()) => {
   if (binding.kind === "import" && WORKER_MODULES.has(binding.module)) {
     return importedExport(binding, node.text) === "Worker";
   }
+  if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
+    const parameterNext = new Set(seen);
+    parameterNext.add(binding.node);
+    return (parameterValueArguments.get(binding.node) ?? []).some((value) =>
+      (ts.isIdentifier(binding.node.name) ? [value] :
+        bindingPatternValuesOf(
+          binding.node.name, value, node.text, parameterNext
+        )).some((candidate) => workerConstructorOf(candidate, parameterNext)));
+  }
   if (!(binding.kind === "variable" || binding.kind === "opaque") ||
       !ts.isVariableDeclaration(binding.node)) return false;
   const next = new Set(seen);
@@ -3164,14 +3276,69 @@ const inspectWorkerEvalValue = (value, findingNode, unproven) => {
   }
 };
 let workerCallExpressions;
-const inspectKnownWorkerOptionMutations = (
-  options, reference, seen, unproven
+const workerOptionMutationReferenceKeysOf = (options, seen = new Set()) => {
+  const keys = new Set();
+  const visited = new Set();
+  const queue = [unwrap(options)].filter(Boolean);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [parameter, argumentsList] of parameterValueArguments) {
+      if (!ts.isIdentifier(parameter.name)) continue;
+      const parameterKey = assignmentReferenceKey(parameter.name);
+      if (parameterKey === undefined || keys.has(parameterKey)) continue;
+      if (argumentsList.some((argument) =>
+        keys.has(assignmentReferenceKey(argument)))) {
+        keys.add(parameterKey);
+        queue.push(parameter.name);
+        changed = true;
+      }
+    }
+    while (queue.length > 0) {
+      const value = unwrap(queue.shift());
+      if (!value || visited.has(value)) continue;
+      visited.add(value);
+      const key = assignmentReferenceKey(value);
+      if (key !== undefined && !keys.has(key)) {
+        keys.add(key);
+        changed = true;
+      }
+      const next = new Set(seen);
+      next.add(value);
+      for (const resolved of resolvedValuesOf(value, next)) {
+        if (!ts.isCallExpression(resolved)) continue;
+        queue.push(...objectCreatePrototypeValuesOf(resolved, next));
+      }
+    }
+  }
+  return keys;
+};
+const workerReferenceMatchesKeysOf = (
+  input, targetKeys, seen = new Set()
 ) => {
-  const targetKey = assignmentReferenceKey(options);
-  if (targetKey === undefined || !reference) return;
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  if (targetKeys.has(assignmentReferenceKey(node))) return true;
+  const member = assignmentMemberAccess(node);
+  if (!member) return false;
+  const next = new Set(seen);
+  next.add(node);
+  return memberValueCandidatesOf(member.receiver, member.property, next)
+    .some((value) => workerReferenceMatchesKeysOf(value, targetKeys, next));
+};
+const inspectKnownWorkerOptionMutations = (
+  options, reference, seen, unproven, targetKeys
+) => {
+  if (!reference || targetKeys.size === 0) return;
   const referenceStart = reference.getStart(file);
   const targetsOptions = (candidate) =>
-    assignmentReferenceKey(candidate) === targetKey;
+    workerReferenceMatchesKeysOf(candidate, targetKeys);
+  for (const assignment of dynamicMemberAssignments) {
+    if (assignment.node.getStart(file) <= referenceStart &&
+        targetsOptions(assignment.receiver)) {
+      add(assignment.node, unproven);
+    }
+  }
   const inspectNamedMutation = (call, name, value) => {
     const property = staticStringOf(name);
     if (property === undefined) {
@@ -3310,20 +3477,38 @@ const inspectWorkerOptions = (
   const next = new Set(seen);
   next.add(options);
   const unproven = "worker_threads inline-evaluation options are unproven";
+  let inspectedParameterValues = false;
+  if (ts.isIdentifier(options)) {
+    const binding = resolveBinding(options);
+    if (binding?.kind === "parameter" && ts.isParameter(binding.node)) {
+      const parameterValues = parameterValueArguments.get(binding.node) ?? [];
+      if (parameterValues.length > 0) {
+        inspectedParameterValues = true;
+        const parameterNext = new Set(next);
+        parameterNext.add(binding.node);
+        for (const value of parameterValues) {
+          inspectWorkerOptions(value, parameterNext, reference, inspectMutations);
+        }
+      }
+    }
+  }
+  const mutationKeys = workerOptionMutationReferenceKeysOf(options, seen);
   if (inspectMutations) {
     inspectKnownWorkerOptionMutations(
-      options, reference, next, unproven
+      options, reference, next, unproven, mutationKeys
     );
   }
-  const evalAssignmentKey = assignmentMemberPathKey(options, "eval");
-  for (const assignment of evalAssignmentKey
-    ? assignmentsByMemberPath.get(evalAssignmentKey) ?? []
-    : []) {
-    inspectWorkerEvalValue(assignment, assignment, unproven);
+  const referenceStart = reference?.getStart(file) ?? Number.POSITIVE_INFINITY;
+  for (const assignment of memberAssignmentTargets) {
+    if (assignment.property === "eval" &&
+        assignment.node.getStart(file) <= referenceStart &&
+        workerReferenceMatchesKeysOf(assignment.receiver, mutationKeys)) {
+      inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
+    }
   }
   const objects = objectValueCandidatesOf(options, seen);
   if (objects.length === 0) {
-    add(options, unproven);
+    if (!inspectedParameterValues) add(options, unproven);
     return;
   }
   for (const object of objects) {
@@ -3353,7 +3538,14 @@ const inspectWorkerOptions = (
   }
 };
 const inspectWorkerConstruction = (call) => {
-  inspectWorkerOptions(call.arguments?.[1], new Set(), call);
+  const plan = fixedCallArgumentPlanOf(call.arguments);
+  const options = callArgumentCandidatesAt(plan, 1);
+  if (plan.unknownIndex !== undefined && plan.unknownIndex <= 1) {
+    add(call, "worker_threads inline-evaluation options are unproven");
+  }
+  for (const option of options) {
+    inspectWorkerOptions(option, new Set(), call);
+  }
 };
   const inspectRunnerReference = (node) => {
     const parent = node.parent;
@@ -5510,6 +5702,9 @@ const recordParameterFunctions = (parameter, functions) => {
           }
           for (const argument of callArgumentCandidatesAt(plan, runtimeIndex)) {
             if (!argument) continue;
+          capabilityArgumentsChanged = recordParameterArgument(
+            parameterValueArguments, parameter, argument
+          ) || capabilityArgumentsChanged;
             capabilityArgumentsChanged = recordParameterFunctions(
               parameter, localFunctionValuesOf(argument)
             ) || capabilityArgumentsChanged;

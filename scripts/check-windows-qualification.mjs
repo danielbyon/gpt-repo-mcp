@@ -5450,17 +5450,14 @@ function mandatoryLinuxBuildStep(steps, findings, readPackage) {
     findings.push("Linux build step must use an approved build verification command");
     return step;
   }
-  if (approved.command === "npm run verify:dist") {
-    try {
-      // The workflow command is valid only while the package script still
-      // performs the distribution build and health smoke test.
-      const verifyDist = JSON.parse(readPackage())?.scripts?.["verify:dist"];
-      if (verifyDist !== DISTRIBUTION_VERIFY_SCRIPT) {
-        findings.push("verify:dist must build and smoke-test the distribution");
-      }
-    } catch {
+  try {
+    // Validate independently of which approved workflow build pair is used.
+    const verifyDist = JSON.parse(readPackage())?.scripts?.["verify:dist"];
+    if (verifyDist !== DISTRIBUTION_VERIFY_SCRIPT) {
       findings.push("verify:dist must build and smoke-test the distribution");
     }
+  } catch {
+    findings.push("verify:dist must build and smoke-test the distribution");
   }
   return step;
 }
