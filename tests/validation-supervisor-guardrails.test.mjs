@@ -797,6 +797,7 @@ test("rejects worker constructor exports from audited supervisor sources", () =>
 test.each([
   "export { Worker } from 'node:worker_threads';",
   "export { Worker as Thread } from 'node:worker_threads';",
+  "export { isMainThread as Worker } from 'node:worker_threads';",
   "export * from 'node:worker_threads';",
   "export * as threads from 'node:worker_threads';"
 ])("rejects worker capability module re-export %s", (source) => {
@@ -808,7 +809,9 @@ test.each([
   ["default export", "export default Worker;"],
   ["exported immutable alias", "export const Thread = Worker;"],
   ["exported factory", "export const getWorker = () => Worker;"],
-  ["exported function", "export function getWorker() { return Worker; }"]
+  ["exported function", "export function getWorker() { return Worker; }"],
+  ["exported helper value", "const getWorker = () => Worker; export function exported() { return getWorker; }"],
+  ["member-held exported factory", "const getWorker = () => Worker; export const tools = { make: () => getWorker() };"]
 ])("rejects worker capability %s", (_name, declaration) => {
   const source = "import { Worker } from 'node:worker_threads'; " + declaration;
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
@@ -824,6 +827,8 @@ test("accepts worker module exports that exclude constructor capability", () => 
     "export const mainThreadValue = isMainThread;",
     "export const getMainThread = () => isMainThread;",
     "export function readMainThread() { return isMainThread; }",
+    "const getMainThread = () => isMainThread;",
+    "export const safeTools = { make: getMainThread };",
     "export default 1;"
   ].join("\n");
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))

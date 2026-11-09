@@ -3287,11 +3287,30 @@ const workerConstructorOf = (input, seen = new Set()) => {
   ];
   return values.some((value) => workerConstructorOf(value, next));
 };
-// Verified Worker capability must not escape the fixed supervisor inventory.
+// Verified Worker capability must not escape the fixed supervisor inventory,
+// including through local helpers or functions held in exported objects.
 const workerCapabilityOf = (input, seen = new Set()) => {
-  if (workerConstructorOf(input, seen) || workerNamespaceOf(input, seen)) return true;
-  return functionReturnExpressionsOf(input, seen).some((value) =>
-    workerConstructorOf(value, seen) || workerNamespaceOf(value, seen));
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  if (workerConstructorOf(node, seen) || workerNamespaceOf(node, seen)) return true;
+  const next = new Set(seen);
+  next.add(node);
+  for (const object of objectValueCandidatesOf(node, seen)) {
+    for (const property of object.properties) {
+      if (ts.isSpreadAssignment(property)) {
+        if (workerCapabilityOf(property.expression, next)) return true;
+        continue;
+      }
+      if (!("name" in property)) continue;
+      const value = ts.isPropertyAssignment(property) ? property.initializer
+        : ts.isShorthandPropertyAssignment(property) ? property.name
+          : ts.isMethodDeclaration(property) || ts.isGetAccessorDeclaration(property)
+            ? property : undefined;
+      if (value && workerCapabilityOf(value, next)) return true;
+    }
+  }
+  return functionReturnExpressionsOf(node, seen).some((value) =>
+    workerCapabilityOf(value, next));
 };
 // Only a statically false eval option is safe. Retrieved spreads use the same
 // provenance rules; computed names and unresolved values fail closed.
@@ -3641,7 +3660,7 @@ const inspectWorkerConstruction = (call) => {
     // Named, namespace, and star exports can all expose Worker.
     const exportsWorker = !clause || !ts.isNamedExports(clause) ||
       clause.elements.some((element) => !element.isTypeOnly &&
-        (element.propertyName?.text ?? element.name.text) === "Worker");
+        [element.propertyName?.text, element.name.text].includes("Worker"));
     if (!typeOnly && WORKER_MODULES.has(module) && exportsWorker) {
       add(node, "runtime worker_threads capability re-export is forbidden");
     }
