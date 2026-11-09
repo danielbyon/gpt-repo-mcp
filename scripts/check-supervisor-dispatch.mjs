@@ -102,8 +102,15 @@ function inspectJavaScript(filename, source, isLauncher = false) {
         if (seen.has(binding.node)) return false;
         const next = new Set(seen);
         next.add(binding.node);
-        return (parameterRequireArguments.get(binding.node) ?? [])
-          .some((value) => requireReferenceOf(value, next));
+        return (parameterRequireArguments.get(binding.node) ?? []).some((value) => {
+          const candidates = ts.isIdentifier(binding.node.name)
+            ? [value]
+            : bindingPatternValuesOf(
+              binding.node.name, value, node.text, next
+            );
+          return candidates.some((candidate) =>
+            requireReferenceOf(candidate, next));
+        });
       }
       return node.text === "require" && !binding;
     }
@@ -1098,6 +1105,8 @@ const assignmentMemberPathKey = (receiver, property) => {
           node.text,
           next
         ) : []),
+      ...(parameterProcessArguments.get(binding.node) ?? []).flatMap((value) =>
+        bindingPatternValuesOf(binding.node.name, value, node.text, next)),
         ...(destructuredAssignmentsByBinding.get(
           `${binding.node.pos}:${node.text}`) ?? [])
       ].some((value) => processObjectOf(value, next));
@@ -1195,6 +1204,8 @@ const assignmentMemberPathKey = (receiver, property) => {
           node.text,
           next
         ) : []),
+      ...(parameterGlobalArguments.get(binding.node) ?? []).flatMap((value) =>
+        bindingPatternValuesOf(binding.node.name, value, node.text, next)),
         ...(destructuredAssignmentsByBinding.get(
           `${binding.node.pos}:${node.text}`) ?? [])
       ].some((value) => globalObjectOf(value, next));
@@ -2282,6 +2293,21 @@ const reflectiveReadOf = (input, seen = new Set()) => {
     }
     return values;
   };
+  const bindingNamesOf = (pattern, names = []) => {
+    for (const element of pattern.elements) {
+      if (ts.isIdentifier(element.name)) {
+        names.push(element.name.text);
+      } else {
+        bindingNamesOf(element.name, names);
+      }
+    }
+    return names;
+  };
+  const carriesParameterCapabilityOf = (parameter, argument, predicate) => {
+    if (ts.isIdentifier(parameter.name)) return predicate(argument);
+    return bindingNamesOf(parameter.name).some((name) =>
+      bindingPatternValuesOf(parameter.name, argument, name).some(predicate));
+  };
   const recordParameterArgument = (store, parameter, argument) => {
     const values = store.get(parameter) ?? [];
     if (values.includes(argument)) return false;
@@ -2301,17 +2327,23 @@ const reflectiveReadOf = (input, seen = new Set()) => {
             index += 1) {
             const parameter = fn.parameters[index];
             const argument = callArguments[index];
-            if (processObjectOf(argument)) {
+            if (carriesParameterCapabilityOf(
+              parameter, argument, processObjectOf
+            )) {
               capabilityArgumentsChanged = recordParameterArgument(
                 parameterProcessArguments, parameter, argument
               ) || capabilityArgumentsChanged;
             }
-            if (globalObjectOf(argument)) {
+            if (carriesParameterCapabilityOf(
+              parameter, argument, globalObjectOf
+            )) {
               capabilityArgumentsChanged = recordParameterArgument(
                 parameterGlobalArguments, parameter, argument
               ) || capabilityArgumentsChanged;
             }
-            if (requireReferenceOf(argument)) {
+            if (carriesParameterCapabilityOf(
+              parameter, argument, requireReferenceOf
+            )) {
               capabilityArgumentsChanged = recordParameterArgument(
                 parameterRequireArguments, parameter, argument
               ) || capabilityArgumentsChanged;

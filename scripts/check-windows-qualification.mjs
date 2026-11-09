@@ -770,12 +770,12 @@ const expressionValuesOf = (input, seen = new Set()) => {
       .filter(Boolean)
       .flatMap((value) => expressionValuesOf(value, next));
   }
-  if (binding.kind === "parameter" &&
-      ts.isParameter(binding.node) &&
-      ts.isIdentifier(binding.node.name) &&
-      binding.node.initializer) {
-    return expressionValuesOf(binding.node.initializer, next);
-  }
+    if (binding.kind === "parameter" &&
+        ts.isParameter(binding.node) &&
+        ts.isIdentifier(binding.node.name) &&
+        binding.node.initializer) {
+      return expressionValuesOf(binding.node.initializer, next);
+    }
   return [node];
 };
 const expandedArgumentValuesOf = (input, seen = new Set()) => {
@@ -827,7 +827,7 @@ const containerValuesOf = (input, seen = new Set()) => {
   return values;
 };
 const objectPropertyValuesOf = (input, key, seen = new Set()) => {
-  const values = [];
+    const values = restPropertyValuesOf(input, key, seen);
   for (const container of containerValuesOf(input, seen)) {
     if (ts.isObjectLiteralExpression(container)) {
       for (const property of container.properties) {
@@ -856,9 +856,7 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
   return values;
 };
 // Resolve the source value selected for one identifier in an assignment pattern.
-const destructuredValuesOf = (declaration, targetName) => {
-  if ((!ts.isVariableDeclaration(declaration) && !ts.isParameter(declaration)) ||
-      !declaration.initializer) return [];
+  const destructuredSourceValuesOf = (pattern, source, targetName) => {
   const values = [];
   const visitPattern = (pattern, source) => {
     if (ts.isObjectBindingPattern(pattern)) {
@@ -901,9 +899,96 @@ const destructuredValuesOf = (declaration, targetName) => {
       }
     }
   };
-  visitPattern(declaration.name, declaration.initializer);
+    visitPattern(pattern, source);
   return values;
 };
+  const destructuredValuesOf = (declaration, targetName) => {
+    if ((!ts.isVariableDeclaration(declaration) && !ts.isParameter(declaration)) ||
+        !declaration.initializer) return [];
+    return destructuredSourceValuesOf(
+      declaration.name, declaration.initializer, targetName
+    );
+  };
+  const bindingNameInfoOf = (pattern, values = []) => {
+    if (!ts.isObjectBindingPattern(pattern) && !ts.isArrayBindingPattern(pattern)) {
+      return values;
+    }
+    for (const element of pattern.elements) {
+      if (!ts.isBindingElement(element)) continue;
+      if (ts.isIdentifier(element.name)) {
+        values.push({
+          name: element.name.text,
+          rest: Boolean(element.dotDotDotToken)
+        });
+      } else {
+        bindingNameInfoOf(element.name, values);
+      }
+    }
+    return values;
+  };
+  const restBindingInfoOf = (pattern, targetName) => {
+    if (!ts.isObjectBindingPattern(pattern) && !ts.isArrayBindingPattern(pattern)) {
+      return undefined;
+    }
+    if (ts.isObjectBindingPattern(pattern)) {
+      const excluded = [];
+      for (const element of pattern.elements) {
+        if (!ts.isBindingElement(element)) continue;
+        if (element.dotDotDotToken && ts.isIdentifier(element.name) &&
+            element.name.text === targetName) {
+          return { kind: "object", excluded };
+        }
+        const key = element.propertyName
+          ? assignmentKey(element.propertyName)
+          : ts.isIdentifier(element.name) ? element.name.text : undefined;
+        if (key !== undefined) excluded.push(key);
+      }
+      return undefined;
+    }
+    const index = pattern.elements.findIndex((element) =>
+      ts.isBindingElement(element) && element.dotDotDotToken &&
+      ts.isIdentifier(element.name) && element.name.text === targetName);
+    return index === -1 ? undefined : { kind: "array", index };
+  };
+  const restPropertyValuesOf = (input, key, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || !ts.isIdentifier(node)) return [];
+    const binding = resolveBinding(node);
+    if (!binding?.node || !ts.isParameter(binding.node) || seen.has(binding.node)) {
+      return [];
+    }
+    const info = restBindingInfoOf(binding.node.name, node.text);
+    if (!info) return [];
+    const next = new Set(seen);
+    next.add(binding.node);
+    const sources = [...(parameterRunnerArguments.get(binding.node) ?? [])];
+    if (binding.node.initializer) sources.push(binding.node.initializer);
+    const values = [];
+    for (const source of sources) {
+      for (const container of containerValuesOf(source, next)) {
+        if (info.kind === "object" && ts.isObjectLiteralExpression(container)) {
+          if (info.excluded.includes(key)) continue;
+          for (const property of container.properties) {
+            if (ts.isSpreadAssignment(property)) {
+              values.push(...objectPropertyValuesOf(
+                property.expression, key, next
+              ));
+            } else if (assignmentKey(property.name) === key) {
+              if (ts.isPropertyAssignment(property)) values.push(property.initializer);
+              if (ts.isShorthandPropertyAssignment(property)) values.push(property.name);
+            }
+          }
+        }
+        if (info.kind === "array" && ts.isArrayLiteralExpression(container) &&
+            /^\d+$/.test(key)) {
+          const element = container.elements[info.index + Number(key)];
+          if (element && !ts.isOmittedExpression(element) &&
+              !ts.isSpreadElement(element)) values.push(element);
+        }
+      }
+    }
+    return values;
+  };
 const recordResolvedAssignments = (target, source) => {
   target = unwrap(target);
   if (assignmentMemberAccess(target) ||
@@ -1459,13 +1544,17 @@ if (candidate) return candidate;
     if (binding?.kind === "variable" && runnerAssignmentsByBinding.has(binding.node)) {
       return runnerAssignmentsByBinding.get(binding.node);
     }
-  if (binding?.kind === "opaque" && ts.isParameter(binding.node) &&
-      ts.isIdentifier(binding.node.name) && !seen.has(binding.node)) {
+    if (binding?.kind === "opaque" && ts.isParameter(binding.node) &&
+        !seen.has(binding.node)) {
     const next = new Set(seen);
     next.add(binding.node);
       const values = [
-        binding.node.initializer,
-        ...(parameterRunnerArguments.get(binding.node) ?? []),
+        ts.isIdentifier(binding.node.name) ? binding.node.initializer : undefined,
+        ...destructuredValuesOf(binding.node, node.text),
+        ...(parameterRunnerArguments.get(binding.node) ?? []).flatMap((value) =>
+          ts.isIdentifier(binding.node.name)
+            ? [value]
+            : destructuredSourceValuesOf(binding.node.name, value, node.text)),
         ...(assignmentsByBinding.get(binding.node) ?? [])
       ];
       for (const value of values) {
@@ -1691,11 +1780,7 @@ if (candidate) return candidate;
     return false;
   };
   const collectBoundNames = (pattern, names = []) => {
-    for (const element of pattern.elements) {
-      if (!ts.isBindingElement(element)) continue;
-      if (ts.isIdentifier(element.name)) names.push(element.name.text);
-      else collectBoundNames(element.name, names);
-    }
+    names.push(...bindingNameInfoOf(pattern).map((binding) => binding.name));
     return names;
   };
   const visitIntrinsicAliases = (node) => {
@@ -1824,6 +1909,35 @@ if (candidate) return candidate;
     }
     return values;
   };
+  const containsRunnerValueOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!node || seen.has(node)) return false;
+    if (possibleTestRunnerOf(node, ["test", "it", "describe"])) return true;
+    const next = new Set(seen);
+    next.add(node);
+    if (ts.isObjectLiteralExpression(node)) {
+      return node.properties.some((property) => {
+        if (ts.isSpreadAssignment(property)) {
+          return containsRunnerValueOf(property.expression, next);
+        }
+        if (ts.isPropertyAssignment(property)) {
+          return containsRunnerValueOf(property.initializer, next);
+        }
+        if (ts.isShorthandPropertyAssignment(property)) {
+          return containsRunnerValueOf(property.name, next);
+        }
+        return false;
+      });
+    }
+    if (ts.isArrayLiteralExpression(node)) {
+      return node.elements.some((element) =>
+        !ts.isOmittedExpression(element) &&
+        containsRunnerValueOf(
+          ts.isSpreadElement(element) ? element.expression : element, next
+        ));
+    }
+    return false;
+  };
   let parameterRunnerArgumentsChanged = true;
   while (parameterRunnerArgumentsChanged) {
     parameterRunnerArgumentsChanged = false;
@@ -1836,9 +1950,21 @@ if (candidate) return candidate;
             index += 1) {
             const parameter = fn.parameters[index];
             const argument = callArguments[index];
-            if (!possibleTestRunnerOf(
-              argument, ["test", "it", "describe"]
-            )) continue;
+            const boundNames = ts.isIdentifier(parameter.name)
+              ? []
+              : collectBoundNames(parameter.name);
+            const hasRestBinding = bindingNameInfoOf(parameter.name)
+              .some((binding) => binding.rest);
+            const carriesRunner = ts.isIdentifier(parameter.name)
+              ? possibleTestRunnerOf(
+                argument, ["test", "it", "describe"]
+              )
+              : (hasRestBinding && containsRunnerValueOf(argument)) ||
+              boundNames.some((name) =>
+                destructuredSourceValuesOf(
+                  parameter.name, argument, name
+                ).some((value) => containsRunnerValueOf(value)));
+            if (!carriesRunner) continue;
             const values = parameterRunnerArguments.get(parameter) ?? [];
             if (values.includes(argument)) continue;
             values.push(argument);
