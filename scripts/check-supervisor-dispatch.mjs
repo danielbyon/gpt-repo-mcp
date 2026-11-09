@@ -2029,9 +2029,7 @@ const boundStaticMethodPrefixPlanOf = (
   const bind = bindMethodReferenceOf(node.expression, next);
   if (bind?.property === "bind" &&
       staticMethodReferenceOf(bind.receiver, property, ownerOf, next)) {
-    return dropLeadingCallArgument(
-      fixedCallArgumentPlanOf(node.arguments.slice(1))
-    );
+    return dropLeadingCallArgument(fixedCallArgumentPlanOf(node.arguments));
   }
   if (genericBindMethodOf(node.expression, next) &&
       staticMethodReferenceOf(node.arguments[0], property, ownerOf, next)) {

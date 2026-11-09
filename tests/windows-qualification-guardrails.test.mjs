@@ -811,14 +811,22 @@ describe("Windows qualification scope guard", () => {
       `import { test } from 'vitest'; const args = Object.create.apply(Object, [{ runtime: ${capability} }]); args.runtime.only('focused', () => {});`],
     ['Object.create bind', (capability) =>
       `import { test } from 'vitest'; const args = Object.create.bind(Object)({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['Object.create bind captured prototype', (capability) =>
+      `import { test } from 'vitest'; const args = Object.create.bind(Object, { runtime: ${capability} })(); args.runtime.only('focused', () => {});`],
     ['Reflect.apply Object.create', (capability) =>
       `import { test } from 'vitest'; const args = Reflect.apply(Object.create, Object, [{ runtime: ${capability} }]); args.runtime.only('focused', () => {});`],
     ['generic bind call Object.create', (capability) =>
       `import { test } from 'vitest'; const create = Function.prototype.bind.call(Object.create, Object); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['generic bind call Object.create captured prototype', (capability) =>
+      `import { test } from 'vitest'; const create = Function.prototype.bind.call(Object.create, Object, { runtime: ${capability} }); const args = create(); args.runtime.only('focused', () => {});`],
     ['generic bind apply Object.create', (capability) =>
       `import { test } from 'vitest'; const create = Function.prototype.bind.apply(Object.create, [Object]); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['generic bind apply Object.create captured prototype', (capability) =>
+      `import { test } from 'vitest'; const create = Function.prototype.bind.apply(Object.create, [Object, { runtime: ${capability} }]); const args = create(); args.runtime.only('focused', () => {});`],
     ['generic bind Reflect.apply Object.create', (capability) =>
       `import { test } from 'vitest'; const create = Reflect.apply(Function.prototype.bind, Object.create, [Object]); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['generic bind Reflect.apply Object.create captured prototype', (capability) =>
+      `import { test } from 'vitest'; const create = Reflect.apply(Function.prototype.bind, Object.create, [Object, { runtime: ${capability} }]); const args = create(); args.runtime.only('focused', () => {});`],
     ['aliased Object.assign', (capability) =>
       `import { test } from 'vitest'; const assign = Object.assign; assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
     ['destructured Object.assign', (capability) =>
@@ -837,10 +845,16 @@ describe("Windows qualification scope guard", () => {
       `import { test } from 'vitest'; Reflect.apply(Object.assign, Object, [{}, { runtime: ${capability} }]).runtime.only('focused', () => {});`],
     ['generic bind call Object.assign', (capability) =>
       `import { test } from 'vitest'; const assign = Function.prototype.bind.call(Object.assign, Object); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['generic bind call Object.assign captured source', (capability) =>
+      `import { test } from 'vitest'; const assign = Function.prototype.bind.call(Object.assign, Object, {}, { runtime: ${capability} }); assign().runtime.only('focused', () => {});`],
     ['generic bind apply Object.assign', (capability) =>
       `import { test } from 'vitest'; const assign = Function.prototype.bind.apply(Object.assign, [Object]); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['generic bind apply Object.assign captured source', (capability) =>
+      `import { test } from 'vitest'; const assign = Function.prototype.bind.apply(Object.assign, [Object, {}, { runtime: ${capability} }]); assign().runtime.only('focused', () => {});`],
     ['generic bind Reflect.apply Object.assign', (capability) =>
-      `import { test } from 'vitest'; const assign = Reflect.apply(Function.prototype.bind, Object.assign, [Object]); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`]
+      `import { test } from 'vitest'; const assign = Reflect.apply(Function.prototype.bind, Object.assign, [Object]); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['generic bind Reflect.apply Object.assign captured source', (capability) =>
+      `import { test } from 'vitest'; const assign = Reflect.apply(Function.prototype.bind, Object.assign, [Object, {}, { runtime: ${capability} }]); assign().runtime.only('focused', () => {});`]
   ];
 
   test.each(staticProvenanceCases)(
