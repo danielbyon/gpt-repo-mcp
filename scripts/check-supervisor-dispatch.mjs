@@ -96,6 +96,7 @@ function inspectJavaScript(filename, source, isLauncher = false) {
   const parameterRestArguments = new Map();
 const parameterFunctionArguments = new Map();
 const functionArgumentsPlans = new Map();
+const thisReceiverByGetter = new WeakMap();
   const requireReferenceOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
@@ -813,6 +814,21 @@ const assignmentMemberPathKey = (receiver, property) => {
     const next = new Set(seen);
     next.add(node);
     const objects = [];
+  if (node.kind === ts.SyntaxKind.ThisKeyword) {
+    let current = node.parent;
+    while (current) {
+      if (ts.isGetAccessorDeclaration(current)) {
+        const receiver = thisReceiverByGetter.get(current);
+        if (receiver) {
+          objects.push(...objectValueCandidatesOf(receiver, next));
+        }
+        return objects;
+      }
+      if (ts.isFunctionLike(current) && !ts.isArrowFunction(current)) return [];
+      current = current.parent;
+    }
+    return objects;
+  }
     for (const value of resolvedValuesOf(node, next)) {
       if (ts.isObjectLiteralExpression(value)) {
         objects.push(value);
@@ -884,6 +900,7 @@ const functionArgumentsPlanOf = (identifier, seen = new Set()) => {
         if (ts.isShorthandPropertyAssignment(candidate)) values.push(candidate.name);
       if (ts.isMethodDeclaration(candidate)) values.push(candidate);
 if (ts.isGetAccessorDeclaration(candidate)) {
+        thisReceiverByGetter.set(candidate, object);
 values.push(candidate, ...functionReturnExpressionsOf(candidate, next));
 }
       }
@@ -2479,6 +2496,20 @@ const objectAssignInvocationArgumentsOf = (call, seen = new Set()) => {
     if (!node || seen.has(node)) return undefined;
     const next = new Set(seen);
     next.add(node);
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    const restPlans = binding?.node && ts.isParameter(binding.node) &&
+      binding.node.dotDotDotToken
+      ? parameterRestArguments.get(binding.node) ?? [] : [];
+    if (restPlans.length > 0) {
+      const merged = restPlans.reduce((left, right) =>
+        mergeCallArgumentPlans(left, right));
+      if (merged.unknownAll || merged.unknownIndex !== undefined) {
+        return undefined;
+      }
+      return merged.before;
+    }
+  }
     if (ts.isConditionalExpression(node)) {
       const whenTrue = fixedSpreadValuesOf(node.whenTrue, next);
       const whenFalse = fixedSpreadValuesOf(node.whenFalse, next);
@@ -2486,6 +2517,14 @@ const objectAssignInvocationArgumentsOf = (call, seen = new Set()) => {
     }
     if (ts.isBinaryExpression(node) &&
         node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    const left = unwrap(node.left);
+    const inertPrefix = ts.isNumericLiteral(left) ||
+      ts.isBigIntLiteral(left) ||
+      ts.isStringLiteral(left) ||
+      ts.isNoSubstitutionTemplateLiteral(left) ||
+      [ts.SyntaxKind.TrueKeyword, ts.SyntaxKind.FalseKeyword,
+        ts.SyntaxKind.NullKeyword].includes(left.kind);
+    if (!inertPrefix) return undefined;
       return fixedSpreadValuesOf(node.right, next);
     }
   if (ts.isCallExpression(node)) {
@@ -2514,21 +2553,47 @@ const objectAssignInvocationArgumentsOf = (call, seen = new Set()) => {
     }
     return values;
   };
+const restSpreadPlanOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || !ts.isIdentifier(node) || seen.has(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (!binding?.node || !ts.isParameter(binding.node) ||
+      !binding.node.dotDotDotToken) return undefined;
+  const plans = parameterRestArguments.get(binding.node) ?? [];
+  if (plans.length === 0) return undefined;
+  const next = new Set(seen);
+  next.add(node);
+  return plans.map((plan) => {
+    const offset = plan.offset ?? 0;
+    return {
+      before: plan.unknownAll ? [] : plan.before.slice(offset),
+      after: [...plan.after],
+      unknownIndex: plan.unknownAll || plan.unknownIndex === undefined
+        ? plan.unknownAll ? 0 : undefined
+        : Math.max(0, plan.unknownIndex - offset),
+      ...(plan.unknownAll ? { unknownAll: true } : {})
+    };
+  }).reduce((left, right) => mergeCallArgumentPlans(left, right));
+};
 const fixedCallArgumentPlanOf = (argumentsList) => {
-  const before = [];
-  const after = [];
-  let unknownIndex;
+  let plan = { before: [], after: [], unknownIndex: undefined };
   for (const argument of argumentsList) {
-    const target = unknownIndex === undefined ? before : after;
-    if (!ts.isSpreadElement(argument)) {
-      target.push(unwrap(argument));
+    const restPlan = ts.isSpreadElement(argument)
+      ? restSpreadPlanOf(argument.expression) : undefined;
+    if (restPlan) {
+      plan = mergeCallArgumentPlans(plan, restPlan);
       continue;
     }
-    const expanded = fixedSpreadValuesOf(argument.expression);
-    if (expanded) target.push(...expanded);
-    else if (unknownIndex === undefined) unknownIndex = before.length;
+    const expanded = ts.isSpreadElement(argument)
+      ? fixedSpreadValuesOf(argument.expression) : undefined;
+    const argumentPlan = ts.isSpreadElement(argument)
+      ? expanded
+        ? { before: expanded, after: [], unknownIndex: undefined }
+        : { before: [], after: [], unknownIndex: 0 }
+      : { before: [unwrap(argument)], after: [], unknownIndex: undefined };
+    plan = mergeCallArgumentPlans(plan, argumentPlan);
   }
-  return { before, after, unknownIndex };
+  return plan;
 };
 const callArgumentCandidatesAt = (plan, index) => {
   if (plan.unknownAll) return plan.after;
@@ -2582,10 +2647,15 @@ const argumentArrayPlanOf = (input, seen = new Set()) => {
   if (!node) return { before: [], after: [], unknownIndex: 0 };
   if (ts.isArrayLiteralExpression(node)) return fixedCallArgumentPlanOf(node.elements);
   if (ts.isCallExpression(node)) {
+  const next = new Set(seen);
+  next.add(node);
+  const create = memberAccess(unwrap(node.expression));
+  if (create?.property === "create" && node.arguments.length === 1 &&
+      globalPrototypeObjectOf(create.receiver, next)) {
+    return argumentArrayPlanOf(node.arguments[0], next);
+  }
     const returned = functionReturnExpressionsOf(node.expression, seen);
     if (returned.length > 0) {
-      const next = new Set(seen);
-      next.add(node);
       return returned.map((value) => argumentArrayPlanOf(value, next))
         .reduce((left, right) => mergeCallArgumentPlans(left, right));
     }

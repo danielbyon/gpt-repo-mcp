@@ -302,7 +302,24 @@ test("accepts ordinary helper arguments and member factories", () => {
     "const reflectedSafeBound = Reflect.apply(loadSafe.bind, loadSafe, [null]);",
     "reflectedSafeBound(processLike);",
     "const commaSafeCopy = (0, globalThis.Object.assign.bind(Object, {}, processLike))();",
-    "commaSafeCopy.getBuiltinModule();"
+    "commaSafeCopy.getBuiltinModule();",
+    "const getterSafeTools = { runtime: processLike, get read() { return this.runtime; } };",
+    "function readGetterSafe(runtime) { return runtime.getBuiltinModule(); }",
+    "readGetterSafe(getterSafeTools.read);",
+    "const createSafeArgs = Object.create({ 0: processLike, length: 1 });",
+    "function inspectCreateSafe(runtime) { return runtime.getBuiltinModule(); }",
+    "inspectCreateSafe.apply(null, createSafeArgs);",
+    "const restSafeTools = { get runtime() { return processLike; } };",
+    "function restSafeInner(...args) { return args[0].getBuiltinModule(); }",
+    "function restSafeOuter(...args) { return restSafeInner(...args); }",
+    "restSafeOuter(restSafeTools.runtime);",
+    "declare const restSafePrefix: any[];",
+    "function restTailSafeInner(...args) { return args[0].getBuiltinModule(); }",
+    "function restTailSafeOuter(...args) { return restTailSafeInner(...args); }",
+    "restTailSafeOuter(...restSafePrefix, processLike);",
+    "function restAfterHeadSafeInner(head, ...args) { return args[0].getBuiltinModule(); }",
+    "function restAfterHeadSafeOuter(...args) { return restAfterHeadSafeInner('head', ...args); }",
+    "restAfterHeadSafeOuter(processLike);"
   ].join("\n");
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
 });
@@ -858,6 +875,11 @@ test.each([
   ["nested local function returns", "const make = () => () => process; make()().getBuiltinModule('node:child_process').exec('id');"],
   ["aliased nested local function returns", "const make = () => () => process; const inner = make(); inner().getBuiltinModule('node:child_process').exec('id');"],
   ["getter-held Object constructor", "const tools = { get ctor() { return globalThis.Object; } }; tools.ctor.create(process).getBuiltinModule('node:child_process').exec('id');"],
+    ["getter this capability", "const tools = { runtime: process, get read() { return this.runtime; } }; function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } load(tools.read).exec('id');"],
+    ["Object.create inherited array-like", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const args = Object.create({ 0: process, length: 1 }); load.apply(null, args).exec('id');"],
+    ["rest forwarding through getter", "const tools = { get runtime() { return process; } }; function inner(...args) { return args[0].getBuiltinModule('node:child_process'); } function outer(...args) { return inner(...args); } outer(tools.runtime).exec('id');"],
+    ["rest forwarding unknown prefix", "function inner(...args) { return args[0].getBuiltinModule('node:child_process'); } function outer(...args) { return inner(...args); } declare const prefix: any[]; outer(...prefix, process).exec('id');"],
+    ["rest forwarding after fixed argument", "function inner(head, ...args) { return args[0].getBuiltinModule('node:child_process'); } function outer(...args) { return inner('head', ...args); } outer(process).exec('id');"],
   ["reflected Function.prototype.bind", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = Reflect.apply(Function.prototype.bind, load, [null]); bound(process).exec('id');"],
     ["generic bind unknown prefix", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } declare const prefix: any[]; const bind = Function.prototype.bind; const bound = bind.call(load, ...prefix, process); bound().exec('id');"],
     ["factory carrier", "const tools = { make: () => ({ runtime: process }) }; tools.make().runtime.getBuiltinModule('node:child_process').exec('id');"],
