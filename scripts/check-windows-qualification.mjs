@@ -854,6 +854,68 @@ const fixedSpreadValuesOf = (input, seen = new Set()) => {
   }
   return values;
 };
+const fixedSpreadPlansOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return [];
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isSpreadElement(node)) return fixedSpreadPlansOf(node.expression, next);
+  if (ts.isConditionalExpression(node)) {
+    return [
+      ...fixedSpreadPlansOf(node.whenTrue, next),
+      ...fixedSpreadPlansOf(node.whenFalse, next)
+    ];
+  }
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return fixedSpreadPlansOf(node.right, next);
+  }
+  if (ts.isArrayLiteralExpression(node)) {
+    let plans = [{ before: [], after: [], unknownIndex: undefined }];
+    const append = (plan, value) => mergeCallArgumentPlans(
+      plan, { before: [value], after: [], unknownIndex: undefined }
+    );
+    for (const element of node.elements) {
+      if (ts.isOmittedExpression(element)) {
+        plans = plans.map((plan) => append(plan, undefined));
+      } else if (ts.isSpreadElement(element)) {
+        const nested = fixedSpreadPlansOf(element.expression, next);
+        const alternatives = nested.length > 0
+          ? nested
+          : [{ before: [], after: [], unknownIndex: 0 }];
+        plans = plans.flatMap((plan) => alternatives.map((alternative) =>
+          mergeCallArgumentPlans(plan, alternative))).slice(0, 32);
+      } else {
+        plans = plans.map((plan) => append(plan, unwrap(element)));
+      }
+    }
+    return plans;
+  }
+  if (ts.isIdentifier(node)) {
+    const values = expressionValuesOf(node, next).filter((value) => value !== node);
+    return values.flatMap((value) => fixedSpreadPlansOf(value, next)).slice(0, 32);
+  }
+  if (ts.isCallExpression(node)) {
+    return functionReturnExpressionsOf(node.expression, next)
+      .flatMap((value) => fixedSpreadPlansOf(value, next)).slice(0, 32);
+  }
+  return [];
+};
+const fixedIndexedValuesOf = (input, index, seen = new Set()) => {
+  const plans = fixedSpreadPlansOf(input, seen);
+  return plans.flatMap((plan) => callArgumentCandidatesAt(plan, index)).filter(Boolean);
+};
+const fixedSpreadPlanOf = (input, seen = new Set()) => {
+  const plans = fixedSpreadPlansOf(input, seen);
+  if (plans.length === 0) return undefined;
+  if (plans.length === 1) return plans[0];
+  return {
+    before: [],
+    after: plans.flatMap((plan) => [...plan.before, ...plan.after]),
+    unknownIndex: 0,
+    unknownAll: true
+  };
+};
 const restSpreadPlanOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || !ts.isIdentifier(node) || seen.has(node)) return undefined;
@@ -885,11 +947,11 @@ const fixedCallArgumentPlanOf = (argumentsList) => {
       plan = mergeCallArgumentPlans(plan, restPlan);
       continue;
     }
-    const expanded = ts.isSpreadElement(argument)
-      ? fixedSpreadValuesOf(argument.expression) : undefined;
+    const expandedPlan = ts.isSpreadElement(argument)
+      ? fixedSpreadPlanOf(argument.expression) : undefined;
     const argumentPlan = ts.isSpreadElement(argument)
-      ? expanded
-        ? { before: expanded, after: [], unknownIndex: undefined }
+      ? expandedPlan
+        ? expandedPlan
         : { before: [], after: [], unknownIndex: 0 }
       : { before: [unwrap(argument)], after: [], unknownIndex: undefined };
     plan = mergeCallArgumentPlans(plan, argumentPlan);
@@ -950,10 +1012,11 @@ const argumentArrayPlanOf = (input, seen = new Set()) => {
   if (ts.isCallExpression(node)) {
   const next = new Set(seen);
   next.add(node);
-  const create = resolvedAccess(unwrap(node.expression));
-  if (create?.method === "create" && node.arguments.length === 1 &&
-      globalIntrinsicOf(create.receiver, ["Object"], next)) {
-    return argumentArrayPlanOf(node.arguments[0], next);
+    const createArguments = intrinsicInvocationArgumentsOf(
+      node, ["Object"], ["create"], next
+    );
+    if (createArguments?.[0]) {
+      return argumentArrayPlanOf(createArguments[0], next);
   }
     const returned = functionReturnExpressionsOf(node.expression, seen);
     if (returned.length > 0) {
@@ -1179,12 +1242,17 @@ if (node.kind === ts.SyntaxKind.ThisKeyword) {
   return values;
 }
     for (const value of expressionValuesOf(node, next)) {
+      if (value.kind === ts.SyntaxKind.ThisKeyword) {
+        values.push(...containerValuesOf(value, next));
+        continue;
+      }
     if (ts.isObjectLiteralExpression(value) || ts.isArrayLiteralExpression(value)) {
       values.push(value);
       continue;
     }
-      if (objectAssignCall(value)) {
-        for (const argument of value.arguments) {
+      const assignArguments = objectAssignArgumentsOf(value);
+      if (assignArguments) {
+        for (const argument of assignArguments) {
           const expanded = ts.isSpreadElement(argument)
             ? expandedArgumentValuesOf(argument.expression, next)
             : [argument];
@@ -1192,6 +1260,13 @@ if (node.kind === ts.SyntaxKind.ThisKeyword) {
             values.push(...containerValuesOf(source, next));
           }
         }
+        continue;
+      }
+      const createArguments = intrinsicInvocationArgumentsOf(
+        value, ["Object"], ["create"], next
+      );
+      if (createArguments?.[0]) {
+        values.push(...containerValuesOf(createArguments[0], next));
         continue;
       }
     if (ts.isCallExpression(value)) {
@@ -1293,8 +1368,7 @@ const objectPropertyValuesOf = (input, key, seen = new Set()) => {
         }
       }
     } else if (ts.isArrayLiteralExpression(container) && /^\d+$/.test(key)) {
-      const element = fixedSpreadValuesOf(container, new Set())?.[Number(key)];
-      if (element) values.push(element);
+      values.push(...fixedIndexedValuesOf(container, Number(key)));
     }
   }
   const receiverKey = assignmentReferenceKey(input);
@@ -1652,7 +1726,6 @@ collectResolvedAssignments(file);
         .some((value) => globalIntrinsicMethodOf(
           value, receiverNames, methods, next));
     }
-    if (!intrinsicMethodAliasNames.has(node.text)) return false;
     const binding = resolveBinding(node);
     if (!binding?.node || seen.has(binding.node)) return false;
     if (binding.kind !== "variable" &&
@@ -1745,11 +1818,31 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
     }
     if (!ts.isCallExpression(node)) return undefined;
     const wrapper = resolvedAccess(node.expression);
-    if (wrapper?.method !== "bind" ||
-        !globalIntrinsicMethodOf(
-          wrapper.receiver, receiverNames, methods, next
-        )) return undefined;
+  if (wrapper?.method === "bind" &&
+      globalIntrinsicMethodOf(
+        wrapper.receiver, receiverNames, methods, next
+      )) {
     return intrinsicArgumentValuesOf(node.arguments.slice(1), next);
+  }
+  if (wrapper && ["apply", "call"].includes(wrapper.method) &&
+      genericBindMethodOf(wrapper.receiver, next) &&
+      globalIntrinsicMethodOf(
+        node.arguments[0], receiverNames, methods, next
+      )) {
+    const plan = wrapper.method === "call"
+      ? fixedCallArgumentPlanOf(node.arguments.slice(1))
+      : argumentArrayPlanOf(node.arguments[1], next);
+    return intrinsicArgumentPlanValuesOf(dropLeadingCallArgument(plan));
+  }
+  if (reflectApplyReferenceOf(node.expression, next) &&
+      genericBindMethodOf(node.arguments[0], next) &&
+      globalIntrinsicMethodOf(
+        node.arguments[1], receiverNames, methods, next
+      )) {
+    const plan = argumentArrayPlanOf(node.arguments[2], next);
+    return intrinsicArgumentPlanValuesOf(dropLeadingCallArgument(plan));
+  }
+  return undefined;
   }
   function intrinsicInvocationArgumentsOf(
     input, receiverNames, methods, seen = new Set()
@@ -1843,11 +1936,18 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
     return member?.method === "assign" && globalObjectOf(receiver, seen);
   }
   function objectAssignCall(node) {
-    return ts.isCallExpression(node) && objectAssignReference(node.expression);
+    return objectAssignArgumentsOf(node) !== undefined;
+  }
+  function objectAssignArgumentsOf(node) {
+    if (!ts.isCallExpression(node)) return undefined;
+    return intrinsicInvocationArgumentsOf(
+      node, ["Object"], ["assign"]
+    ) ?? (objectAssignReference(node.expression) ? node.arguments : undefined);
   }
   const collectAssignments = (node) => {
-    if (objectAssignCall(node)) {
-      const [target, ...sources] = node.arguments;
+    const assignArguments = objectAssignArgumentsOf(node);
+    if (assignArguments) {
+      const [target, ...sources] = assignArguments;
       if (target && !ts.isSpreadElement(target)) {
         for (const source of sources) {
           const values = ts.isSpreadElement(source)
@@ -2023,7 +2123,7 @@ return functionReturnExpressionsOf(node.expression, next)
     return objectPropertyValuesOf(member.receiver, member.method, next)
       .flatMap((value) => localFunctionValuesOf(value, next));
   };
-  const functionReturnExpressionsOf = (input, seen = new Set()) => {
+  function functionReturnExpressionsOf(input, seen = new Set()) {
     const node = unwrap(input);
     if (!node || seen.has(node)) return [];
     const next = new Set(seen);
@@ -2088,6 +2188,13 @@ return functionReturnExpressionsOf(node.expression, next)
     }
   }
   if (ts.isCallExpression(node)) {
+    const createArguments = intrinsicInvocationArgumentsOf(
+      node, ["Object"], ["create"], seen
+    );
+    if (createArguments?.[0]) {
+      const candidate = possibleTestRunnerOf(createArguments[0], names, seen);
+      if (candidate) return candidate;
+    }
     const decorator = resolvedAccess(node.expression);
     if (decorator && ["each", "skipIf", "runIf"].includes(decorator.method)) {
       return possibleTestRunnerOf(decorator.receiver, names, seen);
@@ -2194,7 +2301,7 @@ if (candidate) return candidate;
       }
     }
     return testRunnerOf(node, names);
-  };
+  }
   const selectedBindingNameOf = (pattern, targetName) => {
    if (ts.isObjectBindingPattern(pattern)) {
      for (const element of pattern.elements) {
@@ -2395,7 +2502,7 @@ if (assignArguments) {
       if (ts.isIdentifier(node.name)) {
         if (globalIntrinsicMethodOf(node.initializer, ["Reflect"], ["get"]) ||
             globalIntrinsicMethodOf(node.initializer, ["Object"], [
-              "entries", "fromEntries", "getOwnPropertyDescriptor",
+          "assign", "create", "entries", "fromEntries", "getOwnPropertyDescriptor",
               "getOwnPropertyDescriptors", "values"
             ])) intrinsicMethodAliasNames.add(node.name.text);
         if (ts.isObjectLiteralExpression(unwrap(node.initializer)) &&
@@ -2406,7 +2513,7 @@ if (assignArguments) {
               return Boolean(value &&
                 (globalIntrinsicMethodOf(value, ["Reflect"], ["get"]) ||
                  globalIntrinsicMethodOf(value, ["Object"], [
-                   "entries", "fromEntries", "getOwnPropertyDescriptor",
+            "assign", "create", "entries", "fromEntries", "getOwnPropertyDescriptor",
                    "getOwnPropertyDescriptors", "values"
                  ])));
             })) intrinsicMethodContainerNames.add(node.name.text);
@@ -2417,7 +2524,7 @@ if (assignArguments) {
           if (selected.some((value) =>
             globalIntrinsicMethodOf(value, ["Reflect"], ["get"]) ||
             globalIntrinsicMethodOf(value, ["Object"], [
-              "entries", "fromEntries", "getOwnPropertyDescriptor",
+              "assign", "create", "entries", "fromEntries", "getOwnPropertyDescriptor",
               "getOwnPropertyDescriptors", "values"
             ]))) {
             intrinsicMethodAliasNames.add(name);
@@ -2425,7 +2532,7 @@ if (assignArguments) {
               patternSelectsProperty(node.name, name, "get")) {
             intrinsicMethodAliasNames.add(name);
           } else if (globalIntrinsicOf(node.initializer, ["Object"]) &&
-              ["entries", "fromEntries", "getOwnPropertyDescriptor",
+            ["assign", "create", "entries", "fromEntries", "getOwnPropertyDescriptor",
                 "getOwnPropertyDescriptors", "values"].some((method) =>
                 patternSelectsProperty(node.name, name, method))) {
             intrinsicMethodAliasNames.add(name);
@@ -2437,7 +2544,7 @@ if (assignArguments) {
         ts.isIdentifier(unwrap(node.left)) &&
         (globalIntrinsicMethodOf(node.right, ["Reflect"], ["get"]) ||
          globalIntrinsicMethodOf(node.right, ["Object"], [
-           "entries", "fromEntries", "getOwnPropertyDescriptor",
+           "assign", "create", "entries", "fromEntries", "getOwnPropertyDescriptor",
            "getOwnPropertyDescriptors", "values"
          ]))) intrinsicMethodAliasNames.add(unwrap(node.left).text);
     ts.forEachChild(node, visitIntrinsicAliases);
@@ -2553,7 +2660,7 @@ const bindMethodReferenceOf = (input, seen = new Set()) => {
   next.add(binding.node);
   return bindMethodReferenceOf(binding.node.initializer, next);
 };
-const genericBindMethodOf = (input, seen = new Set()) => {
+function genericBindMethodOf(input, seen = new Set()) {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
   if (ts.isFunctionLike(node)) {
@@ -2581,7 +2688,7 @@ const genericBindMethodOf = (input, seen = new Set()) => {
   return Boolean(binding?.kind === "variable" &&
     ts.isVariableDeclaration(binding.node) && binding.node.initializer &&
     genericBindMethodOf(binding.node.initializer, next));
-};
+}
 const storedBindInvocationOf = (input, invocationPlan, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return undefined;

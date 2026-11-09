@@ -792,23 +792,6 @@ const assignmentMemberPathKey = (receiver, property) => {
     }
     return [node];
   };
-  const expandedSpreadValuesOf = (input, seen = new Set()) => {
-    const node = unwrap(input);
-    if (!node || seen.has(node)) return [];
-    const next = new Set(seen);
-    next.add(node);
-    if (ts.isSpreadElement(node)) return expandedSpreadValuesOf(node.expression, next);
-    const values = [];
-    for (const value of resolvedValuesOf(node, next)) {
-      if (ts.isArrayLiteralExpression(value)) {
-        values.push(...value.elements.flatMap((element) =>
-          ts.isOmittedExpression(element) ? [undefined] : expandedSpreadValuesOf(element, next)));
-      } else {
-        values.push(value);
-      }
-    }
-    return values;
-  };
   const objectValueCandidatesOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node || seen.has(node)) return [];
@@ -831,6 +814,10 @@ const assignmentMemberPathKey = (receiver, property) => {
     return objects;
   }
     for (const value of resolvedValuesOf(node, next)) {
+      if (value.kind === ts.SyntaxKind.ThisKeyword) {
+        objects.push(...objectValueCandidatesOf(value, next));
+        continue;
+      }
       if (ts.isObjectLiteralExpression(value)) {
         objects.push(value);
         continue;
@@ -843,6 +830,13 @@ const assignmentMemberPathKey = (receiver, property) => {
           }
         continue;
       }
+        const prototypes = objectCreatePrototypeValuesOf(value, next);
+        if (prototypes.length > 0) {
+          for (const prototype of prototypes) {
+            objects.push(...objectValueCandidatesOf(prototype, next));
+          }
+          continue;
+        }
       for (const returned of functionReturnExpressionsOf(value.expression, next)) {
         objects.push(...objectValueCandidatesOf(returned, next));
         }
@@ -907,8 +901,7 @@ if (ts.isGetAccessorDeclaration(candidate)) {
     }
     for (const value of resolvedValuesOf(node, next)) {
       if (!ts.isArrayLiteralExpression(value) || !/^\d+$/.test(property)) continue;
-      const indexed = fixedSpreadValuesOf(value, new Set())?.[Number(property)];
-      if (indexed) values.push(indexed);
+      values.push(...fixedIndexedValuesOf(value, Number(property)));
     }
     if (ts.isIdentifier(node)) {
     if (/^\d+$/.test(property)) {
@@ -1125,10 +1118,8 @@ return functionReturnExpressionsOf(node.expression, next)
       if (processModuleRequire(node)) return true;
   const copiedArguments = objectAssignInvocationArgumentsOf(node, seen);
   if (copiedArguments?.some((value) => processObjectOf(value, seen))) return true;
-  const createFactory = memberAccess(unwrap(node.expression));
-  if (createFactory?.property === "create" &&
-      globalPrototypeObjectOf(createFactory.receiver, seen) &&
-      node.arguments[0] && processObjectOf(node.arguments[0], seen)) return true;
+      const prototypes = objectCreatePrototypeValuesOf(node, seen);
+      if (prototypes.some((value) => processObjectOf(value, seen))) return true;
       const callee = unwrap(node.expression);
       const binding = ts.isIdentifier(callee) ? resolveBinding(callee) : undefined;
       if (binding && seen.has(binding.node)) return false;
@@ -1971,51 +1962,130 @@ const reflectiveReadOf = (input, seen = new Set()) => {
     return Boolean(member && ["Object", "Reflect"].includes(member.property) &&
       globalObjectOf(member.receiver, seen));
   };
-const isObjectAssignMethodOf = (input, seen = new Set()) => {
-  const method = memberAccess(unwrap(input));
-  return Boolean(method?.property === "assign" &&
-    globalPrototypeObjectOf(method.receiver, seen));
+const staticMethodReferenceOf = (
+  input, property, ownerOf, seen = new Set()
+) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isGetAccessorDeclaration(node) || ts.isFunctionLike(node)) {
+    return functionReturnExpressionsOf(node, next)
+      .some((value) => staticMethodReferenceOf(value, property, ownerOf, next));
+  }
+  const member = memberAccess(node);
+  if (member) {
+    if (member.property === property && ownerOf(member.receiver, next)) return true;
+    if (memberValueCandidatesOf(member.receiver, member.property, next)
+      .some((value) => staticMethodReferenceOf(value, property, ownerOf, next))) {
+      return true;
+    }
+  }
+  if (ts.isCallExpression(node)) {
+    return functionReturnExpressionsOf(node.expression, next)
+      .some((value) => staticMethodReferenceOf(value, property, ownerOf, next));
+  }
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node)) return false;
+  if (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)) {
+    if (!ts.isIdentifier(binding.node.name)) {
+      return Boolean(binding.node.initializer &&
+        ownerOf(binding.node.initializer, next) &&
+        bindingPatternSelectsPropertyOf(binding.node.name, node.text, property)) ||
+        bindingPatternValuesOf(
+          binding.node.name, binding.node.initializer, node.text, next
+        ).some((value) => staticMethodReferenceOf(value, property, ownerOf, next));
+    }
+    return [binding.node.initializer, ...(assignmentsByBinding.get(binding.node) ?? [])]
+      .filter(Boolean)
+      .some((value) => staticMethodReferenceOf(value, property, ownerOf, next));
+  }
+  return false;
 };
-const boundObjectAssignArgumentsOf = (input, seen = new Set()) => {
+const boundStaticMethodPrefixPlanOf = (
+  input, property, ownerOf, seen = new Set()
+) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return undefined;
+  const next = new Set(seen);
+  next.add(node);
   if (ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
-    const next = new Set(seen);
-    next.add(node);
-    return boundObjectAssignArgumentsOf(node.right, next);
+    return boundStaticMethodPrefixPlanOf(node.right, property, ownerOf, next);
+  }
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (binding?.kind === "variable" &&
+        ts.isVariableDeclaration(binding.node) &&
+        ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+      return boundStaticMethodPrefixPlanOf(
+        binding.node.initializer, property, ownerOf, next
+      );
+    }
+    return undefined;
   }
   if (!ts.isCallExpression(node)) return undefined;
-  const method = memberAccess(unwrap(node.expression));
-  if (method?.property !== "bind" ||
-      !isObjectAssignMethodOf(method.receiver, seen)) return undefined;
-  return node.arguments.slice(1);
-};
-const expandedInvocationArgumentsOf = (argumentsList, seen = new Set()) =>
-  argumentsList.flatMap((argument) => ts.isSpreadElement(argument)
-    ? expandedSpreadValuesOf(argument.expression, seen)
-    : [argument]);
-const objectAssignInvocationArgumentsOf = (call, seen = new Set()) => {
-  const callee = unwrap(call.expression);
-  if (isObjectAssignMethodOf(callee, seen)) {
-    return expandedInvocationArgumentsOf(call.arguments, seen);
+  const bind = bindMethodReferenceOf(node.expression, next);
+  if (bind?.property === "bind" &&
+      staticMethodReferenceOf(bind.receiver, property, ownerOf, next)) {
+    return dropLeadingCallArgument(
+      fixedCallArgumentPlanOf(node.arguments.slice(1))
+    );
   }
-  const boundArguments = boundObjectAssignArgumentsOf(callee, seen);
-  if (boundArguments) {
-    return [
-      ...expandedInvocationArgumentsOf(boundArguments, seen),
-      ...expandedInvocationArgumentsOf(call.arguments, seen)
-    ];
+  if (genericBindMethodOf(node.expression, next) &&
+      staticMethodReferenceOf(node.arguments[0], property, ownerOf, next)) {
+    return fixedCallArgumentPlanOf(node.arguments.slice(2));
+  }
+  return undefined;
+};
+const staticMethodInvocationPlanOf = (
+  call, property, ownerOf, seen = new Set()
+) => {
+  const callee = unwrap(call.expression);
+  if (!callee) return undefined;
+  const next = new Set(seen);
+  next.add(call);
+  if (staticMethodReferenceOf(callee, property, ownerOf, next)) {
+    return fixedCallArgumentPlanOf(call.arguments);
+  }
+  if (reflectApplyReferenceOf(callee, next)) {
+    const target = call.arguments[0];
+    const applicationPlan = argumentArrayPlanOf(call.arguments[2], next);
+    if (staticMethodReferenceOf(target, property, ownerOf, next)) {
+      return applicationPlan;
+    }
+    const boundPlan = boundStaticMethodPrefixPlanOf(
+      target, property, ownerOf, next
+    );
+    return boundPlan
+      ? mergeCallArgumentPlans(boundPlan, applicationPlan) : undefined;
   }
   const wrapper = memberAccess(callee);
-  if (!wrapper || !["apply", "call"].includes(wrapper.property) ||
-      !isObjectAssignMethodOf(wrapper.receiver, seen)) return undefined;
-  if (wrapper.property === "call") {
-    return expandedInvocationArgumentsOf(call.arguments.slice(1), seen);
+  if (wrapper && ["apply", "call"].includes(wrapper.property) &&
+      staticMethodReferenceOf(wrapper.receiver, property, ownerOf, next)) {
+    return wrapper.property === "call"
+      ? fixedCallArgumentPlanOf(call.arguments.slice(1))
+      : argumentArrayPlanOf(call.arguments[1], next);
   }
-  return call.arguments[1]
-    ? expandedSpreadValuesOf(call.arguments[1], seen)
-    : [];
+  const boundPlan = boundStaticMethodPrefixPlanOf(
+    callee, property, ownerOf, next
+  );
+  return boundPlan === undefined
+    ? undefined
+    : mergeCallArgumentPlans(boundPlan, fixedCallArgumentPlanOf(call.arguments));
+};
+const objectCreatePrototypeValuesOf = (call, seen = new Set()) => {
+  const plan = staticMethodInvocationPlanOf(
+    call, "create", globalPrototypeObjectOf, seen
+  );
+  return plan ? callArgumentCandidatesAt(plan, 0).filter(Boolean) : [];
+};
+const objectAssignInvocationArgumentsOf = (call, seen = new Set()) => {
+  const plan = staticMethodInvocationPlanOf(
+    call, "assign", globalPrototypeObjectOf, seen
+  );
+  return plan ? [...plan.before, ...plan.after].filter(Boolean) : undefined;
 };
   const getPrototypeOfFunctionOf = (input, seen = new Set()) => {
     const node = unwrap(input);
@@ -2551,6 +2621,68 @@ const objectAssignInvocationArgumentsOf = (call, seen = new Set()) => {
     }
     return values;
   };
+const fixedSpreadPlansOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return [];
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isSpreadElement(node)) return fixedSpreadPlansOf(node.expression, next);
+  if (ts.isConditionalExpression(node)) {
+    return [
+      ...fixedSpreadPlansOf(node.whenTrue, next),
+      ...fixedSpreadPlansOf(node.whenFalse, next)
+    ];
+  }
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return fixedSpreadPlansOf(node.right, next);
+  }
+  if (ts.isArrayLiteralExpression(node)) {
+    let plans = [{ before: [], after: [], unknownIndex: undefined }];
+    const append = (plan, value) => mergeCallArgumentPlans(
+      plan, { before: [value], after: [], unknownIndex: undefined }
+    );
+    for (const element of node.elements) {
+      if (ts.isOmittedExpression(element)) {
+        plans = plans.map((plan) => append(plan, undefined));
+      } else if (ts.isSpreadElement(element)) {
+        const nested = fixedSpreadPlansOf(element.expression, next);
+        const alternatives = nested.length > 0
+          ? nested
+          : [{ before: [], after: [], unknownIndex: 0 }];
+        plans = plans.flatMap((plan) => alternatives.map((alternative) =>
+          mergeCallArgumentPlans(plan, alternative))).slice(0, 32);
+      } else {
+        plans = plans.map((plan) => append(plan, unwrap(element)));
+      }
+    }
+    return plans;
+  }
+  if (ts.isIdentifier(node)) {
+    const values = resolvedValuesOf(node, next).filter((value) => value !== node);
+    return values.flatMap((value) => fixedSpreadPlansOf(value, next)).slice(0, 32);
+  }
+  if (ts.isCallExpression(node)) {
+    return functionReturnExpressionsOf(node.expression, next)
+      .flatMap((value) => fixedSpreadPlansOf(value, next)).slice(0, 32);
+  }
+  return [];
+};
+const fixedIndexedValuesOf = (input, index, seen = new Set()) => {
+  const plans = fixedSpreadPlansOf(input, seen);
+  return plans.flatMap((plan) => callArgumentCandidatesAt(plan, index)).filter(Boolean);
+};
+const fixedSpreadPlanOf = (input, seen = new Set()) => {
+  const plans = fixedSpreadPlansOf(input, seen);
+  if (plans.length === 0) return undefined;
+  if (plans.length === 1) return plans[0];
+  return {
+    before: [],
+    after: plans.flatMap((plan) => [...plan.before, ...plan.after]),
+    unknownIndex: 0,
+    unknownAll: true
+  };
+};
 const restSpreadPlanOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || !ts.isIdentifier(node) || seen.has(node)) return undefined;
@@ -2582,11 +2714,11 @@ const fixedCallArgumentPlanOf = (argumentsList) => {
       plan = mergeCallArgumentPlans(plan, restPlan);
       continue;
     }
-    const expanded = ts.isSpreadElement(argument)
-      ? fixedSpreadValuesOf(argument.expression) : undefined;
+    const expandedPlan = ts.isSpreadElement(argument)
+      ? fixedSpreadPlanOf(argument.expression) : undefined;
     const argumentPlan = ts.isSpreadElement(argument)
-      ? expanded
-        ? { before: expanded, after: [], unknownIndex: undefined }
+      ? expandedPlan
+        ? expandedPlan
         : { before: [], after: [], unknownIndex: 0 }
       : { before: [unwrap(argument)], after: [], unknownIndex: undefined };
     plan = mergeCallArgumentPlans(plan, argumentPlan);
@@ -2647,10 +2779,10 @@ const argumentArrayPlanOf = (input, seen = new Set()) => {
   if (ts.isCallExpression(node)) {
   const next = new Set(seen);
   next.add(node);
-  const create = memberAccess(unwrap(node.expression));
-  if (create?.property === "create" && node.arguments.length === 1 &&
-      globalPrototypeObjectOf(create.receiver, next)) {
-    return argumentArrayPlanOf(node.arguments[0], next);
+    const prototypes = objectCreatePrototypeValuesOf(node, next);
+    if (prototypes.length > 0) {
+      return prototypes.map((value) => argumentArrayPlanOf(value, next))
+        .reduce((left, right) => mergeCallArgumentPlans(left, right));
   }
     const returned = functionReturnExpressionsOf(node.expression, seen);
     if (returned.length > 0) {

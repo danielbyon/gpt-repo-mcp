@@ -784,6 +784,78 @@ describe("Windows qualification scope guard", () => {
       .toThrow(/Exclusive or dynamically selected Vitest/);
   });
 
+  const staticProvenanceCases = [
+    ['conditional spread alternatives', (capability) =>
+      `import { test } from 'vitest'; declare const condition: boolean; const safe = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus(...(condition ? [safe] : [${capability}]));`],
+    ['nested unknown spread followed by capability', (capability) =>
+      `import { test } from 'vitest'; declare const args: any[]; function focus(register) { register.only('focused', () => {}); } focus(...[...args, ${capability}]);`],
+    ['unknown prefix indexed capability', (capability) =>
+      `import { test } from 'vitest'; declare const args: any[]; const values = [...args, ${capability}]; values[0].only('focused', () => {});`],
+    ['getter this capability through alias', (capability) =>
+      `import { test } from 'vitest'; const tools = { runtime: ${capability}, get read() { const self = this; return self.runtime; } }; tools.read.only('focused', () => {});`],
+    ['Object.create inherited index', (capability) =>
+      `import { test } from 'vitest'; const args = Object.create({ 0: ${capability}, length: 1 }); args[0].only('focused', () => {});`],
+    ['Object.create inherited getter', (capability) =>
+      `import { test } from 'vitest'; const args = Object.create({ runtime: ${capability}, get read() { return this.runtime; } }); args.read.only('focused', () => {});`],
+    ['aliased Object.create', (capability) =>
+      `import { test } from 'vitest'; const create = Object.create; const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['destructured Object.create', (capability) =>
+      `import { test } from 'vitest'; const { create } = Object; const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['member-held Object.create', (capability) =>
+      `import { test } from 'vitest'; const tools = { create: Object.create }; const args = tools.create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['getter-held Object.create', (capability) =>
+      `import { test } from 'vitest'; const tools = { get create() { return Object.create; } }; const args = tools.create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['Object.create call', (capability) =>
+      `import { test } from 'vitest'; const args = Object.create.call(Object, { runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['Object.create apply', (capability) =>
+      `import { test } from 'vitest'; const args = Object.create.apply(Object, [{ runtime: ${capability} }]); args.runtime.only('focused', () => {});`],
+    ['Object.create bind', (capability) =>
+      `import { test } from 'vitest'; const args = Object.create.bind(Object)({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['Reflect.apply Object.create', (capability) =>
+      `import { test } from 'vitest'; const args = Reflect.apply(Object.create, Object, [{ runtime: ${capability} }]); args.runtime.only('focused', () => {});`],
+    ['generic bind call Object.create', (capability) =>
+      `import { test } from 'vitest'; const create = Function.prototype.bind.call(Object.create, Object); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['generic bind apply Object.create', (capability) =>
+      `import { test } from 'vitest'; const create = Function.prototype.bind.apply(Object.create, [Object]); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['generic bind Reflect.apply Object.create', (capability) =>
+      `import { test } from 'vitest'; const create = Reflect.apply(Function.prototype.bind, Object.create, [Object]); const args = create({ runtime: ${capability} }); args.runtime.only('focused', () => {});`],
+    ['aliased Object.assign', (capability) =>
+      `import { test } from 'vitest'; const assign = Object.assign; assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['destructured Object.assign', (capability) =>
+      `import { test } from 'vitest'; const { assign } = Object; assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['member-held Object.assign', (capability) =>
+      `import { test } from 'vitest'; const tools = { assign: Object.assign }; tools.assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['getter-held Object.assign', (capability) =>
+      `import { test } from 'vitest'; const tools = { get assign() { return Object.assign; } }; tools.assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['Object.assign call', (capability) =>
+      `import { test } from 'vitest'; Object.assign.call(Object, {}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['Object.assign apply', (capability) =>
+      `import { test } from 'vitest'; Object.assign.apply(Object, [{}, { runtime: ${capability} }]).runtime.only('focused', () => {});`],
+    ['Object.assign bind', (capability) =>
+      `import { test } from 'vitest'; Object.assign.bind(Object, {}, { runtime: ${capability} })().runtime.only('focused', () => {});`],
+    ['Reflect.apply Object.assign', (capability) =>
+      `import { test } from 'vitest'; Reflect.apply(Object.assign, Object, [{}, { runtime: ${capability} }]).runtime.only('focused', () => {});`],
+    ['generic bind call Object.assign', (capability) =>
+      `import { test } from 'vitest'; const assign = Function.prototype.bind.call(Object.assign, Object); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['generic bind apply Object.assign', (capability) =>
+      `import { test } from 'vitest'; const assign = Function.prototype.bind.apply(Object.assign, [Object]); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`],
+    ['generic bind Reflect.apply Object.assign', (capability) =>
+      `import { test } from 'vitest'; const assign = Reflect.apply(Function.prototype.bind, Object.assign, [Object]); assign({}, { runtime: ${capability} }).runtime.only('focused', () => {});`]
+  ];
+
+  test.each(staticProvenanceCases)(
+    'rejects bounded static provenance through %s', (_name, makeSource) => {
+      expect(() => collectWindowsTestTitles('fixture.ts', makeSource('test')))
+        .toThrow(/Exclusive or dynamically selected Vitest/);
+    });
+
+  test.each(staticProvenanceCases)(
+    'accepts safe bounded static provenance through %s', (_name, makeSource) => {
+      expect(() => collectWindowsTestTitles(
+        'fixture.ts', makeSource('({ only() {} })')
+      )).not.toThrow();
+    });
+
   test("accepts ordinary holes, rests, helpers, factories, and opaque spreads without test capability", () => {
     const source = [
       "import { test } from 'vitest';",
