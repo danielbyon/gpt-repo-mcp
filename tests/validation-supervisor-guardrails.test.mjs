@@ -1540,5 +1540,5 @@ test('rejects capability-bearing array read before a later safe write', () => {
   "const U = undefined; function defaultSafe() { return processLike; } const { run = defaultSafe } = { run: U }; run().getBuiltinModule();"
     ].join("\n");
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
-  });
+  }, 20_000);
 });

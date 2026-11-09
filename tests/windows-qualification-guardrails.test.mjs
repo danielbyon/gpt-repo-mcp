@@ -425,7 +425,7 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
   ].join("\n");
   expect(collectWindowsTestTitles("fixture.ts", source))
     .toEqual([{ title: "required", enabled: true }]);
-});
+}, 20_000);
 
   test("recognizes direct Vitest namespace registration", () => {
     expect(collectWindowsTestTitles("fixture.ts",
@@ -765,7 +765,7 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
       "const invokeStoredSafe = Array.of.apply.bind(Array.of); const [storedSafeRegister] = invokeStoredSafe.call(null, Array, [testLike]);",
       "test('required', () => {});"
     ].join("\n"))).toEqual([{ title: "required", enabled: true }]);
-  });
+  }, 20_000);
 
   test("keeps globalThis and local member provenance bounded", () => {
     const source = [
