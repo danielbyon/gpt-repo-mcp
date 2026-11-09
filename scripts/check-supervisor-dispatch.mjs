@@ -851,12 +851,7 @@ function staticStringArrayOf(input, seen = new Set()) {
     }
     return values;
   }
-  if (!ts.isIdentifier(node)) return undefined;
-  const binding = resolveBinding(node);
-  if (binding?.kind !== "variable" || !binding.constant ||
-      !binding.node.initializer || next.has(binding.node)) return undefined;
-  next.add(binding.node);
-  return staticStringArrayOf(binding.node.initializer, next);
+  return undefined;
 }
 
 function staticJoinedStringOf(input, seen = new Set()) {
@@ -929,6 +924,65 @@ function staticJoinedStringOf(input, seen = new Set()) {
     next.add(binding.node);
     return staticStringOf(binding.node.initializer, next);
   };
+function staticStringArrayAtInspectionOf(input, seen = new Set()) {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isArrayLiteralExpression(node)) {
+    const values = [];
+    for (const element of node.elements) {
+      if (ts.isOmittedExpression(element) || ts.isSpreadElement(element)) {
+        return undefined;
+      }
+      const value = staticStringAtInspectionOf(element, next);
+      if (value === undefined) return undefined;
+      values.push(value);
+    }
+    return values;
+  }
+  if (!ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (binding?.kind !== "variable" || !binding.constant ||
+      !binding.node.initializer || next.has(binding.node)) return undefined;
+  if ((arrayMutationValuesByBinding.get(binding.node) ?? []).length > 0) {
+    return undefined;
+  }
+  return staticStringArrayAtInspectionOf(
+    binding.node.initializer, next
+  );
+}
+function staticStringAtInspectionOf(input, seen = new Set()) {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  if (ts.isCallExpression(node) && !node.questionDotToken) {
+    const callee = unwrap(node.expression);
+    if (ts.isIdentifier(callee) && callee.text === "String" &&
+        !resolveBinding(callee) && node.arguments.length === 1) {
+      return staticStringAtInspectionOf(node.arguments[0], seen);
+    }
+    const member = memberAccess(callee);
+    if (member?.property === "join" && node.arguments.length <= 1) {
+      const values = staticStringArrayAtInspectionOf(
+        member.receiver, seen
+      );
+      const separator = node.arguments.length === 0
+        ? ","
+        : staticStringAtInspectionOf(node.arguments[0], seen);
+      if (values && separator !== undefined) return values.join(separator);
+    }
+  }
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (binding?.kind === "variable" && binding.constant &&
+        binding.node.initializer && !seen.has(binding.node)) {
+      const next = new Set(seen);
+      next.add(binding.node);
+      return staticStringAtInspectionOf(binding.node.initializer, next);
+    }
+  }
+  return staticStringOf(node, seen);
+}
   const staticPropertyNameOf = (name) => {
     if (!name) return undefined;
     if (ts.isComputedPropertyName(name)) return staticStringOf(name.expression);
@@ -3336,7 +3390,14 @@ const inspectKnownWorkerOptionMutations = (
   for (const assignment of dynamicMemberAssignments) {
     if (assignment.node.getStart(file) <= referenceStart &&
         targetsOptions(assignment.receiver)) {
-      add(assignment.node, unproven);
+      const property = staticStringAtInspectionOf(
+        assignment.node.argumentExpression
+      );
+      if (property === undefined) {
+        add(assignment.node, unproven);
+      } else if (property === "eval") {
+        inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
+      }
     }
   }
   const inspectNamedMutation = (call, name, value) => {

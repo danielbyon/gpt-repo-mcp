@@ -655,10 +655,24 @@ test.each([
 "const key = ['e', 'v', 'a', 'l'].join(''); options[key] = true; " +
 "new Worker('worker.js', options);",
 "worker_threads inline evaluation is forbidden"],
+["array-alias evaluation option",
+"import { Worker } from 'node:worker_threads'; const parts = ['e', 'v', 'a', 'l']; " +
+"const options = {}; options[parts.join('')] = true; new Worker('worker.js', options);",
+"worker_threads inline evaluation is forbidden"],
 ["concatenated computed evaluation option",
 "import { Worker } from 'node:worker_threads'; const options = {}; " +
 "options['ev' + 'al'] = true; new Worker('worker.js', options);",
 "worker_threads inline evaluation is forbidden"],
+["mutated array-selected evaluation option",
+"import { Worker } from 'node:worker_threads'; const parts = ['safe']; " +
+"parts[0] = 'eval'; const options = {}; " +
+"options[parts.join('')] = true; new Worker('worker.js', options);",
+"worker_threads inline-evaluation options are unproven"],
+["helper-mutated array-selected evaluation option",
+"import { Worker } from 'node:worker_threads'; const parts = ['safe']; enable(); " +
+"const options = {}; options[parts.join('')] = true; " +
+"new Worker('worker.js', options); function enable() { parts[0] = 'eval'; }",
+"worker_threads inline-evaluation options are unproven"],
 ["unknown computed evaluation option",
 "import { Worker } from 'node:worker_threads'; const options = {}; " +
 "declare const key: string; options[key] = true; new Worker('worker.js', options);",
@@ -842,6 +856,9 @@ test("accepts worker construction without inline evaluation", () => {
 "const joinedSafeOptions = {}; const joinedSafeKey = ['e', 'v', 'a', 'l'].join('');",
 "joinedSafeOptions[joinedSafeKey] = false;",
 "new NamedWorker('./worker.mjs', joinedSafeOptions);",
+"const safeKeyParts = ['e', 'v', 'a', 'l']; const aliasKeyOptions = {};",
+"aliasKeyOptions[safeKeyParts.join('')] = false;",
+"new NamedWorker('./worker.mjs', aliasKeyOptions);",
 "declare const safeExternalKey: string; const safeUnrelatedOptions = {};",
 "safeUnrelatedOptions[safeExternalKey] = true;",
 "new NamedWorker('./worker.mjs', { eval: false });",
