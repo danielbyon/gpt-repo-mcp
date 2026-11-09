@@ -3038,12 +3038,12 @@ const workerNamespaceOf = (input, seen = new Set()) => {
     return Boolean(named && ts.isNamespaceImport(named) &&
       named.name.text === node.text);
   }
-  if (binding.kind !== "variable" || !binding.constant ||
-      !ts.isVariableDeclaration(binding.node) ||
+  if (binding.kind !== "variable" || !ts.isVariableDeclaration(binding.node) ||
       !ts.isIdentifier(binding.node.name) || !binding.node.initializer) return false;
   const next = new Set(seen);
   next.add(binding.node);
-  return workerNamespaceOf(binding.node.initializer, next);
+  return activeBindingValuesOf(binding.node, node)
+    .some((value) => workerNamespaceOf(value, next));
 };
 const workerConstructorOf = (input, seen = new Set()) => {
   const node = unwrap(input);

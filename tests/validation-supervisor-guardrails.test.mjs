@@ -538,6 +538,10 @@ test.each([
     "import * as threads from 'node:worker_threads'; " +
     "new threads.Worker('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
+  ["mutable namespace alias",
+    "import * as threads from 'node:worker_threads'; " +
+    "let namespace = threads; new namespace.Worker('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
   ["destructured namespace constructor",
     "import * as threads from 'node:worker_threads'; " +
     "const { Worker: Thread } = threads; new Thread('worker.js', { eval: true });",
@@ -545,6 +549,10 @@ test.each([
   ["CommonJS namespace constructor",
     "const threads = require('node:worker_threads'); " +
     "new threads.Worker('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["CommonJS mutable namespace alias",
+    "const threads = require('node:worker_threads'); " +
+    "let namespace = threads; new namespace.Worker('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
   ["CommonJS destructured constructor",
     "const { Worker: Thread } = require('node:worker_threads'); " +
@@ -594,6 +602,8 @@ test("accepts worker construction without inline evaluation", () => {
     "new WorkerConstructor(new URL('./worker.mjs', import.meta.url));",
     "let MutableWorkerConstructor = NamedWorker;",
     "new MutableWorkerConstructor('./worker.mjs', { eval: false });",
+    "let MutableThreads = threads;",
+    "new MutableThreads.Worker('./worker.mjs', { eval: false });",
     "new NamedWorker('./worker.mjs');",
     "new NamedWorker('./worker.mjs', { type: 'module' });",
     "const safeOptions = { eval: false };",
