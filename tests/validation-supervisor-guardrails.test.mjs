@@ -530,9 +530,29 @@ test.each([
     "import { Worker as Thread } from 'node:worker_threads'; " +
     "const WorkerConstructor = Thread; new WorkerConstructor('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
+  ["comma-selected constructor alias",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const WorkerConstructor = (0, Worker); new WorkerConstructor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["member-held constructor",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const workers = { Worker }; new workers.Worker('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["local constructor factory",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const getWorker = () => Worker; new (getWorker())('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
   ["mutable constructor alias",
     "import { Worker as Thread } from 'node:worker_threads'; " +
     "let WorkerConstructor = Thread; new WorkerConstructor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["constructor alias assigned after declaration",
+    "import { Worker as Thread } from 'node:worker_threads'; " +
+    "let WorkerConstructor; WorkerConstructor = Thread; new WorkerConstructor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["conditional constructor alias",
+    "import { Worker as Thread } from 'node:worker_threads'; declare const condition: boolean; " +
+    "const WorkerConstructor = condition ? Thread : Thread; new WorkerConstructor('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
   ["namespace constructor",
     "import * as threads from 'node:worker_threads'; " +
@@ -541,6 +561,16 @@ test.each([
   ["mutable namespace alias",
     "import * as threads from 'node:worker_threads'; " +
     "let namespace = threads; new namespace.Worker('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["reassigned namespace member",
+    "import * as threads from 'node:worker_threads'; " +
+    "const namespace = { Worker: class {} }; namespace.Worker = threads.Worker; " +
+    "new namespace.Worker('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["spread namespace",
+    "import * as threads from 'node:worker_threads'; " +
+    "const namespace = { ...threads, type: 'module' }; " +
+    "new namespace.Worker('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
   ["destructured namespace constructor",
     "import * as threads from 'node:worker_threads'; " +
@@ -556,6 +586,10 @@ test.each([
     "worker_threads inline evaluation is forbidden"],
   ["CommonJS destructured constructor",
     "const { Worker: Thread } = require('node:worker_threads'); " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["mutable CommonJS destructured constructor",
+    "let { Worker: Thread } = require('node:worker_threads'); " +
     "new Thread('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
   ["immutable options alias",
@@ -586,6 +620,24 @@ test.each([
     "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
     "const alias = options; alias.eval = true; new Worker('worker.js', options);",
     "worker_threads inline evaluation is forbidden"],
+  ["Object.assign evaluation option",
+    "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
+    "Object.assign(options, { eval: true }); new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["Reflect.set evaluation option",
+    "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
+    "Reflect.set(options, 'eval', true); new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["defineProperty evaluation option",
+    "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
+    "Object.defineProperty(options, 'eval', { value: true }); " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["dynamically named Reflect.set option",
+    "import { Worker } from 'node:worker_threads'; const options = {}; " +
+    "declare const key: string; Reflect.set(options, key, false); " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline-evaluation options"],
   ["unresolved evaluation options",
     "import { Worker } from 'node:worker_threads'; declare const options: any; " +
     "new Worker('worker.js', options);",
@@ -611,6 +663,25 @@ test("accepts worker construction without inline evaluation", () => {
     "new NamedWorker('./worker.mjs', { ...safeOptions });",
     "const { Worker: NamespacedWorker } = threads;",
     "new NamespacedWorker('./worker.mjs', { eval: false });",
+    "let AssignedWorker; AssignedWorker = NamedWorker;",
+    "new AssignedWorker('./worker.mjs', { eval: false });",
+    "let { Worker: MutableCommonJsWorker } = require('node:worker_threads');",
+    "new MutableCommonJsWorker('./worker.mjs', { eval: false });",
+    "const CommaWorker = (0, NamedWorker);",
+    "new CommaWorker('./worker.mjs', { eval: false });",
+    "const workers = { Worker: NamedWorker };",
+    "new workers.Worker('./worker.mjs', { eval: false });",
+    "const reassignedWorkers = { Worker: class {} }; reassignedWorkers.Worker = threads.Worker;",
+    "new reassignedWorkers.Worker('./worker.mjs', { eval: false });",
+    "const copiedThreads = { ...threads, type: 'module' };",
+    "new copiedThreads.Worker('./worker.mjs', { eval: false });",
+    "const getWorker = () => NamedWorker;",
+    "new (getWorker())('./worker.mjs', { eval: false });",
+    "const mutatedSafeOptions = {};",
+    "Object.assign(mutatedSafeOptions, { type: 'module' });",
+    "Reflect.set(mutatedSafeOptions, 'type', 'module');",
+    "Object.defineProperty(mutatedSafeOptions, 'type', { value: 'module' });",
+    "new NamedWorker('./worker.mjs', mutatedSafeOptions);",
     "const inlineEvaluation = false;",
     "new threads.Worker('./worker.mjs', { eval: inlineEvaluation });",
     "const mutableSafeOptions = { eval: false };",
@@ -1109,6 +1180,7 @@ test.each([
     ["array-rest unknown tail before capability", "declare const tail: any[]; const [, ...rest] = [null, ...tail, process]; rest[0].getBuiltinModule('node:child_process').exec('id');"],
     ["array-rest unknown tail after capability", "declare const tail: any[]; const [, ...rest] = [null, process, ...tail]; rest[0].getBuiltinModule('node:child_process').exec('id');"],
   ["aliased undefined default", "const U = undefined; function load(this: any) { return this.getBuiltinModule('node:child_process'); } const { run = load } = { run: U }; run.call(process).exec('id');"],
+  ["mutable aliased undefined default", "let U = undefined; function load(this: any) { return this.getBuiltinModule('node:child_process'); } const { run = load } = { run: U }; run.call(process).exec('id');"],
   ["aliased void default", "const U = void 0; function load(this: any) { return this.getBuiltinModule('node:child_process'); } const { run = load } = { run: U }; run.call(process).exec('id');"]
   ])('rejects bounded process provenance through %s', (_name, source) => {
     expect(inspectSupervisorSource('src/services/windows-process-host.ts', source))
@@ -1635,7 +1707,8 @@ test('rejects capability-bearing array read before a later safe write', () => {
   "for (const [, ...safeRest] of [[null, processLike]]) safeRest[0].getBuiltinModule();",
       "declare const safeRestTail: any[]; const [, ...safeRestWithTail] = [null, processLike, ...safeRestTail]; safeRestWithTail[0].getBuiltinModule();",
       "declare const opaqueRestSource: any[]; const [, ...opaqueRest] = opaqueRestSource; opaqueRest[0]?.length;",
-  "const U = undefined; function defaultSafe() { return processLike; } const { run = defaultSafe } = { run: U }; run().getBuiltinModule();"
+  "const U = undefined; function defaultSafe() { return processLike; } const { run = defaultSafe } = { run: U }; run().getBuiltinModule();",
+  "let mutableSafeValue; mutableSafeValue = processLike; const { get = defaultSafe } = { get: mutableSafeValue }; get().getBuiltinModule();"
     ].join("\n");
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
   }, 20_000);

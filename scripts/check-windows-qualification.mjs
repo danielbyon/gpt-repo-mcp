@@ -529,15 +529,15 @@ const mayBeUndefinedOf = (input, seen = new Set()) => {
   if (!ts.isIdentifier(node)) return false;
   const binding = resolveBinding(node);
   if (!binding) return node.text === "undefined";
-  if (binding.kind !== "variable" || !binding.constant ||
+  if (binding.kind !== "variable" ||
       !ts.isVariableDeclaration(binding.node) ||
-      !ts.isIdentifier(binding.node.name) || !binding.node.initializer ||
-      seen.has(binding.node)) {
+      !ts.isIdentifier(binding.node.name) || seen.has(binding.node)) {
     return false;
   }
   const next = new Set(seen);
   next.add(binding.node);
-  return mayBeUndefinedOf(binding.node.initializer, next);
+  return activeBindingValuesOf(binding.node, node)
+    .some((value) => mayBeUndefinedOf(value, next));
 };
   const resolvedAccess = (input) => {
     const node = unwrap(input);

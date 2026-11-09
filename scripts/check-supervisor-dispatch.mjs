@@ -437,15 +437,15 @@ const mayBeUndefinedOf = (input, seen = new Set()) => {
   if (!ts.isIdentifier(node)) return false;
   const binding = resolveBinding(node);
   if (!binding) return node.text === "undefined";
-  if (binding.kind !== "variable" || !binding.constant ||
+  if (binding.kind !== "variable" ||
       !ts.isVariableDeclaration(binding.node) ||
-      !ts.isIdentifier(binding.node.name) || !binding.node.initializer ||
-      seen.has(binding.node)) {
+      !ts.isIdentifier(binding.node.name) || seen.has(binding.node)) {
     return false;
   }
   const next = new Set(seen);
   next.add(binding.node);
-  return mayBeUndefinedOf(binding.node.initializer, next);
+  return activeBindingValuesOf(binding.node, node)
+    .some((value) => mayBeUndefinedOf(value, next));
 };
   const assignmentsByBinding = new Map();
   const destructuredAssignmentsByBinding = new Map();
@@ -3025,11 +3025,48 @@ const workerModuleRequireOf = (input) => {
     !resolveBinding(callee) && WORKER_MODULES.has(moduleLiteral(call.arguments[0]));
 };
 // Resolve Worker provenance through static imports, CommonJS bindings, and
-// immutable local aliases. Other constructor sources remain unaudited.
+// active local aliases. Other constructor sources remain unaudited.
 const workerNamespaceOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
   if (workerModuleRequireOf(node)) return true;
+  if (ts.isObjectLiteralExpression(node)) {
+    let hasWorker = false;
+    for (const property of node.properties) {
+      if (ts.isSpreadAssignment(property)) {
+        if (workerNamespaceOf(property.expression, seen)) hasWorker = true;
+        continue;
+      }
+      if (!("name" in property) ||
+          staticPropertyNameOf(property.name) !== "Worker") continue;
+      if (ts.isPropertyAssignment(property)) {
+        hasWorker = workerConstructorOf(property.initializer, seen);
+      } else if (ts.isShorthandPropertyAssignment(property)) {
+        hasWorker = workerConstructorOf(property.name, seen);
+      } else if (ts.isGetAccessorDeclaration(property)) {
+        hasWorker = functionReturnExpressionsOf(property, seen)
+          .some((value) => workerConstructorOf(value, seen));
+      } else {
+        hasWorker = false;
+      }
+    }
+    return hasWorker;
+  }
+  if (ts.isCallExpression(node)) {
+    const copiedArguments = objectAssignInvocationArgumentsOf(node, seen);
+    if (copiedArguments?.some((value) => workerNamespaceOf(value, seen))) {
+      return true;
+    }
+    return functionReturnExpressionsOf(node.expression, seen)
+      .some((value) => workerNamespaceOf(value, seen));
+  }
+  const resolved = resolvedValuesOf(node, seen);
+  if (resolved.some((value) => value !== node)) {
+    const next = new Set(seen);
+    next.add(node);
+    return resolved.filter((value) => value !== node)
+      .some((value) => workerNamespaceOf(value, next));
+  }
   if (!ts.isIdentifier(node)) return false;
   const binding = resolveBinding(node);
   if (!binding?.node || seen.has(binding.node)) return false;
@@ -3038,21 +3075,42 @@ const workerNamespaceOf = (input, seen = new Set()) => {
     return Boolean(named && ts.isNamespaceImport(named) &&
       named.name.text === node.text);
   }
-  if (binding.kind !== "variable" || !ts.isVariableDeclaration(binding.node) ||
-      !ts.isIdentifier(binding.node.name) || !binding.node.initializer) return false;
+  return false;
+};
+const workerMemberOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  if (workerNamespaceOf(node, seen)) return true;
   const next = new Set(seen);
-  next.add(binding.node);
-  return activeBindingValuesOf(binding.node, node)
-    .some((value) => workerNamespaceOf(value, next));
+  next.add(node);
+  if (memberValueCandidatesOf(node, "Worker", seen)
+      .some((value) => workerConstructorOf(value, seen))) return true;
+  return objectValueCandidatesOf(node, seen).some((object) =>
+    object.properties.some((property) =>
+      ts.isSpreadAssignment(property) &&
+      workerNamespaceOf(property.expression, next)));
 };
 const workerConstructorOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
+  const resolved = resolvedValuesOf(node, seen);
+  if (resolved.some((value) => value !== node)) {
+    const next = new Set(seen);
+    next.add(node);
+    return resolved.filter((value) => value !== node)
+      .some((value) => workerConstructorOf(value, next));
+  }
   const member = memberAccess(node);
   if (member?.property === "Worker") {
     const next = new Set(seen);
     next.add(node);
-    return workerNamespaceOf(member.receiver, next);
+    return workerMemberOf(member.receiver, next);
+  }
+  if (ts.isCallExpression(node)) {
+    const next = new Set(seen);
+    next.add(node);
+    return functionReturnExpressionsOf(node.expression, next)
+      .some((value) => workerConstructorOf(value, next));
   }
   if (!ts.isIdentifier(node)) return false;
   const binding = resolveBinding(node);
@@ -3060,24 +3118,24 @@ const workerConstructorOf = (input, seen = new Set()) => {
   if (binding.kind === "import" && WORKER_MODULES.has(binding.module)) {
     return importedExport(binding, node.text) === "Worker";
   }
-  if (!ts.isVariableDeclaration(binding.node) ||
-      !binding.node.initializer) return false;
+  if (!(binding.kind === "variable" || binding.kind === "opaque") ||
+      !ts.isVariableDeclaration(binding.node)) return false;
   const next = new Set(seen);
   next.add(binding.node);
-  if (ts.isIdentifier(binding.node.name)) {
-    return activeBindingValuesOf(binding.node, node)
-      .some((value) => workerConstructorOf(value, next));
-  }
-  if (!ts.isVariableDeclarationList(binding.node.parent) ||
-      !(binding.node.parent.flags & ts.NodeFlags.Const) ||
-      !ts.isObjectBindingPattern(binding.node.name)) return false;
-  const element = binding.node.name.elements.find((item) =>
-    ts.isIdentifier(item.name) && item.name.text === node.text &&
-    !item.dotDotDotToken && !item.initializer);
-  if (!element || (element.propertyName?.text ?? element.name.text) !== "Worker") {
-    return false;
-  }
-  return workerNamespaceOf(binding.node.initializer, next);
+  if (ts.isIdentifier(binding.node.name)) return false;
+  if (!bindingPatternSelectsPropertyOf(
+    binding.node.name, node.text, "Worker"
+  )) return false;
+  if (binding.node.initializer &&
+      workerNamespaceOf(binding.node.initializer, next)) return true;
+  const values = [
+    ...bindingPatternValuesOf(
+      binding.node.name, binding.node.initializer, node.text, next
+    ),
+    ...(destructuredAssignmentsByBinding.get(
+      `${binding.node.pos}:${node.text}`) ?? [])
+  ];
+  return values.some((value) => workerConstructorOf(value, next));
 };
 // Only a statically false eval option is safe. Retrieved spreads use the same
 // provenance rules; computed names and unresolved values fail closed.
@@ -3089,13 +3147,93 @@ const inspectWorkerEvalValue = (value, findingNode, unproven) => {
     add(findingNode, "worker_threads inline evaluation is forbidden");
   }
 };
-const inspectWorkerOptions = (input, seen = new Set()) => {
+let workerCallExpressions;
+const inspectKnownWorkerOptionMutations = (
+  options, reference, seen, unproven
+) => {
+  const targetKey = assignmentReferenceKey(options);
+  if (targetKey === undefined || !reference) return;
+  const referenceStart = reference.getStart(file);
+  const targetsOptions = (candidate) =>
+    assignmentReferenceKey(candidate) === targetKey;
+  const inspectNamedMutation = (call, name, value) => {
+    const property = staticStringOf(name);
+    if (property === undefined) {
+      add(call, unproven);
+    } else if (property === "eval") {
+      inspectWorkerEvalValue(value, value, unproven);
+    }
+  };
+  if (!workerCallExpressions) {
+    workerCallExpressions = [];
+    const collect = (node) => {
+      if (ts.isCallExpression(node)) workerCallExpressions.push(node);
+      ts.forEachChild(node, collect);
+    };
+    ts.forEachChild(file, collect);
+  }
+  for (const node of workerCallExpressions) {
+    if (node.getStart(file) > referenceStart) continue;
+      const copiedArguments = objectAssignInvocationArgumentsOf(node, seen);
+      if (copiedArguments && targetsOptions(copiedArguments[0])) {
+        for (const source of copiedArguments.slice(1)) {
+          inspectWorkerOptions(source, seen, reference, false);
+        }
+      }
+      const setPlan = staticMethodInvocationPlanOf(
+        node, "set", globalReflectOf, seen
+      );
+      if (setPlan && callArgumentCandidatesAt(setPlan, 0).some(targetsOptions)) {
+        const names = callArgumentCandidatesAt(setPlan, 1);
+        if (names.length === 0) add(node, unproven);
+        for (const name of names) {
+          for (const value of callArgumentCandidatesAt(setPlan, 2)) {
+            inspectNamedMutation(node, name, value);
+          }
+        }
+      }
+      const definePlan = staticMethodInvocationPlanOf(
+        node, "defineProperty", globalObjectOf, seen
+      ) ?? staticMethodInvocationPlanOf(
+        node, "defineProperty", globalPrototypeObjectOf, seen
+      );
+      if (definePlan && callArgumentCandidatesAt(definePlan, 0).some(targetsOptions)) {
+        const names = callArgumentCandidatesAt(definePlan, 1);
+        if (names.length === 0) add(node, unproven);
+        for (const name of names) {
+          const property = staticStringOf(name);
+          if (property === undefined) {
+            add(node, unproven);
+            continue;
+          }
+          if (property !== "eval") continue;
+          const descriptors = callArgumentCandidatesAt(definePlan, 2);
+          if (descriptors.length === 0) add(node, unproven);
+          for (const descriptor of descriptors) {
+            const values = memberValueCandidatesOf(descriptor, "value", seen);
+            if (values.length === 0) add(descriptor, unproven);
+            for (const value of values) {
+              inspectWorkerEvalValue(value, value, unproven);
+            }
+          }
+        }
+      }
+  }
+};
+const inspectWorkerOptions = (
+  input, seen = new Set(), reference = unwrap(input), inspectMutations = true
+) => {
   const options = unwrap(input);
   // Worker treats a missing options argument as eval: false.
   if (!options || seen.has(options)) return;
   const next = new Set(seen);
   next.add(options);
   const unproven = "worker_threads inline-evaluation options are unproven";
+  if (inspectMutations) {
+    inspectKnownWorkerOptionMutations(
+      options, reference, next, unproven
+    );
+  }
   const evalAssignmentKey = assignmentMemberPathKey(options, "eval");
   for (const assignment of evalAssignmentKey
     ? assignmentsByMemberPath.get(evalAssignmentKey) ?? []
@@ -3112,7 +3250,7 @@ const inspectWorkerOptions = (input, seen = new Set()) => {
     // evaluation of source text.
     for (const property of object.properties) {
       if (!("name" in property)) {
-        inspectWorkerOptions(property.expression, next);
+        inspectWorkerOptions(property.expression, next, reference, false);
         continue;
       }
       const name = staticPropertyNameOf(property.name);
@@ -3129,7 +3267,7 @@ const inspectWorkerOptions = (input, seen = new Set()) => {
   }
 };
 const inspectWorkerConstruction = (call) => {
-  inspectWorkerOptions(call.arguments?.[1]);
+  inspectWorkerOptions(call.arguments?.[1], new Set(), call);
 };
   const inspectRunnerReference = (node) => {
     const parent = node.parent;

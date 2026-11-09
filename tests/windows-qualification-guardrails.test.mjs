@@ -1162,7 +1162,9 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
     ['static class getter', (capability) =>
       `import { test } from 'vitest'; class C { static register = ${capability}; static get focus() { return this.register; } } C.focus.only('focused', () => {}); test('required', () => {});`],
     ['instance class getter', (capability) =>
-      `import { test } from 'vitest'; class C { register = ${capability}; get focus() { return this.register; } } new C().focus.only('focused', () => {}); test('required', () => {});`]
+    `import { test } from 'vitest'; class C { register = ${capability}; get focus() { return this.register; } } new C().focus.only('focused', () => {}); test('required', () => {});`],
+  ['mutable undefined default', (capability) =>
+    `import { test } from 'vitest'; let U = undefined; const { register = ${capability} } = { register: U }; register.only('focused', () => {}); test('required', () => {});`]
   ];
 
   test.each(staticProvenanceCases)(
