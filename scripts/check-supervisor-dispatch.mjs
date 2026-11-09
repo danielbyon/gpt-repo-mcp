@@ -1968,7 +1968,7 @@ const boundObjectAssignArgumentsOf = (input, seen = new Set()) => {
       node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
     const next = new Set(seen);
     next.add(node);
-    return bindMethodReferenceOf(node.right, next);
+    return boundObjectAssignArgumentsOf(node.right, next);
   }
   if (!ts.isCallExpression(node)) return undefined;
   const method = memberAccess(unwrap(node.expression));

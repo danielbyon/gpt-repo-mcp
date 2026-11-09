@@ -300,7 +300,9 @@ test("accepts ordinary helper arguments and member factories", () => {
     "const returnedSafeBound = getSafeBind()(null);",
     "returnedSafeBound(processLike);",
     "const reflectedSafeBound = Reflect.apply(loadSafe.bind, loadSafe, [null]);",
-    "reflectedSafeBound(processLike);"
+    "reflectedSafeBound(processLike);",
+    "const commaSafeCopy = (0, globalThis.Object.assign.bind(Object, {}, processLike))();",
+    "commaSafeCopy.getBuiltinModule();"
   ].join("\n");
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
 });
@@ -857,11 +859,13 @@ test.each([
   ["aliased nested local function returns", "const make = () => () => process; const inner = make(); inner().getBuiltinModule('node:child_process').exec('id');"],
   ["getter-held Object constructor", "const tools = { get ctor() { return globalThis.Object; } }; tools.ctor.create(process).getBuiltinModule('node:child_process').exec('id');"],
   ["reflected Function.prototype.bind", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } const bound = Reflect.apply(Function.prototype.bind, load, [null]); bound(process).exec('id');"],
+    ["generic bind unknown prefix", "function load(runtime) { return runtime.getBuiltinModule('node:child_process'); } declare const prefix: any[]; const bind = Function.prototype.bind; const bound = bind.call(load, ...prefix, process); bound().exec('id');"],
     ["factory carrier", "const tools = { make: () => ({ runtime: process }) }; tools.make().runtime.getBuiltinModule('node:child_process').exec('id');"],
     ["destructured factory carrier", "const make = () => ({ runtime: process }); const { runtime } = make(); runtime.getBuiltinModule('node:child_process').exec('id');"],
     ["Object.assign call", "const copy = globalThis.Object.assign.call(Object, {}, process); copy.getBuiltinModule('node:child_process').exec('id');"],
     ["Object.assign apply", "const copy = globalThis.Object.assign.apply(Object, [{}, process]); copy.getBuiltinModule('node:child_process').exec('id');"],
     ["Object.assign bind", "const copy = globalThis.Object.assign.bind(Object, {}, process)(); copy.getBuiltinModule('node:child_process').exec('id');"],
+    ["comma-wrapped Object.assign bind", "const copy = (0, globalThis.Object.assign.bind(Object, {}, process))(); copy.getBuiltinModule('node:child_process').exec('id');"],
     ["Object.assign static spread", "const copy = globalThis.Object.assign.call(Object, ...[{}, process]); copy.getBuiltinModule('node:child_process').exec('id');"]
   ])('rejects bounded process provenance through %s', (_name, source) => {
     expect(inspectSupervisorSource('src/services/windows-process-host.ts', source))

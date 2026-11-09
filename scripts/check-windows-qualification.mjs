@@ -793,9 +793,17 @@ const fixedSpreadValuesOf = (input, seen = new Set()) => {
   if (!node || seen.has(node)) return undefined;
   if (ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    const left = unwrap(node.left);
+    const inertPrefix = ts.isNumericLiteral(left) ||
+      ts.isBigIntLiteral(left) ||
+      ts.isStringLiteral(left) ||
+      ts.isNoSubstitutionTemplateLiteral(left) ||
+      [ts.SyntaxKind.TrueKeyword, ts.SyntaxKind.FalseKeyword,
+        ts.SyntaxKind.NullKeyword].includes(left.kind);
+    if (!inertPrefix) return undefined;
     const next = new Set(seen);
     next.add(node);
-    return bindMethodReferenceOf(node.right, next);
+    return fixedSpreadValuesOf(node.right, next);
   }
   const next = new Set(seen);
   next.add(node);
@@ -803,10 +811,6 @@ const fixedSpreadValuesOf = (input, seen = new Set()) => {
     const whenTrue = fixedSpreadValuesOf(node.whenTrue, next);
     const whenFalse = fixedSpreadValuesOf(node.whenFalse, next);
     return whenTrue && whenFalse ? [...whenTrue, ...whenFalse] : undefined;
-  }
-  if (ts.isBinaryExpression(node) &&
-      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
-    return fixedSpreadValuesOf(node.right, next);
   }
   if (ts.isCallExpression(node)) {
     const returned = functionReturnExpressionsOf(node.expression, next);
@@ -1664,6 +1668,12 @@ function reflectApplyTargetArgumentsOf(input, seen = new Set()) {
     if (!node || seen.has(node)) return undefined;
     const next = new Set(seen);
     next.add(node);
+    if (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+      return boundIntrinsicArgumentsOf(
+        node.right, receiverNames, methods, next
+      );
+    }
     if (ts.isIdentifier(node)) {
       const binding = resolveBinding(node);
       const declaration = binding?.kind === "variable" &&

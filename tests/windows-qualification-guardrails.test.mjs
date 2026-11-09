@@ -753,6 +753,9 @@ describe("Windows qualification scope guard", () => {
     ["Object.assign call", "import { test } from 'vitest'; globalThis.Object.assign.call(Object, {}, test).only('focused', () => {});"],
     ["Object.assign apply", "import { test } from 'vitest'; globalThis.Object.assign.apply(Object, [{}, test]).only('focused', () => {});"],
     ["Object.assign bind", "import { test } from 'vitest'; globalThis.Object.assign.bind(Object, {}, test)().only('focused', () => {});"],
+    ["comma-wrapped Object.assign bind", "import { test } from 'vitest'; const copy = (0, globalThis.Object.assign.bind(Object, {}, test))(); copy.only('focused', () => {});"],
+    ["comma-expression spread argument", "import { test } from 'vitest'; function focus(register) { register.only('focused', () => {}); } focus.apply(null, [...(0, [test])]);"],
+    ["comma-expression spread side effect", "import { test } from 'vitest'; const testLike = { only() {} }; function focus(register) { register.only('focused', () => {}); } focus.apply(null, [...(test.only('focused', () => {}), [testLike])]);"],
     ["Object.assign static spread", "import { test } from 'vitest'; globalThis.Object.assign.call(Object, ...[{}, test]).only('focused', () => {});"],
     ["Reflect.apply of Object.assign", "import { test } from 'vitest'; Reflect.apply(Object.assign, Object, [{}, test]).only('focused', () => {});"],
     ["Reflect.apply of Object.assign with array-like arguments", "import { test } from 'vitest'; Reflect.apply(Object.assign, Object, { 0: {}, 1: test, length: 2 }).only('focused', () => {});"],
@@ -767,6 +770,7 @@ describe("Windows qualification scope guard", () => {
   ["getter-held Object constructor", "import { test } from 'vitest'; const tools = { get ctor() { return globalThis.Object; } }; tools.ctor.create(test).only('focused', () => {});"],
   ["reflected Function.prototype.bind", "import { test } from 'vitest'; function focus(register) { register.only('focused', () => {}); } const bound = Reflect.apply(Function.prototype.bind, focus, [null]); bound(test);"],
   ["aliased reflected Function.prototype.bind", "import { test } from 'vitest'; function focus(register) { register.only('focused', () => {}); } const bind = Function.prototype.bind; const bound = Reflect.apply(bind, focus, [null]); bound(test);"],
+    ["generic bind unknown prefix", "import { test } from 'vitest'; declare const prefix: any[]; function focus(register) { register.only('focused', () => {}); } const bind = Function.prototype.bind; const bound = bind.call(focus, ...prefix, test); bound();"],
     ["factory carrier", "import { test } from 'vitest'; const tools = { make: () => ({ runtime: test }) }; tools.make().runtime.only('focused', () => {});"],
     ["destructured factory carrier", "import { test } from 'vitest'; const make = () => ({ runtime: test }); const { runtime } = make(); runtime.only('focused', () => {});"]
   ])('rejects bounded Vitest provenance through %s', (_name, source) => {
@@ -818,6 +822,10 @@ describe("Windows qualification scope guard", () => {
       "globalThis.Object.assign.call(Object, ...[{}, { value: testLike }]).value.only('safe', () => {});",
       "Reflect.apply(Object.assign, Object, [{}, { value: testLike }]).value.only('safe', () => {});",
       "Reflect.apply(Object.assign, Object, { 0: {}, 1: { value: testLike }, length: 2 }).value.only('safe', () => {});",
+      "const commaSafeCopy = (0, globalThis.Object.assign.bind(Object, {}, testLike))();",
+      "commaSafeCopy.only('safe', () => {});",
+      "function focusCommaSpread(register: any) { register.only('safe', () => {}); }",
+      "focusCommaSpread.apply(null, [...(0, [testLike])]);",
       "const make = (_unused: unknown) => testLike; const tools = { make }; tools.make(1).only('safe', () => {});",
       "const getters = { get make() { return testLike; } }; getters.make().only('safe', () => {});",
     "const carrier = { make: () => ({ runtime: testLike }) }; carrier.make().runtime.only('safe', () => {});",
@@ -848,6 +856,9 @@ describe("Windows qualification scope guard", () => {
 "const genericBind = Function.prototype.bind;",
 "const genericSafeBound = Reflect.apply(genericBind, focusSafe, [null]);",
 "genericSafeBound(testLike);",
+      "declare const prefix: any[];",
+      "const prefixSafeBound = genericBind.call(focusSafe, ...prefix, testLike);",
+      "prefixSafeBound();",
     "test('required', () => {});"
     ].join('\n');
     expect(collectWindowsTestTitles('fixture.ts', source))
