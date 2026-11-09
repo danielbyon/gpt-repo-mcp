@@ -521,7 +521,89 @@ test("accepts ordinary helper arguments and member factories", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
   });
 
-  test("accepts type-only node:module imports", () => {
+test.each([
+  ["direct inline evaluation",
+    "import { Worker } from 'node:worker_threads'; " +
+    "new Worker(\"process.getBuiltinModule('node:child_process').execFileSync('node', ['--version'])\", { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["immutable constructor alias",
+    "import { Worker as Thread } from 'node:worker_threads'; " +
+    "const WorkerConstructor = Thread; new WorkerConstructor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["namespace constructor",
+    "import * as threads from 'node:worker_threads'; " +
+    "new threads.Worker('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["destructured namespace constructor",
+    "import * as threads from 'node:worker_threads'; " +
+    "const { Worker: Thread } = threads; new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["CommonJS namespace constructor",
+    "const threads = require('node:worker_threads'); " +
+    "new threads.Worker('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["CommonJS destructured constructor",
+    "const { Worker: Thread } = require('node:worker_threads'); " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["immutable options alias",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options = { eval: true }; new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["conditional options",
+    "import { Worker } from 'node:worker_threads'; declare const condition: boolean; " +
+    "new Worker('worker.js', condition ? { eval: true } : { eval: false });",
+    "worker_threads inline evaluation is forbidden"],
+  ["computed evaluation option",
+    "import { Worker } from 'node:worker_threads'; " +
+    "new Worker('worker.js', { ['eval']: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["spread evaluation options",
+    "import { Worker } from 'node:worker_threads'; declare const options: any; " +
+    "new Worker('worker.js', { ...options });",
+    "worker_threads inline-evaluation options are unproven"],
+  ["known spread evaluation options",
+    "import { Worker } from 'node:worker_threads'; const options = { eval: true }; " +
+    "new Worker('worker.js', { ...options });",
+    "worker_threads inline evaluation is forbidden"],
+  ["mutable evaluation option",
+    "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
+    "options.eval = true; new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["aliased mutable evaluation option",
+    "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
+    "const alias = options; alias.eval = true; new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["unresolved evaluation options",
+    "import { Worker } from 'node:worker_threads'; declare const options: any; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline-evaluation options are unproven"]
+])("rejects worker inline evaluation through %s", (_name, source, expected) => {
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+    .some((finding) => finding.includes(expected))).toBe(true);
+});
+test("accepts worker construction without inline evaluation", () => {
+  const source = [
+    "import { Worker as NamedWorker } from 'node:worker_threads';",
+    "import * as threads from 'node:worker_threads';",
+    "const WorkerConstructor = NamedWorker;",
+    "new WorkerConstructor(new URL('./worker.mjs', import.meta.url));",
+    "new NamedWorker('./worker.mjs');",
+    "new NamedWorker('./worker.mjs', { type: 'module' });",
+    "const safeOptions = { eval: false };",
+    "new NamedWorker('./worker.mjs', safeOptions);",
+    "new NamedWorker('./worker.mjs', { ...safeOptions });",
+    "const { Worker: NamespacedWorker } = threads;",
+    "new NamespacedWorker('./worker.mjs', { eval: false });",
+    "const inlineEvaluation = false;",
+    "new threads.Worker('./worker.mjs', { eval: inlineEvaluation });",
+    "const mutableSafeOptions = { eval: false };",
+    "mutableSafeOptions.eval = false;",
+    "new NamedWorker('./worker.mjs', mutableSafeOptions);"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
+});
+test("accepts type-only node:module imports", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts",
       "import type { Module } from 'node:module';")).toEqual([]);
     expect(inspectSupervisorSource("src/services/windows-process-host.ts",

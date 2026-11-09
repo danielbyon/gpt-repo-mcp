@@ -585,6 +585,67 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
     expect(inspect(load())).toEqual([]);
   }, 20_000);
 
+  test("accepts current-main distribution build and health smoke contract", () => {
+    const workflow = load();
+    const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
+    build.name = "Distribution build and health smoke";
+    build.run = "npm run verify:dist";
+    expect(inspect(workflow)).toEqual([]);
+  }, 20_000);
+
+  test.each([
+    ["missing build verification", (workflow) => {
+      workflow.jobs.test.steps.splice(
+        workflow.jobs.test.steps.findIndex((step) => step.name === "Build"), 1
+      );
+    }, "exactly one required build or distribution verification step"],
+    ["duplicate build verification", (workflow) => {
+      const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
+      build.name = "Distribution build and health smoke";
+      build.run = "npm run verify:dist";
+      workflow.jobs.test.steps.push({ ...build });
+    }, "exactly one required build or distribution verification step"],
+    ["mismatched legacy step", (workflow) => {
+      workflow.jobs.test.steps.find((step) => step.name === "Build").run =
+        "npm run verify:dist";
+    }, "approved build verification command"],
+    ["mismatched current-main step", (workflow) => {
+      const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
+      build.name = "Distribution build and health smoke";
+    }, "approved build verification command"],
+    ["command substitution", (workflow) => {
+      const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
+      build.name = "Distribution build and health smoke";
+      build.run = "npm run verify:dist && echo skipped";
+    }, "approved build verification command"],
+    ["conditional current-main step", (workflow) => {
+      const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
+      build.name = "Distribution build and health smoke";
+      build.run = "npm run verify:dist";
+      build.if = "false";
+    }, "conditional or optional build or distribution verification step"]
+  ])("rejects %s", (_name, mutate, expected) => {
+    const workflow = load();
+    mutate(workflow);
+    expect(inspect(workflow).some((finding) => finding.includes(expected))).toBe(true);
+  }, 20_000);
+
+  test("rejects a weakened verify:dist script", () => {
+    const workflow = load();
+    const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
+    build.name = "Distribution build and health smoke";
+    build.run = "npm run verify:dist";
+    const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    packageJson.scripts["verify:dist"] = "npm run build";
+    const findings = inspectQualificationWorkflow(
+      workflow,
+      (path) => readFileSync(join(root, path), "utf8"),
+      JSON.stringify(packageJson)
+    );
+    expect(findings.some((finding) =>
+      finding.includes("verify:dist must build and smoke-test the distribution"))).toBe(true);
+  }, 20_000);
+
   test("rejects loss of a required Windows suite", () => {
     const workflow = load();
     windowsStep(workflow, "Windows process supervision").run =

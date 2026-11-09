@@ -5420,6 +5420,51 @@ function expandMandatory(title) {
   return [title];
 }
 
+// Linux CI may use either approved build command. Match the complete step-name
+// and command pair so added commands and duplicate steps remain invalid.
+const LINUX_BUILD_CONTRACTS = Object.freeze([
+  { name: "Build", command: "npm run build" },
+  { name: "Distribution build and health smoke", command: "npm run verify:dist" }
+]);
+const DISTRIBUTION_VERIFY_SCRIPT =
+  "npm run build && node scripts/smoke-dist-server.mjs";
+
+function mandatoryLinuxBuildStep(steps, findings, readPackage) {
+  const matches = steps.filter((step) => LINUX_BUILD_CONTRACTS.some(
+    (contract) => contract.name === step?.name));
+  if (matches.length !== 1) {
+    findings.push(
+      "Linux must have exactly one required build or distribution verification step");
+    return undefined;
+  }
+  const step = matches[0];
+  if (Object.hasOwn(step, "if") ||
+      (Object.hasOwn(step, "continue-on-error") && step["continue-on-error"] !== false)) {
+    findings.push(
+      "Linux has a conditional or optional build or distribution verification step");
+  }
+  const command = typeof step.run === "string" ? step.run.trim() : undefined;
+  const approved = LINUX_BUILD_CONTRACTS.find((contract) =>
+    contract.name === step.name && contract.command === command);
+  if (!approved) {
+    findings.push("Linux build step must use an approved build verification command");
+    return step;
+  }
+  if (approved.command === "npm run verify:dist") {
+    try {
+      // The workflow command is valid only while the package script still
+      // performs the distribution build and health smoke test.
+      const verifyDist = JSON.parse(readPackage())?.scripts?.["verify:dist"];
+      if (verifyDist !== DISTRIBUTION_VERIFY_SCRIPT) {
+        findings.push("verify:dist must build and smoke-test the distribution");
+      }
+    } catch {
+      findings.push("verify:dist must build and smoke-test the distribution");
+    }
+  }
+  return step;
+}
+
 function mandatoryStep(steps, name, findings, platform) {
   const matches = steps.filter((step) => step?.name === name);
   if (matches.length !== 1) {
@@ -5457,7 +5502,8 @@ function mandatoryJob(jobs, name, runner, findings) {
 }
 
 export function inspectQualificationWorkflow(workflow, readTest = (path) =>
-  readFileSync(join(ROOT, path), "utf8")) {
+  readFileSync(join(ROOT, path), "utf8"), readPackage = () =>
+  readFileSync(join(ROOT, "package.json"), "utf8")) {
   const findings = [];
   const pullRequest = workflow?.on?.pull_request;
   if (!workflow?.on || !Object.hasOwn(workflow.on, "pull_request") ||
@@ -5478,7 +5524,6 @@ export function inspectQualificationWorkflow(workflow, readTest = (path) =>
       ["Typecheck", "npm run typecheck"],
       ["Lint", "npm run lint"],
       ["Public hygiene", "npm run check:public"],
-      ["Build", "npm run build"],
       ["Whitespace check", "git diff --check"]
     ]],
     [windows, "Windows", [
@@ -5495,6 +5540,7 @@ export function inspectQualificationWorkflow(workflow, readTest = (path) =>
       }
     }
   }
+  mandatoryLinuxBuildStep(linux, findings, readPackage);
   const linuxSuite = mandatoryStep(linux, "Test", findings, "Linux");
   if (linuxSuite?.run?.trim() !== "npm test") {
     findings.push("Linux CI must run the unfiltered full suite, including POSIX supervision tests.");

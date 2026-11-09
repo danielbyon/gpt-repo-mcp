@@ -15,6 +15,7 @@ export const SUPERVISOR_SOURCES = Object.freeze([
 const PROCESS_MODULES = new Set(["node:child_process", "child_process"]);
 const MODULE_LOADING_MODULES = new Set(["node:module", "module"]);
 const DYNAMIC_EVALUATION_MODULES = new Set(["node:vm", "vm"]);
+const WORKER_MODULES = new Set(["node:worker_threads", "worker_threads"]);
 const SHELL_MODULES = new Set(["cross-spawn", "shelljs", "execa"]);
 const SAFE_PROCESS_EXPORTS = new Set(["spawn", "spawnSync", "execFile", "execFileSync"]);
 const DISALLOWED_PROGRAMS = /(?:^|[\\/])(?:cmd|command|powershell|pwsh|bash|dash|sh|zsh|ksh|ash|fish|csh|tcsh|busybox|env)(?:\.exe)?$/i;
@@ -3015,6 +3016,120 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
       importedExport(binding, callee.text) === "promisify" &&
       runnerOf(call.arguments[0], seen) === "execFile";
   };
+const workerModuleRequireOf = (input) => {
+  const call = unwrap(input);
+  if (!call || !ts.isCallExpression(call) || call.questionDotToken ||
+      call.arguments.length !== 1) return false;
+  const callee = unwrap(call.expression);
+  return ts.isIdentifier(callee) && callee.text === "require" &&
+    !resolveBinding(callee) && WORKER_MODULES.has(moduleLiteral(call.arguments[0]));
+};
+// Resolve Worker provenance through static imports, CommonJS bindings, and
+// immutable local aliases. Other constructor sources remain unaudited.
+const workerNamespaceOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  if (workerModuleRequireOf(node)) return true;
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node)) return false;
+  if (binding.kind === "import" && WORKER_MODULES.has(binding.module)) {
+    const named = binding.node.importClause?.namedBindings;
+    return Boolean(named && ts.isNamespaceImport(named) &&
+      named.name.text === node.text);
+  }
+  if (binding.kind !== "variable" || !binding.constant ||
+      !ts.isVariableDeclaration(binding.node) ||
+      !ts.isIdentifier(binding.node.name) || !binding.node.initializer) return false;
+  const next = new Set(seen);
+  next.add(binding.node);
+  return workerNamespaceOf(binding.node.initializer, next);
+};
+const workerConstructorOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  const member = memberAccess(node);
+  if (member?.property === "Worker") {
+    const next = new Set(seen);
+    next.add(node);
+    return workerNamespaceOf(member.receiver, next);
+  }
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node)) return false;
+  if (binding.kind === "import" && WORKER_MODULES.has(binding.module)) {
+    return importedExport(binding, node.text) === "Worker";
+  }
+  if (!ts.isVariableDeclaration(binding.node) ||
+      !ts.isVariableDeclarationList(binding.node.parent) ||
+      !(binding.node.parent.flags & ts.NodeFlags.Const) ||
+      !binding.node.initializer) return false;
+  const next = new Set(seen);
+  next.add(binding.node);
+  if (ts.isIdentifier(binding.node.name)) {
+    return workerConstructorOf(binding.node.initializer, next);
+  }
+  if (!ts.isObjectBindingPattern(binding.node.name)) return false;
+  const element = binding.node.name.elements.find((item) =>
+    ts.isIdentifier(item.name) && item.name.text === node.text &&
+    !item.dotDotDotToken && !item.initializer);
+  if (!element || (element.propertyName?.text ?? element.name.text) !== "Worker") {
+    return false;
+  }
+  return workerNamespaceOf(binding.node.initializer, next);
+};
+// Only a statically false eval option is safe. Retrieved spreads use the same
+// provenance rules; computed names and unresolved values fail closed.
+const inspectWorkerEvalValue = (value, findingNode, unproven) => {
+  const staticValue = staticLogicalValueOf(value);
+  if (!staticValue) {
+    add(findingNode, unproven);
+  } else if (staticValue.truthy) {
+    add(findingNode, "worker_threads inline evaluation is forbidden");
+  }
+};
+const inspectWorkerOptions = (input, seen = new Set()) => {
+  const options = unwrap(input);
+  // Worker treats a missing options argument as eval: false.
+  if (!options || seen.has(options)) return;
+  const next = new Set(seen);
+  next.add(options);
+  const unproven = "worker_threads inline-evaluation options are unproven";
+  const evalAssignmentKey = assignmentMemberPathKey(options, "eval");
+  for (const assignment of evalAssignmentKey
+    ? assignmentsByMemberPath.get(evalAssignmentKey) ?? []
+    : []) {
+    inspectWorkerEvalValue(assignment, assignment, unproven);
+  }
+  const objects = objectValueCandidatesOf(options, seen);
+  if (objects.length === 0) {
+    add(options, unproven);
+    return;
+  }
+  for (const object of objects) {
+    // An omitted eval property means false; other Worker options do not enable
+    // evaluation of source text.
+    for (const property of object.properties) {
+      if (!("name" in property)) {
+        inspectWorkerOptions(property.expression, next);
+        continue;
+      }
+      const name = staticPropertyNameOf(property.name);
+      if (name === undefined) {
+        add(property, unproven);
+        continue;
+      }
+      if (name !== "eval") continue;
+      const value = ts.isPropertyAssignment(property)
+        ? property.initializer
+        : ts.isShorthandPropertyAssignment(property) ? property.name : property;
+      inspectWorkerEvalValue(value, property, unproven);
+    }
+  }
+};
+const inspectWorkerConstruction = (call) => {
+  inspectWorkerOptions(call.arguments?.[1]);
+};
   const inspectRunnerReference = (node) => {
     const parent = node.parent;
     // Declaration names, property keys and erased types are not references.
@@ -3180,6 +3295,9 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
     }
     if (ts.isNewExpression(node) && dynamicFunctionOf(node.expression)) {
       add(node, "dynamic function construction is unaudited");
+    }
+    if (ts.isNewExpression(node) && workerConstructorOf(node.expression)) {
+      inspectWorkerConstruction(node);
     }
     const member = memberAccess(node);
     if (member?.property === "getBuiltinModule" && processObjectOf(member.receiver)) {
