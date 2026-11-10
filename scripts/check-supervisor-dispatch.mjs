@@ -4112,10 +4112,12 @@ const inspectWorkerOptions = (
   // inline local factory may mutate its result after the outer call starts.
   const canAffectOptions = workerOptionMutationCanAffectOf(options, reference);
   for (const assignment of memberAssignmentTargets) {
-    if (assignment.property === "eval" &&
-        canAffectOptions(assignment.node) &&
-        workerReferenceMatchesKeysOf(assignment.receiver, mutationKeys)) {
+    if (!canAffectOptions(assignment.node) ||
+        !workerReferenceMatchesKeysOf(assignment.receiver, mutationKeys)) continue;
+    if (assignment.property === "eval") {
       inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
+    } else if (assignment.property === "__proto__") {
+      inspectWorkerOptions(assignment.value, next, reference, false);
     }
   }
   const objects = [];

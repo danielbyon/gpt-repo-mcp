@@ -743,6 +743,10 @@ test.each([
     "Object.setPrototypeOf(namespace, threads); " +
     "new namespace.Worker('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
+  ["prototype-assigned Worker options",
+    "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
+    "options.__proto__ = { eval: true }; new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
   ["Reflect-selected worker constructor",
     "import * as threads from 'node:worker_threads'; " +
     "const Thread = Reflect.get(threads, 'Worker'); " +
@@ -1321,6 +1325,9 @@ test("accepts worker construction without inline evaluation", () => {
    "import * as threads from 'node:worker_threads'; const namespace = {}; " +
    "Object.setPrototypeOf(namespace, threads); " +
    "new namespace.Worker('worker.js', { eval: false });"],
+  ["prototype-assigned Worker options",
+    "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
+    "options.__proto__ = { eval: false }; new Worker('worker.js', options);"],
   ["Reflect-selected worker constructor",
    "import * as threads from 'node:worker_threads'; " +
    "const Thread = Reflect.get(threads, 'Worker'); " +
