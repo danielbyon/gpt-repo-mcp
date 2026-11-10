@@ -3426,11 +3426,51 @@ const workerModuleRequireOf = (input) => {
   return ts.isIdentifier(callee) && callee.text === "require" &&
     !resolveBinding(callee) && WORKER_MODULES.has(moduleLiteral(call.arguments[0]));
 };
+let objectSetPrototypeAssignments;
+const objectSetPrototypeValuesOf = (input) => {
+  const node = unwrap(input);
+  if (!node) return [];
+  if (!objectSetPrototypeAssignments) {
+    objectSetPrototypeAssignments = [];
+    const collect = (child) => {
+      if (ts.isCallExpression(child)) {
+        const plan = staticMethodInvocationPlanOf(
+          child, "setPrototypeOf", globalObjectOf, new Set()
+        ) ?? staticMethodInvocationPlanOf(
+          child, "setPrototypeOf", globalPrototypeObjectOf, new Set()
+        ) ?? staticMethodInvocationPlanOf(
+          child, "setPrototypeOf", globalReflectOf, new Set()
+        );
+        if (plan) {
+          const targetKeys = new Set(callArgumentCandidatesAt(plan, 0)
+            .map((value) => assignmentReferenceKey(value))
+            .filter((value) => value !== undefined));
+          objectSetPrototypeAssignments.push({
+            node: child,
+            targetKeys,
+            prototypes: callArgumentCandidatesAt(plan, 1)
+          });
+        }
+      }
+      ts.forEachChild(child, collect);
+    };
+    collect(file);
+  }
+  const key = assignmentReferenceKey(node);
+  return objectSetPrototypeAssignments
+    .filter((assignment) => assignment.node === node ||
+      (key !== undefined && assignment.targetKeys.has(key)))
+    .flatMap((assignment) => assignment.prototypes);
+};
 // Resolve Worker provenance through static imports, CommonJS bindings, and
 // active local aliases. Other constructor sources remain unaudited.
 const workerNamespaceOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
+  const next = new Set(seen);
+  next.add(node);
+  if (objectSetPrototypeValuesOf(node)
+    .some((value) => workerNamespaceOf(value, next))) return true;
   if (workerModuleRequireOf(node)) return true;
   if (ts.isObjectLiteralExpression(node)) {
     let hasWorker = false;
@@ -3455,6 +3495,8 @@ const workerNamespaceOf = (input, seen = new Set()) => {
     return hasWorker;
   }
   if (ts.isCallExpression(node)) {
+    if (objectCreatePrototypeValuesOf(node, seen)
+      .some((value) => workerNamespaceOf(value, next))) return true;
     const copiedArguments = objectAssignInvocationArgumentsOf(node, seen);
     if (copiedArguments?.some((value) => workerNamespaceOf(value, seen))) {
       return true;
@@ -3464,8 +3506,6 @@ const workerNamespaceOf = (input, seen = new Set()) => {
   }
   const resolved = resolvedValuesOf(node, seen);
   if (resolved.some((value) => value !== node)) {
-    const next = new Set(seen);
-    next.add(node);
     return resolved.filter((value) => value !== node)
       .some((value) => workerNamespaceOf(value, next));
   }
@@ -3495,6 +3535,22 @@ const workerNamespaceOf = (input, seen = new Set()) => {
     if (rest && workerNamespaceOf(binding.node.initializer, seen)) return true;
   }
   return false;
+};
+const workerReflectConstructorOf = (input, seen = new Set()) => {
+  const call = unwrap(input);
+  if (!call || !ts.isCallExpression(call) || seen.has(call)) return false;
+  const plan = staticMethodInvocationPlanOf(call, "get", globalReflectOf, seen);
+  if (!plan) return false;
+  const next = new Set(seen);
+  next.add(call);
+  if (!callArgumentCandidatesAt(plan, 0)
+    .some((value) => workerNamespaceOf(value, next))) return false;
+  const names = callArgumentCandidatesAt(plan, 1);
+  if (names.length === 0) return true;
+  return names.some((value) => {
+    const name = staticStringOf(value);
+    return name === undefined || name === "Worker";
+  });
 };
 const workerAssignedClassMemberValuesOf = (
   input, property, seen = new Set()
@@ -3600,7 +3656,8 @@ const workerConstructorOf = (input, seen = new Set()) => {
   if (ts.isCallExpression(node)) {
     const next = new Set(seen);
     next.add(node);
- if (workerBoundConstructorPlanOf(node, seen)) return true;
+    if (workerReflectConstructorOf(node, seen)) return true;
+    if (workerBoundConstructorPlanOf(node, seen)) return true;
     return functionReturnExpressionsOf(node.expression, next)
       .some((value) => workerConstructorOf(value, next));
   }
@@ -3801,15 +3858,6 @@ const workerReferenceMatchesKeysOf = (
   return memberValueCandidatesOf(member.receiver, member.property, next)
     .some((value) => workerReferenceMatchesKeysOf(value, targetKeys, next));
 };
-const workerOptionFactoryReturnExpressionsOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return [];
-  const next = new Set(seen);
-  next.add(node);
-  if (!ts.isCallExpression(node)) return functionReturnExpressionsOf(node, next);
-  return localFunctionValuesOf(node.expression, next)
-    .flatMap((value) => functionReturnExpressionsOf(value, next));
-};
 const firstDirectReturnByBlock = new WeakMap();
 const workerMutationIsUnreachableOf = (node) => {
   for (let current = node; current && !ts.isFunctionLike(current);
@@ -3828,10 +3876,16 @@ const workerMutationIsUnreachableOf = (node) => {
   }
   return false;
 };
-// A mutation can affect Worker options when it is evaluated in the constructor
-// argument or in the bounded local factory that produced the options value.
-const workerOptionMutationCanAffectOf = (options, reference) => {
-  const referenceEnd = reference?.getEnd() ?? Number.POSITIVE_INFINITY;
+const workerOptionFactoryReturnExpressionsOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return [];
+  const next = new Set(seen);
+  next.add(node);
+  if (!ts.isCallExpression(node)) return functionReturnExpressionsOf(node, next);
+  return localFunctionValuesOf(node.expression, next)
+    .flatMap((value) => functionReturnExpressionsOf(value, next));
+};
+const workerOptionFactoryFunctionsOf = (options) => {
   const functions = new Set(workerOptionFactoryReturnExpressionsOf(options)
     .map((value) => {
       let owner = value.parent;
@@ -3839,6 +3893,29 @@ const workerOptionMutationCanAffectOf = (options, reference) => {
       return owner;
     })
     .filter(Boolean));
+  const queue = [...functions];
+  for (let index = 0; index < queue.length; index += 1) {
+    const factory = queue[index];
+    const visit = (node) => {
+      if (node !== factory && ts.isFunctionLike(node)) return;
+      if (ts.isCallExpression(node) && !workerMutationIsUnreachableOf(node)) {
+        for (const called of localFunctionValuesOf(node.expression)) {
+          if (functions.has(called)) continue;
+          functions.add(called);
+          queue.push(called);
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    if (factory.body) visit(factory.body);
+  }
+  return functions;
+};
+// A mutation can affect Worker options when it is evaluated in the constructor
+// argument or in the bounded local factory that produced the options value.
+const workerOptionMutationCanAffectOf = (options, reference) => {
+  const referenceEnd = reference?.getEnd() ?? Number.POSITIVE_INFINITY;
+  const functions = workerOptionFactoryFunctionsOf(options);
   return (node) => {
     if (workerMutationIsUnreachableOf(node)) return false;
     if (node.getStart(file) <= referenceEnd) return true;

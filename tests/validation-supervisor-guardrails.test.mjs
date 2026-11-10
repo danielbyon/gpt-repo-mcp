@@ -733,6 +733,36 @@ test.each([
     "import * as threads from 'node:worker_threads'; " +
     "new threads.Worker('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
+  ["Object.create worker namespace",
+    "import * as threads from 'node:worker_threads'; " +
+    "const namespace = Object.create(threads); " +
+    "new namespace.Worker('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["setPrototypeOf worker namespace",
+    "import * as threads from 'node:worker_threads'; const namespace = {}; " +
+    "Object.setPrototypeOf(namespace, threads); " +
+    "new namespace.Worker('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["Reflect-selected worker constructor",
+    "import * as threads from 'node:worker_threads'; " +
+    "const Thread = Reflect.get(threads, 'Worker'); " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["aliased Reflect-selected worker constructor",
+    "import * as threads from 'node:worker_threads'; const read = Reflect.get; " +
+    "const Thread = read(threads, 'Worker'); " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["unresolved Reflect-selected worker constructor",
+    "import * as threads from 'node:worker_threads'; declare const key: string; " +
+    "const Thread = Reflect.get(threads, key); " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["Reflect.construct selected worker constructor",
+    "import * as threads from 'node:worker_threads'; " +
+    "const Thread = Reflect.get(threads, 'Worker'); " +
+    "Reflect.construct(Thread, ['worker.js', { eval: true }]);",
+    "worker_threads inline evaluation is forbidden"],
   ["mutable namespace alias",
     "import * as threads from 'node:worker_threads'; " +
     "let namespace = threads; new namespace.Worker('worker.js', { eval: true });",
@@ -980,6 +1010,11 @@ test.each([
   "import { Worker } from 'node:worker_threads'; " +
   "new Worker('worker.js', make()); " +
   "function make(): any { const options: any = {}; options.eval = true; return options; }",
+  "worker_threads inline evaluation is forbidden"],
+ ["hoisted factory calling a local mutator",
+  "import { Worker } from 'node:worker_threads'; " +
+  "new Worker('worker.js', make()); function make(): any { const options: any = {}; " +
+  "const mutate = () => { options.eval = true; }; mutate(); return options; }",
   "worker_threads inline evaluation is forbidden"],
 ["local Worker constructor parameter",
 "import { Worker } from 'node:worker_threads'; " +
@@ -1277,7 +1312,33 @@ test("accepts worker construction without inline evaluation", () => {
   ["comma-wrapped Reflect.set factory",
    "import { Worker } from 'node:worker_threads'; " +
    "new Worker('worker.js', (() => { const options: any = {}; " +
-   "(0, Reflect.set)(options, 'eval', false); return options; })());"]
+   "(0, Reflect.set)(options, 'eval', false); return options; })());"],
+  ["Object.create worker namespace",
+   "import * as threads from 'node:worker_threads'; " +
+   "const namespace = Object.create(threads); " +
+   "new namespace.Worker('worker.js', { eval: false });"],
+  ["setPrototypeOf worker namespace",
+   "import * as threads from 'node:worker_threads'; const namespace = {}; " +
+   "Object.setPrototypeOf(namespace, threads); " +
+   "new namespace.Worker('worker.js', { eval: false });"],
+  ["Reflect-selected worker constructor",
+   "import * as threads from 'node:worker_threads'; " +
+   "const Thread = Reflect.get(threads, 'Worker'); " +
+   "new Thread('worker.js', { eval: false });"],
+  ["aliased Reflect-selected worker constructor",
+   "import * as threads from 'node:worker_threads'; const read = Reflect.get; " +
+   "const Thread = read(threads, 'Worker'); new Thread('worker.js', { eval: false });"],
+  ["unresolved Reflect-selected worker constructor",
+   "import * as threads from 'node:worker_threads'; declare const key: string; " +
+   "const Thread = Reflect.get(threads, key); new Thread('worker.js', { eval: false });"],
+  ["Reflect.construct selected worker constructor",
+   "import * as threads from 'node:worker_threads'; " +
+   "const Thread = Reflect.get(threads, 'Worker'); " +
+   "Reflect.construct(Thread, ['worker.js', { eval: false }]);"],
+  ["hoisted factory calling a safe local mutator",
+   "import { Worker } from 'node:worker_threads'; " +
+   "new Worker('worker.js', make()); function make(): any { const options: any = {}; " +
+   "const mutate = () => { options.eval = false; }; mutate(); return options; }"]
  ])("accepts safe %s options without inline evaluation", (_name, source) => {
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
  });

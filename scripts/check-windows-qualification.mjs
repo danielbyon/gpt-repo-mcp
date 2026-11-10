@@ -59,12 +59,12 @@ const FILTERED_CASES = Object.freeze([
 ]);
 const WINDOWS_TEST_DECLARATION_CACHE = new Map();
 
-function collectCachedWindowsTestTitles(filename, source) {
+function collectCachedWindowsTestDeclarations(filename, source) {
   const cached = WINDOWS_TEST_DECLARATION_CACHE.get(filename);
-  if (cached?.source === source) return cached.titles;
-  const titles = collectWindowsTestTitles(filename, source);
-  WINDOWS_TEST_DECLARATION_CACHE.set(filename, { source, titles });
-  return titles;
+  if (cached?.source === source) return cached.declarations;
+  const declarations = collectWindowsTestDeclarations(filename, source);
+  WINDOWS_TEST_DECLARATION_CACHE.set(filename, { source, declarations });
+  return declarations;
 }
 
 function tokenize(line) {
@@ -5157,10 +5157,10 @@ selectedExtractionContainerOf, testRunnerContainerOf, globalIntrinsicOf,
  * enabled describe suites. Uninvoked functions and deferred callbacks are
  * not registration contexts, even when they contain matching test strings.
  */
-export function collectWindowsTestTitles(filename, source) {
+function collectWindowsTestDeclarations(filename, source) {
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   if (file.parseDiagnostics.length) throw new Error("Cannot parse Vitest declarations");
-  const titles = [];
+  const declarations = [];
 const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
 possibleVitestNamespaceOf, descriptorGetterCapabilityOf,
 testRunnerContainerOf,
@@ -5474,67 +5474,114 @@ if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
   };
   checkExclusive(file);
 
-  const register = (node, disabled = false) => {
+  const expandedInvocationTitles = (titleNode, invocation) => {
+    const title = literal(titleNode);
+    if (title === undefined) return undefined;
+    return invocation.values
+      ? invocation.values.map((value, index) => title.replace(
+        /%s|%d|%i/,
+        (placeholder) => placeholder === "%i" ? String(index) : String(value)
+      ))
+      : [title];
+  };
+  const register = (node, disabled = false, suiteTitles = [],
+      completeSuite = true) => {
     if (ts.isSourceFile(node) || ts.isBlock(node)) {
       let continuing = true;
       for (const statement of node.statements) {
-        const branchContinues = register(statement, disabled || !continuing);
+        const branchContinues = register(
+          statement, disabled || !continuing, suiteTitles, completeSuite
+        );
         if (continuing) continuing = branchContinues;
       }
       return continuing;
     }
     if (ts.isIfStatement(node)) {
       const outcome = conditionOnWindows(node.expression, isProcessPlatform);
-      const thenContinues = register(node.thenStatement, disabled || outcome !== true);
+      const thenContinues = register(
+        node.thenStatement, disabled || outcome !== true, suiteTitles, completeSuite
+      );
       const elseContinues = node.elseStatement
-        ? register(node.elseStatement, disabled || outcome !== false)
+        ? register(
+          node.elseStatement, disabled || outcome !== false, suiteTitles, completeSuite
+        )
         : true;
       if (outcome === true) return thenContinues;
       if (outcome === false) return elseContinues;
       return thenContinues && elseContinues;
     }
     if (ts.isExpressionStatement(node)) {
-      register(node.expression, disabled);
+      register(node.expression, disabled, suiteTitles, completeSuite);
       return true;
     }
     node = unwrap(node);
     if (ts.isConditionalExpression(node)) {
       const outcome = conditionOnWindows(node.condition, isProcessPlatform);
-      register(node.whenTrue, disabled || outcome !== true);
-      register(node.whenFalse, disabled || outcome !== false);
+      register(
+        node.whenTrue, disabled || outcome !== true, suiteTitles, completeSuite
+      );
+      register(
+        node.whenFalse, disabled || outcome !== false, suiteTitles, completeSuite
+      );
       return true;
     }
     if (ts.isReturnStatement(node) || ts.isThrowStatement(node)) return false;
     if (!ts.isCallExpression(node)) return true;
 
-    const suite = invocationKind(node.expression, ["describe"], isProcessPlatform, testRunnerOf);
+    const suite = invocationKind(
+      node.expression, ["describe"], isProcessPlatform, testRunnerOf
+    );
     if (suite) {
+      const expandedSuiteTitles = expandedInvocationTitles(
+        node.arguments[0], suite
+      );
       const callback = node.arguments.slice(1).map(unwrap).find((argument) =>
         ts.isArrowFunction(argument) || ts.isFunctionExpression(argument));
       if (callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) {
-        register(callback.body,
-          disabled || !suite.enabled ||
-          !registrationOptionsEnabled(node.arguments, resolveBinding));
+        const suiteDisabled = disabled || !suite.enabled ||
+          !registrationOptionsEnabled(node.arguments, resolveBinding);
+        for (const suiteTitle of expandedSuiteTitles ?? [undefined]) {
+          const nestedSuiteTitles = suiteTitle === undefined
+            ? suiteTitles : [...suiteTitles, suiteTitle];
+          register(
+            callback.body,
+            suiteDisabled,
+            nestedSuiteTitles,
+            completeSuite && expandedSuiteTitles !== undefined
+          );
+        }
       }
       // Unresolved suite callbacks are not proven to register tests.
       return true;
     }
-    const title = literal(node.arguments[0]);
     const call = invocationKind(node.expression, ["test", "it"], isProcessPlatform, testRunnerOf);
-    if (call && title !== undefined) {
-      const expanded = call.values ? call.values.map((value, i) =>
-        title.replace(/%s|%d|%i/, (p) => p === "%i" ? String(i) : String(value))) : [title];
+    const expanded = call && expandedInvocationTitles(node.arguments[0], call);
+    if (call && expanded !== undefined) {
       const enabled = call.enabled &&
         registrationOptionsEnabled(node.arguments, resolveBinding) &&
         hasRegistrationCallback(node.arguments, resolveBinding);
-      for (const name of expanded) titles.push({ title: name, enabled: enabled && !disabled });
+      for (const name of expanded) {
+        declarations.push({
+          title: name,
+          full_name: completeSuite
+            ? [...suiteTitles, name].join(" ") : undefined,
+          declaration_key: `${node.pos}:${node.end}`,
+          enabled: enabled && !disabled
+        });
+      }
     }
     // Other calls (setTimeout, .then, IIFEs, fixtures) are not Vitest
     // registration contexts; never descend through their callbacks.
     return true;
   };
   register(file);
-  return titles;
+  return declarations;
+}
+
+/** Return the public title/enabled records used by compatibility tests. */
+export function collectWindowsTestTitles(filename, source) {
+  return collectWindowsTestDeclarations(filename, source)
+    .map(({ title, enabled }) => ({ title, enabled }));
 }
 
 function expandMandatory(title) {
@@ -5703,7 +5750,7 @@ export function inspectQualificationWorkflow(workflow, readTest = (path) =>
   const parsedFiles = new Map();
   for (const file of new Set(REQUIREMENTS.flatMap((scope) => scope.files))) {
     try {
-      parsedFiles.set(file, collectCachedWindowsTestTitles(file, readTest(file)));
+      parsedFiles.set(file, collectCachedWindowsTestDeclarations(file, readTest(file)));
     } catch {
       parsedFiles.set(file, []);
       findings.push("Could not parse mandatory Vitest declarations: " + file);
@@ -5715,11 +5762,18 @@ export function inspectQualificationWorkflow(workflow, readTest = (path) =>
     const declarations = parsedFiles.get(scope.file);
     for (const expected of scope.titles.flatMap(expandMandatory)) {
       const matching = declarations.filter((test) => test.title === expected && test.enabled);
-      if (matching.length !== 1) {
+      const declarationKeys = new Set(
+        matching.map((declaration) => declaration.declaration_key)
+      );
+      if (declarationKeys.size !== 1) {
         findings.push(scope.file + " is missing or disabling mandatory regression: " + expected);
       }
-      if (!commands.some((command) =>
-        command.selector === undefined || new RegExp(command.selector).test(expected))) {
+      const selectedDeclarations = matching.filter((declaration) =>
+        declaration.declaration_key === matching[0]?.declaration_key);
+      if (!commands.some((command) => command.selector === undefined ||
+        selectedDeclarations.every((declaration) =>
+          declaration.full_name !== undefined &&
+          new RegExp(command.selector).test(declaration.full_name)))) {
         findings.push(scope.step + " does not select mandatory regression: " + expected);
       }
     }

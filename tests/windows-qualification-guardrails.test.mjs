@@ -85,24 +85,32 @@ describe("Windows qualification scope guard", () => {
     expect(inspect(workflow).some((f) => f.includes("unaudited Vitest command"))).toBe(true);
   });
 
-  test("accepts a double-quoted regex selector with a literal dollar anchor", () => {
+  test("rejects an anchored bare title that Vitest matches against the suite-qualified name", () => {
     const workflow = load();
     windowsStep(workflow, "Windows helper package hygiene").run =
       'npm test -- tests/package-hygiene.test.ts -t "^(pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$"';
+    expect(inspect(workflow).some((finding) =>
+      finding.includes("does not select mandatory regression"))).toBe(true);
+  });
+
+  test("accepts a double-quoted suite-qualified regex selector with a literal dollar anchor", () => {
+    const workflow = load();
+    windowsStep(workflow, "Windows helper package hygiene").run =
+      'npm test -- tests/package-hygiene.test.ts -t "^package boundary hygiene (pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$"';
     expect(inspect(workflow)).toEqual([]);
   });
 
   test("accepts a double-quoted selector with a PowerShell-escaped dollar", () => {
     const workflow = load();
     windowsStep(workflow, "Windows helper package hygiene").run =
-      'npm test -- tests/package-hygiene.test.ts -t "`$env:REQUIRED|^(pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$"';
+      'npm test -- tests/package-hygiene.test.ts -t "`$env:REQUIRED|^package boundary hygiene (pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$"';
     expect(inspect(workflow)).toEqual([]);
   });
 
   test("accepts a literal dollar before punctuation in a double-quoted selector", () => {
     const workflow = load();
     windowsStep(workflow, "Windows helper package hygiene").run =
-      'npm test -- tests/package-hygiene.test.ts -t "$!REQUIRED|^(pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$"';
+      'npm test -- tests/package-hygiene.test.ts -t "$!REQUIRED|^package boundary hygiene (pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$"';
     expect(inspect(workflow)).toEqual([]);
   });
 
@@ -141,6 +149,36 @@ describe("Windows qualification scope guard", () => {
         readFileSync(join(root, path), "utf8"));
     expect(problems.some((p) => p.includes("missing or disabling mandatory regression"))).toBe(true);
   });
+
+  test("requires every parameterized suite expansion to be selected", () => {
+    const workflow = load();
+    windowsStep(workflow, "Windows helper package hygiene").run =
+      'npm test -- tests/package-hygiene.test.ts -t "^package boundary hygiene a (pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional)$"';
+    const source =
+      "describe.each(['a', 'b'])('package boundary hygiene %s', () => {" +
+      "test('pins the repository package inventory to its runtime files', () => {});" +
+      "test('requires the Windows process host only for Windows package builds', () => {});" +
+      "test('checks the parent route before treating an absent Windows host as optional', () => {});" +
+      "});";
+    const findings = inspectQualificationWorkflow(workflow, (path) =>
+      path === "tests/package-hygiene.test.ts" ? source :
+        readFileSync(join(root, path), "utf8"));
+    expect(findings.filter((finding) =>
+      finding.includes("does not select mandatory regression"))).toHaveLength(3);
+  }, 20_000);
+
+  test("accepts one declaration expanded across parameterized suites", () => {
+    const workflow = load();
+    const source =
+      "describe.each(['a', 'b'])('package boundary hygiene %s', () => {" +
+      "test('pins the repository package inventory to its runtime files', () => {});" +
+      "test('requires the Windows process host only for Windows package builds', () => {});" +
+      "test('checks the parent route before treating an absent Windows host as optional', () => {});" +
+      "});";
+    expect(inspectQualificationWorkflow(workflow, (path) =>
+      path === "tests/package-hygiene.test.ts" ? source :
+        readFileSync(join(root, path), "utf8"))).toEqual([]);
+  }, 20_000);
 
   test.each([
     "// test('pins the repository package inventory to its runtime files', () => {});",
