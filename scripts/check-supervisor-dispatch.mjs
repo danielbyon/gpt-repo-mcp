@@ -3801,11 +3801,11 @@ const inspectKnownWorkerOptionMutations = (
   options, reference, seen, unproven, targetKeys
 ) => {
   if (!reference || targetKeys.size === 0) return;
-  const referenceStart = reference.getStart(file);
+  const referenceEnd = reference.getEnd();
   const targetsOptions = (candidate) =>
     workerReferenceMatchesKeysOf(candidate, targetKeys);
   for (const assignment of dynamicMemberAssignments) {
-    if (assignment.node.getStart(file) <= referenceStart &&
+    if (assignment.node.getStart(file) <= referenceEnd &&
         targetsOptions(assignment.receiver)) {
       const property = staticStringAtInspectionOf(
         assignment.node.argumentExpression
@@ -3879,7 +3879,7 @@ const inspectKnownWorkerOptionMutations = (
     ts.forEachChild(file, collect);
   }
   for (const node of workerCallExpressions) {
-    if (node.getStart(file) > referenceStart) continue;
+    if (node.getStart(file) > referenceEnd) continue;
       const copiedArguments = objectAssignInvocationArgumentsOf(node, seen);
       if (copiedArguments && targetsOptions(copiedArguments[0])) {
         for (const source of copiedArguments.slice(1)) {
@@ -3966,10 +3966,12 @@ const inspectWorkerOptions = (
       options, reference, next, unproven, mutationKeys
     );
   }
-  const referenceStart = reference?.getStart(file) ?? Number.POSITIVE_INFINITY;
+  // The options expression is evaluated before Worker construction, so an
+  // inline local factory may mutate its result after the outer call starts.
+  const referenceEnd = reference?.getEnd() ?? Number.POSITIVE_INFINITY;
   for (const assignment of memberAssignmentTargets) {
     if (assignment.property === "eval" &&
-        assignment.node.getStart(file) <= referenceStart &&
+        assignment.node.getStart(file) <= referenceEnd &&
         workerReferenceMatchesKeysOf(assignment.receiver, mutationKeys)) {
       inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
     }

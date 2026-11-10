@@ -5619,11 +5619,12 @@ function mandatoryJob(jobs, name, runner, findings) {
   }
   if (JSON.stringify(job.strategy?.matrix?.["node-version"]) !==
         JSON.stringify(["20.x", "22.x"]) ||
-      Object.keys(job.strategy?.matrix ?? {}).some((key) => key !== "node-version")) {
+      Object.keys(job.strategy?.matrix ?? {}).some((key) => key !== "node-version" && key !== "exclude")) {
     findings.push("Required CI job must qualify both Node 20.x and Node 22.x: " + name);
   }
-  if (Object.hasOwn(job.strategy ?? {}, "exclude") &&
-      (!Array.isArray(job.strategy.exclude) || job.strategy.exclude.length > 0)) {
+  // GitHub matrix exclusions live under matrix; any entry can remove a required target.
+  if (Object.hasOwn(job.strategy?.matrix ?? {}, "exclude") &&
+      (!Array.isArray(job.strategy?.matrix?.exclude) || job.strategy?.matrix?.exclude.length > 0)) {
     findings.push("Required CI job must run every matrix entry without exclusions: " + name);
   }
   return job.steps;

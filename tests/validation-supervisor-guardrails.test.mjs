@@ -951,6 +951,21 @@ test.each([
 "const options: any = {}; options.self = options; options.eval = true; return options; } " +
 "new Worker('worker.js', getOptions());",
 "worker_threads inline evaluation is forbidden"],
+ ["immediately invoked factory-created mutated options",
+  "import { Worker } from 'node:worker_threads'; " +
+  "new Worker('worker.js', (() => { const options: any = {}; " +
+  "options.eval = true; return options; })());",
+  "worker_threads inline evaluation is forbidden"],
+ ["immediately invoked factory computed eval mutation",
+  "import { Worker } from 'node:worker_threads'; " +
+  "new Worker('worker.js', (() => { const options: any = {}; " +
+  "options[String('eval')] = true; return options; })());",
+  "worker_threads inline evaluation is forbidden"],
+ ["immediately invoked factory Reflect.set eval mutation",
+  "import { Worker } from 'node:worker_threads'; " +
+  "new Worker('worker.js', (() => { const options: any = {}; " +
+  "Reflect.set(options, 'eval', true); return options; })());",
+  "worker_threads inline evaluation is forbidden"],
 ["local Worker constructor parameter",
 "import { Worker } from 'node:worker_threads'; " +
 "function launch(Ctor, options) { new Ctor('worker.js', options); } " +
@@ -1224,6 +1239,13 @@ test("accepts worker construction without inline evaluation", () => {
   ].join("\n");
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
 }, 20_000);
+ test("accepts immediately invoked factory options without inline evaluation", () => {
+ expect(inspectSupervisorSource("src/services/windows-process-host.ts",
+ "import { Worker } from 'node:worker_threads'; " +
+ "new Worker('worker.js', (() => { const options: any = {}; " +
+ "options.type = 'module'; options.eval = false; return options; })());")).toEqual([]);
+ });
+
 test("accepts type-only node:module imports", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts",
       "import type { Module } from 'node:module';")).toEqual([]);

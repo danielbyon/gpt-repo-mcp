@@ -602,7 +602,7 @@ test.each([
   ["an unrelated matrix value", { "node-version": "21.x" }]
 ])("rejects CI matrix exclusion of %s", (_case, exclude) => {
   const workflow = load();
-  workflow.jobs["windows-test"].strategy.exclude = exclude;
+  workflow.jobs["windows-test"].strategy.matrix.exclude = exclude;
   expect(inspect(workflow)).toContain(
     "Required CI job must run every matrix entry without exclusions: windows-test"
   );
@@ -643,6 +643,12 @@ test.each([
     const workflow = load();
     mutate(workflow);
     expect(inspect(workflow).some((finding) => finding.includes(expected))).toBe(true);
+  }, 20_000);
+
+  test("accepts an empty GitHub matrix exclusion list", () => {
+    const workflow = load();
+    workflow.jobs["windows-test"].strategy.matrix.exclude = [];
+    expect(inspect(workflow)).toEqual([]);
   }, 20_000);
 
   test("rejects a weakened verify:dist script", () => {
