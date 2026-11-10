@@ -229,7 +229,7 @@ const thisArgumentsOf = (owner) => [
 
   // Resolve a reference through enclosing lexical scopes, not through a file-
   // wide name table. An unknown or ambiguous binding is never argv evidence.
-  const resolveBinding = (reference) => {
+  const resolveBindingUncached = (reference) => {
     const text = reference.text;
   const isAmbientDeclaration = (statement) => Boolean(statement.modifiers?.some(
     (modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword));
@@ -334,6 +334,16 @@ const matches = declarations(scopeStatements);
       }
     }
     return undefined;
+  };
+
+  // The parsed tree is immutable during inspection, so repeated alias walks can
+  // reuse the lexical result for the same identifier node.
+  const bindingCache = new WeakMap();
+  const resolveBinding = (reference) => {
+    if (!bindingCache.has(reference)) {
+      bindingCache.set(reference, resolveBindingUncached(reference));
+    }
+    return bindingCache.get(reference);
   };
 
   const aliasAssignmentKinds = new Set([
