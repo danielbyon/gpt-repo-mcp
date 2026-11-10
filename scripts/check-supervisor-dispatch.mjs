@@ -3885,14 +3885,16 @@ const workerOptionFactoryReturnExpressionsOf = (input, seen = new Set()) => {
   return localFunctionValuesOf(node.expression, next)
     .flatMap((value) => functionReturnExpressionsOf(value, next));
 };
-const workerOptionFactoryFunctionsOf = (options) => {
-  const functions = new Set(workerOptionFactoryReturnExpressionsOf(options)
+const workerOptionFactoryOwnersOf = (options) =>
+  new Set(workerOptionFactoryReturnExpressionsOf(options)
     .map((value) => {
       let owner = value.parent;
       while (owner && !ts.isFunctionLike(owner)) owner = owner.parent;
       return owner;
     })
     .filter(Boolean));
+const workerOptionFactoryFunctionsOf = (options) => {
+  const functions = workerOptionFactoryOwnersOf(options);
   const queue = [...functions];
   for (let index = 0; index < queue.length; index += 1) {
     const factory = queue[index];
@@ -3915,13 +3917,16 @@ const workerOptionFactoryFunctionsOf = (options) => {
 // argument or in the bounded local factory that produced the options value.
 const workerOptionMutationCanAffectOf = (options, reference) => {
   const referenceEnd = reference?.getEnd() ?? Number.POSITIVE_INFINITY;
-  const functions = workerOptionFactoryFunctionsOf(options);
+  const factoryOwners = workerOptionFactoryOwnersOf(options);
+  let factoryFunctions;
   return (node) => {
     if (workerMutationIsUnreachableOf(node)) return false;
     if (node.getStart(file) <= referenceEnd) return true;
     let owner = node.parent;
     while (owner && !ts.isFunctionLike(owner)) owner = owner.parent;
-    return functions.has(owner);
+    if (factoryOwners.has(owner)) return true;
+    factoryFunctions ??= workerOptionFactoryFunctionsOf(options);
+    return factoryFunctions.has(owner);
   };
 };
 const inspectKnownWorkerOptionMutations = (
