@@ -3649,11 +3649,8 @@ const workerConstructorOf = (input, seen = new Set()) => {
     memberNext.add(node);
     if (earlyMember.property === "value" &&
         workerPropertyDescriptorValueOf(earlyMember.receiver, memberNext)) return true;
-    if (earlyMember.property === "constructor") {
-      const prototypeMember = memberAccess(earlyMember.receiver);
-      if (prototypeMember?.property === "prototype" &&
-          workerConstructorOf(prototypeMember.receiver, memberNext)) return true;
-    }
+    if (earlyMember.property === "constructor" &&
+        workerPrototypeObjectOf(earlyMember.receiver, memberNext)) return true;
     if (workerMemberOf(
       earlyMember.receiver, earlyMember.property, memberNext
     )) return true;
@@ -3727,7 +3724,7 @@ const workerPropertyDescriptorValueOf = (input, seen = new Set()) => {
   const plan = staticMethodInvocationPlanOf(
     node, "getOwnPropertyDescriptor", globalReflectOf, seen
   ) ?? staticMethodInvocationPlanOf(
-    node, "getOwnPropertyDescriptor", globalObjectOf, seen
+    node, "getOwnPropertyDescriptor", globalPrototypeObjectOf, seen
   );
   if (!plan) return false;
   const holdsWorker = callArgumentCandidatesAt(plan, 0).some((value) =>
@@ -3738,6 +3735,59 @@ const workerPropertyDescriptorValueOf = (input, seen = new Set()) => {
     const name = staticStringOf(value);
     return name === undefined || name === "Worker";
   });
+};
+const workerPrototypeObjectOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isConditionalExpression(node)) {
+    return workerPrototypeObjectOf(node.whenTrue, next) ||
+      workerPrototypeObjectOf(node.whenFalse, next);
+  }
+  if (ts.isBinaryExpression(node) && [
+    ts.SyntaxKind.CommaToken,
+    ts.SyntaxKind.AmpersandAmpersandToken,
+    ts.SyntaxKind.BarBarToken,
+    ts.SyntaxKind.QuestionQuestionToken
+  ].includes(node.operatorToken.kind)) {
+    return workerPrototypeObjectOf(node.left, next) ||
+      workerPrototypeObjectOf(node.right, next);
+  }
+  const member = memberAccess(node);
+  if (member) {
+    if (member.property === "prototype" &&
+        workerConstructorOf(member.receiver, next)) return true;
+    if (memberValueCandidatesOf(member.receiver, member.property, next)
+      .some((value) => workerPrototypeObjectOf(value, next))) return true;
+  }
+  if (!ts.isIdentifier(node)) return false;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node)) return false;
+  const bindingNext = new Set(seen);
+  bindingNext.add(binding.node);
+  if ((binding.kind === "variable" || binding.kind === "opaque") &&
+      ts.isVariableDeclaration(binding.node)) {
+    if (ts.isIdentifier(binding.node.name)) {
+      return workerAliasReferenceValuesOf(binding, node)
+        .some((value) => workerPrototypeObjectOf(value, bindingNext));
+    }
+    if (binding.node.initializer &&
+        bindingPatternSelectsPropertyOf(
+          binding.node.name, node.text, "prototype"
+        ) && workerConstructorOf(binding.node.initializer, bindingNext)) {
+      return true;
+    }
+  }
+  if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
+    return (parameterValueArguments.get(binding.node) ?? []).some((value) =>
+      (ts.isIdentifier(binding.node.name) ? [value] :
+        bindingPatternValuesOf(
+          binding.node.name, value, node.text, bindingNext
+        )).some((candidate) =>
+          workerPrototypeObjectOf(candidate, bindingNext)));
+  }
+  return false;
 };
 const classBodyCapabilityOf = (body, seen) => {
 if (!body) return false;
@@ -3902,6 +3952,23 @@ const workerReferenceMatchesKeysOf = (
 ) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
+  if (ts.isConditionalExpression(node)) {
+    const next = new Set(seen);
+    next.add(node);
+    return workerReferenceMatchesKeysOf(node.whenTrue, targetKeys, next) ||
+      workerReferenceMatchesKeysOf(node.whenFalse, targetKeys, next);
+  }
+  if (ts.isBinaryExpression(node) && [
+    ts.SyntaxKind.CommaToken,
+    ts.SyntaxKind.AmpersandAmpersandToken,
+    ts.SyntaxKind.BarBarToken,
+    ts.SyntaxKind.QuestionQuestionToken
+  ].includes(node.operatorToken.kind)) {
+    const next = new Set(seen);
+    next.add(node);
+    return workerReferenceMatchesKeysOf(node.left, targetKeys, next) ||
+      workerReferenceMatchesKeysOf(node.right, targetKeys, next);
+  }
   if (targetKeys.has(assignmentReferenceKey(node))) return true;
   if (ts.isCallExpression(node)) {
     const prototypePlan = staticMethodInvocationPlanOf(
@@ -4055,8 +4122,7 @@ const inspectKnownWorkerOptionMutations = (
       inspectWorkerEvalValue(value, value, unproven);
     }
   };
-  const inspectNamedDescriptorMutation = (call, name, descriptor) => {
-    const property = staticStringOf(name) ?? staticPropertyNameOf(name);
+  const inspectNamedDescriptorMutation = (call, property, descriptor) => {
     if (property === undefined) {
       add(call, unproven);
     } else if (property === "eval") {
@@ -4088,7 +4154,9 @@ const inspectKnownWorkerOptionMutations = (
           continue;
         }
         for (const descriptor of descriptors) {
-          inspectNamedDescriptorMutation(call, property.name, descriptor);
+          inspectNamedDescriptorMutation(
+            call, staticPropertyNameOf(property.name), descriptor
+          );
         }
       }
     }
@@ -4240,8 +4308,9 @@ const inspectKnownWorkerOptionMutations = (
         const descriptors = callArgumentCandidatesAt(definePlan, 2);
         if (descriptors.length === 0) add(node, unproven);
         for (const name of names) {
+          const property = staticStringOf(name);
           for (const descriptor of descriptors) {
-            inspectNamedDescriptorMutation(node, name, descriptor);
+            inspectNamedDescriptorMutation(node, property, descriptor);
           }
         }
       }
