@@ -605,6 +605,58 @@ test.each([
     "class Base { constructor() { this.Ctor = Worker; } } class Runner extends Base {} " +
     "new (new Runner().Ctor)('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
+  ["inherited constructor Worker member past prototype method",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Base { constructor() { this.Ctor = Worker; } } " +
+    "class Runner extends Base { Ctor() {} } " +
+    "new (new Runner().Ctor)('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["conditional inherited constructor Worker member",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Base { constructor() { this.Ctor = Worker; } } " +
+    "class Runner extends Base { constructor() { super(); " +
+    "if (chooseSafe) this.Ctor = class {}; } } " +
+    "declare const chooseSafe: boolean; " +
+    "new (new Runner().Ctor)('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["conditional inherited static Worker member",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Base { static Ctor = Worker; } " +
+    "class Runner extends Base { static { " +
+    "if (chooseSafe) this.Ctor = class {}; } } " +
+    "declare const chooseSafe: boolean; " +
+    "new Runner.Ctor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["inherited private Worker member",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Base { #Ctor = Worker; getCtor() { return this.#Ctor; } } " +
+    "class Runner extends Base {} " +
+    "new (new Runner().getCtor())('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["immutable heritage alias",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Base { static Ctor = Worker; } const Alias = Base; " +
+    "class Runner extends Alias {} new Runner.Ctor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["reassigned heritage class",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Original { static Ctor = class {}; } " +
+    "class WorkerHolder { static Ctor = Worker; } " +
+    "Original = WorkerHolder; class Runner extends Original {} " +
+    "new Runner.Ctor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["mutable heritage alias",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Safe { static Ctor = class {}; } class Base { static Ctor = Worker; } " +
+    "let Alias = Safe; Alias = Base; class Runner extends Alias {} " +
+    "new Runner.Ctor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["conditional heritage alias",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Safe { static Ctor = class {}; } class Base { static Ctor = Worker; } " +
+    "declare const chooseBase: boolean; const Alias = chooseBase ? Base : Safe; " +
+    "class Runner extends Alias {} new Runner.Ctor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
   ["private static Worker member",
     "import { Worker } from 'node:worker_threads'; " +
     "class Runner { static #Ctor = Worker; static getCtor() { return this.#Ctor; } } " +
@@ -694,6 +746,12 @@ test.each([
     "import { Worker } from 'node:worker_threads'; declare const condition: boolean; " +
     "new Worker('worker.js', condition ? { eval: true } : { eval: false });",
     "worker_threads inline evaluation is forbidden"],
+  ["conditional known and unresolved options",
+    "import { Worker } from 'node:worker_threads'; " +
+    "import { getOptions } from './options.js'; declare const chooseSafe: boolean; " +
+    "const options = chooseSafe ? { eval: false } : getOptions(); " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline-evaluation options are unproven"],
   ["computed evaluation option",
     "import { Worker } from 'node:worker_threads'; " +
     "new Worker('worker.js', { ['eval']: true });",
@@ -997,6 +1055,14 @@ test("accepts worker construction without inline evaluation", () => {
 "class SafeWorkerBase { static Ctor = NamedWorker; }",
 "class SafeInheritedInstall extends SafeWorkerBase {}",
 "new SafeInheritedInstall.Ctor('./worker.mjs', { eval: false });",
+"const SafeHeritageAlias = SafeWorkerBase;",
+"class SafeAliasInstall extends SafeHeritageAlias {}",
+"new SafeAliasInstall.Ctor('./worker.mjs', { eval: false });",
+"class SafeAssignedHeritage { static Ctor = NamedWorker; }",
+"class SafeHeritageSnapshot extends SafeAssignedHeritage {}",
+"class SafeReplacementHeritage { static Ctor = class {}; }",
+"SafeAssignedHeritage = SafeReplacementHeritage;",
+"new SafeHeritageSnapshot.Ctor('./worker.mjs', { eval: false });",
 "class ShadowedSafeInstall extends SafeWorkerBase { static Ctor = class {}; }",
 "new ShadowedSafeInstall.Ctor('./worker.mjs', { eval: true });",
 "class SafeStaticBlockBase { static { this.Ctor = NamedWorker; } }",
@@ -1007,6 +1073,9 @@ test("accepts worker construction without inline evaluation", () => {
 "new (new SafeInheritedConstructor().Ctor)('./worker.mjs', { eval: false });",
 "class SafePrivateInstall { static #Ctor = NamedWorker; static getCtor() { return this.#Ctor; } }",
 "new (SafePrivateInstall.getCtor())('./worker.mjs', { eval: false });",
+"class SafePrivateBase { #Ctor = NamedWorker; getCtor() { return this.#Ctor; } }",
+"class SafePrivateChild extends SafePrivateBase {}",
+"new (new SafePrivateChild().getCtor())('./worker.mjs', { eval: false });",
     "const { ...commonJsNamespace } = require('node:worker_threads');",
     "new commonJsNamespace.Worker('./worker.mjs', { eval: false });",
     "Reflect.construct(NamedWorker, ['./worker.mjs', { eval: false }]);",
@@ -1026,6 +1095,9 @@ test("accepts worker construction without inline evaluation", () => {
 "new NamedWorker(...['./worker.mjs', { eval: false }]);",
 "const safeArgumentList = ['./worker.mjs', { eval: false }];",
 "new NamedWorker(...safeArgumentList);",
+"declare const useFirstSafeOptions: boolean;",
+"const safeConditionalOptions = useFirstSafeOptions ? { eval: false } : {};",
+"new NamedWorker('./worker.mjs', safeConditionalOptions);",
 "const safeHolderOptions = {}; const safeHolder = { options: safeHolderOptions };",
 "safeHolder.options.eval = false; new NamedWorker('./worker.mjs', safeHolderOptions);",
 "const safeAliasOptions = {}; const safeAliasHolder = { options: safeAliasOptions };",

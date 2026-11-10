@@ -555,10 +555,12 @@ const assignmentMemberPathKey = (receiver, property) => {
     const directBinding =
       (binding.kind === "variable" && ts.isVariableDeclaration(binding.node)) ||
       (binding.kind === "parameter" && ts.isParameter(binding.node)) ||
+    (binding.kind === "class" && ts.isClassDeclaration(binding.node)) ||
       (binding.kind === "opaque" && (ts.isVariableDeclaration(binding.node) ||
-       ts.isParameter(binding.node)));
+      ts.isParameter(binding.node) || ts.isClassDeclaration(binding.node)));
     if (!directBinding) return;
-    const name = ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node)
+  const name = ts.isVariableDeclaration(binding.node) ||
+    ts.isParameter(binding.node) || ts.isClassDeclaration(binding.node)
       ? binding.node.name : undefined;
     if (!name) return;
     const usesDirectBinding = ts.isIdentifier(name);
@@ -1243,12 +1245,40 @@ const localClassMemberTargetOf = (input, seen = new Set()) => {
   }
   return undefined;
 };
+// Heritage stays local: follow class declarations/expressions and immutable
+// aliases only. Any other heritage is unresolved for member provenance.
+const unresolvedLocalClassHeritage = Symbol("unresolvedLocalClassHeritage");
+const localClassHeritageOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node) return undefined;
+  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) return node;
+  if (node.kind === ts.SyntaxKind.NullKeyword) return undefined;
+  if (!ts.isIdentifier(node)) return unresolvedLocalClassHeritage;
+  const binding = resolveBinding(node);
+  if (!binding?.node) return unresolvedLocalClassHeritage;
+  if (ts.isClassDeclaration(binding.node) || ts.isClassExpression(binding.node)) {
+    const reassignedBeforeUse = (assignmentsByBinding.get(binding.node) ?? [])
+      .some((value) => value.getStart(file) <= node.getStart(file));
+    if (reassignedBeforeUse) return unresolvedLocalClassHeritage;
+    return binding.node;
+  }
+  if ((binding.kind === "variable" || binding.kind === "opaque") &&
+      binding.constant && immutableAlias(binding.node) &&
+      ts.isVariableDeclaration(binding.node) &&
+      ts.isIdentifier(binding.node.name) && binding.node.initializer &&
+      !seen.has(binding.node)) {
+    const next = new Set(seen);
+    next.add(binding.node);
+    return localClassHeritageOf(binding.node.initializer, next);
+  }
+  return unresolvedLocalClassHeritage;
+};
 const localClassBaseOf = (classNode, seen = new Set()) => {
   const heritage = (classNode.heritageClauses ?? []).find((clause) =>
     clause.token === ts.SyntaxKind.ExtendsKeyword);
   const baseType = heritage?.types[0];
   if (!baseType) return undefined;
-  return localClassMemberTargetOf(baseType.expression, seen)?.classNode;
+  return localClassHeritageOf(baseType.expression, seen);
 };
 const classMemberMatchesAccessOf = (member, property, instance) => {
   if (!("name" in member) ||
@@ -1281,64 +1311,172 @@ const localClassAssignedMemberValuesOf = (classNode, property, instance) => {
   }
   return values;
 };
-// Public members inherit through a bounded local extends chain. Private
-// identifiers remain scoped to the class where they are declared.
+// Public members inherit through a bounded local extends chain. Instance
+// fields precede prototype methods, while static members share one own
+// property namespace. Private identifiers remain scoped to their class.
 const localClassMemberResolutionOf = (classNode, property, instance) => {
+  const privateAccess = property.startsWith("#");
+  if (!instance) {
+    let current = classNode;
+    const visited = new Set();
+    const inheritedAssignments = [];
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const members = current.members.filter((member) =>
+        classMemberMatchesAccessOf(member, property, false));
+      const assignedValues = localClassAssignedMemberValuesOf(
+        current, property, false
+      );
+      if (members.length > 0) {
+        return {
+          classNode: current,
+          members,
+          assignedValues: [...inheritedAssignments, ...assignedValues]
+        };
+      }
+      inheritedAssignments.push(...assignedValues);
+      if (privateAccess) return undefined;
+      current = localClassBaseOf(current, visited);
+      if (current === unresolvedLocalClassHeritage) return { unresolved: true };
+    }
+    return inheritedAssignments.length > 0
+      ? { classNode, members: [], assignedValues: inheritedAssignments }
+      : undefined;
+  }
+
+  // Constructor assignments and field initializers create own properties,
+  // which precede every prototype method. A derived own source shadows a base
+  // own source, but a derived prototype method does not.
   let current = classNode;
-  const visited = new Set();
-  while (current && !visited.has(current)) {
-    visited.add(current);
-    const hasMember = current.members.some((member) =>
-      classMemberMatchesAccessOf(member, property, instance));
+  const ownVisited = new Set();
+  const inheritedAssignments = [];
+  while (current && !ownVisited.has(current)) {
+    ownVisited.add(current);
+    const members = current.members.filter((member) =>
+      ts.isPropertyDeclaration(member) &&
+      classMemberMatchesAccessOf(member, property, true));
     const assignedValues = localClassAssignedMemberValuesOf(
-      current, property, instance
+      current, property, true
     );
-    if (hasMember || assignedValues.length > 0) {
-      return { classNode: current, assignedValues };
+    if (members.length > 0) {
+      return {
+        classNode: current,
+        members,
+        assignedValues: [...inheritedAssignments, ...assignedValues]
+      };
     }
-    if (property.startsWith("#")) return undefined;
-    current = localClassBaseOf(current, visited);
+    inheritedAssignments.push(...assignedValues);
+    if (privateAccess) return undefined;
+    current = localClassBaseOf(current, ownVisited);
+    if (current === unresolvedLocalClassHeritage) return { unresolved: true };
   }
-  return undefined;
+
+  current = classNode;
+  const prototypeVisited = new Set();
+  while (current && !prototypeVisited.has(current)) {
+    prototypeVisited.add(current);
+    const members = current.members.filter((member) =>
+      (ts.isMethodDeclaration(member) || ts.isGetAccessorDeclaration(member)) &&
+      classMemberMatchesAccessOf(member, property, true));
+    if (members.length > 0) {
+      return {
+        classNode: current,
+        members,
+        assignedValues: inheritedAssignments
+      };
+    }
+    if (privateAccess) return undefined;
+    current = localClassBaseOf(current, prototypeVisited);
+    if (current === unresolvedLocalClassHeritage) return { unresolved: true };
+  }
+  return inheritedAssignments.length > 0
+    ? { classNode, members: [], assignedValues: inheritedAssignments }
+    : undefined;
 };
-const localClassMemberValuesOf = (input, property, seen = new Set()) => {
-  if (!hasLocalClasses) return [];
-  const node = unwrap(input);
-  if (!node) return [];
-  if (node.kind === ts.SyntaxKind.ThisKeyword) {
-    const owner = enclosingFunctionOf(node);
-    const ownerClass = owner?.parent;
-    if (!ownerClass ||
-        (!ts.isClassDeclaration(ownerClass) && !ts.isClassExpression(ownerClass))) {
-      return [];
-    }
-    const next = new Set(seen);
-    next.delete(owner);
-    next.add(node);
-    return thisArgumentsOf(owner).flatMap((receiver) =>
-      localClassMemberValuesOf(receiver, property, next));
-  }
-  const target = localClassMemberTargetOf(node, seen);
-  if (!target) return [];
-  const { classNode, instance } = target;
+const classMemberIsStaticOf = (member) =>
+  (member.modifiers ?? []).some((modifier) =>
+    modifier.kind === ts.SyntaxKind.StaticKeyword);
+const localClassMemberValuesForTargetOf = (
+  target, property, receiver
+) => {
+  const resolution = localClassMemberResolutionOf(
+    target.classNode, property, target.instance
+  );
+  if (!resolution?.classNode) return [];
   const values = [];
-  const resolution = localClassMemberResolutionOf(classNode, property, instance);
-  if (!resolution) return [];
-  for (const member of resolution.classNode.members) {
-    if (!classMemberMatchesAccessOf(member, property, instance)) continue;
+  for (const member of resolution.members) {
     if (ts.isPropertyDeclaration(member) && member.initializer) {
       values.push(member.initializer);
     } else if (ts.isMethodDeclaration(member) ||
-               ts.isGetAccessorDeclaration(member)) {
+        ts.isGetAccessorDeclaration(member)) {
       const receivers = classMemberThisArguments.get(member) ?? [];
-      if (!receivers.includes(node)) {
-        receivers.push(node);
+      if (!receivers.includes(receiver)) {
+        receivers.push(receiver);
         classMemberThisArguments.set(member, receivers);
       }
       values.push(member);
     }
   }
   return values;
+};
+const localClassMemberTargetFromThisOf = (node, property) => {
+  const owner = enclosingFunctionOf(node);
+  const ownerClass = owner?.parent;
+  if (!ownerClass ||
+      (!ts.isClassDeclaration(ownerClass) && !ts.isClassExpression(ownerClass))) {
+    return undefined;
+  }
+  return {
+    owner,
+    target: { classNode: ownerClass, instance: !classMemberIsStaticOf(owner) },
+    privateAccess: property.startsWith("#")
+  };
+};
+const localClassMemberValuesOf = (input, property, seen = new Set()) => {
+  if (!hasLocalClasses) return [];
+  const node = unwrap(input);
+  if (!node) return [];
+  if (node.kind === ts.SyntaxKind.ThisKeyword) {
+    const context = localClassMemberTargetFromThisOf(node, property);
+    if (!context) return [];
+    const next = new Set(seen);
+    next.delete(context.owner);
+    next.add(node);
+    if (context.privateAccess) {
+      return localClassMemberValuesForTargetOf(
+        context.target, property, node
+      );
+    }
+    return thisArgumentsOf(context.owner).flatMap((receiver) =>
+      localClassMemberValuesOf(receiver, property, next));
+  }
+  const target = localClassMemberTargetOf(node, seen);
+  if (!target) return [];
+  return localClassMemberValuesForTargetOf(target, property, node);
+};
+const localClassMemberUnresolvedOf = (input, property, seen = new Set()) => {
+  if (!hasLocalClasses) return false;
+  const node = unwrap(input);
+  if (!node) return false;
+  if (node.kind === ts.SyntaxKind.ThisKeyword) {
+    const context = localClassMemberTargetFromThisOf(node, property);
+    if (!context) return false;
+    const next = new Set(seen);
+    next.delete(context.owner);
+    next.add(node);
+    if (context.privateAccess) {
+      return Boolean(localClassMemberResolutionOf(
+        context.target.classNode, property, context.target.instance
+      )?.unresolved);
+    }
+    return thisArgumentsOf(context.owner).some((receiver) =>
+      localClassMemberUnresolvedOf(receiver, property, next));
+  }
+  const target = localClassMemberTargetOf(node, seen);
+  if (!target) return false;
+  return Boolean(localClassMemberResolutionOf(
+    target.classNode, property, target.instance
+  )?.unresolved);
 };
   const memberValueCandidatesOf = (input, property, seen = new Set()) => {
     const node = unwrap(input);
@@ -3294,6 +3432,7 @@ const workerMemberOf = (input, property, seen = new Set()) => {
   if (property === "Worker" && workerNamespaceOf(node, seen)) return true;
   const next = new Set(seen);
   next.add(node);
+  if (localClassMemberUnresolvedOf(node, property, seen)) return true;
   const candidates = memberValueCandidatesOf(node, property, seen);
   if (candidates.some((value) => workerConstructorOf(value, next) ||
       functionReturnExpressionsOf(value, next)
@@ -3723,14 +3862,19 @@ const inspectKnownWorkerOptionMutations = (
       }
   }
 };
+const isAbsentOptionsValue = (input) => {
+  const node = unwrap(input);
+  if (!node || node.kind === ts.SyntaxKind.NullKeyword ||
+      ts.isVoidExpression(node)) return true;
+  return ts.isIdentifier(node) && node.text === "undefined" &&
+    !resolveBinding(node);
+};
 const inspectWorkerOptions = (
   input, seen = new Set(), reference = unwrap(input), inspectMutations = true
 ) => {
   const options = unwrap(input);
   // Worker treats a missing options argument as eval: false.
-  if (!options || seen.has(options)) return;
-  if (ts.isIdentifier(options) && options.text === "undefined" &&
-      !resolveBinding(options)) return;
+  if (seen.has(options) || isAbsentOptionsValue(options)) return;
   const next = new Set(seen);
   next.add(options);
   const unproven = "worker_threads inline-evaluation options are unproven";
@@ -3764,10 +3908,16 @@ const inspectWorkerOptions = (
     }
   }
   const objects = objectValueCandidatesOf(options, seen);
-  if (objects.length === 0) {
-    if (!inspectedParameterValues) add(options, unproven);
-    return;
+  // Conditional and assigned options can contain branches that do not resolve
+  // to an object literal. Any such branch can enable inline evaluation.
+  for (const candidate of resolvedValuesOf(options, next)) {
+    if (isAbsentOptionsValue(candidate) ||
+        (inspectedParameterValues && candidate === options)) continue;
+    if (objectValueCandidatesOf(candidate, seen).length === 0) {
+      add(candidate, unproven);
+    }
   }
+  if (objects.length === 0) return;
   for (const object of objects) {
     // An omitted eval property means false; other Worker options do not enable
     // evaluation of source text.
