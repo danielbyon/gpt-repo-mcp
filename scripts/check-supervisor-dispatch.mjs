@@ -3022,9 +3022,15 @@ const objectFreezeMutationStatusOf = (input, seen = new Set()) => {
       globalObjectConstructorOf(member.receiver)) {
     const referenceBlock = statementBlockOf(node);
     const referenceStart = node.getStart(file);
-    const objectFreezeWrites = memberAssignmentTargets.filter((assignment) =>
-      assignment.property === "freeze" &&
-      globalObjectConstructorOf(assignment.receiver));
+    const objectFreezeWrites = memberAssignmentTargets.flatMap((assignment) => {
+      if (assignment.property !== "freeze") return [];
+      const receiverIdentity = objectFreezeMutationReceiverIdentityAtOf(
+        assignment.receiver, assignment.node
+      );
+      return receiverIdentity === "unrelated"
+        ? []
+        : [{ ...assignment, receiverIdentity }];
+    });
     const referenceFunction = enclosingFunctionOf(node);
     if (referenceFunction && objectFreezeWrites.some((assignment) =>
       enclosingFunctionOf(assignment.node) !== referenceFunction)) {
@@ -3033,6 +3039,8 @@ const objectFreezeMutationStatusOf = (input, seen = new Set()) => {
     const writes = objectFreezeWrites.filter((assignment) =>
       assignment.node.getStart(file) < referenceStart);
     if (writes.length === 0) return "unmodified";
+    if (writes.some((assignment) =>
+      assignment.receiverIdentity === "unresolved")) return "unresolved";
     // A write in another block may not run before this call.
     if (referenceBlock && writes.every((assignment) =>
       definiteAssignmentBlockOf(assignment.node) === referenceBlock)) return "replaced";
@@ -4143,6 +4151,61 @@ const workerAliasReferenceValuesOf = (binding, reference) => {
     values.push(value);
   }
   return values;
+};
+const definitelyUnrelatedObjectConstructorValueOf = (input) => {
+  const node = unwrap(input);
+  return Boolean(node && (
+    ts.isObjectLiteralExpression(node) ||
+    ts.isArrayLiteralExpression(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isClassExpression(node) ||
+    ts.isStringLiteralLike(node) ||
+    ts.isNumericLiteral(node) ||
+    node.kind === ts.SyntaxKind.TrueKeyword ||
+    node.kind === ts.SyntaxKind.FalseKeyword ||
+    node.kind === ts.SyntaxKind.NullKeyword
+  ));
+};
+const objectFreezeMutationReceiverIdentityAtOf = (
+  input, reference, seen = new Set(), mayBeGlobalObject = false
+) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return "unresolved";
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (!binding?.node) {
+      if (node.text === "Object") return "global";
+      return mayBeGlobalObject ? "unresolved" : "unrelated";
+    }
+    if (!globalObjectConstructorOf(node) && !mayBeGlobalObject) {
+      return "unrelated";
+    }
+    if (!(ts.isVariableDeclaration(binding.node) ||
+        ts.isParameter(binding.node))) {
+      return mayBeGlobalObject ? "unresolved" : "unrelated";
+    }
+    const assignments = assignmentsByBinding.get(binding.node) ?? [];
+    if (assignments.some((value) =>
+      enclosingFunctionOf(value) !== enclosingFunctionOf(reference))) {
+      return "unresolved";
+    }
+    const values = ts.isParameter(binding.node)
+      ? parameterValueArguments.get(binding.node) ?? []
+      : workerAliasReferenceValuesOf(binding, node);
+    if (values.length === 0) return "unresolved";
+    const identities = values.map((value) =>
+      objectFreezeMutationReceiverIdentityAtOf(value, value, next, true));
+    if (identities.every((identity) => identity === "global")) return "global";
+    if (identities.every((identity) => identity === "unrelated")) return "unrelated";
+    return "unresolved";
+  }
+  if (assignmentReferenceKey(node) === "global:Object" ||
+      globalObjectConstructorOf(node)) return "global";
+  if (definitelyUnrelatedObjectConstructorValueOf(node)) return "unrelated";
+  return mayBeGlobalObject ? "unresolved" : "unrelated";
 };
 const workerReferenceMatchesKeysOf = (
   input, targetKeys, seen = new Set()

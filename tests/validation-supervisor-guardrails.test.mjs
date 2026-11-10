@@ -1647,6 +1647,50 @@ test("does not treat a shadowed Object.freeze result as Worker", () => {
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
     .toEqual([]);
 });
+test("rejects Worker evaluation after a freeze write through a rebound Object alias", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "let O: any = Object;",
+    "O = { freeze: (_value: any) => class SafeWorker {} };",
+    "O.freeze = (_value: any) => class SafeWorker {};",
+    "const SafeWorker = Object.freeze(Worker);",
+    "new SafeWorker(\"console.log('worker executed')\", { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual(expect.arrayContaining([
+      expect.stringContaining("worker_threads inline evaluation is forbidden")
+    ]));
+});
+
+test("preserves a genuine Object.freeze replacement made before alias rebind", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "let O: any = Object;",
+    "O.freeze = (_value: any) => class SafeWorker {};",
+    "O = {};",
+    "const SafeWorker = Object.freeze(Worker);",
+    "new SafeWorker('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual([]);
+});
+
+test("fails closed when an Object alias may have been rebound before its freeze write", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "declare const rebind: boolean;",
+    "let O: any = Object;",
+    "if (rebind) O = {};",
+    "O.freeze = (_value: any) => class SafeWorker {};",
+    "const FrozenWorker = Object.freeze(Worker);",
+    "new FrozenWorker('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual(expect.arrayContaining([
+      expect.stringContaining("worker_threads inline evaluation is forbidden")
+    ]));
+});
+
 test("preserves Worker identity through unmodified Object.freeze", () => {
   const source = [
     "import { Worker } from 'node:worker_threads';",
