@@ -5622,6 +5622,10 @@ function mandatoryJob(jobs, name, runner, findings) {
       Object.keys(job.strategy?.matrix ?? {}).some((key) => key !== "node-version")) {
     findings.push("Required CI job must qualify both Node 20.x and Node 22.x: " + name);
   }
+  if (Object.hasOwn(job.strategy ?? {}, "exclude") &&
+      (!Array.isArray(job.strategy.exclude) || job.strategy.exclude.length > 0)) {
+    findings.push("Required CI job must run every matrix entry without exclusions: " + name);
+  }
   return job.steps;
 }
 

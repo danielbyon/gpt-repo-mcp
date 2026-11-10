@@ -593,6 +593,21 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
     expect(inspect(workflow)).toEqual([]);
   }, 20_000);
 
+test.each([
+  ["Node 20.x", { "node-version": "20.x" }],
+  ["Node 22.x", { "node-version": "22.x" }],
+  ["both supported Node versions", [
+    { "node-version": "20.x" }, { "node-version": "22.x" }
+  ]],
+  ["an unrelated matrix value", { "node-version": "21.x" }]
+])("rejects CI matrix exclusion of %s", (_case, exclude) => {
+  const workflow = load();
+  workflow.jobs["windows-test"].strategy.exclude = exclude;
+  expect(inspect(workflow)).toContain(
+    "Required CI job must run every matrix entry without exclusions: windows-test"
+  );
+}, 20_000);
+
   test.each([
     ["missing build verification", (workflow) => {
       workflow.jobs.test.steps.splice(

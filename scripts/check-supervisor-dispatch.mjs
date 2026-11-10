@@ -1104,9 +1104,12 @@ const hasExportModifier = (node) =>
     }
     return [node];
   };
-  const objectValueCandidatesOf = (input, seen = new Set()) => {
+const objectValueCandidatesOf = (input, seen = new Set(), unresolved) => {
     const node = unwrap(input);
-    if (!node || seen.has(node)) return [];
+  if (!node || seen.has(node)) {
+    unresolved?.push(input);
+    return [];
+  }
     const next = new Set(seen);
     next.add(node);
     const objects = [];
@@ -1116,17 +1119,18 @@ const hasExportModifier = (node) =>
       if (ts.isGetAccessorDeclaration(current)) {
         const receiver = getterReceiverOf(current);
         if (receiver) {
-          objects.push(...objectValueCandidatesOf(receiver, next));
+        objects.push(...objectValueCandidatesOf(receiver, next, unresolved));
         }
         return objects;
       }
       if (ts.isFunctionLike(current) && !ts.isArrowFunction(current)) {
-        objects.push(...thisArgumentsOf(current)
-          .flatMap((receiver) => objectValueCandidatesOf(receiver, next)));
+      objects.push(...thisArgumentsOf(current)
+        .flatMap((receiver) => objectValueCandidatesOf(receiver, next, unresolved)));
         return objects;
       }
       current = current.parent;
     }
+    if (objects.length === 0) unresolved?.push(node);
     return objects;
   }
   if (ts.isIdentifier(node)) {
@@ -1139,7 +1143,7 @@ const hasExportModifier = (node) =>
         ...(parameterProcessArguments.get(binding.node) ?? []),
         ...(parameterGlobalArguments.get(binding.node) ?? [])
       ]) {
-        objects.push(...objectValueCandidatesOf(argument, parameterNext));
+      objects.push(...objectValueCandidatesOf(argument, parameterNext, unresolved));
       }
     }
   }
@@ -1154,12 +1158,12 @@ const hasExportModifier = (node) =>
           ...(parameterProcessArguments.get(binding.node) ?? []),
           ...(parameterGlobalArguments.get(binding.node) ?? [])
         ]) {
-          objects.push(...objectValueCandidatesOf(argument, parameterNext));
+        objects.push(...objectValueCandidatesOf(argument, parameterNext, unresolved));
         }
       }
     }
       if (value.kind === ts.SyntaxKind.ThisKeyword) {
-        objects.push(...objectValueCandidatesOf(value, next));
+      objects.push(...objectValueCandidatesOf(value, next, unresolved));
         continue;
       }
       if (ts.isObjectLiteralExpression(value)) {
@@ -1170,30 +1174,43 @@ const hasExportModifier = (node) =>
       const copiedArguments = objectAssignInvocationArgumentsOf(value, next);
       if (copiedArguments) {
         for (const argument of copiedArguments) {
-          objects.push(...objectValueCandidatesOf(argument, next));
+        objects.push(...objectValueCandidatesOf(argument, next, unresolved));
           }
         continue;
       }
         const prototypes = objectCreatePrototypeValuesOf(value, next);
         if (prototypes.length > 0) {
           for (const prototype of prototypes) {
-            objects.push(...objectValueCandidatesOf(prototype, next));
+        objects.push(...objectValueCandidatesOf(prototype, next, unresolved));
           }
           continue;
         }
-      for (const returned of functionReturnExpressionsOf(value.expression, next)) {
-        objects.push(...objectValueCandidatesOf(returned, next));
+    const returnedValues = functionReturnExpressionsOf(value.expression, next);
+    if (returnedValues.length === 0) {
+      unresolved?.push(value);
+    } else {
+      for (const returned of returnedValues) {
+        objects.push(...objectValueCandidatesOf(returned, next, unresolved));
+      }
         }
         continue;
       }
       const member = memberAccess(value);
-      if (!member) continue;
-      for (const candidate of memberValueCandidatesOf(
+  if (!member) {
+    unresolved?.push(value);
+    continue;
+  }
+  const candidates = memberValueCandidatesOf(
         member.receiver,
         member.property,
         next
-      )) {
-        objects.push(...objectValueCandidatesOf(candidate, next));
+  );
+  if (candidates.length === 0) {
+    unresolved?.push(value);
+    continue;
+  }
+  for (const candidate of candidates) {
+    objects.push(...objectValueCandidatesOf(candidate, next, unresolved));
       }
     }
     return objects;
@@ -1244,6 +1261,67 @@ const localClassMemberTargetOf = (input, seen = new Set()) => {
     return localClassMemberTargetOf(binding.node.initializer, next);
   }
   return undefined;
+};
+const localClassMemberTargetsOf = (input, seen = new Set()) => {
+  const targets = [];
+  const unresolved = [];
+  const addTarget = (target) => {
+    if (target && !targets.some((candidate) =>
+      candidate.classNode === target.classNode &&
+      candidate.instance === target.instance)) {
+      targets.push(target);
+    }
+  };
+  const visit = (input, instance, encountered) => {
+    const node = unwrap(input);
+    if (!node || encountered.has(node)) {
+      unresolved.push(node);
+      return;
+    }
+    const next = new Set(encountered);
+    next.add(node);
+    if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+      addTarget({ classNode: node, instance });
+      return;
+    }
+    if (ts.isNewExpression(node)) {
+      visit(node.expression, true, next);
+      return;
+    }
+    if (!ts.isIdentifier(node)) {
+      unresolved.push(node);
+      return;
+    }
+    const binding = resolveBinding(node);
+    if (!binding?.node) {
+      unresolved.push(node);
+      return;
+    }
+    if (ts.isClassDeclaration(binding.node) || ts.isClassExpression(binding.node)) {
+      addTarget({ classNode: binding.node, instance });
+      const referenceStart = node.getStart(file);
+      for (const assigned of assignmentsByBinding.get(binding.node) ?? []) {
+        if (assigned.getStart(file) <= referenceStart) visit(assigned, instance, next);
+      }
+      return;
+    }
+    if ((binding.kind === "variable" || binding.kind === "opaque") &&
+        ts.isVariableDeclaration(binding.node) && binding.node.initializer) {
+      const values = resolvedValuesOf(node, next);
+      if (values.length === 0 || values.every((value) => unwrap(value) === node)) {
+        unresolved.push(node);
+      } else {
+        for (const value of values) visit(value, instance, next);
+      }
+      return;
+    }
+    unresolved.push(node);
+  };
+  visit(input, false, new Set(seen));
+  return {
+    targets,
+    unresolved: targets.length > 0 && unresolved.length > 0
+  };
 };
 // Heritage stays local: follow class declarations/expressions and immutable
 // aliases only. Any other heritage is unresolved for member provenance.
@@ -1298,7 +1376,7 @@ const localClassAssignedMemberValuesOf = (classNode, property, instance) => {
     if (!ownerMatches) continue;
     const visit = (child) => {
       if (ts.isBinaryExpression(child) &&
-          child.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        aliasAssignmentKinds.has(child.operatorToken.kind)) {
         const assigned = assignmentMemberAccess(child.left);
         if (assigned?.property === property &&
             unwrap(assigned.receiver)?.kind === ts.SyntaxKind.ThisKeyword) {
@@ -1403,7 +1481,7 @@ const localClassMemberValuesForTargetOf = (
     target.classNode, property, target.instance
   );
   if (!resolution?.classNode) return [];
-  const values = [];
+  const values = [...(resolution.assignedValues ?? [])];
   for (const member of resolution.members) {
     if (ts.isPropertyDeclaration(member) && member.initializer) {
       values.push(member.initializer);
@@ -1450,9 +1528,9 @@ const localClassMemberValuesOf = (input, property, seen = new Set()) => {
     return thisArgumentsOf(context.owner).flatMap((receiver) =>
       localClassMemberValuesOf(receiver, property, next));
   }
-  const target = localClassMemberTargetOf(node, seen);
-  if (!target) return [];
-  return localClassMemberValuesForTargetOf(target, property, node);
+  const resolution = localClassMemberTargetsOf(node, seen);
+  return resolution.targets.flatMap((target) =>
+    localClassMemberValuesForTargetOf(target, property, node));
 };
 const localClassMemberUnresolvedOf = (input, property, seen = new Set()) => {
   if (!hasLocalClasses) return false;
@@ -1472,11 +1550,11 @@ const localClassMemberUnresolvedOf = (input, property, seen = new Set()) => {
     return thisArgumentsOf(context.owner).some((receiver) =>
       localClassMemberUnresolvedOf(receiver, property, next));
   }
-  const target = localClassMemberTargetOf(node, seen);
-  if (!target) return false;
-  return Boolean(localClassMemberResolutionOf(
-    target.classNode, property, target.instance
-  )?.unresolved);
+  const targets = localClassMemberTargetsOf(node, seen);
+  return targets.unresolved || targets.targets.some((target) =>
+    Boolean(localClassMemberResolutionOf(
+      target.classNode, property, target.instance
+    )?.unresolved));
 };
   const memberValueCandidatesOf = (input, property, seen = new Set()) => {
     const node = unwrap(input);
@@ -3420,11 +3498,10 @@ const workerAssignedClassMemberValuesOf = (
   const classSeen = new Set(seen);
   const normalized = unwrap(input);
   if (normalized) classSeen.delete(normalized);
-  const target = localClassMemberTargetOf(normalized, classSeen);
-  if (!target) return [];
-  return localClassMemberResolutionOf(
-    target.classNode, property, target.instance
-  )?.assignedValues ?? [];
+  return localClassMemberTargetsOf(normalized, classSeen).targets.flatMap((target) =>
+    localClassMemberResolutionOf(
+      target.classNode, property, target.instance
+    )?.assignedValues ?? []);
 };
 const workerMemberOf = (input, property, seen = new Set()) => {
   const node = unwrap(input);
@@ -3615,14 +3692,18 @@ const workerCapabilityOf = (input, seen = new Set()) => {
   if (workerConstructorOf(node, seen) || workerNamespaceOf(node, seen)) return true;
   const next = new Set(seen);
   next.add(node);
+  if (ts.isIdentifier(node) && localClassMemberTargetsOf(node, seen).targets.some(
+    (target) => !target.instance && workerClassCapabilityOf(target.classNode, next))) {
+    return true;
+  }
   const arrayValues = fixedSpreadValuesOf(node, seen);
   if (arrayValues?.some((value) => workerCapabilityOf(value, next))) return true;
   if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
 if (workerClassCapabilityOf(node, seen)) return true;
 }
 if (ts.isNewExpression(node)) {
-const target = localClassMemberTargetOf(node, seen);
-if (target && workerClassCapabilityOf(target.classNode, next)) return true;
+    if (localClassMemberTargetsOf(node, seen).targets.some((target) =>
+      workerClassCapabilityOf(target.classNode, next))) return true;
 }
   for (const object of objectValueCandidatesOf(node, seen)) {
     for (const property of object.properties) {
@@ -3878,21 +3959,6 @@ const inspectWorkerOptions = (
   const next = new Set(seen);
   next.add(options);
   const unproven = "worker_threads inline-evaluation options are unproven";
-  let inspectedParameterValues = false;
-  if (ts.isIdentifier(options)) {
-    const binding = resolveBinding(options);
-    if (binding?.kind === "parameter" && ts.isParameter(binding.node)) {
-      const parameterValues = parameterValueArguments.get(binding.node) ?? [];
-      if (parameterValues.length > 0) {
-        inspectedParameterValues = true;
-        const parameterNext = new Set(next);
-        parameterNext.add(binding.node);
-        for (const value of parameterValues) {
-          inspectWorkerOptions(value, parameterNext, reference, inspectMutations);
-        }
-      }
-    }
-  }
   const mutationKeys = workerOptionMutationReferenceKeysOf(options, seen);
   if (inspectMutations) {
     inspectKnownWorkerOptionMutations(
@@ -3907,15 +3973,46 @@ const inspectWorkerOptions = (
       inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
     }
   }
-  const objects = objectValueCandidatesOf(options, seen);
+  const objects = [];
+  const inspectedParameters = new Set();
   // Conditional and assigned options can contain branches that do not resolve
   // to an object literal. Any such branch can enable inline evaluation.
   for (const candidate of resolvedValuesOf(options, next)) {
-    if (isAbsentOptionsValue(candidate) ||
-        (inspectedParameterValues && candidate === options)) continue;
-    if (objectValueCandidatesOf(candidate, seen).length === 0) {
+    if (isAbsentOptionsValue(candidate)) continue;
+    const binding = ts.isIdentifier(candidate) ? resolveBinding(candidate) : undefined;
+    if (binding?.kind === "parameter" && ts.isParameter(binding.node) &&
+        !inspectedParameters.has(binding.node)) {
+      const parameterValues = parameterValueArguments.get(binding.node) ?? [];
+      if (parameterValues.length > 0) {
+        inspectedParameters.add(binding.node);
+        const parameterNext = new Set(next);
+        parameterNext.add(binding.node);
+        for (const value of parameterValues) {
+          const selected = ts.isIdentifier(binding.node.name)
+            ? [value]
+            : bindingPatternValuesOf(
+                binding.node.name, value, candidate.text, parameterNext
+              );
+          if (selected.length === 0) add(candidate, unproven);
+          for (const selectedValue of selected) {
+            inspectWorkerOptions(
+              selectedValue, parameterNext, reference, inspectMutations
+            );
+          }
+        }
+        continue;
+      }
+    }
+    if (binding?.kind === "parameter" && ts.isParameter(binding.node) &&
+        inspectedParameters.has(binding.node)) continue;
+    const unresolvedCandidates = [];
+    const candidateObjects = objectValueCandidatesOf(
+      candidate, seen, unresolvedCandidates
+    );
+    if (candidateObjects.length === 0 || unresolvedCandidates.length > 0) {
       add(candidate, unproven);
     }
+    objects.push(...candidateObjects);
   }
   if (objects.length === 0) return;
   for (const object of objects) {
