@@ -522,6 +522,56 @@ test("accepts ordinary helper arguments and member factories", () => {
   });
 
 test.each([
+  ["Worker returned by a bound member-held factory",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const make = () => Worker; const holder = { make: make.bind(null) }; " +
+    "new (holder.make())('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["Worker constructor preserved by Object.freeze",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const FrozenWorker = Object.freeze(Worker); " +
+    "new FrozenWorker('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["postfix increment can enable Worker eval",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = { eval: false }; options.eval++; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["prefix increment can enable Worker eval",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = { eval: false }; ++options.eval; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["postfix decrement can enable Worker eval",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = { eval: false }; options.eval--; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["prefix decrement can enable Worker eval",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = { eval: false }; --options.eval; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["addition assignment can enable Worker eval",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = { eval: false }; options.eval += 1; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["subtraction assignment can enable Worker eval",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = { eval: false }; options.eval -= 1; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["bitwise or assignment can enable Worker eval",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = { eval: false }; options.eval |= 1; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["bitwise xor assignment can enable Worker eval",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = { eval: false }; options.eval ^= 1; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
   ["direct inline evaluation",
     "import { Worker } from 'node:worker_threads'; " +
     "new Worker(\"process.getBuiltinModule('node:child_process').execFileSync('node', ['--version'])\", { eval: true });",
@@ -1394,6 +1444,18 @@ test("accepts worker construction without inline evaluation", () => {
     "methodOptions.markEnabled();",
     "methodOptions.disableEvaluation();",
     "new NamedWorker('./worker.mjs', methodOptions);",
+    "const makeSafeValue = (value: any) => value;",
+    "const safeFunctionHolder = { make: makeSafeValue.bind(null, 7) };",
+    "safeFunctionHolder.make();",
+    "class OrdinaryConstructor {}",
+    "const FrozenOrdinaryConstructor = Object.freeze(OrdinaryConstructor);",
+    "new FrozenOrdinaryConstructor();",
+    "const frozenOrdinaryObject = Object.freeze({ value: 1 });",
+    "const safeMutationOptions: any = { eval: false, count: 0 };",
+    "safeMutationOptions.count++;",
+    "safeMutationOptions.count += 1;",
+    "safeMutationOptions.eval = false;",
+    "new NamedWorker('./worker.mjs', safeMutationOptions);",
     "const lateMutationOptions: any = { enable() { this.eval = true; } };",
     "new NamedWorker('./worker.mjs', lateMutationOptions);",
     "lateMutationOptions.enable();",
@@ -1563,6 +1625,37 @@ test("accepts worker construction without inline evaluation", () => {
   ].join("\n");
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
 }, 20_000);
+test("accepts a shadowed Object.freeze wrapper around Worker", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "{",
+    "  const Object = { freeze(value: any) { return value; } };",
+    "  const WrappedWorker = Object.freeze(Worker);",
+    "  new WrappedWorker('./worker.mjs', { eval: false });",
+    "}"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual([]);
+});
+test("does not treat a shadowed Object.freeze result as Worker", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "const Object = { freeze(_value: any) { return class SafeWorker {}; } };",
+    "const SafeWorker = Object.freeze(Worker);",
+    "new SafeWorker('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual([]);
+});
+test("accepts unrelated bound member-held constructors", () => {
+  const source = [
+    "const make = () => class Ordinary {}.bind(null);",
+    "const holder = { make };",
+    "new (holder.make())();"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual([]);
+});
  test("accepts immediately invoked factory options without inline evaluation", () => {
  expect(inspectSupervisorSource("src/services/windows-process-host.ts",
  "import { Worker } from 'node:worker_threads'; " +

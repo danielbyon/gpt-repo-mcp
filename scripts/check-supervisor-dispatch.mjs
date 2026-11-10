@@ -352,6 +352,20 @@ const matches = declarations(scopeStatements);
     ts.SyntaxKind.BarBarEqualsToken,
     ts.SyntaxKind.AmpersandAmpersandEqualsToken
   ]);
+const workerOptionCompoundAssignmentKinds = new Set([
+  ts.SyntaxKind.PlusEqualsToken,
+  ts.SyntaxKind.MinusEqualsToken,
+  ts.SyntaxKind.AsteriskEqualsToken,
+  ts.SyntaxKind.AsteriskAsteriskEqualsToken,
+  ts.SyntaxKind.SlashEqualsToken,
+  ts.SyntaxKind.PercentEqualsToken,
+  ts.SyntaxKind.AmpersandEqualsToken,
+  ts.SyntaxKind.BarEqualsToken,
+  ts.SyntaxKind.CaretEqualsToken,
+  ts.SyntaxKind.LessThanLessThanEqualsToken,
+  ts.SyntaxKind.GreaterThanGreaterThanEqualsToken,
+  ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken
+]);
 const staticNumericNameOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node) return undefined;
@@ -534,28 +548,35 @@ const assignmentMemberPathKey = (receiver, property) => {
   const key = assignmentReferenceKey(receiver);
   return key === undefined ? undefined : JSON.stringify([key, property]);
 };
-  const recordAssignment = (target, value) => {
+  const recordAssignment = (
+    target, value, operator = ts.SyntaxKind.EqualsToken
+  ) => {
   const member = assignmentMemberAccess(target);
   if (member) {
     memberAssignmentTargets.push({
       node: target,
       receiver: member.receiver,
       property: member.property,
-      value
+      value,
+      operator
     });
     const key = assignmentReferenceKey(target);
-    if (key !== undefined) {
+    if (key !== undefined && operator !== "update") {
       const assignments = assignmentsByMemberPath.get(key) ?? [];
       assignments.push(value);
       assignmentsByMemberPath.set(key, assignments);
     }
     return;
   }
+  if (ts.isPrefixUnaryExpression(value) || ts.isPostfixUnaryExpression(value)) {
+    value = value.operand;
+  }
   if (ts.isElementAccessExpression(target)) {
     dynamicMemberAssignments.push({
       node: target,
       receiver: target.expression,
-      value
+      value,
+      operator
     });
     return;
   }
@@ -685,7 +706,7 @@ const recordNestedDestructuredProperties = (target, source) => {
     recordNestedDestructuredProperties(target, node.right);
     if (ts.isIdentifier(target) || assignmentMemberAccess(target) ||
         ts.isElementAccessExpression(target)) {
-        recordAssignment(target, node.right);
+        recordAssignment(target, node.right, node.operatorToken.kind);
     } else if (ts.isObjectLiteralExpression(target)) {
         const source = unwrap(node.right);
         for (const property of target.properties) {
@@ -713,6 +734,19 @@ const recordNestedDestructuredProperties = (target, source) => {
           if (targetName && value) recordAssignment(targetName, value);
         }
       }
+    }
+    if (ts.isBinaryExpression(node) &&
+        workerOptionCompoundAssignmentKinds.has(node.operatorToken.kind) &&
+        (assignmentMemberAccess(node.left) ||
+         ts.isElementAccessExpression(unwrap(node.left)))) {
+      recordAssignment(unwrap(node.left), node.right, node.operatorToken.kind);
+    }
+    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+        [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken]
+          .includes(node.operator) &&
+        (assignmentMemberAccess(node.operand) ||
+         ts.isElementAccessExpression(unwrap(node.operand)))) {
+      recordAssignment(unwrap(node.operand), node, "update");
     }
     ts.forEachChild(node, collectAssignments);
   };
@@ -1845,6 +1879,11 @@ const bindingPatternSourcePropertyOf = (
       ];
     }
 if (ts.isCallExpression(node)) {
+      const member = memberAccess(node.expression);
+      if (member?.property === "bind") {
+        const bound = localFunctionValuesOf(member.receiver, next);
+        if (bound.length > 0) return bound;
+      }
 return functionReturnExpressionsOf(node.expression, next)
 .flatMap((value) => localFunctionValuesOf(value, next));
 }
@@ -3672,6 +3711,20 @@ const workerConstructorOf = (input, seen = new Set()) => {
     next.add(node);
     if (workerReflectConstructorOf(node, seen)) return true;
     if (workerBoundConstructorPlanOf(node, seen)) return true;
+    const frozenValues = staticMethodInvocationPlanOf(
+      node, "freeze", globalPrototypeObjectOf, seen
+    );
+    if (frozenValues && callArgumentCandidatesAt(frozenValues, 0)
+      .some((value) => workerConstructorOf(value, next))) return true;
+    const invocation = localInvocationOf(
+      node.expression,
+      node.arguments ?? [],
+      ts.isNewExpression(node) ? "construct" : "call"
+    );
+    const alternatives = invocation?.alternatives ?? [invocation].filter(Boolean);
+    if (alternatives.some((alternative) => alternative.functions.some((fn) =>
+      functionReturnExpressionsOf(fn, next)
+        .some((value) => workerConstructorOf(value, next))))) return true;
     return functionReturnExpressionsOf(node.expression, next)
       .some((value) => workerConstructorOf(value, next));
   }
@@ -3882,6 +3935,21 @@ const inspectWorkerEvalValue = (value, findingNode, unproven) => {
   } else if (staticValue.truthy) {
     add(findingNode, "worker_threads inline evaluation is forbidden");
   }
+};
+const inspectWorkerEvalMutation = (assignment, unproven) => {
+  if (assignment.operator === ts.SyntaxKind.EqualsToken) {
+    inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
+    return;
+  }
+  const enablesEval = assignment.operator === "update" ||
+    [ts.SyntaxKind.PlusEqualsToken, ts.SyntaxKind.MinusEqualsToken,
+      ts.SyntaxKind.BarEqualsToken, ts.SyntaxKind.CaretEqualsToken]
+      .includes(assignment.operator);
+  if (enablesEval) {
+    add(assignment.node, "worker_threads inline evaluation is forbidden");
+    return;
+  }
+  add(assignment.node, unproven);
 };
 let workerCallExpressions;
 const workerOptionMutationReferenceKeysOf = (options, seen = new Set()) => {
@@ -4101,7 +4169,7 @@ const inspectKnownWorkerOptionMutations = (
       if (property === undefined) {
         add(assignment.node, unproven);
       } else if (property === "eval") {
-        inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
+        inspectWorkerEvalMutation(assignment, unproven);
       }
     }
   }
@@ -4196,7 +4264,7 @@ const inspectKnownWorkerOptionMutations = (
           unwrap(assignment.receiver).kind !== ts.SyntaxKind.ThisKeyword ||
           !directlyInsideFunctionOf(assignment.node, fn)) continue;
       if (assignment.property === "eval") {
-        inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
+        inspectWorkerEvalMutation(assignment, unproven);
       } else if (assignment.property === "__proto__") {
         inspectWorkerOptions(assignment.value, seen, reference, false);
       }
@@ -4211,7 +4279,7 @@ const inspectKnownWorkerOptionMutations = (
       if (property === undefined) {
         add(assignment.node, unproven);
       } else if (property === "eval") {
-        inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
+        inspectWorkerEvalMutation(assignment, unproven);
       } else if (property === "__proto__") {
         inspectWorkerOptions(assignment.value, seen, reference, false);
       }
@@ -4344,7 +4412,7 @@ const inspectWorkerOptions = (
     if (!canAffectOptions(assignment.node) ||
         !workerReferenceMatchesKeysOf(assignment.receiver, mutationKeys)) continue;
     if (assignment.property === "eval") {
-      inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
+      inspectWorkerEvalMutation(assignment, unproven);
     } else if (assignment.property === "__proto__") {
       inspectWorkerOptions(assignment.value, next, reference, false);
     }
