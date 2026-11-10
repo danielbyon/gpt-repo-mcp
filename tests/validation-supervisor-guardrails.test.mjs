@@ -767,6 +767,19 @@ test.each([
     "const alias = Object.getPrototypeOf(options); alias.eval = true; " +
     "new Worker('worker.js', options);",
     "worker_threads inline evaluation is forbidden"],
+  ["mutable getPrototypeOf alias",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); " +
+    "let alias = Object.getPrototypeOf(options); alias.eval = true; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["conditionally reassigned getPrototypeOf alias",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); " +
+    "let alias = Object.getPrototypeOf(options); declare const reset: boolean; " +
+    "if (reset) alias = {}; alias.eval = true; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
   ["destructured prototype alias",
     "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
     "const options: any = Object.create(proto); " +
@@ -776,6 +789,18 @@ test.each([
   ["Reflect-selected worker constructor",
     "import * as threads from 'node:worker_threads'; " +
     "const Thread = Reflect.get(threads, 'Worker'); " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["descriptor-selected worker constructor",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const { value: Thread } = " +
+    "Reflect.getOwnPropertyDescriptor({ Worker }, 'Worker')!; " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["unresolved descriptor-selected worker constructor",
+    "import { Worker } from 'node:worker_threads'; declare const key: string; " +
+    "const { value: Thread } = " +
+    "Reflect.getOwnPropertyDescriptor({ Worker }, key)!; " +
     "new Thread('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
   ["aliased Reflect-selected worker constructor",
@@ -933,6 +958,35 @@ test.each([
 "function enable(value) { value.eval = true; } const options = {}; " +
 "enable(options); new Worker('worker.js', options);",
 "worker_threads inline evaluation is forbidden"],
+  ["member-held option method mutation",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = { enable() { this.eval = true; } }; " +
+    "options.enable(); new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["assigned member-held option method mutation",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = {}; options.enable = function () { this.eval = true; }; " +
+    "options.enable(); new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["Reflect.apply option method mutation",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const options: any = { enable() { this.eval = true; } }; " +
+    "Reflect.apply(options.enable, options, []); new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["computed member-held option method mutation",
+    "import { Worker } from 'node:worker_threads'; declare const key: string; " +
+    "const options: any = { enable() { this[key] = true; } }; " +
+    "options.enable(); new Worker('worker.js', options);",
+    "worker_threads inline-evaluation options are unproven"],
+  ["unresolved member-held option method",
+    "import { Worker } from 'node:worker_threads'; import { load } from './load.js'; " +
+    "const options: any = {}; options.enable = load; options.enable(); " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline-evaluation options are unproven"],
+  ["unknown member-held option method",
+    "import { Worker } from 'node:worker_threads'; declare const key: string; " +
+    "const options: any = {}; options[key](); new Worker('worker.js', options);",
+    "worker_threads inline-evaluation options are unproven"],
 ["chained local option mutator",
 "import { Worker } from 'node:worker_threads'; " +
 "function enable(value) { value.eval = true; } " +
@@ -1195,6 +1249,28 @@ test("accepts worker construction without inline evaluation", () => {
     "new arrayWorker('./worker.mjs', { eval: false });",
 "const boundWorker = NamedWorker.bind(null, './worker.mjs', { eval: false });",
 "new boundWorker();",
+    "const methodOptions: any = {",
+    "  markEnabled() { this.enabled = true; },",
+    "  disableEvaluation() { this.eval = false; }",
+    "};",
+    "methodOptions.markEnabled();",
+    "methodOptions.disableEvaluation();",
+    "new NamedWorker('./worker.mjs', methodOptions);",
+    "const lateMutationOptions: any = { enable() { this.eval = true; } };",
+    "new NamedWorker('./worker.mjs', lateMutationOptions);",
+    "lateMutationOptions.enable();",
+    "const safeMutablePrototypeOptions: any = Object.create({});",
+    "let safeMutablePrototypeAlias = " +
+      "Object.getPrototypeOf(safeMutablePrototypeOptions);",
+    "safeMutablePrototypeAlias = {};",
+    "safeMutablePrototypeAlias.eval = true;",
+    "new NamedWorker('./worker.mjs', safeMutablePrototypeOptions);",
+    "const { value: DescriptorWorker } = " +
+      "Reflect.getOwnPropertyDescriptor({ Worker: NamedWorker }, 'Worker')!;",
+    "new DescriptorWorker('./worker.mjs', { eval: false });",
+    "const { value: SafeDescriptorWorker } = Reflect.getOwnPropertyDescriptor(",
+    "  { Worker: class SafeWorker {} }, 'Worker')!;",
+    "new SafeDescriptorWorker('./worker.mjs', { eval: true });",
     "const safeBind = NamedWorker.bind;",
     "const safeStoredBoundWorker = safeBind(null, './worker.mjs', { eval: false });",
     "new safeStoredBoundWorker();",

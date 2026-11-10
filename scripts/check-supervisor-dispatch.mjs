@@ -3700,6 +3700,9 @@ const workerConstructorOf = (input, seen = new Set()) => {
     binding.node.name, node.text, "Worker"
   ) &&
       workerNamespaceOf(binding.node.initializer, next)) return true;
+  if (binding.node.initializer && bindingPatternSelectsPropertyOf(
+    binding.node.name, node.text, "value"
+  ) && workerPropertyDescriptorValueOf(binding.node.initializer, next)) return true;
   const values = [
     ...bindingPatternValuesOf(
       binding.node.name, binding.node.initializer, node.text, next
@@ -3708,6 +3711,26 @@ const workerConstructorOf = (input, seen = new Set()) => {
       `${binding.node.pos}:${node.text}`) ?? [])
   ];
   return values.some((value) => workerConstructorOf(value, next));
+};
+const workerPropertyDescriptorValueOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node) || !ts.isCallExpression(node)) return false;
+  const next = new Set(seen);
+  next.add(node);
+  const plan = staticMethodInvocationPlanOf(
+    node, "getOwnPropertyDescriptor", globalReflectOf, seen
+  ) ?? staticMethodInvocationPlanOf(
+    node, "getOwnPropertyDescriptor", globalObjectOf, seen
+  );
+  if (!plan) return false;
+  const holdsWorker = callArgumentCandidatesAt(plan, 0).some((value) =>
+    workerMemberOf(value, "Worker", next));
+  if (!holdsWorker) return false;
+  const names = callArgumentCandidatesAt(plan, 1);
+  return names.length === 0 || names.some((value) => {
+    const name = staticStringOf(value);
+    return name === undefined || name === "Worker";
+  });
 };
 const classBodyCapabilityOf = (body, seen) => {
 if (!body) return false;
@@ -3842,6 +3865,31 @@ const workerOptionMutationReferenceKeysOf = (options, seen = new Set()) => {
   }
   return keys;
 };
+const workerAliasReferenceValuesOf = (binding, reference) => {
+  const referenceStart = reference.getStart(file);
+  const referenceOwner = enclosingFunctionOf(reference);
+  let referenceContainer = reference;
+  while (referenceContainer && !ts.isBlock(referenceContainer) &&
+      !ts.isSourceFile(referenceContainer) && !ts.isModuleBlock(referenceContainer)) {
+    referenceContainer = referenceContainer.parent;
+  }
+  const priorValues = (assignmentsByBinding.get(binding.node) ?? [])
+    .filter((value) => value.getStart(file) <= referenceStart &&
+      enclosingFunctionOf(value) === referenceOwner)
+    .sort((left, right) => left.getStart(file) - right.getStart(file));
+  const values = binding.node.initializer ? [binding.node.initializer] : [];
+  for (const value of priorValues) {
+    const assignment = value.parent;
+    const replacing = ts.isBinaryExpression(assignment) &&
+        assignment.right === value &&
+        assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isExpressionStatement(assignment.parent) &&
+        assignment.parent.parent === referenceContainer;
+    if (replacing) values.length = 0;
+    values.push(value);
+  }
+  return values;
+};
 const workerReferenceMatchesKeysOf = (
   input, targetKeys, seen = new Set()
 ) => {
@@ -3867,9 +3915,10 @@ const workerReferenceMatchesKeysOf = (
       next.add(node);
       next.add(binding.node);
       if (ts.isIdentifier(binding.node.name)) {
-        if (binding.constant && workerReferenceMatchesKeysOf(
-          binding.node.initializer, targetKeys, next
-        )) return true;
+        if (workerAliasReferenceValuesOf(binding, node).some((value) =>
+          workerReferenceMatchesKeysOf(
+            value, targetKeys, next
+          ))) return true;
       } else {
         if (binding.constant && bindingPatternSelectsPropertyOf(
           binding.node.name, node.text, "__proto__"
@@ -4037,6 +4086,84 @@ const inspectKnownWorkerOptionMutations = (
       }
     }
   };
+  let assignmentsByFunction;
+  const assignmentsForFunctionOf = (fn) => {
+    if (!assignmentsByFunction) {
+      const member = new Map();
+      const dynamic = new Map();
+      const addTo = (store, assignment) => {
+        const owner = enclosingFunctionOf(assignment.node);
+        const values = store.get(owner) ?? [];
+        values.push(assignment);
+        store.set(owner, values);
+      };
+      for (const assignment of memberAssignmentTargets) addTo(member, assignment);
+      for (const assignment of dynamicMemberAssignments) addTo(dynamic, assignment);
+      assignmentsByFunction = { member, dynamic };
+    }
+    return {
+      member: assignmentsByFunction.member.get(fn) ?? [],
+      dynamic: assignmentsByFunction.dynamic.get(fn) ?? []
+    };
+  };
+  const directlyInsideFunctionOf = (node, fn) => {
+    let current = node.parent;
+    while (current && current !== fn) {
+      if (ts.isFunctionLike(current)) return false;
+      current = current.parent;
+    }
+    return current === fn;
+  };
+  const inspectDirectFunctionMutations = (fn) => {
+    const assignments = assignmentsForFunctionOf(fn);
+    for (const assignment of assignments.member) {
+      if (!canAffectOptions(assignment.node) ||
+          unwrap(assignment.receiver).kind !== ts.SyntaxKind.ThisKeyword ||
+          !directlyInsideFunctionOf(assignment.node, fn)) continue;
+      if (assignment.property === "eval") {
+        inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
+      } else if (assignment.property === "__proto__") {
+        inspectWorkerOptions(assignment.value, seen, reference, false);
+      }
+    }
+    for (const assignment of assignments.dynamic) {
+      if (!canAffectOptions(assignment.node) ||
+          unwrap(assignment.receiver).kind !== ts.SyntaxKind.ThisKeyword ||
+          !directlyInsideFunctionOf(assignment.node, fn)) continue;
+      const property = staticStringAtInspectionOf(
+        assignment.node.argumentExpression
+      );
+      if (property === undefined) {
+        add(assignment.node, unproven);
+      } else if (property === "eval") {
+        inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
+      } else if (property === "__proto__") {
+        inspectWorkerOptions(assignment.value, seen, reference, false);
+      }
+    }
+  };
+  const inspectOptionMethodInvocation = (call) => {
+    const invocation = localInvocationOf(call.expression, call.arguments);
+    const alternatives = invocation?.alternatives ?? [invocation].filter(Boolean);
+    let inspectedMethod = false;
+    for (const alternative of alternatives) {
+      if (!(alternative.thisArguments ?? []).some(targetsOptions)) continue;
+      inspectedMethod = true;
+      for (const fn of alternative.functions) inspectDirectFunctionMutations(fn);
+    }
+    const callee = unwrap(call.expression);
+    const receiver =
+      ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)
+        ? callee.expression
+        : undefined;
+    if (!receiver || !targetsOptions(receiver)) return;
+    const property = ts.isPropertyAccessExpression(callee)
+      ? callee.name.text
+      : staticAssignmentNameOf(callee.argumentExpression);
+    if (property === undefined || !inspectedMethod) {
+      add(call, unproven);
+    }
+  };
   if (!workerCallExpressions) {
     workerCallExpressions = [];
     const collect = (node) => {
@@ -4047,6 +4174,7 @@ const inspectKnownWorkerOptionMutations = (
   }
   for (const node of workerCallExpressions) {
     if (!canAffectOptions(node)) continue;
+      inspectOptionMethodInvocation(node);
       const copiedArguments = objectAssignInvocationArgumentsOf(node, seen);
       if (copiedArguments &&
           (targetsOptions(copiedArguments[0]) || targetsOptions(node))) {
