@@ -941,6 +941,16 @@ test.each([
 "return choose ? { eval: false } : loadOptions(); } " +
 "new Worker('worker.js', getOptions());",
 "worker_threads inline-evaluation options are unproven"],
+["factory-created mutated options",
+"import { Worker } from 'node:worker_threads'; function getOptions(): any { " +
+"const options: any = {}; options.eval = true; return options; } " +
+"new Worker('worker.js', getOptions());",
+"worker_threads inline evaluation is forbidden"],
+["factory-created cyclic mutated options",
+"import { Worker } from 'node:worker_threads'; function getOptions(): any { " +
+"const options: any = {}; options.self = options; options.eval = true; return options; } " +
+"new Worker('worker.js', getOptions());",
+"worker_threads inline evaluation is forbidden"],
 ["local Worker constructor parameter",
 "import { Worker } from 'node:worker_threads'; " +
 "function launch(Ctor, options) { new Ctor('worker.js', options); } " +
@@ -1169,6 +1179,12 @@ test("accepts worker construction without inline evaluation", () => {
   "new NamedWorker('./worker.mjs', safeCreatedOptions);",
   "function safeFactoryOptions() { return useFirstSafeOptions ? { eval: false } : {}; }",
   "new NamedWorker('./worker.mjs', safeFactoryOptions());",
+  "function safeMutatedFactoryOptions(): any { const options: any = {}; options.eval = false; return options; }",
+  "new NamedWorker('./worker.mjs', safeMutatedFactoryOptions());",
+  "function safeCyclicFactoryOptions(): any { const options: any = {}; options.self = options; options.eval = false; return options; }",
+  "new NamedWorker('./worker.mjs', safeCyclicFactoryOptions());",
+  "function safeMultiFactoryOptions(alternate: boolean): any { const first: any = { eval: false }; const second: any = {}; if (alternate) return second; return first; }",
+  "new NamedWorker('./worker.mjs', safeMultiFactoryOptions(false));",
 "const safeHolderOptions = {}; const safeHolder = { options: safeHolderOptions };",
 "safeHolder.options.eval = false; new NamedWorker('./worker.mjs', safeHolderOptions);",
 "const safeAliasOptions = {}; const safeAliasHolder = { options: safeAliasOptions };",

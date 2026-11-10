@@ -3765,6 +3765,7 @@ const workerOptionMutationReferenceKeysOf = (options, seen = new Set()) => {
       for (const resolved of resolvedValuesOf(value, next)) {
         if (!ts.isCallExpression(resolved)) continue;
         queue.push(...objectCreatePrototypeValuesOf(resolved, next));
+      queue.push(...functionReturnExpressionsOf(resolved.expression, next));
       }
     }
   }
