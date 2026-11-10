@@ -3865,6 +3865,8 @@ const workerReferenceMatchesKeysOf = (
   if (!member) return false;
   const next = new Set(seen);
   next.add(node);
+  if (member.property === "__proto__" &&
+      workerReferenceMatchesKeysOf(member.receiver, targetKeys, next)) return true;
   return memberValueCandidatesOf(member.receiver, member.property, next)
     .some((value) => workerReferenceMatchesKeysOf(value, targetKeys, next));
 };
@@ -3965,6 +3967,8 @@ const inspectKnownWorkerOptionMutations = (
       add(call, unproven);
     } else if (property === "eval") {
       inspectWorkerEvalValue(value, value, unproven);
+    } else if (property === "__proto__") {
+      inspectWorkerOptions(value, seen, reference, false);
     }
   };
   const inspectDescriptorValue = (call, descriptor) => {

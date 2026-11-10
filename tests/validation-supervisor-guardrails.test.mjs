@@ -747,6 +747,15 @@ test.each([
     "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
     "options.__proto__ = { eval: true }; new Worker('worker.js', options);",
     "worker_threads inline evaluation is forbidden"],
+  ["Reflect.set prototype-assigned Worker options",
+    "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
+    "Reflect.set(options, '__proto__', { eval: true }); new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["inherited Worker options member",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); options.__proto__.eval = true; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
   ["Reflect-selected worker constructor",
     "import * as threads from 'node:worker_threads'; " +
     "const Thread = Reflect.get(threads, 'Worker'); " +
@@ -1328,6 +1337,13 @@ test("accepts worker construction without inline evaluation", () => {
   ["prototype-assigned Worker options",
     "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
     "options.__proto__ = { eval: false }; new Worker('worker.js', options);"],
+  ["Reflect.set prototype-assigned Worker options",
+    "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
+    "Reflect.set(options, '__proto__', { eval: false }); new Worker('worker.js', options);"],
+  ["inherited Worker options member",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); options.__proto__.eval = false; " +
+    "new Worker('worker.js', options);"],
   ["Reflect-selected worker constructor",
    "import * as threads from 'node:worker_threads'; " +
    "const Thread = Reflect.get(threads, 'Worker'); " +
