@@ -3233,6 +3233,26 @@ const workerMemberOf = (input, property, seen = new Set()) => {
       ts.isSpreadAssignment(property) &&
       workerNamespaceOf(property.expression, next)));
 };
+const workerBoundConstructorPlanOf = (input, seen = new Set()) => {
+ const node = unwrap(input);
+ if (!node || seen.has(node)) return undefined;
+ const next = new Set(seen);
+ next.add(node);
+ if (ts.isIdentifier(node)) {
+ const binding = resolveBinding(node);
+ if (binding?.kind === "variable" &&
+ ts.isVariableDeclaration(binding.node) &&
+ ts.isIdentifier(binding.node.name) && binding.node.initializer) {
+ return workerBoundConstructorPlanOf(binding.node.initializer, next);
+ }
+ return undefined;
+ }
+ if (!ts.isCallExpression(node)) return undefined;
+ const bind = memberAccess(node.expression);
+ if (bind?.property !== "bind" ||
+ !workerConstructorOf(bind.receiver, next)) return undefined;
+ return dropLeadingCallArgument(fixedCallArgumentPlanOf(node.arguments));
+};
 const workerConstructorOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
@@ -3252,6 +3272,7 @@ const workerConstructorOf = (input, seen = new Set()) => {
   if (ts.isCallExpression(node)) {
     const next = new Set(seen);
     next.add(node);
+ if (workerBoundConstructorPlanOf(node, seen)) return true;
     return functionReturnExpressionsOf(node.expression, next)
       .some((value) => workerConstructorOf(value, next));
   }
@@ -3288,6 +3309,22 @@ const workerConstructorOf = (input, seen = new Set()) => {
   ];
   return values.some((value) => workerConstructorOf(value, next));
 };
+const classBodyCapabilityOf = (body, seen) => {
+if (!body) return false;
+let found = false;
+const visit = (child) => {
+if (found || seen.has(child)) return;
+if (workerConstructorOf(child, seen) || workerNamespaceOf(child, seen)) {
+found = true;
+return;
+}
+const next = new Set(seen);
+next.add(child);
+ts.forEachChild(child, visit);
+};
+ts.forEachChild(body, visit);
+return found;
+};
 // Verified Worker capability must not escape the fixed supervisor inventory,
 // including through local helpers, arrays, classes, or exported containers.
 const workerCapabilityOf = (input, seen = new Set()) => {
@@ -3308,12 +3345,21 @@ const workerCapabilityOf = (input, seen = new Set()) => {
   const arrayValues = fixedSpreadValuesOf(node, seen);
   if (arrayValues?.some((value) => workerCapabilityOf(value, next))) return true;
   if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+for (const clause of node.heritageClauses ?? []) {
+if (clause.token !== ts.SyntaxKind.ExtendsKeyword) continue;
+for (const clauseType of clause.types) {
+if (workerCapabilityOf(clauseType.expression, next)) return true;
+}
+}
     for (const member of node.members) {
       if (ts.isPropertyDeclaration(member) && member.initializer &&
           workerCapabilityOf(member.initializer, next)) return true;
       if (ts.isMethodDeclaration(member) || ts.isGetAccessorDeclaration(member)) {
         if (workerCapabilityOf(member, next)) return true;
       }
+if ((ts.isConstructorDeclaration(member) ||
+ts.isClassStaticBlockDeclaration(member)) &&
+classBodyCapabilityOf(member.body, next)) return true;
     }
   }
   for (const object of objectValueCandidatesOf(node, seen)) {
@@ -3625,8 +3671,9 @@ const inspectWorkerOptions = (
     }
   }
 };
-const inspectWorkerConstruction = (call) => {
-  const plan = fixedCallArgumentPlanOf(call.arguments);
+const inspectWorkerConstruction = (
+ call, plan = fixedCallArgumentPlanOf(call.arguments)
+) => {
   const options = callArgumentCandidatesAt(plan, 1);
   if (plan.unknownIndex !== undefined && plan.unknownIndex <= 1) {
     add(call, "worker_threads inline-evaluation options are unproven");
@@ -3827,8 +3874,12 @@ if (ts.isVariableDeclaration(node) && node.initializer &&
     if (ts.isNewExpression(node) && dynamicFunctionOf(node.expression)) {
       add(node, "dynamic function construction is unaudited");
     }
-    if (ts.isNewExpression(node) && workerConstructorOf(node.expression)) {
-      inspectWorkerConstruction(node);
+if (ts.isNewExpression(node) && workerConstructorOf(node.expression)) {
+ const boundPlan = workerBoundConstructorPlanOf(node.expression);
+ inspectWorkerConstruction(node, boundPlan
+   ? mergeCallArgumentPlans(
+     boundPlan, fixedCallArgumentPlanOf(node.arguments ?? []))
+   : undefined);
     }
   if (ts.isCallExpression(node) &&
       reflectConstructReferenceOf(node.expression) &&

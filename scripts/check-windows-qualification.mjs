@@ -4374,6 +4374,10 @@ const descriptorGetterCapabilityOf = (input, seen = new Set()) => {
   if (reflectedApply && descriptorGetterCapabilityOf(reflectedApply[0], next)) {
     return true;
   }
+  const directCallee = unwrap(node.expression);
+  if (ts.isIdentifier(directCallee)) {
+    return descriptorGetterCapabilityOf(directCallee, next);
+  }
   return Boolean(invoked && ["apply", "bind", "call"].includes(invoked.method) &&
     descriptorGetterCapabilityOf(invoked.receiver, next));
 };

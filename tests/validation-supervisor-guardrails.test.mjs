@@ -530,6 +530,16 @@ test.each([
     "import { Worker as Thread } from 'node:worker_threads'; " +
     "const WorkerConstructor = Thread; new WorkerConstructor('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
+["bound constructor arguments",
+"import { Worker } from 'node:worker_threads'; " +
+"const WorkerConstructor = Worker.bind(null, 'worker.js', { eval: true }); " +
+"new WorkerConstructor();",
+"worker_threads inline evaluation is forbidden"],
+["unresolved bound constructor arguments",
+"import { Worker } from 'node:worker_threads'; declare const args: any[]; " +
+"const WorkerConstructor = Worker.bind(null, ...args); " +
+"new WorkerConstructor();",
+"worker_threads inline-evaluation options are unproven"],
   ["comma-selected constructor alias",
     "import { Worker } from 'node:worker_threads'; " +
     "const WorkerConstructor = (0, Worker); new WorkerConstructor('worker.js', { eval: true });",
@@ -814,6 +824,9 @@ test.each([
   ["member-held exported factory", "const getWorker = () => Worker; export const tools = { make: () => getWorker() };"],
   ["array-held constructor", "export const runtime = [Worker];"],
   ["class-held constructor", "export class Box { static make() { return Worker; } }"],
+  ["class heritage", "export class Box extends Worker {}"],
+  ["class constructor member", "export class Box { constructor() { this.make = Worker; } }"],
+  ["class static block member", "export class Box { static { this.make = Worker; } }"],
   ["bound constructor", "export const make = Worker.bind(null);"],
   ["bound constructor argument", "const wrap = (value) => value; export const make = wrap.bind(null, Worker);"]
 ])("rejects worker capability %s", (_name, declaration) => {
@@ -835,6 +848,8 @@ test("accepts worker module exports that exclude constructor capability", () => 
     "export const safeTools = { make: getMainThread };",
     "export const safeRuntime = [isMainThread];",
     "export class SafeBox { static read() { return isMainThread; } }",
+    "export class SafeExtended extends Array {}",
+    "export class SafeMembers { constructor() { this.value = 1; } static { this.other = 2; } }",
     "export const safeBound = getMainThread.bind(null);",
     "export default 1;"
   ].join("\n");
@@ -888,6 +903,8 @@ test("accepts worker construction without inline evaluation", () => {
     "new (getWorker())('./worker.mjs', { eval: false });",
     "const arrayWorker = [NamedWorker][0];",
     "new arrayWorker('./worker.mjs', { eval: false });",
+"const boundWorker = NamedWorker.bind(null, './worker.mjs', { eval: false });",
+"new boundWorker();",
     "const { ...commonJsNamespace } = require('node:worker_threads');",
     "new commonJsNamespace.Worker('./worker.mjs', { eval: false });",
     "Reflect.construct(NamedWorker, ['./worker.mjs', { eval: false }]);",
