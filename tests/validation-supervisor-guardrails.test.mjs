@@ -814,7 +814,8 @@ test.each([
   ["member-held exported factory", "const getWorker = () => Worker; export const tools = { make: () => getWorker() };"],
   ["array-held constructor", "export const runtime = [Worker];"],
   ["class-held constructor", "export class Box { static make() { return Worker; } }"],
-  ["bound constructor", "export const make = Worker.bind(null);"]
+  ["bound constructor", "export const make = Worker.bind(null);"],
+  ["bound constructor argument", "const wrap = (value) => value; export const make = wrap.bind(null, Worker);"]
 ])("rejects worker capability %s", (_name, declaration) => {
   const source = "import { Worker } from 'node:worker_threads'; " + declaration;
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)

@@ -566,6 +566,7 @@ const activeBindingValuesOf = (declaration, reference) => {
 };
   const runnerAssignmentsByBinding = new Map();
   const destructuredAssignmentsByBinding = new Map();
+  const destructuredAssignmentSourcesByBinding = new Map();
   const destructuredPropertyAssignmentsByBinding = new Map();
   const arrayMutationValuesByBinding = new Map();
 const assignmentsByMemberPath = new Map();
@@ -683,6 +684,26 @@ const sourcePropertyValue = (source, key) => {
 };
   const recordDestructuredAssignments = (target, source) => {
     source = unwrap(source);
+    if (ts.isObjectLiteralExpression(target)) {
+      for (const property of target.properties) {
+        if (ts.isSpreadAssignment(property)) continue;
+        const key = assignmentKey(property.name);
+        const targetValue = ts.isShorthandPropertyAssignment(property)
+          ? property.name
+          : ts.isPropertyAssignment(property)
+          ? unwrap(property.initializer) : undefined;
+        if (key === undefined || !targetValue ||
+            !ts.isIdentifier(targetValue)) continue;
+        const binding = resolveBinding(targetValue);
+        if (!binding?.node) continue;
+        const sources = destructuredAssignmentSourcesByBinding.get(binding.node) ?? [];
+        if (!sources.some((entry) =>
+          entry.key === key && entry.source === source)) {
+          sources.push({ key, source });
+          destructuredAssignmentSourcesByBinding.set(binding.node, sources);
+        }
+      }
+    }
     if (ts.isObjectLiteralExpression(target) && vitestNamespaceOf(source)) {
       for (const property of target.properties) {
         const key = ts.isShorthandPropertyAssignment(property)
@@ -4316,6 +4337,11 @@ const descriptorGetterCapabilityOf = (input, seen = new Set()) => {
           declaration.initializer, "get", ["test", "it", "describe"],
           declarationNext
         )) return true;
+    if ((destructuredAssignmentSourcesByBinding.get(declaration) ?? [])
+      .some((entry) => entry.key === "get" &&
+        selectedExtractionContainerOf(
+          entry.source, "get", ["test", "it", "describe"], declarationNext
+        ))) return true;
     return values.some((value) => value &&
       descriptorGetterCapabilityOf(value, declarationNext));
   }

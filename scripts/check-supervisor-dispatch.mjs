@@ -3296,7 +3296,10 @@ const workerCapabilityOf = (input, seen = new Set()) => {
   if (ts.isCallExpression(node)) {
     const bound = memberAccess(node.expression);
     if (bound?.property === "bind") {
-      return workerConstructorOf(bound.receiver, seen);
+      const next = new Set(seen);
+      next.add(node);
+      return workerCapabilityOf(bound.receiver, next) ||
+        node.arguments.some((argument) => workerCapabilityOf(argument, next));
     }
   }
   if (workerConstructorOf(node, seen) || workerNamespaceOf(node, seen)) return true;
