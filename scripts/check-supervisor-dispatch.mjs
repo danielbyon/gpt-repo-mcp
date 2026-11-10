@@ -3647,6 +3647,13 @@ const workerConstructorOf = (input, seen = new Set()) => {
   if (earlyMember) {
     const memberNext = new Set(seen);
     memberNext.add(node);
+    if (earlyMember.property === "value" &&
+        workerPropertyDescriptorValueOf(earlyMember.receiver, memberNext)) return true;
+    if (earlyMember.property === "constructor") {
+      const prototypeMember = memberAccess(earlyMember.receiver);
+      if (prototypeMember?.property === "prototype" &&
+          workerConstructorOf(prototypeMember.receiver, memberNext)) return true;
+    }
     if (workerMemberOf(
       earlyMember.receiver, earlyMember.property, memberNext
     )) return true;

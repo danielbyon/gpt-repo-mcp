@@ -803,6 +803,18 @@ test.each([
     "Reflect.getOwnPropertyDescriptor({ Worker }, key)!; " +
     "new Thread('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
+  ["descriptor value worker constructor",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const Thread = " +
+    "Reflect.getOwnPropertyDescriptor({ Worker }, 'Worker')!.value; " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["unresolved descriptor value worker constructor",
+    "import { Worker } from 'node:worker_threads'; declare const key: string; " +
+    "const Thread = " +
+    "Reflect.getOwnPropertyDescriptor({ Worker }, key)!.value; " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
   ["aliased Reflect-selected worker constructor",
     "import * as threads from 'node:worker_threads'; const read = Reflect.get; " +
     "const Thread = read(threads, 'Worker'); " +
@@ -817,6 +829,24 @@ test.each([
     "import * as threads from 'node:worker_threads'; " +
     "const Thread = Reflect.get(threads, 'Worker'); " +
     "Reflect.construct(Thread, ['worker.js', { eval: true }]);",
+    "worker_threads inline evaluation is forbidden"],
+  ["Worker prototype constructor",
+    "import { Worker } from 'node:worker_threads'; " +
+    "new Worker.prototype.constructor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["bracket Worker prototype constructor",
+    "import { Worker } from 'node:worker_threads'; " +
+    "new Worker['prototype']['constructor']('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["aliased Worker prototype constructor",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const Thread = Worker.prototype.constructor; " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["Reflect.construct Worker prototype constructor",
+    "import { Worker } from 'node:worker_threads'; " +
+    "Reflect.construct(Worker.prototype.constructor, " +
+    "['worker.js', { eval: true }]);",
     "worker_threads inline evaluation is forbidden"],
   ["mutable namespace alias",
     "import * as threads from 'node:worker_threads'; " +
@@ -1226,6 +1256,7 @@ test("accepts worker construction without inline evaluation", () => {
     "new MutableThreads.Worker('./worker.mjs', { eval: false });",
     "new NamedWorker('./worker.mjs');",
     "new NamedWorker('./worker.mjs', { type: 'module' });",
+    "new NamedWorker.prototype.constructor('./worker.mjs', { eval: false });",
     "const safeOptions = { eval: false };",
     "new NamedWorker('./worker.mjs', safeOptions);",
     "new NamedWorker('./worker.mjs', { ...safeOptions });",
@@ -1268,6 +1299,9 @@ test("accepts worker construction without inline evaluation", () => {
     "const { value: DescriptorWorker } = " +
       "Reflect.getOwnPropertyDescriptor({ Worker: NamedWorker }, 'Worker')!;",
     "new DescriptorWorker('./worker.mjs', { eval: false });",
+    "const DescriptorValueWorker = " +
+      "Reflect.getOwnPropertyDescriptor({ Worker: NamedWorker }, 'Worker')!.value;",
+    "new DescriptorValueWorker('./worker.mjs', { eval: false });",
     "const { value: SafeDescriptorWorker } = Reflect.getOwnPropertyDescriptor(",
     "  { Worker: class SafeWorker {} }, 'Worker')!;",
     "new SafeDescriptorWorker('./worker.mjs', { eval: true });",
