@@ -1647,6 +1647,161 @@ test("does not treat a shadowed Object.freeze result as Worker", () => {
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
     .toEqual([]);
 });
+test("preserves Worker identity through unmodified Object.freeze", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "const FrozenWorker = Object.freeze(Worker);",
+    "new FrozenWorker('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual(expect.arrayContaining([
+      expect.stringContaining("worker_threads inline evaluation is forbidden")
+    ]));
+});
+test("accepts an overwritten Object.freeze alias returning a safe constructor", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "const O: any = Object;",
+    "O.freeze = (_value: any) => class SafeWorker {};",
+    "const SafeWorker = O.freeze(Worker);",
+    "new SafeWorker('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual([]);
+});
+test("accepts a direct Object.freeze replacement returning a safe constructor", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "Object.freeze = (_value: any) => class SafeWorker {};",
+    "const SafeWorker = Object.freeze(Worker);",
+    "new SafeWorker('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual([]);
+});
+test("rejects an overwritten Object.freeze alias that returns Worker", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "const O: any = Object;",
+    "O.freeze = (_value: any) => Worker;",
+    "const ReturnedWorker = O.freeze(Worker);",
+    "new ReturnedWorker('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual(expect.arrayContaining([
+      expect.stringContaining("worker_threads inline evaluation is forbidden")
+    ]));
+});
+test("fails closed when an overwritten Object.freeze result is unresolved", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "declare const replacement: any;",
+    "const O: any = Object;",
+    "O.freeze = replacement;",
+    "const UnknownWorker = O.freeze(Worker);",
+    "new UnknownWorker('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual(expect.arrayContaining([
+      expect.stringMatching(
+        /worker_threads inline-evaluation options are unproven|worker_threads inline evaluation is forbidden/
+      )
+    ]));
+});
+test("uses the Object.freeze intrinsic only before a later replacement", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "class SafeConstructor {}",
+    "const FrozenSafeConstructor = Object.freeze(SafeConstructor);",
+    "Object.freeze = (_value: any) => Worker;",
+    "new FrozenSafeConstructor('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual([]);
+});
+test("does not let an uncalled replacement shadow the Object.freeze intrinsic", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "function replaceFreeze() {",
+    "  Object.freeze = (_value: any) => class SafeWorker {};",
+    "}",
+    "const FrozenWorker = Object.freeze(Worker);",
+    "new FrozenWorker('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual(expect.arrayContaining([
+      expect.stringContaining("worker_threads inline evaluation is forbidden")
+    ]));
+});
+test("does not treat a conditional Object.freeze write as definite", () => {
+  const shortCircuitSource = [
+    "import { Worker } from 'node:worker_threads';",
+    "declare const replaceFreeze: boolean;",
+    "replaceFreeze && (Object.freeze = (_value: any) => class SafeWorker {});",
+    "const FrozenWorker = Object.freeze(Worker);",
+    "new FrozenWorker('worker.js', { eval: true });"
+  ].join("\n");
+  const ifBranchSource = [
+    "import { Worker } from 'node:worker_threads';",
+    "declare const replaceFreeze: boolean;",
+    "if (replaceFreeze) Object.freeze = (_value: any) => class SafeWorker {};",
+    "const FrozenWorker = Object.freeze(Worker);",
+    "new FrozenWorker('worker.js', { eval: true });"
+  ].join("\n");
+  for (const source of [shortCircuitSource, ifBranchSource]) {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .toEqual(expect.arrayContaining([
+        expect.stringContaining("worker_threads inline evaluation is forbidden")
+      ]));
+  }
+});
+test("fails closed when a function may read Object.freeze after a later write", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "class SafeConstructor {}",
+    "function constructLater() {",
+    "  const MaybeWorker = Object.freeze(SafeConstructor);",
+    "  new MaybeWorker('worker.js', { eval: true });",
+    "}",
+    "Object.freeze = (_value: any) => Worker;",
+    "constructLater();"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual(expect.arrayContaining([
+      expect.stringMatching(
+        /worker_threads inline-evaluation options are unproven|worker_threads inline evaluation is forbidden/
+      )
+    ]));
+});
+test("accepts safe options when Object.freeze identity is unresolved", () => {
+  const source = [
+    "function replaceFreeze() {",
+    "  Object.freeze = (_value: any) => class SafeWorker {};",
+    "}",
+    "class SafeConstructor {}",
+    "const FrozenSafeConstructor = Object.freeze(SafeConstructor);",
+    "new FrozenSafeConstructor('worker.js', { eval: false });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual([]);
+});
+test("fails closed when a loop may skip an Object.freeze write", () => {
+  const source = [
+    "import { Worker } from 'node:worker_threads';",
+    "declare const keepLooping: boolean;",
+    "while (keepLooping) {",
+    "  Object.freeze = (_value: any) => class SafeWorker {};",
+    "}",
+    "const FrozenWorker = Object.freeze(Worker);",
+    "new FrozenWorker('worker.js', { eval: true });"
+  ].join("\n");
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+    .toEqual(expect.arrayContaining([
+      expect.stringMatching(
+        /worker_threads inline-evaluation options are unproven|worker_threads inline evaluation is forbidden/
+      )
+    ]));
+});
 test("accepts unrelated bound member-held constructors", () => {
   const source = [
     "const make = () => class Ordinary {}.bind(null);",

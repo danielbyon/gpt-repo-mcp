@@ -2959,6 +2959,103 @@ const inspectCapabilityArrayDestructuring = (target, source) => {
     return Boolean(member && ["Object", "Reflect"].includes(member.property) &&
       globalObjectOf(member.receiver, seen));
   };
+const globalObjectConstructorOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  if (assignmentReferenceKey(node) === "global:Object") return true;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    if (!binding?.node || seen.has(binding.node) ||
+        !(ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node))) {
+      return false;
+    }
+    return [
+      ...activeBindingValuesOf(binding.node, node),
+      ...(parameterValueArguments.get(binding.node) ?? [])
+    ].some((value) => globalObjectConstructorOf(value, next));
+  }
+  const member = memberAccess(node);
+  return Boolean(member?.property === "Object" &&
+    globalObjectOf(member.receiver, next));
+};
+const statementBlockOf = (input) => {
+  let statement = input;
+  while (statement && !ts.isStatement(statement)) statement = statement.parent;
+  if (!statement || !(ts.isExpressionStatement(statement) ||
+      ts.isVariableStatement(statement))) return undefined;
+  const block = statement.parent;
+  return ts.isBlock(block) || ts.isSourceFile(block) ? block : undefined;
+};
+const definiteAssignmentBlockOf = (input) => {
+  let statement = input;
+  while (statement && !ts.isStatement(statement)) {
+    if (ts.isConditionalExpression(statement) ||
+        (ts.isBinaryExpression(statement) && [
+          ts.SyntaxKind.AmpersandAmpersandToken,
+          ts.SyntaxKind.BarBarToken,
+          ts.SyntaxKind.QuestionQuestionToken,
+          ts.SyntaxKind.AmpersandAmpersandEqualsToken,
+          ts.SyntaxKind.BarBarEqualsToken,
+          ts.SyntaxKind.QuestionQuestionEqualsToken
+        ].includes(statement.operatorToken.kind))) return undefined;
+    statement = statement.parent;
+  }
+  if (!statement || !(ts.isExpressionStatement(statement) ||
+      ts.isVariableStatement(statement))) return undefined;
+  const block = statement.parent;
+  if (!(ts.isBlock(block) || ts.isSourceFile(block))) return undefined;
+  const statementIndex = block.statements.indexOf(statement);
+  if (statementIndex < 0 || block.statements.slice(0, statementIndex).some((prior) =>
+    ts.isReturnStatement(prior) || ts.isThrowStatement(prior) ||
+    ts.isBreakStatement(prior) || ts.isContinueStatement(prior))) return undefined;
+  return block;
+};
+const objectFreezeMutationStatusOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return undefined;
+  const next = new Set(seen);
+  next.add(node);
+  const member = memberAccess(node);
+  if (member?.property === "freeze" &&
+      globalObjectConstructorOf(member.receiver)) {
+    const referenceBlock = statementBlockOf(node);
+    const referenceStart = node.getStart(file);
+    const objectFreezeWrites = memberAssignmentTargets.filter((assignment) =>
+      assignment.property === "freeze" &&
+      globalObjectConstructorOf(assignment.receiver));
+    const referenceFunction = enclosingFunctionOf(node);
+    if (referenceFunction && objectFreezeWrites.some((assignment) =>
+      enclosingFunctionOf(assignment.node) !== referenceFunction)) {
+      return "unresolved";
+    }
+    const writes = objectFreezeWrites.filter((assignment) =>
+      assignment.node.getStart(file) < referenceStart);
+    if (writes.length === 0) return "unmodified";
+    // A write in another block may not run before this call.
+    if (referenceBlock && writes.every((assignment) =>
+      definiteAssignmentBlockOf(assignment.node) === referenceBlock)) return "replaced";
+    return "unresolved";
+  }
+  if (!ts.isIdentifier(node)) return undefined;
+  const binding = resolveBinding(node);
+  if (!binding?.node || seen.has(binding.node) ||
+      !(ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node))) {
+    return undefined;
+  }
+  const statuses = [
+    ...activeBindingValuesOf(binding.node, node),
+    ...(parameterValueArguments.get(binding.node) ?? [])
+  ].map((value) => objectFreezeMutationStatusOf(value, next)).filter(Boolean);
+  const distinctStatuses = new Set(statuses);
+  if (distinctStatuses.size > 1 || distinctStatuses.has("unresolved")) {
+    return "unresolved";
+  }
+  return distinctStatuses.values().next().value;
+};
+const objectFreezeOverwrittenBeforeOf = (input) =>
+  ["replaced", "unresolved"].includes(objectFreezeMutationStatusOf(input));
 const staticMethodReferenceOf = (
   input, property, ownerOf, seen = new Set()
 ) => {
@@ -2976,7 +3073,9 @@ const staticMethodReferenceOf = (
   }
   const member = memberAccess(node);
   if (member) {
-    if (member.property === property && ownerOf(member.receiver, next)) return true;
+    if (member.property === property && ownerOf(member.receiver, next) &&
+        !(property === "freeze" &&
+          objectFreezeOverwrittenBeforeOf(node))) return true;
     if (memberValueCandidatesOf(member.receiver, member.property, next)
       .some((value) => staticMethodReferenceOf(value, property, ownerOf, next))) {
       return true;
@@ -3670,6 +3769,20 @@ const workerBoundConstructorPlanOf = (input, seen = new Set()) => {
  }
  return undefined;
 };
+const plainClassConstructorOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+    return !(node.heritageClauses ?? []).some((clause) =>
+      clause.token === ts.SyntaxKind.ExtendsKeyword);
+  }
+  const next = new Set(seen);
+  next.add(node);
+  const values = resolvedValuesOf(node, next)
+    .filter((value) => value !== node);
+  return values.length > 0 &&
+    values.every((value) => plainClassConstructorOf(value, next));
+};
 const workerConstructorOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
@@ -3711,22 +3824,38 @@ const workerConstructorOf = (input, seen = new Set()) => {
     next.add(node);
     if (workerReflectConstructorOf(node, seen)) return true;
     if (workerBoundConstructorPlanOf(node, seen)) return true;
+    const freezeStatus = objectFreezeMutationStatusOf(node.expression);
     const frozenValues = staticMethodInvocationPlanOf(
       node, "freeze", globalPrototypeObjectOf, seen
     );
-    if (frozenValues && callArgumentCandidatesAt(frozenValues, 0)
-      .some((value) => workerConstructorOf(value, next))) return true;
+    if (frozenValues) {
+      return callArgumentCandidatesAt(frozenValues, 0)
+        .some((value) => workerConstructorOf(value, next));
+    }
     const invocation = localInvocationOf(
       node.expression,
       node.arguments ?? [],
       ts.isNewExpression(node) ? "construct" : "call"
     );
     const alternatives = invocation?.alternatives ?? [invocation].filter(Boolean);
-    if (alternatives.some((alternative) => alternative.functions.some((fn) =>
-      functionReturnExpressionsOf(fn, next)
-        .some((value) => workerConstructorOf(value, next))))) return true;
-    return functionReturnExpressionsOf(node.expression, next)
-      .some((value) => workerConstructorOf(value, next));
+    const invocationReturns = alternatives.flatMap((alternative) =>
+      alternative.functions.flatMap((fn) =>
+        functionReturnExpressionsOf(fn, next)));
+    if (invocationReturns.some((value) => workerConstructorOf(value, next))) {
+      return true;
+    }
+    const expressionReturns = functionReturnExpressionsOf(node.expression, next);
+    if (expressionReturns.some((value) => workerConstructorOf(value, next))) {
+      return true;
+    }
+    if (freezeStatus === "unresolved") return true;
+    if (freezeStatus === "replaced") {
+      const replacementReturns = invocationReturns.length > 0
+        ? invocationReturns : expressionReturns;
+      return replacementReturns.length === 0 ||
+        replacementReturns.some((value) => !plainClassConstructorOf(value));
+    }
+    return false;
   }
   if (!ts.isIdentifier(node)) return false;
   const binding = resolveBinding(node);
