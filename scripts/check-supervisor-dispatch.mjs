@@ -2917,6 +2917,10 @@ const staticMethodReferenceOf = (
   if (!node || seen.has(node)) return false;
   const next = new Set(seen);
   next.add(node);
+  if (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return staticMethodReferenceOf(node.right, property, ownerOf, next);
+  }
   if (ts.isGetAccessorDeclaration(node) || ts.isFunctionLike(node)) {
     return functionReturnExpressionsOf(node, next)
       .some((value) => staticMethodReferenceOf(value, property, ownerOf, next));
@@ -3797,15 +3801,61 @@ const workerReferenceMatchesKeysOf = (
   return memberValueCandidatesOf(member.receiver, member.property, next)
     .some((value) => workerReferenceMatchesKeysOf(value, targetKeys, next));
 };
+const workerOptionFactoryReturnExpressionsOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return [];
+  const next = new Set(seen);
+  next.add(node);
+  if (!ts.isCallExpression(node)) return functionReturnExpressionsOf(node, next);
+  return localFunctionValuesOf(node.expression, next)
+    .flatMap((value) => functionReturnExpressionsOf(value, next));
+};
+const firstDirectReturnByBlock = new WeakMap();
+const workerMutationIsUnreachableOf = (node) => {
+  for (let current = node; current && !ts.isFunctionLike(current);
+       current = current.parent) {
+    const block = current.parent;
+    if (!block || !ts.isBlock(block)) continue;
+    let firstReturn = firstDirectReturnByBlock.get(block);
+    if (!firstDirectReturnByBlock.has(block)) {
+      firstReturn = block.statements.find(ts.isReturnStatement);
+      firstDirectReturnByBlock.set(block, firstReturn);
+    }
+    if (firstReturn && firstReturn !== current &&
+        firstReturn.getEnd() <= current.getStart(file)) {
+      return true;
+    }
+  }
+  return false;
+};
+// A mutation can affect Worker options when it is evaluated in the constructor
+// argument or in the bounded local factory that produced the options value.
+const workerOptionMutationCanAffectOf = (options, reference) => {
+  const referenceEnd = reference?.getEnd() ?? Number.POSITIVE_INFINITY;
+  const functions = new Set(workerOptionFactoryReturnExpressionsOf(options)
+    .map((value) => {
+      let owner = value.parent;
+      while (owner && !ts.isFunctionLike(owner)) owner = owner.parent;
+      return owner;
+    })
+    .filter(Boolean));
+  return (node) => {
+    if (workerMutationIsUnreachableOf(node)) return false;
+    if (node.getStart(file) <= referenceEnd) return true;
+    let owner = node.parent;
+    while (owner && !ts.isFunctionLike(owner)) owner = owner.parent;
+    return functions.has(owner);
+  };
+};
 const inspectKnownWorkerOptionMutations = (
   options, reference, seen, unproven, targetKeys
 ) => {
   if (!reference || targetKeys.size === 0) return;
-  const referenceEnd = reference.getEnd();
+  const canAffectOptions = workerOptionMutationCanAffectOf(options, reference);
   const targetsOptions = (candidate) =>
     workerReferenceMatchesKeysOf(candidate, targetKeys);
   for (const assignment of dynamicMemberAssignments) {
-    if (assignment.node.getStart(file) <= referenceEnd &&
+    if (canAffectOptions(assignment.node) &&
         targetsOptions(assignment.receiver)) {
       const property = staticStringAtInspectionOf(
         assignment.node.argumentExpression
@@ -3879,11 +3929,12 @@ const inspectKnownWorkerOptionMutations = (
     ts.forEachChild(file, collect);
   }
   for (const node of workerCallExpressions) {
-    if (node.getStart(file) > referenceEnd) continue;
+    if (!canAffectOptions(node)) continue;
       const copiedArguments = objectAssignInvocationArgumentsOf(node, seen);
-      if (copiedArguments && targetsOptions(copiedArguments[0])) {
+      if (copiedArguments &&
+          (targetsOptions(copiedArguments[0]) || targetsOptions(node))) {
         for (const source of copiedArguments.slice(1)) {
-          inspectWorkerOptions(source, seen, reference, false);
+          inspectWorkerOptions(source, seen, reference, true);
         }
       }
       const setPlan = staticMethodInvocationPlanOf(
@@ -3966,12 +4017,11 @@ const inspectWorkerOptions = (
       options, reference, next, unproven, mutationKeys
     );
   }
-  // The options expression is evaluated before Worker construction, so an
   // inline local factory may mutate its result after the outer call starts.
-  const referenceEnd = reference?.getEnd() ?? Number.POSITIVE_INFINITY;
+  const canAffectOptions = workerOptionMutationCanAffectOf(options, reference);
   for (const assignment of memberAssignmentTargets) {
     if (assignment.property === "eval" &&
-        assignment.node.getStart(file) <= referenceEnd &&
+        canAffectOptions(assignment.node) &&
         workerReferenceMatchesKeysOf(assignment.receiver, mutationKeys)) {
       inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
     }

@@ -966,6 +966,21 @@ test.each([
   "new Worker('worker.js', (() => { const options: any = {}; " +
   "Reflect.set(options, 'eval', true); return options; })());",
   "worker_threads inline evaluation is forbidden"],
+ ["comma-wrapped Reflect.set eval mutation",
+  "import { Worker } from 'node:worker_threads'; " +
+  "new Worker('worker.js', (() => { const options: any = {}; " +
+  "(0, Reflect.set)(options, 'eval', true); return options; })());",
+  "worker_threads inline evaluation is forbidden"],
+ ["Object.assign-copied factory eval mutation",
+  "import { Worker } from 'node:worker_threads'; " +
+  "new Worker('worker.js', Object.assign({}, (() => { const options: any = {}; " +
+  "options.eval = true; return options; })()));",
+  "worker_threads inline evaluation is forbidden"],
+ ["hoisted factory declared after Worker call",
+  "import { Worker } from 'node:worker_threads'; " +
+  "new Worker('worker.js', make()); " +
+  "function make(): any { const options: any = {}; options.eval = true; return options; }",
+  "worker_threads inline evaluation is forbidden"],
 ["local Worker constructor parameter",
 "import { Worker } from 'node:worker_threads'; " +
 "function launch(Ctor, options) { new Ctor('worker.js', options); } " +
@@ -1244,6 +1259,27 @@ test("accepts worker construction without inline evaluation", () => {
  "import { Worker } from 'node:worker_threads'; " +
  "new Worker('worker.js', (() => { const options: any = {}; " +
  "options.type = 'module'; options.eval = false; return options; })());")).toEqual([]);
+ });
+
+ test.each([
+  ["Object.assign-copied factory",
+   "import { Worker } from 'node:worker_threads'; " +
+   "new Worker('worker.js', Object.assign({}, (() => { const options: any = {}; " +
+   "options.eval = false; return options; })()));"],
+  ["hoisted factory declared after Worker call",
+   "import { Worker } from 'node:worker_threads'; " +
+   "new Worker('worker.js', make()); " +
+   "function make(): any { const options: any = {}; options.eval = false; return options; }"],
+  ["hoisted factory mutation after unconditional return",
+   "import { Worker } from 'node:worker_threads'; " +
+   "new Worker('worker.js', make()); " +
+   "function make(): any { const options: any = {}; return options; options.eval = true; }"],
+  ["comma-wrapped Reflect.set factory",
+   "import { Worker } from 'node:worker_threads'; " +
+   "new Worker('worker.js', (() => { const options: any = {}; " +
+   "(0, Reflect.set)(options, 'eval', false); return options; })());"]
+ ])("accepts safe %s options without inline evaluation", (_name, source) => {
+  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
  });
 
 test("accepts type-only node:module imports", () => {
