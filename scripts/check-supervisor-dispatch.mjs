@@ -3848,17 +3848,38 @@ const workerReferenceMatchesKeysOf = (
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
   if (targetKeys.has(assignmentReferenceKey(node))) return true;
+  if (ts.isCallExpression(node)) {
+    const prototypePlan = staticMethodInvocationPlanOf(
+      node, "getPrototypeOf", globalPrototypeObjectOf, seen
+    ) ?? staticMethodInvocationPlanOf(
+      node, "getPrototypeOf", globalReflectOf, seen
+    );
+    if (prototypePlan && callArgumentCandidatesAt(prototypePlan, 0)
+      .some((value) => workerReferenceMatchesKeysOf(value, targetKeys, seen))) {
+      return true;
+    }
+  }
   if (ts.isIdentifier(node)) {
     const binding = resolveBinding(node);
     if ((binding?.kind === "variable" || binding?.kind === "opaque") &&
-        ts.isVariableDeclaration(binding.node) && binding.node.initializer &&
-        !ts.isIdentifier(binding.node.name)) {
+        ts.isVariableDeclaration(binding.node) && binding.node.initializer) {
       const next = new Set(seen);
       next.add(node);
       next.add(binding.node);
-      return bindingPatternValuesOf(
-        binding.node.name, binding.node.initializer, node.text, next
-      ).some((value) => workerReferenceMatchesKeysOf(value, targetKeys, next));
+      if (ts.isIdentifier(binding.node.name)) {
+        if (binding.constant && workerReferenceMatchesKeysOf(
+          binding.node.initializer, targetKeys, next
+        )) return true;
+      } else {
+        if (binding.constant && bindingPatternSelectsPropertyOf(
+          binding.node.name, node.text, "__proto__"
+        ) && workerReferenceMatchesKeysOf(
+          binding.node.initializer, targetKeys, next
+        )) return true;
+        return bindingPatternValuesOf(
+          binding.node.name, binding.node.initializer, node.text, next
+        ).some((value) => workerReferenceMatchesKeysOf(value, targetKeys, next));
+      }
     }
   }
   const member = assignmentMemberAccess(node);

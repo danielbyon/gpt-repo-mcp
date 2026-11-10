@@ -756,6 +756,23 @@ test.each([
     "const options: any = Object.create(proto); options.__proto__.eval = true; " +
     "new Worker('worker.js', options);",
     "worker_threads inline evaluation is forbidden"],
+  ["prototype member alias",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); const alias = options.__proto__; " +
+    "alias.eval = true; new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["getPrototypeOf alias",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); " +
+    "const alias = Object.getPrototypeOf(options); alias.eval = true; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
+  ["destructured prototype alias",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); " +
+    "const { __proto__: alias } = options; alias.eval = true; " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
   ["Reflect-selected worker constructor",
     "import * as threads from 'node:worker_threads'; " +
     "const Thread = Reflect.get(threads, 'Worker'); " +
@@ -1343,6 +1360,25 @@ test("accepts worker construction without inline evaluation", () => {
   ["inherited Worker options member",
     "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
     "const options: any = Object.create(proto); options.__proto__.eval = false; " +
+    "new Worker('worker.js', options);"],
+  ["prototype member alias",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); const alias = options.__proto__; " +
+    "alias.eval = false; new Worker('worker.js', options);"],
+  ["getPrototypeOf alias",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); " +
+    "const alias = Object.getPrototypeOf(options); alias.eval = false; " +
+    "new Worker('worker.js', options);"],
+  ["destructured prototype alias",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); " +
+    "const { __proto__: alias } = options; alias.eval = false; " +
+    "new Worker('worker.js', options);"],
+  ["reassigned destructured prototype alias",
+    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
+    "const options: any = Object.create(proto); " +
+    "let { __proto__: alias } = options; alias = {}; alias.eval = true; " +
     "new Worker('worker.js', options);"],
   ["Reflect-selected worker constructor",
    "import * as threads from 'node:worker_threads'; " +
