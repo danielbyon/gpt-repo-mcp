@@ -470,6 +470,7 @@ const arrayMutationValuesByBinding = new Map();
   };
   const assignmentPropertyName = (name) => {
     if (!name) return undefined;
+    if (ts.isPrivateIdentifier(name)) return name.text;
     if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) {
       return name.text;
     }
@@ -1242,6 +1243,64 @@ const localClassMemberTargetOf = (input, seen = new Set()) => {
   }
   return undefined;
 };
+const localClassBaseOf = (classNode, seen = new Set()) => {
+  const heritage = (classNode.heritageClauses ?? []).find((clause) =>
+    clause.token === ts.SyntaxKind.ExtendsKeyword);
+  const baseType = heritage?.types[0];
+  if (!baseType) return undefined;
+  return localClassMemberTargetOf(baseType.expression, seen)?.classNode;
+};
+const classMemberMatchesAccessOf = (member, property, instance) => {
+  if (!("name" in member) ||
+      staticPropertyNameOf(member.name) !== property) return false;
+  const isStatic = (member.modifiers ?? []).some((modifier) =>
+    modifier.kind === ts.SyntaxKind.StaticKeyword);
+  return isStatic === !instance;
+};
+// Class fields and methods are inherited through the class chain. Follow the
+// same chain for this.member assignments in constructors and static blocks.
+const localClassAssignedMemberValuesOf = (classNode, property, instance) => {
+  const values = [];
+  for (const member of classNode.members) {
+    const ownerMatches = instance
+      ? ts.isConstructorDeclaration(member)
+      : ts.isClassStaticBlockDeclaration(member);
+    if (!ownerMatches) continue;
+    const visit = (child) => {
+      if (ts.isBinaryExpression(child) &&
+          child.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const assigned = assignmentMemberAccess(child.left);
+        if (assigned?.property === property &&
+            unwrap(assigned.receiver)?.kind === ts.SyntaxKind.ThisKeyword) {
+          values.push(child.right);
+        }
+      }
+      ts.forEachChild(child, visit);
+    };
+    ts.forEachChild(member, visit);
+  }
+  return values;
+};
+// Public members inherit through a bounded local extends chain. Private
+// identifiers remain scoped to the class where they are declared.
+const localClassMemberResolutionOf = (classNode, property, instance) => {
+  let current = classNode;
+  const visited = new Set();
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    const hasMember = current.members.some((member) =>
+      classMemberMatchesAccessOf(member, property, instance));
+    const assignedValues = localClassAssignedMemberValuesOf(
+      current, property, instance
+    );
+    if (hasMember || assignedValues.length > 0) {
+      return { classNode: current, assignedValues };
+    }
+    if (property.startsWith("#")) return undefined;
+    current = localClassBaseOf(current, visited);
+  }
+  return undefined;
+};
 const localClassMemberValuesOf = (input, property, seen = new Set()) => {
   if (!hasLocalClasses) return [];
   const node = unwrap(input);
@@ -1263,12 +1322,10 @@ const localClassMemberValuesOf = (input, property, seen = new Set()) => {
   if (!target) return [];
   const { classNode, instance } = target;
   const values = [];
-  for (const member of classNode.members) {
-    if (!("name" in member) ||
-        staticPropertyNameOf(member.name) !== property) continue;
-    const isStatic = (member.modifiers ?? []).some((modifier) =>
-      modifier.kind === ts.SyntaxKind.StaticKeyword);
-    if (isStatic !== !instance) continue;
+  const resolution = localClassMemberResolutionOf(classNode, property, instance);
+  if (!resolution) return [];
+  for (const member of resolution.classNode.members) {
+    if (!classMemberMatchesAccessOf(member, property, instance)) continue;
     if (ts.isPropertyDeclaration(member) && member.initializer) {
       values.push(member.initializer);
     } else if (ts.isMethodDeclaration(member) ||
@@ -3222,34 +3279,14 @@ const workerNamespaceOf = (input, seen = new Set()) => {
 const workerAssignedClassMemberValuesOf = (
   input, property, seen = new Set()
 ) => {
-  // Class field declarations use memberValueCandidatesOf. This bounded helper
-  // follows this.member assignments in constructors and static blocks.
   const classSeen = new Set(seen);
   const normalized = unwrap(input);
   if (normalized) classSeen.delete(normalized);
   const target = localClassMemberTargetOf(normalized, classSeen);
   if (!target) return [];
-  const values = [];
-  for (const member of target.classNode.members) {
-    const ownerMatches = target.instance
-      ? ts.isConstructorDeclaration(member)
-      : ts.isClassStaticBlockDeclaration(member);
-    if (!ownerMatches) continue;
-    const visit = (child) => {
-      if (seen.has(child)) return;
-      if (ts.isBinaryExpression(child) &&
-          child.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-        const assigned = assignmentMemberAccess(child.left);
-        if (assigned?.property === property &&
-            unwrap(assigned.receiver)?.kind === ts.SyntaxKind.ThisKeyword) {
-          values.push(child.right);
-        }
-      }
-      ts.forEachChild(child, visit);
-    };
-    ts.forEachChild(member, visit);
-  }
-  return values;
+  return localClassMemberResolutionOf(
+    target.classNode, property, target.instance
+  )?.assignedValues ?? [];
 };
 const workerMemberOf = (input, property, seen = new Set()) => {
   const node = unwrap(input);

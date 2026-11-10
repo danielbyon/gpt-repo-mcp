@@ -584,6 +584,32 @@ test.each([
 "class Runner { static get Ctor() { return Worker; } } " +
 "new Runner.Ctor('worker.js', { eval: true });",
 "worker_threads inline evaluation is forbidden"],
+  ["inherited static Worker member",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Base { static Ctor = Worker; } class Runner extends Base {} " +
+    "new Runner.Ctor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["inherited static Worker member past instance member",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Base { static Ctor = Worker; } " +
+    "class Runner extends Base { Ctor = class {}; } " +
+    "new Runner.Ctor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["inherited static-block Worker member",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Base { static { this.Ctor = Worker; } } class Runner extends Base {} " +
+    "new Runner.Ctor('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["inherited constructor Worker member",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Base { constructor() { this.Ctor = Worker; } } class Runner extends Base {} " +
+    "new (new Runner().Ctor)('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["private static Worker member",
+    "import { Worker } from 'node:worker_threads'; " +
+    "class Runner { static #Ctor = Worker; static getCtor() { return this.#Ctor; } } " +
+    "new (Runner.getCtor())('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
   ["comma-selected constructor alias",
     "import { Worker } from 'node:worker_threads'; " +
     "const WorkerConstructor = (0, Worker); new WorkerConstructor('worker.js', { eval: true });",
@@ -968,6 +994,19 @@ test("accepts worker construction without inline evaluation", () => {
     "new (new SafeInstanceInstall().Ctor)('./worker.mjs', { eval: false });",
     "class SafeGetterInstall { static get Ctor() { return NamedWorker; } }",
     "new SafeGetterInstall.Ctor('./worker.mjs', { eval: false });",
+"class SafeWorkerBase { static Ctor = NamedWorker; }",
+"class SafeInheritedInstall extends SafeWorkerBase {}",
+"new SafeInheritedInstall.Ctor('./worker.mjs', { eval: false });",
+"class ShadowedSafeInstall extends SafeWorkerBase { static Ctor = class {}; }",
+"new ShadowedSafeInstall.Ctor('./worker.mjs', { eval: true });",
+"class SafeStaticBlockBase { static { this.Ctor = NamedWorker; } }",
+"class SafeInheritedStaticBlock extends SafeStaticBlockBase {}",
+"new SafeInheritedStaticBlock.Ctor('./worker.mjs', { eval: false });",
+"class SafeConstructorBase { constructor() { this.Ctor = NamedWorker; } }",
+"class SafeInheritedConstructor extends SafeConstructorBase {}",
+"new (new SafeInheritedConstructor().Ctor)('./worker.mjs', { eval: false });",
+"class SafePrivateInstall { static #Ctor = NamedWorker; static getCtor() { return this.#Ctor; } }",
+"new (SafePrivateInstall.getCtor())('./worker.mjs', { eval: false });",
     "const { ...commonJsNamespace } = require('node:worker_threads');",
     "new commonJsNamespace.Worker('./worker.mjs', { eval: false });",
     "Reflect.construct(NamedWorker, ['./worker.mjs', { eval: false }]);",
