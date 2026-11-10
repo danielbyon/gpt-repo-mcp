@@ -794,7 +794,12 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
   test.each([
     ["descriptor getter call", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); descriptor?.get?.call(test);"],
     ["descriptor getter apply", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); descriptor?.get?.apply(test, []);"],
-    ["descriptor getter invocation", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); descriptor?.get?.();"]
+    ["descriptor getter invocation", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); descriptor?.get?.();"],
+    ["stored descriptor getter", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); const get = descriptor.get; get.call(test);"],
+    ["destructured descriptor getter", "const { get } = Object.getOwnPropertyDescriptor(test, 'only'); get.call(test);"],
+    ["reflect-applied descriptor getter", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); Reflect.apply(descriptor.get, test, []);"],
+    ["bound descriptor getter", "const get = Object.getOwnPropertyDescriptor(test, 'only').get.bind(test); get();"],
+    ["reflected descriptor getter", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); Reflect.get(descriptor, 'get').call(test);"]
   ])("rejects descriptor accessor exclusive registration through %s", (_name, source) => {
     const fixture = "import { test } from 'vitest'; " + source +
       " (() => {})('focused', () => {});";
@@ -811,6 +816,9 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
       "Object.getOwnPropertyDescriptors(holder).test.value;",
       "const ordinaryDescriptor = Object.getOwnPropertyDescriptor(holder, 'test'); ordinaryDescriptor?.get?.call(holder);",
       "Object.getOwnPropertyDescriptor(test, 'length')?.get?.call(test);",
+      "const safeGetter = ordinaryDescriptor.get; safeGetter?.call(holder);",
+      "const { get: safeDestructuredGetter } = ordinaryDescriptor; safeDestructuredGetter?.call(holder);",
+      "Reflect.get(ordinaryDescriptor, 'get')?.call(holder);",
       "Object.values(holder)[0];",
       "Object.entries(holder)[0][1];",
       "Object.fromEntries(Object.entries(holder)).test;",

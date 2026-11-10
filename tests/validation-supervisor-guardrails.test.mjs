@@ -811,7 +811,10 @@ test.each([
   ["exported factory", "export const getWorker = () => Worker;"],
   ["exported function", "export function getWorker() { return Worker; }"],
   ["exported helper value", "const getWorker = () => Worker; export function exported() { return getWorker; }"],
-  ["member-held exported factory", "const getWorker = () => Worker; export const tools = { make: () => getWorker() };"]
+  ["member-held exported factory", "const getWorker = () => Worker; export const tools = { make: () => getWorker() };"],
+  ["array-held constructor", "export const runtime = [Worker];"],
+  ["class-held constructor", "export class Box { static make() { return Worker; } }"],
+  ["bound constructor", "export const make = Worker.bind(null);"]
 ])("rejects worker capability %s", (_name, declaration) => {
   const source = "import { Worker } from 'node:worker_threads'; " + declaration;
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
@@ -829,6 +832,9 @@ test("accepts worker module exports that exclude constructor capability", () => 
     "export function readMainThread() { return isMainThread; }",
     "const getMainThread = () => isMainThread;",
     "export const safeTools = { make: getMainThread };",
+    "export const safeRuntime = [isMainThread];",
+    "export class SafeBox { static read() { return isMainThread; } }",
+    "export const safeBound = getMainThread.bind(null);",
     "export default 1;"
   ].join("\n");
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))

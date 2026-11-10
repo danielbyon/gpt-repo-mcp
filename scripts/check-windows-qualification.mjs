@@ -4281,6 +4281,76 @@ if (assignArguments) {
     }
     return false;
   };
+const descriptorGetterCapabilityOf = (input, seen = new Set()) => {
+  const node = unwrap(input);
+  if (!node || seen.has(node)) return false;
+  const next = new Set(seen);
+  next.add(node);
+  if (ts.isConditionalExpression(node)) {
+    return descriptorGetterCapabilityOf(node.whenTrue, next) ||
+      descriptorGetterCapabilityOf(node.whenFalse, next);
+  }
+  if (ts.isBinaryExpression(node) && [
+    ts.SyntaxKind.AmpersandAmpersandToken,
+    ts.SyntaxKind.BarBarToken,
+    ts.SyntaxKind.CommaToken,
+    ts.SyntaxKind.QuestionQuestionToken
+  ].includes(node.operatorToken.kind)) {
+    return descriptorGetterCapabilityOf(node.left, next) ||
+      descriptorGetterCapabilityOf(node.right, next);
+  }
+  if (ts.isIdentifier(node)) {
+    const binding = resolveBinding(node);
+    const declaration = binding?.node &&
+      (ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node))
+      ? binding.node : undefined;
+    if (!declaration || seen.has(declaration)) return false;
+    const declarationNext = new Set(next);
+    declarationNext.add(declaration);
+    const values = ts.isIdentifier(declaration.name)
+      ? [declaration.initializer, ...(assignmentsByBinding.get(declaration) ?? [])]
+      : destructuredValuesOf(declaration, node.text);
+    if (!ts.isIdentifier(declaration.name) &&
+        selectedBindingNameOf(declaration.name, node.text) === "get" &&
+        selectedExtractionContainerOf(
+          declaration.initializer, "get", ["test", "it", "describe"],
+          declarationNext
+        )) return true;
+    return values.some((value) => value &&
+      descriptorGetterCapabilityOf(value, declarationNext));
+  }
+  const member = resolvedAccess(node);
+  if (member?.method === "get") {
+    return selectedExtractionContainerOf(
+      member.receiver, "get", ["test", "it", "describe"], next
+    );
+  }
+  if (!ts.isCallExpression(node)) return false;
+  const invoked = resolvedAccess(node.expression);
+  const reflected = intrinsicInvocationArgumentsOf(
+    node, ["Reflect"], ["get"], seen
+  );
+  if (reflected) {
+    const property = staticStringOf(reflected[1], seen);
+    return (property === undefined || property === "get") &&
+      selectedExtractionContainerOf(
+        reflected[0], "get", ["test", "it", "describe"], next
+      );
+  }
+  if (invoked?.method === "get") {
+    return selectedExtractionContainerOf(
+      invoked.receiver, "get", ["test", "it", "describe"], next
+    );
+  }
+  const reflectedApply = intrinsicInvocationArgumentsOf(
+    node, ["Reflect"], ["apply"], seen
+  );
+  if (reflectedApply && descriptorGetterCapabilityOf(reflectedApply[0], next)) {
+    return true;
+  }
+  return Boolean(invoked && ["apply", "bind", "call"].includes(invoked.method) &&
+    descriptorGetterCapabilityOf(invoked.receiver, next));
+};
   const collectBoundNames = (pattern, names = []) => {
     names.push(...bindingNameInfoOf(pattern).map((binding) => binding.name));
     return names;
@@ -5029,7 +5099,8 @@ argument, ["test", "it", "describe"]
   }
 collectBroadArrayMutations(file);
 return { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
-possibleVitestNamespaceOf, selectedExtractionContainerOf, testRunnerContainerOf, globalIntrinsicOf,
+possibleVitestNamespaceOf, descriptorGetterCapabilityOf,
+selectedExtractionContainerOf, testRunnerContainerOf, globalIntrinsicOf,
     intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, fixedIndexedValuesOf,
     objectPropertyValuesOf,
   resolveBinding, resolvedAccess, staticStringOf, mayBeUndefinedOf };
@@ -5045,7 +5116,8 @@ export function collectWindowsTestTitles(filename, source) {
   if (file.parseDiagnostics.length) throw new Error("Cannot parse Vitest declarations");
   const titles = [];
 const { isProcessPlatform, testRunnerOf, possibleTestRunnerOf,
-possibleVitestNamespaceOf, selectedExtractionContainerOf, testRunnerContainerOf,
+possibleVitestNamespaceOf, descriptorGetterCapabilityOf,
+testRunnerContainerOf,
     intrinsicInvocationArgumentsOf, fixedSpreadValuesOf, fixedIndexedValuesOf,
     objectPropertyValuesOf,
   resolveBinding, resolvedAccess, staticStringOf, mayBeUndefinedOf } =
@@ -5230,21 +5302,6 @@ const inspectExclusiveArrayPatternValues = (pattern, values) => {
     if (rest) break;
   }
 };
-  // Vitest exposes "only" through a getter, so invoking that descriptor
-  // accessor selects exclusive tests even without a direct member reference.
-  const isExclusiveDescriptorGetterCall = (node) => {
-    if (!ts.isCallExpression(node)) return false;
-    const invoked = resolvedAccess(node.expression);
-    const getter = invoked?.method === "get"
-      ? invoked
-      : invoked && ["apply", "call"].includes(invoked.method)
-        ? resolvedAccess(invoked.receiver)
-        : undefined;
-    if (getter?.method !== "get") return false;
-    return selectedExtractionContainerOf(
-      getter.receiver, "get", ["test", "it", "describe"]
-    );
-  };
   const checkExclusive = (node) => {
     if (ts.isParameter(node) && node.initializer &&
         possibleTestRunnerOf(node.initializer, ["test", "it", "describe"])) {
@@ -5261,7 +5318,9 @@ const inspectExclusiveArrayPatternValues = (pattern, values) => {
       : [];
     inspectExclusiveArrayPatternValues(node.name, values);
   }
-    if (isExclusiveDescriptorGetterCall(node)) {
+  // Vitest exposes "only" through a getter; retaining or invoking that
+  // accessor selects exclusive tests even without a direct member reference.
+    if (ts.isCallExpression(node) && descriptorGetterCapabilityOf(node)) {
       throw new Error("Exclusive or dynamically selected Vitest tests are unaudited.");
     }
 const member = resolvedAccess(node);

@@ -506,6 +506,7 @@ const assignmentReferenceKey = (input, seen = new Set()) => {
   if (!ts.isIdentifier(node)) return `expression:${node.pos}:${node.end}`;
   const binding = resolveBinding(node);
   if (!binding) return `global:${node.text}`;
+  if (!binding.node) return `unbound:${node.text}`;
   if (seen.has(binding.node)) return `binding:${binding.node.pos}`;
   const next = new Set(seen);
   next.add(binding.node);
@@ -3288,13 +3289,30 @@ const workerConstructorOf = (input, seen = new Set()) => {
   return values.some((value) => workerConstructorOf(value, next));
 };
 // Verified Worker capability must not escape the fixed supervisor inventory,
-// including through local helpers or functions held in exported objects.
+// including through local helpers, arrays, classes, or exported containers.
 const workerCapabilityOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
+  if (ts.isCallExpression(node)) {
+    const bound = memberAccess(node.expression);
+    if (bound?.property === "bind") {
+      return workerConstructorOf(bound.receiver, seen);
+    }
+  }
   if (workerConstructorOf(node, seen) || workerNamespaceOf(node, seen)) return true;
   const next = new Set(seen);
   next.add(node);
+  const arrayValues = fixedSpreadValuesOf(node, seen);
+  if (arrayValues?.some((value) => workerCapabilityOf(value, next))) return true;
+  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+    for (const member of node.members) {
+      if (ts.isPropertyDeclaration(member) && member.initializer &&
+          workerCapabilityOf(member.initializer, next)) return true;
+      if (ts.isMethodDeclaration(member) || ts.isGetAccessorDeclaration(member)) {
+        if (workerCapabilityOf(member, next)) return true;
+      }
+    }
+  }
   for (const object of objectValueCandidatesOf(node, seen)) {
     for (const property of object.properties) {
       if (ts.isSpreadAssignment(property)) {
@@ -3688,6 +3706,10 @@ if (ts.isExportAssignment(node) && workerCapabilityOf(node.expression)) {
   add(node, "runtime worker_threads capability re-export is forbidden");
 }
 if (ts.isFunctionDeclaration(node) && hasExportModifier(node) &&
+    workerCapabilityOf(node)) {
+  add(node, "runtime worker_threads capability re-export is forbidden");
+}
+if (ts.isClassDeclaration(node) && hasExportModifier(node) &&
     workerCapabilityOf(node)) {
   add(node, "runtime worker_threads capability re-export is forbidden");
 }
