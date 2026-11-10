@@ -840,6 +840,18 @@ test.each([
     "Object.getOwnPropertyDescriptor({ Worker }, key)!.value; " +
     "new Thread('worker.js', { eval: true });",
     "worker_threads inline evaluation is forbidden"],
+  ["Object descriptor value worker constructor through Object alias",
+    "import { Worker } from 'node:worker_threads'; const O = Object; " +
+    "const Thread = " +
+    "O.getOwnPropertyDescriptor({ Worker }, 'Worker')!.value; " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
+  ["Object descriptor value worker constructor through method alias",
+    "import { Worker } from 'node:worker_threads'; " +
+    "const read = Object.getOwnPropertyDescriptor; " +
+    "const Thread = read({ Worker }, 'Worker')!.value; " +
+    "new Thread('worker.js', { eval: true });",
+    "worker_threads inline evaluation is forbidden"],
   ["aliased Reflect-selected worker constructor",
     "import * as threads from 'node:worker_threads'; const read = Reflect.get; " +
     "const Thread = read(threads, 'Worker'); " +
@@ -1107,6 +1119,12 @@ test.each([
     "Object.defineProperty(options, key, { value: true }); " +
     "new Worker('worker.js', options);",
     "worker_threads inline-evaluation options are unproven"],
+  ["resolved Object.defineProperty key alias",
+    "import { Worker } from 'node:worker_threads'; const options = {}; " +
+    "const key = 'eval'; " +
+    "Object.defineProperty(options, key, { value: true }); " +
+    "new Worker('worker.js', options);",
+    "worker_threads inline evaluation is forbidden"],
   ["unresolved Reflect.defineProperty key",
     "import { Worker } from 'node:worker_threads'; const options = {}; " +
     "const key = process.env.WORKER_OPTION_KEY; " +
