@@ -540,6 +540,50 @@ test.each([
 "const WorkerConstructor = Worker.bind(null, ...args); " +
 "new WorkerConstructor();",
 "worker_threads inline-evaluation options are unproven"],
+["stored bound constructor",
+"import { Worker } from 'node:worker_threads'; const bind = Worker.bind; " +
+"const WorkerConstructor = bind(null, 'worker.js', { eval: true }); " +
+"new WorkerConstructor();",
+"worker_threads inline evaluation is forbidden"],
+["call-applied bound constructor",
+"import { Worker } from 'node:worker_threads'; " +
+"const WorkerConstructor = Worker.bind.call(null, 'worker.js', { eval: true }); " +
+"new WorkerConstructor();",
+"worker_threads inline evaluation is forbidden"],
+["apply-applied bound constructor",
+"import { Worker } from 'node:worker_threads'; " +
+"const WorkerConstructor = Worker.bind.apply(null, ['worker.js', { eval: true }]); " +
+"new WorkerConstructor();",
+"worker_threads inline evaluation is forbidden"],
+["reflect-applied bound constructor",
+"import { Worker } from 'node:worker_threads'; " +
+"const WorkerConstructor = Reflect.apply(Worker.bind, null, ['worker.js', { eval: true }]); " +
+"new WorkerConstructor();",
+"worker_threads inline evaluation is forbidden"],
+["Worker subclass construction",
+"import { Worker } from 'node:worker_threads'; class Runner extends Worker {} " +
+"new Runner('worker.js', { eval: true });",
+"worker_threads inline evaluation is forbidden"],
+["Worker subclass super arguments",
+"import { Worker } from 'node:worker_threads'; " +
+"class Runner extends Worker { constructor() { super('worker.js', { eval: true }); } } " +
+"new Runner();",
+"worker_threads inline evaluation is forbidden"],
+["static-block Worker member",
+"import { Worker } from 'node:worker_threads'; " +
+"class Runner { static { this.Ctor = Worker; } } " +
+"new Runner.Ctor('worker.js', { eval: true });",
+"worker_threads inline evaluation is forbidden"],
+["constructor-held Worker member",
+"import { Worker } from 'node:worker_threads'; " +
+"class Runner { constructor() { this.Ctor = Worker; } } " +
+"new (new Runner().Ctor)('worker.js', { eval: true });",
+"worker_threads inline evaluation is forbidden"],
+["static getter Worker member",
+"import { Worker } from 'node:worker_threads'; " +
+"class Runner { static get Ctor() { return Worker; } } " +
+"new Runner.Ctor('worker.js', { eval: true });",
+"worker_threads inline evaluation is forbidden"],
   ["comma-selected constructor alias",
     "import { Worker } from 'node:worker_threads'; " +
     "const WorkerConstructor = (0, Worker); new WorkerConstructor('worker.js', { eval: true });",
@@ -905,6 +949,25 @@ test("accepts worker construction without inline evaluation", () => {
     "new arrayWorker('./worker.mjs', { eval: false });",
 "const boundWorker = NamedWorker.bind(null, './worker.mjs', { eval: false });",
 "new boundWorker();",
+    "const safeBind = NamedWorker.bind;",
+    "const safeStoredBoundWorker = safeBind(null, './worker.mjs', { eval: false });",
+    "new safeStoredBoundWorker();",
+    "const safeCallBoundWorker = NamedWorker.bind.call(null, './worker.mjs', { eval: false });",
+    "new safeCallBoundWorker();",
+    "const safeApplyBoundWorker = NamedWorker.bind.apply(null, ['./worker.mjs', { eval: false }]);",
+    "new safeApplyBoundWorker();",
+    "const safeReflectBoundWorker = Reflect.apply(NamedWorker.bind, null, ['./worker.mjs', { eval: false }]);",
+    "new safeReflectBoundWorker();",
+    "class SafeRunner extends NamedWorker {}",
+    "new SafeRunner('./worker.mjs', { eval: false });",
+    "class SafeSubclassSuper extends NamedWorker { constructor() { super('./worker.mjs', { eval: false }); } }",
+    "new SafeSubclassSuper();",
+    "class SafeStaticInstall { static { this.Ctor = NamedWorker; } }",
+    "new SafeStaticInstall.Ctor('./worker.mjs', { eval: false });",
+    "class SafeInstanceInstall { constructor() { this.Ctor = NamedWorker; } }",
+    "new (new SafeInstanceInstall().Ctor)('./worker.mjs', { eval: false });",
+    "class SafeGetterInstall { static get Ctor() { return NamedWorker; } }",
+    "new SafeGetterInstall.Ctor('./worker.mjs', { eval: false });",
     "const { ...commonJsNamespace } = require('node:worker_threads');",
     "new commonJsNamespace.Worker('./worker.mjs', { eval: false });",
     "Reflect.construct(NamedWorker, ['./worker.mjs', { eval: false }]);",

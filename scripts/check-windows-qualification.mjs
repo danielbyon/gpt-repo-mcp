@@ -4328,8 +4328,18 @@ const descriptorGetterCapabilityOf = (input, seen = new Set()) => {
     if (!declaration || seen.has(declaration)) return false;
     const declarationNext = new Set(next);
     declarationNext.add(declaration);
+    const parameterValues = ts.isParameter(declaration)
+      ? (functionArgumentsPlans.get(declaration.parent) ?? []).flatMap((plan) =>
+        callArgumentCandidatesAt(
+          plan, runtimeParameterIndexOf(declaration.parent, declaration)
+        )).filter(Boolean)
+      : [];
     const values = ts.isIdentifier(declaration.name)
-      ? [declaration.initializer, ...(assignmentsByBinding.get(declaration) ?? [])]
+      ? [
+        declaration.initializer,
+        ...(assignmentsByBinding.get(declaration) ?? []),
+        ...parameterValues
+      ]
       : destructuredValuesOf(declaration, node.text);
     if (!ts.isIdentifier(declaration.name) &&
         selectedBindingNameOf(declaration.name, node.text) === "get" &&
@@ -4346,6 +4356,10 @@ const descriptorGetterCapabilityOf = (input, seen = new Set()) => {
       descriptorGetterCapabilityOf(value, declarationNext));
   }
   const member = resolvedAccess(node);
+  // Follow accessor values stored in local objects and arrays.
+  if (member && member.method !== "get" && objectPropertyValuesOf(
+    member.receiver, member.method, seen
+  ).some((value) => descriptorGetterCapabilityOf(value, next))) return true;
   if (member?.method === "get") {
     return selectedExtractionContainerOf(
       member.receiver, "get", ["test", "it", "describe"], next
@@ -4376,6 +4390,8 @@ const descriptorGetterCapabilityOf = (input, seen = new Set()) => {
   }
   const directCallee = unwrap(node.expression);
   if (ts.isIdentifier(directCallee)) {
+    if (functionReturnExpressionsOf(directCallee, next)
+      .some((value) => descriptorGetterCapabilityOf(value, next))) return true;
     return descriptorGetterCapabilityOf(directCallee, next);
   }
   return Boolean(invoked && ["apply", "bind", "call"].includes(invoked.method) &&

@@ -3219,14 +3219,50 @@ const workerNamespaceOf = (input, seen = new Set()) => {
   }
   return false;
 };
+const workerAssignedClassMemberValuesOf = (
+  input, property, seen = new Set()
+) => {
+  // Class field declarations use memberValueCandidatesOf. This bounded helper
+  // follows this.member assignments in constructors and static blocks.
+  const classSeen = new Set(seen);
+  const normalized = unwrap(input);
+  if (normalized) classSeen.delete(normalized);
+  const target = localClassMemberTargetOf(normalized, classSeen);
+  if (!target) return [];
+  const values = [];
+  for (const member of target.classNode.members) {
+    const ownerMatches = target.instance
+      ? ts.isConstructorDeclaration(member)
+      : ts.isClassStaticBlockDeclaration(member);
+    if (!ownerMatches) continue;
+    const visit = (child) => {
+      if (seen.has(child)) return;
+      if (ts.isBinaryExpression(child) &&
+          child.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const assigned = assignmentMemberAccess(child.left);
+        if (assigned?.property === property &&
+            unwrap(assigned.receiver)?.kind === ts.SyntaxKind.ThisKeyword) {
+          values.push(child.right);
+        }
+      }
+      ts.forEachChild(child, visit);
+    };
+    ts.forEachChild(member, visit);
+  }
+  return values;
+};
 const workerMemberOf = (input, property, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
   if (property === "Worker" && workerNamespaceOf(node, seen)) return true;
   const next = new Set(seen);
   next.add(node);
-  if (memberValueCandidatesOf(node, property, seen)
-      .some((value) => workerConstructorOf(value, seen))) return true;
+  const candidates = memberValueCandidatesOf(node, property, seen);
+  if (candidates.some((value) => workerConstructorOf(value, next) ||
+      functionReturnExpressionsOf(value, next)
+        .some((returned) => workerConstructorOf(returned, next)))) return true;
+  if (workerAssignedClassMemberValuesOf(node, property, next)
+      .some((value) => workerConstructorOf(value, next))) return true;
   if (property !== "Worker") return false;
   return objectValueCandidatesOf(node, seen).some((object) =>
     object.properties.some((property) =>
@@ -3248,14 +3284,50 @@ const workerBoundConstructorPlanOf = (input, seen = new Set()) => {
  return undefined;
  }
  if (!ts.isCallExpression(node)) return undefined;
- const bind = memberAccess(node.expression);
- if (bind?.property !== "bind" ||
- !workerConstructorOf(bind.receiver, next)) return undefined;
+ const bind = bindMethodReferenceOf(node.expression, next);
+ if (bind?.property === "bind" && workerConstructorOf(bind.receiver, next)) {
  return dropLeadingCallArgument(fixedCallArgumentPlanOf(node.arguments));
+ }
+ const wrapper = memberAccess(node.expression);
+ if (wrapper && ["apply", "call"].includes(wrapper.property)) {
+ const wrappedBind = bindMethodReferenceOf(wrapper.receiver, next);
+ if (wrappedBind?.property === "bind" &&
+ workerConstructorOf(wrappedBind.receiver, next)) {
+ const plan = wrapper.property === "call"
+        ? dropLeadingCallArgument(fixedCallArgumentPlanOf(node.arguments))
+ : argumentArrayPlanOf(node.arguments[1], next);
+      return plan;
+ }
+ }
+ if (reflectApplyReferenceOf(node.expression, next)) {
+ const reflectedBind = bindMethodReferenceOf(node.arguments[0], next);
+ if (reflectedBind?.property === "bind" &&
+ workerConstructorOf(reflectedBind.receiver, next)) {
+        return argumentArrayPlanOf(node.arguments[2], next);
+ }
+ }
+ return undefined;
 };
 const workerConstructorOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node || seen.has(node)) return false;
+  if (ts.isIdentifier(node)) {
+    if (workerBoundConstructorPlanOf(node, seen) !== undefined) return true;
+    const classTarget = localClassMemberTargetOf(node, seen);
+    if (classTarget && !classTarget.instance) {
+      const classNext = new Set(seen);
+      classNext.add(node);
+      if (workerConstructorOf(classTarget.classNode, classNext)) return true;
+    }
+  }
+  const earlyMember = memberAccess(node);
+  if (earlyMember) {
+    const memberNext = new Set(seen);
+    memberNext.add(node);
+    if (workerMemberOf(
+      earlyMember.receiver, earlyMember.property, memberNext
+    )) return true;
+  }
   const resolved = resolvedValuesOf(node, seen);
   if (resolved.some((value) => value !== node)) {
     const next = new Set(seen);
@@ -3263,11 +3335,10 @@ const workerConstructorOf = (input, seen = new Set()) => {
     return resolved.filter((value) => value !== node)
       .some((value) => workerConstructorOf(value, next));
   }
-  const member = memberAccess(node);
-  if (member) {
-    const next = new Set(seen);
-    next.add(node);
-    return workerMemberOf(member.receiver, member.property, next);
+  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+    return (node.heritageClauses ?? []).some((clause) =>
+      clause.token === ts.SyntaxKind.ExtendsKeyword && clause.types.some((type) =>
+        workerConstructorOf(type.expression, seen)));
   }
   if (ts.isCallExpression(node)) {
     const next = new Set(seen);
@@ -3295,7 +3366,12 @@ const workerConstructorOf = (input, seen = new Set()) => {
       !ts.isVariableDeclaration(binding.node)) return false;
   const next = new Set(seen);
   next.add(binding.node);
-  if (ts.isIdentifier(binding.node.name)) return false;
+  if (ts.isIdentifier(binding.node.name)) {
+    if (workerBoundConstructorPlanOf(node, next) !== undefined) return true;
+    const initializer = binding.node.initializer && unwrap(binding.node.initializer);
+    return Boolean(initializer && (ts.isClassDeclaration(initializer) ||
+      ts.isClassExpression(initializer)) && workerConstructorOf(initializer, next));
+  }
   if (binding.node.initializer && bindingPatternSelectsPropertyOf(
     binding.node.name, node.text, "Worker"
   ) &&
@@ -3325,6 +3401,27 @@ ts.forEachChild(child, visit);
 ts.forEachChild(body, visit);
 return found;
 };
+const workerClassCapabilityOf = (classNode, seen = new Set()) => {
+const next = new Set(seen);
+next.add(classNode);
+for (const clause of classNode.heritageClauses ?? []) {
+if (clause.token !== ts.SyntaxKind.ExtendsKeyword) continue;
+for (const clauseType of clause.types) {
+if (workerConstructorOf(clauseType.expression, next)) return true;
+}
+}
+for (const member of classNode.members) {
+if (ts.isPropertyDeclaration(member) && member.initializer &&
+workerCapabilityOf(member.initializer, next)) return true;
+if (ts.isMethodDeclaration(member) || ts.isGetAccessorDeclaration(member)) {
+if (workerCapabilityOf(member, next)) return true;
+}
+if ((ts.isConstructorDeclaration(member) ||
+ts.isClassStaticBlockDeclaration(member)) &&
+classBodyCapabilityOf(member.body, next)) return true;
+}
+return false;
+};
 // Verified Worker capability must not escape the fixed supervisor inventory,
 // including through local helpers, arrays, classes, or exported containers.
 const workerCapabilityOf = (input, seen = new Set()) => {
@@ -3345,23 +3442,12 @@ const workerCapabilityOf = (input, seen = new Set()) => {
   const arrayValues = fixedSpreadValuesOf(node, seen);
   if (arrayValues?.some((value) => workerCapabilityOf(value, next))) return true;
   if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
-for (const clause of node.heritageClauses ?? []) {
-if (clause.token !== ts.SyntaxKind.ExtendsKeyword) continue;
-for (const clauseType of clause.types) {
-if (workerCapabilityOf(clauseType.expression, next)) return true;
+if (workerClassCapabilityOf(node, seen)) return true;
 }
+if (ts.isNewExpression(node)) {
+const target = localClassMemberTargetOf(node, seen);
+if (target && workerClassCapabilityOf(target.classNode, next)) return true;
 }
-    for (const member of node.members) {
-      if (ts.isPropertyDeclaration(member) && member.initializer &&
-          workerCapabilityOf(member.initializer, next)) return true;
-      if (ts.isMethodDeclaration(member) || ts.isGetAccessorDeclaration(member)) {
-        if (workerCapabilityOf(member, next)) return true;
-      }
-if ((ts.isConstructorDeclaration(member) ||
-ts.isClassStaticBlockDeclaration(member)) &&
-classBodyCapabilityOf(member.body, next)) return true;
-    }
-  }
   for (const object of objectValueCandidatesOf(node, seen)) {
     for (const property of object.properties) {
       if (ts.isSpreadAssignment(property)) {
@@ -3873,6 +3959,16 @@ if (ts.isVariableDeclaration(node) && node.initializer &&
     }
     if (ts.isNewExpression(node) && dynamicFunctionOf(node.expression)) {
       add(node, "dynamic function construction is unaudited");
+    }
+    if (ts.isCallExpression(node) &&
+        node.expression.kind === ts.SyntaxKind.SuperKeyword) {
+      const owner = enclosingFunctionOf(node);
+      const ownerClass = owner?.parent;
+      if (ownerClass &&
+          (ts.isClassDeclaration(ownerClass) || ts.isClassExpression(ownerClass)) &&
+          workerConstructorOf(ownerClass, new Set([node]))) {
+        inspectWorkerConstruction(node);
+      }
     }
 if (ts.isNewExpression(node) && workerConstructorOf(node.expression)) {
  const boundPlan = workerBoundConstructorPlanOf(node.expression);

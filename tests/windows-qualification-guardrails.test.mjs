@@ -802,7 +802,12 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
     ["reflected descriptor getter", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); Reflect.get(descriptor, 'get').call(test);"],
     ["direct descriptor getter", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); const get = descriptor.get; get?.()('focused', () => {});"],
     ["assigned descriptor getter", "let get; get = Object.getOwnPropertyDescriptor(test, 'only').get; get.call(test);"],
-    ["destructured assignment descriptor getter", "let get; ({ get } = Object.getOwnPropertyDescriptor(test, 'only')); get.call(test);"]
+    ["destructured assignment descriptor getter", "let get; ({ get } = Object.getOwnPropertyDescriptor(test, 'only')); get.call(test);"],
+    ["returned local descriptor getter", "const invokeAccessor = (getter: any) => getter; const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); const register = invokeAccessor(descriptor.get); register.call(test);"],
+    ["called local descriptor getter", "function invokeAccessor(getter: any) { getter.call(test); } const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); invokeAccessor(descriptor.get);"],
+    ["factory-returned descriptor getter", "const getter = () => Object.getOwnPropertyDescriptor(test, 'only').get; getter().call(test);"],
+    ["object-held descriptor getter", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); const held = { getter: descriptor.get }; held.getter.call(test);"],
+    ["array-held descriptor getter", "const descriptor = Object.getOwnPropertyDescriptor(test, 'only'); const held = [descriptor.get]; const register = held[0]; register.call(test);"],
   ])("rejects descriptor accessor exclusive registration through %s", (_name, source) => {
     const fixture = "import { test } from 'vitest'; " + source +
       " (() => {})('focused', () => {});";
@@ -823,6 +828,14 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
       "safeGetter?.()(holder);",
       "const { get: safeDestructuredGetter } = ordinaryDescriptor; safeDestructuredGetter?.call(holder);",
       "let assignedSafeGetter; ({ get: assignedSafeGetter } = ordinaryDescriptor); assignedSafeGetter?.call(holder);",
+    "const invokeSafeAccessor = (getter: any) => getter;",
+    "const safeReturnedGetter = invokeSafeAccessor(ordinaryDescriptor.get); safeReturnedGetter.call(holder);",
+    "function invokeOrdinaryAccessor(getter: any) { getter.call(holder); }",
+    "invokeOrdinaryAccessor(ordinaryDescriptor.get);",
+    "const safeGetterFactory = () => Object.getOwnPropertyDescriptor(holder, 'test').get;",
+    "safeGetterFactory().call(holder);",
+    "const safeHeldGetter = { getter: ordinaryDescriptor.get }; safeHeldGetter.getter.call(holder);",
+    "const safeGetterArray = [ordinaryDescriptor.get]; const safeArrayGetter = safeGetterArray[0]; safeArrayGetter.call(holder);",
       "Reflect.get(ordinaryDescriptor, 'get')?.call(holder);",
       "Object.values(holder)[0];",
       "Object.entries(holder)[0][1];",
