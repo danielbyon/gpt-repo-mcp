@@ -16,6 +16,7 @@ const PROCESS_MODULES = new Set(["node:child_process", "child_process"]);
 const MODULE_LOADING_MODULES = new Set(["node:module", "module"]);
 const DYNAMIC_EVALUATION_MODULES = new Set(["node:vm", "vm"]);
 const WORKER_MODULES = new Set(["node:worker_threads", "worker_threads"]);
+const SAFE_WORKER_EXPORTS = new Set(["isMainThread"]);
 const SHELL_MODULES = new Set(["cross-spawn", "shelljs", "execa"]);
 const SAFE_PROCESS_EXPORTS = new Set(["spawn", "spawnSync", "execFile", "execFileSync"]);
 const DISALLOWED_PROGRAMS = /(?:^|[\\/])(?:cmd|command|powershell|pwsh|bash|dash|sh|zsh|ksh|ash|fish|csh|tcsh|busybox|env)(?:\.exe)?$/i;
@@ -49,17 +50,21 @@ function inspectJavaScript(filename, source, isLauncher = false) {
 
   const inspectRequire = (node) => {
     if (!ts.isCallExpression(node) || !requireReferenceOf(node.expression)) return;
-    if (node.arguments.length !== 1 || !moduleLiteral(node.arguments[0])) {
+    const module = node.arguments.length === 1
+      ? staticStringOf(node.arguments[0])
+      : undefined;
+    if (module === undefined) {
       add(node, "dynamic require is forbidden in supervisor source");
       return;
     }
-    const module = moduleLiteral(node.arguments[0]);
     if (SHELL_MODULES.has(module)) {
       add(node, "shell-capable runner imports are forbidden");
     } else if (MODULE_LOADING_MODULES.has(module)) {
       add(node, "node:module loading is forbidden in supervisor source");
     } else if (DYNAMIC_EVALUATION_MODULES.has(module)) {
       add(node, "dynamic evaluation module loading is forbidden in supervisor source");
+    } else if (WORKER_MODULES.has(module)) {
+      add(node, "runtime worker_threads capability is forbidden in supervisor source");
     } else if (PROCESS_MODULES.has(module)) {
       const declaration = node.parent;
       if (!ts.isVariableDeclaration(declaration) || declaration.initializer !== node ||
@@ -114,6 +119,17 @@ const thisArgumentsOf = (owner) => [
   ...(functionThisArguments.get(owner) ?? []),
   ...(classMemberThisArguments.get(owner) ?? [])
 ];
+  const commonJsModuleObjectOf = (input, seen = new Set()) => {
+    const node = unwrap(input);
+    if (!ts.isIdentifier(node)) return false;
+    const binding = resolveBinding(node);
+    if (!binding) return node.text === "module";
+    if (binding.kind !== "variable" || !binding.node.initializer ||
+        seen.has(binding.node)) return false;
+    const next = new Set(seen);
+    next.add(binding.node);
+    return commonJsModuleObjectOf(binding.node.initializer, next);
+  };
   const requireReferenceOf = (input, seen = new Set()) => {
     const node = unwrap(input);
     if (!node) return false;
@@ -137,13 +153,19 @@ const thisArgumentsOf = (owner) => [
     }
   if (ts.isPropertyAccessExpression(node)) {
     const property = node.name.text;
-    if (property === "require") return globalObjectOf(node.expression);
+    if (property === "require") {
+      return globalObjectOf(node.expression) ||
+        commonJsModuleObjectOf(node.expression);
+    }
     return ["call", "apply", "bind"].includes(property) &&
       requireReferenceOf(node.expression, seen);
   }
   if (ts.isElementAccessExpression(node)) {
-    const property = moduleLiteral(node.argumentExpression);
-    if (property === "require") return globalObjectOf(node.expression);
+    const property = staticStringOf(node.argumentExpression);
+    if (property === "require") {
+      return globalObjectOf(node.expression) ||
+        commonJsModuleObjectOf(node.expression);
+    }
     return ["call", "apply", "bind"].includes(property) &&
       requireReferenceOf(node.expression, seen);
   }
@@ -213,6 +235,27 @@ const thisArgumentsOf = (owner) => [
     if (ts.isNamespaceImport(bindings)) return true;
     return !bindings || bindings.elements.length === 0 ||
       bindings.elements.some((element) => !element.isTypeOnly);
+  };
+  const hasOnlyAllowedWorkerImports = (node) => {
+    if (!hasRuntimeImport(node)) return true;
+    const clause = node.importClause;
+    const bindings = clause?.namedBindings;
+    return !clause?.name && bindings && ts.isNamedImports(bindings) &&
+      bindings.elements.length > 0 &&
+      bindings.elements.every((element) => element.isTypeOnly ||
+        SAFE_WORKER_EXPORTS.has(
+          (element.propertyName?.text ?? element.name.text)
+        ));
+  };
+  const hasOnlyAllowedWorkerReexports = (node) => {
+    if (node.isTypeOnly) return true;
+    const clause = node.exportClause;
+    return clause && ts.isNamedExports(clause) &&
+      clause.elements.length > 0 &&
+      clause.elements.every((element) => element.isTypeOnly ||
+        SAFE_WORKER_EXPORTS.has(
+          (element.propertyName?.text ?? element.name.text)
+        ));
   };
   const isCallback = (node) => ts.isFunctionExpression(node) || ts.isArrowFunction(node);
 
@@ -352,20 +395,6 @@ const matches = declarations(scopeStatements);
     ts.SyntaxKind.BarBarEqualsToken,
     ts.SyntaxKind.AmpersandAmpersandEqualsToken
   ]);
-const workerOptionCompoundAssignmentKinds = new Set([
-  ts.SyntaxKind.PlusEqualsToken,
-  ts.SyntaxKind.MinusEqualsToken,
-  ts.SyntaxKind.AsteriskEqualsToken,
-  ts.SyntaxKind.AsteriskAsteriskEqualsToken,
-  ts.SyntaxKind.SlashEqualsToken,
-  ts.SyntaxKind.PercentEqualsToken,
-  ts.SyntaxKind.AmpersandEqualsToken,
-  ts.SyntaxKind.BarEqualsToken,
-  ts.SyntaxKind.CaretEqualsToken,
-  ts.SyntaxKind.LessThanLessThanEqualsToken,
-  ts.SyntaxKind.GreaterThanGreaterThanEqualsToken,
-  ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken
-]);
 const staticNumericNameOf = (input, seen = new Set()) => {
   const node = unwrap(input);
   if (!node) return undefined;
@@ -734,12 +763,6 @@ const recordNestedDestructuredProperties = (target, source) => {
           if (targetName && value) recordAssignment(targetName, value);
         }
       }
-    }
-    if (ts.isBinaryExpression(node) &&
-        workerOptionCompoundAssignmentKinds.has(node.operatorToken.kind) &&
-        (assignmentMemberAccess(node.left) ||
-         ts.isElementAccessExpression(unwrap(node.left)))) {
-      recordAssignment(unwrap(node.left), node.right, node.operatorToken.kind);
     }
     if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
         [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken]
@@ -3574,1121 +3597,7 @@ return returnedArguments.length > 0 ? returnedArguments : undefined;
       importedExport(binding, callee.text) === "promisify" &&
       runnerOf(call.arguments[0], seen) === "execFile";
   };
-const workerModuleRequireOf = (input) => {
-  const call = unwrap(input);
-  if (!call || !ts.isCallExpression(call) || call.questionDotToken ||
-      call.arguments.length !== 1) return false;
-  const callee = unwrap(call.expression);
-  return ts.isIdentifier(callee) && callee.text === "require" &&
-    !resolveBinding(callee) && WORKER_MODULES.has(moduleLiteral(call.arguments[0]));
-};
-let objectSetPrototypeAssignments;
-const objectSetPrototypeValuesOf = (input) => {
-  const node = unwrap(input);
-  if (!node) return [];
-  if (!objectSetPrototypeAssignments) {
-    objectSetPrototypeAssignments = [];
-    const collect = (child) => {
-      if (ts.isCallExpression(child)) {
-        const plan = staticMethodInvocationPlanOf(
-          child, "setPrototypeOf", globalObjectOf, new Set()
-        ) ?? staticMethodInvocationPlanOf(
-          child, "setPrototypeOf", globalPrototypeObjectOf, new Set()
-        ) ?? staticMethodInvocationPlanOf(
-          child, "setPrototypeOf", globalReflectOf, new Set()
-        );
-        if (plan) {
-          const targetKeys = new Set(callArgumentCandidatesAt(plan, 0)
-            .map((value) => assignmentReferenceKey(value))
-            .filter((value) => value !== undefined));
-          objectSetPrototypeAssignments.push({
-            node: child,
-            targetKeys,
-            prototypes: callArgumentCandidatesAt(plan, 1)
-          });
-        }
-      }
-      ts.forEachChild(child, collect);
-    };
-    collect(file);
-  }
-  const key = assignmentReferenceKey(node);
-  return objectSetPrototypeAssignments
-    .filter((assignment) => assignment.node === node ||
-      (key !== undefined && assignment.targetKeys.has(key)))
-    .flatMap((assignment) => assignment.prototypes);
-};
-// Resolve Worker provenance through static imports, CommonJS bindings, and
-// active local aliases. Other constructor sources remain unaudited.
-const workerNamespaceOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return false;
-  const next = new Set(seen);
-  next.add(node);
-  if (objectSetPrototypeValuesOf(node)
-    .some((value) => workerNamespaceOf(value, next))) return true;
-  if (workerModuleRequireOf(node)) return true;
-  if (ts.isObjectLiteralExpression(node)) {
-    let hasWorker = false;
-    for (const property of node.properties) {
-      if (ts.isSpreadAssignment(property)) {
-        if (workerNamespaceOf(property.expression, seen)) hasWorker = true;
-        continue;
-      }
-      if (!("name" in property) ||
-          staticPropertyNameOf(property.name) !== "Worker") continue;
-      if (ts.isPropertyAssignment(property)) {
-        hasWorker = workerConstructorOf(property.initializer, seen);
-      } else if (ts.isShorthandPropertyAssignment(property)) {
-        hasWorker = workerConstructorOf(property.name, seen);
-      } else if (ts.isGetAccessorDeclaration(property)) {
-        hasWorker = functionReturnExpressionsOf(property, seen)
-          .some((value) => workerConstructorOf(value, seen));
-      } else {
-        hasWorker = false;
-      }
-    }
-    return hasWorker;
-  }
-  if (ts.isCallExpression(node)) {
-    if (objectCreatePrototypeValuesOf(node, seen)
-      .some((value) => workerNamespaceOf(value, next))) return true;
-    const copiedArguments = objectAssignInvocationArgumentsOf(node, seen);
-    if (copiedArguments?.some((value) => workerNamespaceOf(value, seen))) {
-      return true;
-    }
-    return functionReturnExpressionsOf(node.expression, seen)
-      .some((value) => workerNamespaceOf(value, seen));
-  }
-  const resolved = resolvedValuesOf(node, seen);
-  if (resolved.some((value) => value !== node)) {
-    return resolved.filter((value) => value !== node)
-      .some((value) => workerNamespaceOf(value, next));
-  }
-  if (!ts.isIdentifier(node)) return false;
-  const binding = resolveBinding(node);
-  if (!binding?.node || seen.has(binding.node)) return false;
-  if (binding.kind === "import" && WORKER_MODULES.has(binding.module)) {
-    const named = binding.node.importClause?.namedBindings;
-    return Boolean(named && ts.isNamespaceImport(named) &&
-      named.name.text === node.text);
-  }
-  if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
-    const parameterNext = new Set(seen);
-    parameterNext.add(binding.node);
-    return (parameterValueArguments.get(binding.node) ?? []).some((value) =>
-      (ts.isIdentifier(binding.node.name) ? [value] :
-        bindingPatternValuesOf(
-          binding.node.name, value, node.text, parameterNext
-        )).some((candidate) => workerNamespaceOf(candidate, parameterNext)));
-  }
-  if ((binding.kind === "variable" || binding.kind === "opaque") &&
-      ts.isVariableDeclaration(binding.node) && binding.node.initializer &&
-      ts.isObjectBindingPattern(binding.node.name)) {
-    const rest = binding.node.name.elements.find((element) =>
-      element.dotDotDotToken && ts.isIdentifier(element.name) &&
-      element.name.text === node.text);
-    if (rest && workerNamespaceOf(binding.node.initializer, seen)) return true;
-  }
-  return false;
-};
-const workerReflectConstructorOf = (input, seen = new Set()) => {
-  const call = unwrap(input);
-  if (!call || !ts.isCallExpression(call) || seen.has(call)) return false;
-  const plan = staticMethodInvocationPlanOf(call, "get", globalReflectOf, seen);
-  if (!plan) return false;
-  const next = new Set(seen);
-  next.add(call);
-  if (!callArgumentCandidatesAt(plan, 0)
-    .some((value) => workerNamespaceOf(value, next))) return false;
-  const names = callArgumentCandidatesAt(plan, 1);
-  if (names.length === 0) return true;
-  return names.some((value) => {
-    const name = staticStringOf(value);
-    return name === undefined || name === "Worker";
-  });
-};
-const workerAssignedClassMemberValuesOf = (
-  input, property, seen = new Set()
-) => {
-  const classSeen = new Set(seen);
-  const normalized = unwrap(input);
-  if (normalized) classSeen.delete(normalized);
-  return localClassMemberTargetsOf(normalized, classSeen).targets.flatMap((target) =>
-    localClassMemberResolutionOf(
-      target.classNode, property, target.instance
-    )?.assignedValues ?? []);
-};
-const workerMemberOf = (input, property, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return false;
-  if (property === "Worker" && workerNamespaceOf(node, seen)) return true;
-  const next = new Set(seen);
-  next.add(node);
-  if (localClassMemberUnresolvedOf(node, property, seen)) return true;
-  const candidates = memberValueCandidatesOf(node, property, seen);
-  if (candidates.some((value) => workerConstructorOf(value, next) ||
-      functionReturnExpressionsOf(value, next)
-        .some((returned) => workerConstructorOf(returned, next)))) return true;
-  if (workerAssignedClassMemberValuesOf(node, property, next)
-      .some((value) => workerConstructorOf(value, next))) return true;
-  if (property !== "Worker") return false;
-  return objectValueCandidatesOf(node, seen).some((object) =>
-    object.properties.some((property) =>
-      ts.isSpreadAssignment(property) &&
-      workerNamespaceOf(property.expression, next)));
-};
-const workerBoundConstructorPlanOf = (input, seen = new Set()) => {
- const node = unwrap(input);
- if (!node || seen.has(node)) return undefined;
- const next = new Set(seen);
- next.add(node);
- if (ts.isIdentifier(node)) {
- const binding = resolveBinding(node);
- if (binding?.kind === "variable" &&
- ts.isVariableDeclaration(binding.node) &&
- ts.isIdentifier(binding.node.name) && binding.node.initializer) {
- return workerBoundConstructorPlanOf(binding.node.initializer, next);
- }
- return undefined;
- }
- if (!ts.isCallExpression(node)) return undefined;
- const bind = bindMethodReferenceOf(node.expression, next);
- if (bind?.property === "bind" && workerConstructorOf(bind.receiver, next)) {
- return dropLeadingCallArgument(fixedCallArgumentPlanOf(node.arguments));
- }
- const wrapper = memberAccess(node.expression);
- if (wrapper && ["apply", "call"].includes(wrapper.property)) {
- const wrappedBind = bindMethodReferenceOf(wrapper.receiver, next);
- if (wrappedBind?.property === "bind" &&
- workerConstructorOf(wrappedBind.receiver, next)) {
- const plan = wrapper.property === "call"
-        ? dropLeadingCallArgument(fixedCallArgumentPlanOf(node.arguments))
- : argumentArrayPlanOf(node.arguments[1], next);
-      return plan;
- }
- }
- if (reflectApplyReferenceOf(node.expression, next)) {
- const reflectedBind = bindMethodReferenceOf(node.arguments[0], next);
- if (reflectedBind?.property === "bind" &&
- workerConstructorOf(reflectedBind.receiver, next)) {
-        return argumentArrayPlanOf(node.arguments[2], next);
- }
- }
- return undefined;
-};
-const plainClassConstructorOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return false;
-  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
-    return !(node.heritageClauses ?? []).some((clause) =>
-      clause.token === ts.SyntaxKind.ExtendsKeyword);
-  }
-  const next = new Set(seen);
-  next.add(node);
-  const values = resolvedValuesOf(node, next)
-    .filter((value) => value !== node);
-  return values.length > 0 &&
-    values.every((value) => plainClassConstructorOf(value, next));
-};
-const workerConstructorOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return false;
-  if (ts.isIdentifier(node)) {
-    if (workerBoundConstructorPlanOf(node, seen) !== undefined) return true;
-    const classTarget = localClassMemberTargetOf(node, seen);
-    if (classTarget && !classTarget.instance) {
-      const classNext = new Set(seen);
-      classNext.add(node);
-      if (workerConstructorOf(classTarget.classNode, classNext)) return true;
-    }
-  }
-  const earlyMember = memberAccess(node);
-  if (earlyMember) {
-    const memberNext = new Set(seen);
-    memberNext.add(node);
-    if (earlyMember.property === "value" &&
-        workerPropertyDescriptorValueOf(earlyMember.receiver, memberNext)) return true;
-    if (earlyMember.property === "constructor" &&
-        workerPrototypeObjectOf(earlyMember.receiver, memberNext)) return true;
-    if (workerMemberOf(
-      earlyMember.receiver, earlyMember.property, memberNext
-    )) return true;
-  }
-  const resolved = resolvedValuesOf(node, seen);
-  if (resolved.some((value) => value !== node)) {
-    const next = new Set(seen);
-    next.add(node);
-    return resolved.filter((value) => value !== node)
-      .some((value) => workerConstructorOf(value, next));
-  }
-  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
-    return (node.heritageClauses ?? []).some((clause) =>
-      clause.token === ts.SyntaxKind.ExtendsKeyword && clause.types.some((type) =>
-        workerConstructorOf(type.expression, seen)));
-  }
-  if (ts.isCallExpression(node)) {
-    const next = new Set(seen);
-    next.add(node);
-    if (workerReflectConstructorOf(node, seen)) return true;
-    if (workerBoundConstructorPlanOf(node, seen)) return true;
-    const freezeStatus = objectFreezeMutationStatusOf(node.expression);
-    const frozenValues = staticMethodInvocationPlanOf(
-      node, "freeze", globalPrototypeObjectOf, seen
-    );
-    if (frozenValues) {
-      return callArgumentCandidatesAt(frozenValues, 0)
-        .some((value) => workerConstructorOf(value, next));
-    }
-    const invocation = localInvocationOf(
-      node.expression,
-      node.arguments ?? [],
-      ts.isNewExpression(node) ? "construct" : "call"
-    );
-    const alternatives = invocation?.alternatives ?? [invocation].filter(Boolean);
-    const invocationReturns = alternatives.flatMap((alternative) =>
-      alternative.functions.flatMap((fn) =>
-        functionReturnExpressionsOf(fn, next)));
-    if (invocationReturns.some((value) => workerConstructorOf(value, next))) {
-      return true;
-    }
-    const expressionReturns = functionReturnExpressionsOf(node.expression, next);
-    if (expressionReturns.some((value) => workerConstructorOf(value, next))) {
-      return true;
-    }
-    if (freezeStatus === "unresolved") return true;
-    if (freezeStatus === "replaced") {
-      const replacementReturns = invocationReturns.length > 0
-        ? invocationReturns : expressionReturns;
-      return replacementReturns.length === 0 ||
-        replacementReturns.some((value) => !plainClassConstructorOf(value));
-    }
-    return false;
-  }
-  if (!ts.isIdentifier(node)) return false;
-  const binding = resolveBinding(node);
-  if (!binding?.node || seen.has(binding.node)) return false;
-  if (binding.kind === "import" && WORKER_MODULES.has(binding.module)) {
-    return importedExport(binding, node.text) === "Worker";
-  }
-  if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
-    const parameterNext = new Set(seen);
-    parameterNext.add(binding.node);
-    return (parameterValueArguments.get(binding.node) ?? []).some((value) =>
-      (ts.isIdentifier(binding.node.name) ? [value] :
-        bindingPatternValuesOf(
-          binding.node.name, value, node.text, parameterNext
-        )).some((candidate) => workerConstructorOf(candidate, parameterNext)));
-  }
-  if (!(binding.kind === "variable" || binding.kind === "opaque") ||
-      !ts.isVariableDeclaration(binding.node)) return false;
-  const next = new Set(seen);
-  next.add(binding.node);
-  if (ts.isIdentifier(binding.node.name)) {
-    if (workerBoundConstructorPlanOf(node, next) !== undefined) return true;
-    const initializer = binding.node.initializer && unwrap(binding.node.initializer);
-    return Boolean(initializer && (ts.isClassDeclaration(initializer) ||
-      ts.isClassExpression(initializer)) && workerConstructorOf(initializer, next));
-  }
-  if (binding.node.initializer && bindingPatternSelectsPropertyOf(
-    binding.node.name, node.text, "Worker"
-  ) &&
-      workerNamespaceOf(binding.node.initializer, next)) return true;
-  if (binding.node.initializer && bindingPatternSelectsPropertyOf(
-    binding.node.name, node.text, "value"
-  ) && workerPropertyDescriptorValueOf(binding.node.initializer, next)) return true;
-  const values = [
-    ...bindingPatternValuesOf(
-      binding.node.name, binding.node.initializer, node.text, next
-    ),
-    ...(destructuredAssignmentsByBinding.get(
-      `${binding.node.pos}:${node.text}`) ?? [])
-  ];
-  return values.some((value) => workerConstructorOf(value, next));
-};
-const workerPropertyDescriptorValueOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node) || !ts.isCallExpression(node)) return false;
-  const next = new Set(seen);
-  next.add(node);
-  const plan = staticMethodInvocationPlanOf(
-    node, "getOwnPropertyDescriptor", globalReflectOf, seen
-  ) ?? staticMethodInvocationPlanOf(
-    node, "getOwnPropertyDescriptor", globalPrototypeObjectOf, seen
-  );
-  if (!plan) return false;
-  const holdsWorker = callArgumentCandidatesAt(plan, 0).some((value) =>
-    workerMemberOf(value, "Worker", next));
-  if (!holdsWorker) return false;
-  const names = callArgumentCandidatesAt(plan, 1);
-  return names.length === 0 || names.some((value) => {
-    const name = staticStringOf(value);
-    return name === undefined || name === "Worker";
-  });
-};
-const workerPrototypeObjectOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return false;
-  const next = new Set(seen);
-  next.add(node);
-  if (ts.isConditionalExpression(node)) {
-    return workerPrototypeObjectOf(node.whenTrue, next) ||
-      workerPrototypeObjectOf(node.whenFalse, next);
-  }
-  if (ts.isBinaryExpression(node) && [
-    ts.SyntaxKind.CommaToken,
-    ts.SyntaxKind.AmpersandAmpersandToken,
-    ts.SyntaxKind.BarBarToken,
-    ts.SyntaxKind.QuestionQuestionToken
-  ].includes(node.operatorToken.kind)) {
-    return workerPrototypeObjectOf(node.left, next) ||
-      workerPrototypeObjectOf(node.right, next);
-  }
-  const member = memberAccess(node);
-  if (member) {
-    if (member.property === "prototype" &&
-        workerConstructorOf(member.receiver, next)) return true;
-    if (memberValueCandidatesOf(member.receiver, member.property, next)
-      .some((value) => workerPrototypeObjectOf(value, next))) return true;
-  }
-  if (!ts.isIdentifier(node)) return false;
-  const binding = resolveBinding(node);
-  if (!binding?.node || seen.has(binding.node)) return false;
-  const bindingNext = new Set(seen);
-  bindingNext.add(binding.node);
-  if ((binding.kind === "variable" || binding.kind === "opaque") &&
-      ts.isVariableDeclaration(binding.node)) {
-    if (ts.isIdentifier(binding.node.name)) {
-      return workerAliasReferenceValuesOf(binding, node)
-        .some((value) => workerPrototypeObjectOf(value, bindingNext));
-    }
-    if (binding.node.initializer &&
-        bindingPatternSelectsPropertyOf(
-          binding.node.name, node.text, "prototype"
-        ) && workerConstructorOf(binding.node.initializer, bindingNext)) {
-      return true;
-    }
-  }
-  if (binding.kind === "parameter" && ts.isParameter(binding.node)) {
-    return (parameterValueArguments.get(binding.node) ?? []).some((value) =>
-      (ts.isIdentifier(binding.node.name) ? [value] :
-        bindingPatternValuesOf(
-          binding.node.name, value, node.text, bindingNext
-        )).some((candidate) =>
-          workerPrototypeObjectOf(candidate, bindingNext)));
-  }
-  return false;
-};
-const classBodyCapabilityOf = (body, seen) => {
-if (!body) return false;
-let found = false;
-const visit = (child) => {
-if (found || seen.has(child)) return;
-if (workerConstructorOf(child, seen) || workerNamespaceOf(child, seen)) {
-found = true;
-return;
-}
-const next = new Set(seen);
-next.add(child);
-ts.forEachChild(child, visit);
-};
-ts.forEachChild(body, visit);
-return found;
-};
-const workerClassCapabilityOf = (classNode, seen = new Set()) => {
-const next = new Set(seen);
-next.add(classNode);
-for (const clause of classNode.heritageClauses ?? []) {
-if (clause.token !== ts.SyntaxKind.ExtendsKeyword) continue;
-for (const clauseType of clause.types) {
-if (workerConstructorOf(clauseType.expression, next)) return true;
-}
-}
-for (const member of classNode.members) {
-if (ts.isPropertyDeclaration(member) && member.initializer &&
-workerCapabilityOf(member.initializer, next)) return true;
-if (ts.isMethodDeclaration(member) || ts.isGetAccessorDeclaration(member)) {
-if (workerCapabilityOf(member, next)) return true;
-}
-if ((ts.isConstructorDeclaration(member) ||
-ts.isClassStaticBlockDeclaration(member)) &&
-classBodyCapabilityOf(member.body, next)) return true;
-}
-return false;
-};
-// Verified Worker capability must not escape the fixed supervisor inventory,
-// including through local helpers, arrays, classes, or exported containers.
-const workerCapabilityOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return false;
-  if (ts.isCallExpression(node)) {
-    const bound = memberAccess(node.expression);
-    if (bound?.property === "bind") {
-      const next = new Set(seen);
-      next.add(node);
-      return workerCapabilityOf(bound.receiver, next) ||
-        node.arguments.some((argument) => workerCapabilityOf(argument, next));
-    }
-  }
-  if (workerConstructorOf(node, seen) || workerNamespaceOf(node, seen)) return true;
-  const next = new Set(seen);
-  next.add(node);
-  if (ts.isIdentifier(node) && localClassMemberTargetsOf(node, seen).targets.some(
-    (target) => !target.instance && workerClassCapabilityOf(target.classNode, next))) {
-    return true;
-  }
-  const arrayValues = fixedSpreadValuesOf(node, seen);
-  if (arrayValues?.some((value) => workerCapabilityOf(value, next))) return true;
-  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
-if (workerClassCapabilityOf(node, seen)) return true;
-}
-if (ts.isNewExpression(node)) {
-    if (localClassMemberTargetsOf(node, seen).targets.some((target) =>
-      workerClassCapabilityOf(target.classNode, next))) return true;
-}
-  for (const object of objectValueCandidatesOf(node, seen)) {
-    for (const property of object.properties) {
-      if (ts.isSpreadAssignment(property)) {
-        if (workerCapabilityOf(property.expression, next)) return true;
-        continue;
-      }
-      if (!("name" in property)) continue;
-      const value = ts.isPropertyAssignment(property) ? property.initializer
-        : ts.isShorthandPropertyAssignment(property) ? property.name
-          : ts.isMethodDeclaration(property) || ts.isGetAccessorDeclaration(property)
-            ? property : undefined;
-      if (value && workerCapabilityOf(value, next)) return true;
-    }
-  }
-  return functionReturnExpressionsOf(node, seen).some((value) =>
-    workerCapabilityOf(value, next));
-};
-// Only a statically false eval option is safe. Retrieved spreads use the same
-// provenance rules; computed names and unresolved values fail closed.
-const inspectWorkerEvalValue = (value, findingNode, unproven) => {
-  const staticValue = staticLogicalValueOf(value);
-  if (!staticValue) {
-    add(findingNode, unproven);
-  } else if (staticValue.truthy) {
-    add(findingNode, "worker_threads inline evaluation is forbidden");
-  }
-};
-const inspectWorkerEvalMutation = (assignment, unproven) => {
-  if (assignment.operator === ts.SyntaxKind.EqualsToken) {
-    inspectWorkerEvalValue(assignment.value, assignment.node, unproven);
-    return;
-  }
-  const enablesEval = assignment.operator === "update" ||
-    [ts.SyntaxKind.PlusEqualsToken, ts.SyntaxKind.MinusEqualsToken,
-      ts.SyntaxKind.BarEqualsToken, ts.SyntaxKind.CaretEqualsToken]
-      .includes(assignment.operator);
-  if (enablesEval) {
-    add(assignment.node, "worker_threads inline evaluation is forbidden");
-    return;
-  }
-  add(assignment.node, unproven);
-};
-let workerCallExpressions;
-const workerOptionMutationReferenceKeysOf = (options, seen = new Set()) => {
-  const keys = new Set();
-  const visited = new Set();
-  const queue = [unwrap(options)].filter(Boolean);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const [parameter, argumentsList] of parameterValueArguments) {
-      if (!ts.isIdentifier(parameter.name)) continue;
-      const parameterKey = assignmentReferenceKey(parameter.name);
-      if (parameterKey === undefined || keys.has(parameterKey)) continue;
-      if (argumentsList.some((argument) =>
-        keys.has(assignmentReferenceKey(argument)))) {
-        keys.add(parameterKey);
-        queue.push(parameter.name);
-        changed = true;
-      }
-    }
-    while (queue.length > 0) {
-      const value = unwrap(queue.shift());
-      if (!value || visited.has(value)) continue;
-      visited.add(value);
-      const key = assignmentReferenceKey(value);
-      if (key !== undefined && !keys.has(key)) {
-        keys.add(key);
-        changed = true;
-      }
-      const next = new Set(seen);
-      next.add(value);
-      for (const resolved of resolvedValuesOf(value, next)) {
-        if (!ts.isCallExpression(resolved)) continue;
-        queue.push(...objectCreatePrototypeValuesOf(resolved, next));
-      queue.push(...functionReturnExpressionsOf(resolved.expression, next));
-      }
-    }
-  }
-  return keys;
-};
-const workerAliasReferenceValuesOf = (binding, reference) => {
-  const referenceStart = reference.getStart(file);
-  const referenceOwner = enclosingFunctionOf(reference);
-  let referenceContainer = reference;
-  while (referenceContainer && !ts.isBlock(referenceContainer) &&
-      !ts.isSourceFile(referenceContainer) && !ts.isModuleBlock(referenceContainer)) {
-    referenceContainer = referenceContainer.parent;
-  }
-  const priorValues = (assignmentsByBinding.get(binding.node) ?? [])
-    .filter((value) => value.getStart(file) <= referenceStart &&
-      enclosingFunctionOf(value) === referenceOwner)
-    .sort((left, right) => left.getStart(file) - right.getStart(file));
-  const values = binding.node.initializer ? [binding.node.initializer] : [];
-  for (const value of priorValues) {
-    const assignment = value.parent;
-    const replacing = ts.isBinaryExpression(assignment) &&
-        assignment.right === value &&
-        assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-        ts.isExpressionStatement(assignment.parent) &&
-        assignment.parent.parent === referenceContainer;
-    if (replacing) values.length = 0;
-    values.push(value);
-  }
-  return values;
-};
-const definitelyUnrelatedObjectConstructorValueOf = (input) => {
-  const node = unwrap(input);
-  return Boolean(node && (
-    ts.isObjectLiteralExpression(node) ||
-    ts.isArrayLiteralExpression(node) ||
-    ts.isFunctionExpression(node) ||
-    ts.isArrowFunction(node) ||
-    ts.isClassExpression(node) ||
-    ts.isStringLiteralLike(node) ||
-    ts.isNumericLiteral(node) ||
-    node.kind === ts.SyntaxKind.TrueKeyword ||
-    node.kind === ts.SyntaxKind.FalseKeyword ||
-    node.kind === ts.SyntaxKind.NullKeyword
-  ));
-};
-const objectFreezeMutationReceiverIdentityAtOf = (
-  input, reference, seen = new Set(), mayBeGlobalObject = false
-) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return "unresolved";
-  const next = new Set(seen);
-  next.add(node);
-  if (ts.isIdentifier(node)) {
-    const binding = resolveBinding(node);
-    if (!binding?.node) {
-      if (node.text === "Object") return "global";
-      return mayBeGlobalObject ? "unresolved" : "unrelated";
-    }
-    if (!globalObjectConstructorOf(node) && !mayBeGlobalObject) {
-      return "unrelated";
-    }
-    if (!(ts.isVariableDeclaration(binding.node) ||
-        ts.isParameter(binding.node))) {
-      return mayBeGlobalObject ? "unresolved" : "unrelated";
-    }
-    const assignments = assignmentsByBinding.get(binding.node) ?? [];
-    if (assignments.some((value) =>
-      enclosingFunctionOf(value) !== enclosingFunctionOf(reference))) {
-      return "unresolved";
-    }
-    const values = ts.isParameter(binding.node)
-      ? parameterValueArguments.get(binding.node) ?? []
-      : workerAliasReferenceValuesOf(binding, node);
-    if (values.length === 0) return "unresolved";
-    const identities = values.map((value) =>
-      objectFreezeMutationReceiverIdentityAtOf(value, value, next, true));
-    if (identities.every((identity) => identity === "global")) return "global";
-    if (identities.every((identity) => identity === "unrelated")) return "unrelated";
-    return "unresolved";
-  }
-  if (assignmentReferenceKey(node) === "global:Object" ||
-      globalObjectConstructorOf(node)) return "global";
-  if (definitelyUnrelatedObjectConstructorValueOf(node)) return "unrelated";
-  return mayBeGlobalObject ? "unresolved" : "unrelated";
-};
-const workerReferenceMatchesKeysOf = (
-  input, targetKeys, seen = new Set()
-) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return false;
-  if (ts.isConditionalExpression(node)) {
-    const next = new Set(seen);
-    next.add(node);
-    return workerReferenceMatchesKeysOf(node.whenTrue, targetKeys, next) ||
-      workerReferenceMatchesKeysOf(node.whenFalse, targetKeys, next);
-  }
-  if (ts.isBinaryExpression(node) && [
-    ts.SyntaxKind.CommaToken,
-    ts.SyntaxKind.AmpersandAmpersandToken,
-    ts.SyntaxKind.BarBarToken,
-    ts.SyntaxKind.QuestionQuestionToken
-  ].includes(node.operatorToken.kind)) {
-    const next = new Set(seen);
-    next.add(node);
-    return workerReferenceMatchesKeysOf(node.left, targetKeys, next) ||
-      workerReferenceMatchesKeysOf(node.right, targetKeys, next);
-  }
-  if (targetKeys.has(assignmentReferenceKey(node))) return true;
-  if (ts.isCallExpression(node)) {
-    const prototypePlan = staticMethodInvocationPlanOf(
-      node, "getPrototypeOf", globalPrototypeObjectOf, seen
-    ) ?? staticMethodInvocationPlanOf(
-      node, "getPrototypeOf", globalReflectOf, seen
-    );
-    if (prototypePlan && callArgumentCandidatesAt(prototypePlan, 0)
-      .some((value) => workerReferenceMatchesKeysOf(value, targetKeys, seen))) {
-      return true;
-    }
-  }
-  if (ts.isIdentifier(node)) {
-    const binding = resolveBinding(node);
-    if ((binding?.kind === "variable" || binding?.kind === "opaque") &&
-        ts.isVariableDeclaration(binding.node) && binding.node.initializer) {
-      const next = new Set(seen);
-      next.add(node);
-      next.add(binding.node);
-      if (ts.isIdentifier(binding.node.name)) {
-        if (workerAliasReferenceValuesOf(binding, node).some((value) =>
-          workerReferenceMatchesKeysOf(
-            value, targetKeys, next
-          ))) return true;
-      } else {
-        if (binding.constant && bindingPatternSelectsPropertyOf(
-          binding.node.name, node.text, "__proto__"
-        ) && workerReferenceMatchesKeysOf(
-          binding.node.initializer, targetKeys, next
-        )) return true;
-        return bindingPatternValuesOf(
-          binding.node.name, binding.node.initializer, node.text, next
-        ).some((value) => workerReferenceMatchesKeysOf(value, targetKeys, next));
-      }
-    }
-  }
-  const member = assignmentMemberAccess(node);
-  if (!member) return false;
-  const next = new Set(seen);
-  next.add(node);
-  if (member.property === "__proto__" &&
-      workerReferenceMatchesKeysOf(member.receiver, targetKeys, next)) return true;
-  return memberValueCandidatesOf(member.receiver, member.property, next)
-    .some((value) => workerReferenceMatchesKeysOf(value, targetKeys, next));
-};
-const firstDirectReturnByBlock = new WeakMap();
-const workerMutationIsUnreachableOf = (node) => {
-  for (let current = node; current && !ts.isFunctionLike(current);
-       current = current.parent) {
-    const block = current.parent;
-    if (!block || !ts.isBlock(block)) continue;
-    let firstReturn = firstDirectReturnByBlock.get(block);
-    if (!firstDirectReturnByBlock.has(block)) {
-      firstReturn = block.statements.find(ts.isReturnStatement);
-      firstDirectReturnByBlock.set(block, firstReturn);
-    }
-    if (firstReturn && firstReturn !== current &&
-        firstReturn.getEnd() <= current.getStart(file)) {
-      return true;
-    }
-  }
-  return false;
-};
-const workerOptionFactoryReturnExpressionsOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return [];
-  const next = new Set(seen);
-  next.add(node);
-  if (!ts.isCallExpression(node)) return functionReturnExpressionsOf(node, next);
-  return localFunctionValuesOf(node.expression, next)
-    .flatMap((value) => functionReturnExpressionsOf(value, next));
-};
-const workerOptionFactoryOwnersOf = (options) =>
-  new Set(workerOptionFactoryReturnExpressionsOf(options)
-    .map((value) => {
-      let owner = value.parent;
-      while (owner && !ts.isFunctionLike(owner)) owner = owner.parent;
-      return owner;
-    })
-    .filter(Boolean));
-const workerOptionFactoryFunctionsOf = (options) => {
-  const functions = workerOptionFactoryOwnersOf(options);
-  const queue = [...functions];
-  for (let index = 0; index < queue.length; index += 1) {
-    const factory = queue[index];
-    const visit = (node) => {
-      if (node !== factory && ts.isFunctionLike(node)) return;
-      if (ts.isCallExpression(node) && !workerMutationIsUnreachableOf(node)) {
-        for (const called of localFunctionValuesOf(node.expression)) {
-          if (functions.has(called)) continue;
-          functions.add(called);
-          queue.push(called);
-        }
-      }
-      ts.forEachChild(node, visit);
-    };
-    if (factory.body) visit(factory.body);
-  }
-  return functions;
-};
-// A mutation can affect Worker options when it is evaluated in the constructor
-// argument or in the bounded local factory that produced the options value.
-const workerOptionMutationCanAffectOf = (options, reference) => {
-  const referenceEnd = reference?.getEnd() ?? Number.POSITIVE_INFINITY;
-  const factoryOwners = workerOptionFactoryOwnersOf(options);
-  let factoryFunctions;
-  return (node) => {
-    if (workerMutationIsUnreachableOf(node)) return false;
-    if (node.getStart(file) <= referenceEnd) return true;
-    let owner = node.parent;
-    while (owner && !ts.isFunctionLike(owner)) owner = owner.parent;
-    if (factoryOwners.has(owner)) return true;
-    factoryFunctions ??= workerOptionFactoryFunctionsOf(options);
-    return factoryFunctions.has(owner);
-  };
-};
-const inspectKnownWorkerOptionMutations = (
-  options, reference, seen, unproven, targetKeys
-) => {
-  if (!reference || targetKeys.size === 0) return;
-  const canAffectOptions = workerOptionMutationCanAffectOf(options, reference);
-  const targetsOptions = (candidate) =>
-    workerReferenceMatchesKeysOf(candidate, targetKeys);
-  for (const assignment of dynamicMemberAssignments) {
-    if (canAffectOptions(assignment.node) &&
-        targetsOptions(assignment.receiver)) {
-      const property = staticStringAtInspectionOf(
-        assignment.node.argumentExpression
-      );
-      if (property === undefined) {
-        add(assignment.node, unproven);
-      } else if (property === "eval") {
-        inspectWorkerEvalMutation(assignment, unproven);
-      }
-    }
-  }
-  const inspectNamedMutation = (call, name, value) => {
-    const property = staticStringOf(name);
-    if (property === undefined) {
-      add(call, unproven);
-    } else if (property === "eval") {
-      inspectWorkerEvalValue(value, value, unproven);
-    } else if (property === "__proto__") {
-      inspectWorkerOptions(value, seen, reference, false);
-    }
-  };
-  const inspectDescriptorValue = (call, descriptor) => {
-    const values = memberValueCandidatesOf(descriptor, "value", seen);
-    if (values.length === 0) add(call, unproven);
-    for (const value of values) {
-      inspectWorkerEvalValue(value, value, unproven);
-    }
-  };
-  const inspectNamedDescriptorMutation = (call, property, descriptor) => {
-    if (property === undefined) {
-      add(call, unproven);
-    } else if (property === "eval") {
-      inspectDescriptorValue(call, descriptor);
-    }
-  };
-  const inspectDescriptorMap = (call, descriptors) => {
-    const maps = objectValueCandidatesOf(descriptors, seen);
-    if (maps.length === 0) add(call, unproven);
-    for (const map of maps) {
-      for (const property of map.properties) {
-        if (ts.isSpreadAssignment(property)) {
-          add(call, unproven);
-          continue;
-        }
-        if (!("name" in property)) {
-          add(call, unproven);
-          continue;
-        }
-        let descriptors;
-        if (ts.isPropertyAssignment(property)) {
-          descriptors = [property.initializer];
-        } else if (ts.isShorthandPropertyAssignment(property)) {
-          descriptors = [property.name];
-        } else if (ts.isGetAccessorDeclaration(property)) {
-          descriptors = functionReturnExpressionsOf(property, seen);
-          if (descriptors.length === 0) add(call, unproven);
-        } else {
-          continue;
-        }
-        for (const descriptor of descriptors) {
-          inspectNamedDescriptorMutation(
-            call, staticPropertyNameOf(property.name), descriptor
-          );
-        }
-      }
-    }
-  };
-  let assignmentsByFunction;
-  const assignmentsForFunctionOf = (fn) => {
-    if (!assignmentsByFunction) {
-      const member = new Map();
-      const dynamic = new Map();
-      const addTo = (store, assignment) => {
-        const owner = enclosingFunctionOf(assignment.node);
-        const values = store.get(owner) ?? [];
-        values.push(assignment);
-        store.set(owner, values);
-      };
-      for (const assignment of memberAssignmentTargets) addTo(member, assignment);
-      for (const assignment of dynamicMemberAssignments) addTo(dynamic, assignment);
-      assignmentsByFunction = { member, dynamic };
-    }
-    return {
-      member: assignmentsByFunction.member.get(fn) ?? [],
-      dynamic: assignmentsByFunction.dynamic.get(fn) ?? []
-    };
-  };
-  const directlyInsideFunctionOf = (node, fn) => {
-    let current = node.parent;
-    while (current && current !== fn) {
-      if (ts.isFunctionLike(current)) return false;
-      current = current.parent;
-    }
-    return current === fn;
-  };
-  const inspectDirectFunctionMutations = (fn) => {
-    const assignments = assignmentsForFunctionOf(fn);
-    for (const assignment of assignments.member) {
-      if (!canAffectOptions(assignment.node) ||
-          unwrap(assignment.receiver).kind !== ts.SyntaxKind.ThisKeyword ||
-          !directlyInsideFunctionOf(assignment.node, fn)) continue;
-      if (assignment.property === "eval") {
-        inspectWorkerEvalMutation(assignment, unproven);
-      } else if (assignment.property === "__proto__") {
-        inspectWorkerOptions(assignment.value, seen, reference, false);
-      }
-    }
-    for (const assignment of assignments.dynamic) {
-      if (!canAffectOptions(assignment.node) ||
-          unwrap(assignment.receiver).kind !== ts.SyntaxKind.ThisKeyword ||
-          !directlyInsideFunctionOf(assignment.node, fn)) continue;
-      const property = staticStringAtInspectionOf(
-        assignment.node.argumentExpression
-      );
-      if (property === undefined) {
-        add(assignment.node, unproven);
-      } else if (property === "eval") {
-        inspectWorkerEvalMutation(assignment, unproven);
-      } else if (property === "__proto__") {
-        inspectWorkerOptions(assignment.value, seen, reference, false);
-      }
-    }
-  };
-  const inspectOptionMethodInvocation = (call) => {
-    const invocation = localInvocationOf(call.expression, call.arguments);
-    const alternatives = invocation?.alternatives ?? [invocation].filter(Boolean);
-    let inspectedMethod = false;
-    for (const alternative of alternatives) {
-      if (!(alternative.thisArguments ?? []).some(targetsOptions)) continue;
-      inspectedMethod = true;
-      for (const fn of alternative.functions) inspectDirectFunctionMutations(fn);
-    }
-    const callee = unwrap(call.expression);
-    const receiver =
-      ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)
-        ? callee.expression
-        : undefined;
-    if (!receiver || !targetsOptions(receiver)) return;
-    const property = ts.isPropertyAccessExpression(callee)
-      ? callee.name.text
-      : staticAssignmentNameOf(callee.argumentExpression);
-    if (property === undefined || !inspectedMethod) {
-      add(call, unproven);
-    }
-  };
-  if (!workerCallExpressions) {
-    workerCallExpressions = [];
-    const collect = (node) => {
-      if (ts.isCallExpression(node)) workerCallExpressions.push(node);
-      ts.forEachChild(node, collect);
-    };
-    ts.forEachChild(file, collect);
-  }
-  for (const node of workerCallExpressions) {
-    if (!canAffectOptions(node)) continue;
-      inspectOptionMethodInvocation(node);
-      const copiedArguments = objectAssignInvocationArgumentsOf(node, seen);
-      if (copiedArguments &&
-          (targetsOptions(copiedArguments[0]) || targetsOptions(node))) {
-        for (const source of copiedArguments.slice(1)) {
-          inspectWorkerOptions(source, seen, reference, true);
-        }
-      }
-      const setPlan = staticMethodInvocationPlanOf(
-        node, "set", globalReflectOf, seen
-      );
-      if (setPlan && callArgumentCandidatesAt(setPlan, 0).some(targetsOptions)) {
-        const names = callArgumentCandidatesAt(setPlan, 1);
-        if (names.length === 0) add(node, unproven);
-        for (const name of names) {
-          for (const value of callArgumentCandidatesAt(setPlan, 2)) {
-            inspectNamedMutation(node, name, value);
-          }
-        }
-      }
-      const prototypePlan = staticMethodInvocationPlanOf(
-        node, "setPrototypeOf", globalObjectOf, seen
-      ) ?? staticMethodInvocationPlanOf(
-        node, "setPrototypeOf", globalPrototypeObjectOf, seen
-      );
-      if (prototypePlan &&
-          callArgumentCandidatesAt(prototypePlan, 0).some(targetsOptions)) {
-        const prototypes = callArgumentCandidatesAt(prototypePlan, 1);
-        if (prototypes.length === 0) add(node, unproven);
-        for (const prototype of prototypes) {
-          inspectWorkerOptions(prototype, seen, reference, false);
-        }
-      }
-      const definePropertiesPlan = staticMethodInvocationPlanOf(
-        node, "defineProperties", globalObjectOf, seen
-      ) ?? staticMethodInvocationPlanOf(
-        node, "defineProperties", globalPrototypeObjectOf, seen
-      );
-      if (definePropertiesPlan &&
-          callArgumentCandidatesAt(definePropertiesPlan, 0).some(targetsOptions)) {
-        const descriptors = callArgumentCandidatesAt(definePropertiesPlan, 1);
-        if (descriptors.length === 0) add(node, unproven);
-        for (const descriptor of descriptors) {
-          inspectDescriptorMap(node, descriptor);
-        }
-      }
-      const definePlan = staticMethodInvocationPlanOf(
-        node, "defineProperty", globalObjectOf, seen
-      ) ?? staticMethodInvocationPlanOf(
-        node, "defineProperty", globalPrototypeObjectOf, seen
-      ) ?? staticMethodInvocationPlanOf(
-        node, "defineProperty", globalReflectOf, seen
-      );
-      if (definePlan && callArgumentCandidatesAt(definePlan, 0).some(targetsOptions)) {
-        const names = callArgumentCandidatesAt(definePlan, 1);
-        if (names.length === 0) add(node, unproven);
-        const descriptors = callArgumentCandidatesAt(definePlan, 2);
-        if (descriptors.length === 0) add(node, unproven);
-        for (const name of names) {
-          const property = staticStringOf(name);
-          for (const descriptor of descriptors) {
-            inspectNamedDescriptorMutation(node, property, descriptor);
-          }
-        }
-      }
-  }
-};
-const isAbsentOptionsValue = (input) => {
-  const node = unwrap(input);
-  if (!node || node.kind === ts.SyntaxKind.NullKeyword ||
-      ts.isVoidExpression(node)) return true;
-  return ts.isIdentifier(node) && node.text === "undefined" &&
-    !resolveBinding(node);
-};
-const inspectWorkerOptions = (
-  input, seen = new Set(), reference = unwrap(input), inspectMutations = true
-) => {
-  const options = unwrap(input);
-  // Worker treats a missing options argument as eval: false.
-  if (seen.has(options) || isAbsentOptionsValue(options)) return;
-  const next = new Set(seen);
-  next.add(options);
-  const unproven = "worker_threads inline-evaluation options are unproven";
-  const mutationKeys = workerOptionMutationReferenceKeysOf(options, seen);
-  if (inspectMutations) {
-    inspectKnownWorkerOptionMutations(
-      options, reference, next, unproven, mutationKeys
-    );
-  }
-  // inline local factory may mutate its result after the outer call starts.
-  const canAffectOptions = workerOptionMutationCanAffectOf(options, reference);
-  for (const assignment of memberAssignmentTargets) {
-    if (!canAffectOptions(assignment.node) ||
-        !workerReferenceMatchesKeysOf(assignment.receiver, mutationKeys)) continue;
-    if (assignment.property === "eval") {
-      inspectWorkerEvalMutation(assignment, unproven);
-    } else if (assignment.property === "__proto__") {
-      inspectWorkerOptions(assignment.value, next, reference, false);
-    }
-  }
-  const objects = [];
-  const inspectedParameters = new Set();
-  // Conditional and assigned options can contain branches that do not resolve
-  // to an object literal. Any such branch can enable inline evaluation.
-  for (const candidate of resolvedValuesOf(options, next)) {
-    if (isAbsentOptionsValue(candidate)) continue;
-    const binding = ts.isIdentifier(candidate) ? resolveBinding(candidate) : undefined;
-    if (binding?.kind === "parameter" && ts.isParameter(binding.node) &&
-        !inspectedParameters.has(binding.node)) {
-      const parameterValues = parameterValueArguments.get(binding.node) ?? [];
-      if (parameterValues.length > 0) {
-        inspectedParameters.add(binding.node);
-        const parameterNext = new Set(next);
-        parameterNext.add(binding.node);
-        for (const value of parameterValues) {
-          const selected = ts.isIdentifier(binding.node.name)
-            ? [value]
-            : bindingPatternValuesOf(
-                binding.node.name, value, candidate.text, parameterNext
-              );
-          if (selected.length === 0) add(candidate, unproven);
-          for (const selectedValue of selected) {
-            inspectWorkerOptions(
-              selectedValue, parameterNext, reference, inspectMutations
-            );
-          }
-        }
-        continue;
-      }
-    }
-    if (binding?.kind === "parameter" && ts.isParameter(binding.node) &&
-        inspectedParameters.has(binding.node)) continue;
-    const unresolvedCandidates = [];
-    const candidateObjects = objectValueCandidatesOf(
-      candidate, seen, unresolvedCandidates
-    );
-    if (candidateObjects.length === 0 || unresolvedCandidates.length > 0) {
-      add(candidate, unproven);
-    }
-    objects.push(...candidateObjects);
-  }
-  if (objects.length === 0) return;
-  for (const object of objects) {
-    // An omitted eval property means false; other Worker options do not enable
-    // evaluation of source text.
-    for (const property of object.properties) {
-      if (!("name" in property)) {
-        inspectWorkerOptions(property.expression, next, reference, false);
-        continue;
-      }
-      if (ts.isPropertyAssignment(property) &&
-          staticPropertyNameOf(property.name) === "__proto__") {
-        inspectWorkerOptions(property.initializer, next, reference, false);
-        continue;
-      }
-      const name = staticPropertyNameOf(property.name);
-      if (name === undefined) {
-        add(property, unproven);
-        continue;
-      }
-      if (name !== "eval") continue;
-      const value = ts.isPropertyAssignment(property)
-        ? property.initializer
-        : ts.isShorthandPropertyAssignment(property) ? property.name : property;
-      inspectWorkerEvalValue(value, property, unproven);
-    }
-  }
-};
-const inspectWorkerConstruction = (
- call, plan = fixedCallArgumentPlanOf(call.arguments)
-) => {
-  const options = callArgumentCandidatesAt(plan, 1);
-  if (plan.unknownIndex !== undefined && plan.unknownIndex <= 1) {
-    add(call, "worker_threads inline-evaluation options are unproven");
-  }
-  for (const option of options) {
-    inspectWorkerOptions(option, new Set(), call);
-  }
-};
-  const inspectRunnerReference = (node) => {
+const inspectRunnerReference = (node) => {
     const parent = node.parent;
     // Declaration names, property keys and erased types are not references.
     if ((ts.isPropertyAccessExpression(parent) && parent.name === node) ||
@@ -4731,13 +3640,10 @@ const inspectWorkerConstruction = (
         if (!typeOnly && DYNAMIC_EVALUATION_MODULES.has(module)) {
           add(node, "runtime dynamic-evaluation re-export is forbidden");
         }
-    // Named, namespace, and star exports can all expose Worker.
-    const exportsWorker = !clause || !ts.isNamedExports(clause) ||
-      clause.elements.some((element) => !element.isTypeOnly &&
-        [element.propertyName?.text, element.name.text].includes("Worker"));
-    if (!typeOnly && WORKER_MODULES.has(module) && exportsWorker) {
-      add(node, "runtime worker_threads capability re-export is forbidden");
-    }
+        if (WORKER_MODULES.has(module) &&
+            !hasOnlyAllowedWorkerReexports(node)) {
+          add(node, "runtime worker_threads capability re-export is forbidden");
+        }
         if (!typeOnly && ["node:process", "process"].includes(module)) {
           add(node, "runtime process capability re-export is forbidden");
         }
@@ -4752,30 +3658,15 @@ const inspectWorkerConstruction = (
       if (processObjectOf(node.propertyName ?? node.name)) {
         add(node, "runtime process capability re-export is forbidden");
       }
-    if (workerCapabilityOf(node.propertyName ?? node.name)) {
-      add(node, "runtime worker_threads capability re-export is forbidden");
-    }
     }
       return;
     }
-if (ts.isExportAssignment(node) && workerCapabilityOf(node.expression)) {
-  add(node, "runtime worker_threads capability re-export is forbidden");
-}
-if (ts.isFunctionDeclaration(node) && hasExportModifier(node) &&
-    workerCapabilityOf(node)) {
-  add(node, "runtime worker_threads capability re-export is forbidden");
-}
-if (ts.isClassDeclaration(node) && hasExportModifier(node) &&
-    workerCapabilityOf(node)) {
-  add(node, "runtime worker_threads capability re-export is forbidden");
-}
-if (ts.isVariableDeclaration(node) && node.initializer &&
-    ts.isVariableStatement(node.parent.parent) && hasExportModifier(node.parent.parent) &&
-    workerCapabilityOf(node.initializer)) {
-  add(node, "runtime worker_threads capability re-export is forbidden");
-}
     if (ts.isImportDeclaration(node)) {
       const module = moduleLiteral(node.moduleSpecifier);
+      if (WORKER_MODULES.has(module) &&
+          !hasOnlyAllowedWorkerImports(node)) {
+        add(node, "runtime worker_threads capability is forbidden in supervisor source");
+      }
       if (SHELL_MODULES.has(module) && hasRuntimeImport(node)) {
         add(node, "shell-capable runner imports are forbidden");
       }
@@ -4810,7 +3701,41 @@ if (ts.isVariableDeclaration(node) && node.initializer &&
     }
 
     if (ts.isImportEqualsDeclaration(node)) {
-      add(node, "import-equals loading is unaudited in supervisor source");
+      const moduleReference = node.moduleReference;
+      const module = ts.isExternalModuleReference(moduleReference)
+        ? staticStringOf(moduleReference.expression)
+        : undefined;
+      if (!(node.isTypeOnly && WORKER_MODULES.has(module))) {
+        if (WORKER_MODULES.has(module)) {
+          add(node, "runtime worker_threads capability is forbidden in supervisor source");
+        } else {
+          add(node, "import-equals loading is unaudited in supervisor source");
+        }
+      }
+    }
+    const requiredMember = memberAccess(node);
+    if (requiredMember?.property === "require" &&
+        commonJsModuleObjectOf(requiredMember.receiver)) {
+      const parent = node.parent;
+      if (!(ts.isCallExpression(parent) && parent.expression === node)) {
+        add(node, "CommonJS module.require capability escape is forbidden");
+      }
+    }
+    if (ts.isVariableDeclaration(node) &&
+        ts.isObjectBindingPattern(node.name) && node.initializer &&
+        commonJsModuleObjectOf(node.initializer)) {
+      for (const element of node.name.elements) {
+        const propertyName = element.propertyName
+          ? ts.isIdentifier(element.propertyName)
+            ? element.propertyName.text
+            : ts.isComputedPropertyName(element.propertyName)
+              ? staticStringOf(element.propertyName.expression)
+              : staticStringOf(element.propertyName)
+          : ts.isIdentifier(element.name) ? element.name.text : undefined;
+        if (element.dotDotDotToken || propertyName === "require") {
+          add(element, "CommonJS module.require capability escape is forbidden");
+        }
+      }
     }
     if (ts.isCallExpression(node)) {
       const called = callName(unwrap(node.expression));
@@ -4882,36 +3807,6 @@ if (ts.isVariableDeclaration(node) && node.initializer &&
     if (ts.isNewExpression(node) && dynamicFunctionOf(node.expression)) {
       add(node, "dynamic function construction is unaudited");
     }
-    if (ts.isCallExpression(node) &&
-        node.expression.kind === ts.SyntaxKind.SuperKeyword) {
-      const owner = enclosingFunctionOf(node);
-      const ownerClass = owner?.parent;
-      if (ownerClass &&
-          (ts.isClassDeclaration(ownerClass) || ts.isClassExpression(ownerClass)) &&
-          workerConstructorOf(ownerClass, new Set([node]))) {
-        inspectWorkerConstruction(node);
-      }
-    }
-if (ts.isNewExpression(node) && workerConstructorOf(node.expression)) {
- const boundPlan = workerBoundConstructorPlanOf(node.expression);
- inspectWorkerConstruction(node, boundPlan
-   ? mergeCallArgumentPlans(
-     boundPlan, fixedCallArgumentPlanOf(node.arguments ?? []))
-   : undefined);
-    }
-  if (ts.isCallExpression(node) &&
-      reflectConstructReferenceOf(node.expression) &&
-      node.arguments[0] && workerConstructorOf(node.arguments[0])) {
-    const plan = argumentArrayPlanOf(node.arguments[1]);
-    const options = callArgumentCandidatesAt(plan, 1);
-    if (options.length === 0 && plan.unknownIndex !== undefined &&
-        plan.unknownIndex <= 1) {
-      add(node, "worker_threads inline-evaluation options are unproven");
-    }
-    for (const option of options) {
-      inspectWorkerOptions(option, new Set(), node);
-    }
-  }
     const member = memberAccess(node);
     if (member?.property === "getBuiltinModule" && processObjectOf(member.receiver)) {
       add(node, "process.getBuiltinModule is forbidden in supervisor source");

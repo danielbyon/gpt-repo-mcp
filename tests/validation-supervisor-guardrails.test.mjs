@@ -219,6 +219,7 @@ test.each([
 ])("rejects process provenance through %s", (_name, source) => {
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
     .some((finding) => finding.includes("process.getBuiltinModule"))).toBe(true);
+
 });
 
 test.each([
@@ -545,1331 +546,6 @@ test("accepts ordinary helper arguments and member factories", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
   });
 
-test.each([
-  ["Worker returned by a bound member-held factory",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const make = () => Worker; const holder = { make: make.bind(null) }; " +
-    "new (holder.make())('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["Worker constructor preserved by Object.freeze",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const FrozenWorker = Object.freeze(Worker); " +
-    "new FrozenWorker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["postfix increment can enable Worker eval",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = { eval: false }; options.eval++; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["prefix increment can enable Worker eval",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = { eval: false }; ++options.eval; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["postfix decrement can enable Worker eval",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = { eval: false }; options.eval--; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["prefix decrement can enable Worker eval",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = { eval: false }; --options.eval; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["addition assignment can enable Worker eval",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = { eval: false }; options.eval += 1; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["subtraction assignment can enable Worker eval",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = { eval: false }; options.eval -= 1; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["bitwise or assignment can enable Worker eval",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = { eval: false }; options.eval |= 1; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["bitwise xor assignment can enable Worker eval",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = { eval: false }; options.eval ^= 1; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["direct inline evaluation",
-    "import { Worker } from 'node:worker_threads'; " +
-    "new Worker(\"process.getBuiltinModule('node:child_process').execFileSync('node', ['--version'])\", { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["immutable constructor alias",
-    "import { Worker as Thread } from 'node:worker_threads'; " +
-    "const WorkerConstructor = Thread; new WorkerConstructor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-["bound constructor arguments",
-"import { Worker } from 'node:worker_threads'; " +
-"const WorkerConstructor = Worker.bind(null, 'worker.js', { eval: true }); " +
-"new WorkerConstructor();",
-"worker_threads inline evaluation is forbidden"],
-["unresolved bound constructor arguments",
-"import { Worker } from 'node:worker_threads'; declare const args: any[]; " +
-"const WorkerConstructor = Worker.bind(null, ...args); " +
-"new WorkerConstructor();",
-"worker_threads inline-evaluation options are unproven"],
-["stored bound constructor",
-"import { Worker } from 'node:worker_threads'; const bind = Worker.bind; " +
-"const WorkerConstructor = bind(null, 'worker.js', { eval: true }); " +
-"new WorkerConstructor();",
-"worker_threads inline evaluation is forbidden"],
-["call-applied bound constructor",
-"import { Worker } from 'node:worker_threads'; " +
-"const WorkerConstructor = Worker.bind.call(null, 'worker.js', { eval: true }); " +
-"new WorkerConstructor();",
-"worker_threads inline evaluation is forbidden"],
-["apply-applied bound constructor",
-"import { Worker } from 'node:worker_threads'; " +
-"const WorkerConstructor = Worker.bind.apply(null, ['worker.js', { eval: true }]); " +
-"new WorkerConstructor();",
-"worker_threads inline evaluation is forbidden"],
-["reflect-applied bound constructor",
-"import { Worker } from 'node:worker_threads'; " +
-"const WorkerConstructor = Reflect.apply(Worker.bind, null, ['worker.js', { eval: true }]); " +
-"new WorkerConstructor();",
-"worker_threads inline evaluation is forbidden"],
-["Worker subclass construction",
-"import { Worker } from 'node:worker_threads'; class Runner extends Worker {} " +
-"new Runner('worker.js', { eval: true });",
-"worker_threads inline evaluation is forbidden"],
-["Worker subclass super arguments",
-"import { Worker } from 'node:worker_threads'; " +
-"class Runner extends Worker { constructor() { super('worker.js', { eval: true }); } } " +
-"new Runner();",
-"worker_threads inline evaluation is forbidden"],
-["static-block Worker member",
-"import { Worker } from 'node:worker_threads'; " +
-"class Runner { static { this.Ctor = Worker; } } " +
-"new Runner.Ctor('worker.js', { eval: true });",
-"worker_threads inline evaluation is forbidden"],
-["constructor-held Worker member",
-"import { Worker } from 'node:worker_threads'; " +
-"class Runner { constructor() { this.Ctor = Worker; } } " +
-"new (new Runner().Ctor)('worker.js', { eval: true });",
-"worker_threads inline evaluation is forbidden"],
-["static getter Worker member",
-"import { Worker } from 'node:worker_threads'; " +
-"class Runner { static get Ctor() { return Worker; } } " +
-"new Runner.Ctor('worker.js', { eval: true });",
-"worker_threads inline evaluation is forbidden"],
-  ["inherited static Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Base { static Ctor = Worker; } class Runner extends Base {} " +
-    "new Runner.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["inherited static Worker member past instance member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Base { static Ctor = Worker; } " +
-    "class Runner extends Base { Ctor = class {}; } " +
-    "new Runner.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["inherited static-block Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Base { static { this.Ctor = Worker; } } class Runner extends Base {} " +
-    "new Runner.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["inherited constructor Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Base { constructor() { this.Ctor = Worker; } } class Runner extends Base {} " +
-    "new (new Runner().Ctor)('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["inherited constructor Worker member past prototype method",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Base { constructor() { this.Ctor = Worker; } } " +
-    "class Runner extends Base { Ctor() {} } " +
-    "new (new Runner().Ctor)('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["conditional inherited constructor Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Base { constructor() { this.Ctor = Worker; } } " +
-    "class Runner extends Base { constructor() { super(); " +
-    "if (chooseSafe) this.Ctor = class {}; } } " +
-    "declare const chooseSafe: boolean; " +
-    "new (new Runner().Ctor)('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["conditional inherited static Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Base { static Ctor = Worker; } " +
-    "class Runner extends Base { static { " +
-    "if (chooseSafe) this.Ctor = class {}; } } " +
-    "declare const chooseSafe: boolean; " +
-    "new Runner.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["private constructor-assigned Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Runner { #Ctor; constructor() { this.#Ctor = Worker; } " +
-    "getCtor() { return this.#Ctor; } } " +
-    "new (new Runner().getCtor())('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["private static-block-assigned Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Runner { static #Ctor; static { this.#Ctor = Worker; } " +
-    "static getCtor() { return this.#Ctor; } } " +
-    "new (Runner.getCtor())('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["nullish constructor-assigned Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Runner { constructor() { this.Ctor ??= Worker; } } " +
-    "new (new Runner().Ctor)('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["or static-block-assigned Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Runner { static { this.Ctor ||= Worker; } } " +
-    "new Runner.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["inherited private Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Base { #Ctor = Worker; getCtor() { return this.#Ctor; } } " +
-    "class Runner extends Base {} " +
-    "new (new Runner().getCtor())('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["immutable heritage alias",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Base { static Ctor = Worker; } const Alias = Base; " +
-    "class Runner extends Alias {} new Runner.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["reassigned heritage class",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Original { static Ctor = class {}; } " +
-    "class WorkerHolder { static Ctor = Worker; } " +
-    "Original = WorkerHolder; class Runner extends Original {} " +
-    "new Runner.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["mutable heritage alias",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Safe { static Ctor = class {}; } class Base { static Ctor = Worker; } " +
-    "let Alias = Safe; Alias = Base; class Runner extends Alias {} " +
-    "new Runner.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["mutable class member target",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Safe { static Ctor = class {}; } class Holder { static Ctor = Worker; } " +
-    "let Runner = Safe; Runner = Holder; " +
-    "new Runner.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["conditional class member target",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Safe { static Ctor = class {}; } class Holder { static Ctor = Worker; } " +
-    "declare const condition: boolean; const Pick = condition ? Holder : Safe; " +
-    "new Pick.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["conditional heritage alias",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Safe { static Ctor = class {}; } class Base { static Ctor = Worker; } " +
-    "declare const chooseBase: boolean; const Alias = chooseBase ? Base : Safe; " +
-    "class Runner extends Alias {} new Runner.Ctor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["private static Worker member",
-    "import { Worker } from 'node:worker_threads'; " +
-    "class Runner { static #Ctor = Worker; static getCtor() { return this.#Ctor; } } " +
-    "new (Runner.getCtor())('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["comma-selected constructor alias",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const WorkerConstructor = (0, Worker); new WorkerConstructor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["member-held constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const workers = { Worker }; new workers.Worker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["local constructor factory",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const getWorker = () => Worker; new (getWorker())('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["array-selected constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const WorkerConstructor = [Worker][0]; " +
-    "new WorkerConstructor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["Reflect.construct constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "Reflect.construct(Worker, ['worker.js', { eval: true }]);",
-    "worker_threads inline evaluation is forbidden"],
-  ["mutable constructor alias",
-    "import { Worker as Thread } from 'node:worker_threads'; " +
-    "let WorkerConstructor = Thread; new WorkerConstructor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["constructor alias assigned after declaration",
-    "import { Worker as Thread } from 'node:worker_threads'; " +
-    "let WorkerConstructor; WorkerConstructor = Thread; new WorkerConstructor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["conditional constructor alias",
-    "import { Worker as Thread } from 'node:worker_threads'; declare const condition: boolean; " +
-    "const WorkerConstructor = condition ? Thread : Thread; new WorkerConstructor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["namespace constructor",
-    "import * as threads from 'node:worker_threads'; " +
-    "new threads.Worker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["Object.create worker namespace",
-    "import * as threads from 'node:worker_threads'; " +
-    "const namespace = Object.create(threads); " +
-    "new namespace.Worker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["setPrototypeOf worker namespace",
-    "import * as threads from 'node:worker_threads'; const namespace = {}; " +
-    "Object.setPrototypeOf(namespace, threads); " +
-    "new namespace.Worker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["prototype-assigned Worker options",
-    "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
-    "options.__proto__ = { eval: true }; new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["Reflect.set prototype-assigned Worker options",
-    "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
-    "Reflect.set(options, '__proto__', { eval: true }); new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["inherited Worker options member",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); options.__proto__.eval = true; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["prototype member alias",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); const alias = options.__proto__; " +
-    "alias.eval = true; new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["getPrototypeOf alias",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); " +
-    "const alias = Object.getPrototypeOf(options); alias.eval = true; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["mutable getPrototypeOf alias",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); " +
-    "let alias = Object.getPrototypeOf(options); alias.eval = true; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["conditionally reassigned getPrototypeOf alias",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); " +
-    "let alias = Object.getPrototypeOf(options); declare const reset: boolean; " +
-    "if (reset) alias = {}; alias.eval = true; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["conditional getPrototypeOf mutation alias",
-    "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
-    "declare const condition: boolean; " +
-    "const alias = condition ? Object.getPrototypeOf(options) : " +
-    "Object.getPrototypeOf(options); alias.eval = true; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["destructured prototype alias",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); " +
-    "const { __proto__: alias } = options; alias.eval = true; " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["Reflect-selected worker constructor",
-    "import * as threads from 'node:worker_threads'; " +
-    "const Thread = Reflect.get(threads, 'Worker'); " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["descriptor-selected worker constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const { value: Thread } = " +
-    "Reflect.getOwnPropertyDescriptor({ Worker }, 'Worker')!; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["unresolved descriptor-selected worker constructor",
-    "import { Worker } from 'node:worker_threads'; declare const key: string; " +
-    "const { value: Thread } = " +
-    "Reflect.getOwnPropertyDescriptor({ Worker }, key)!; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["descriptor value worker constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const Thread = " +
-    "Reflect.getOwnPropertyDescriptor({ Worker }, 'Worker')!.value; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["unresolved descriptor value worker constructor",
-    "import { Worker } from 'node:worker_threads'; declare const key: string; " +
-    "const Thread = " +
-    "Reflect.getOwnPropertyDescriptor({ Worker }, key)!.value; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["Object descriptor-selected worker constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const { value: Thread } = " +
-    "Object.getOwnPropertyDescriptor({ Worker }, 'Worker')!; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["Object descriptor value worker constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const Thread = " +
-    "Object.getOwnPropertyDescriptor({ Worker }, 'Worker')!.value; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["Object descriptor value worker constructor with key alias",
-    "import { Worker } from 'node:worker_threads'; const key = 'Worker'; " +
-    "const Thread = " +
-    "Object.getOwnPropertyDescriptor({ Worker }, key)!.value; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["Object descriptor value worker constructor through Object alias",
-    "import { Worker } from 'node:worker_threads'; const O = Object; " +
-    "const Thread = " +
-    "O.getOwnPropertyDescriptor({ Worker }, 'Worker')!.value; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["Object descriptor value worker constructor through method alias",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const read = Object.getOwnPropertyDescriptor; " +
-    "const Thread = read({ Worker }, 'Worker')!.value; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["aliased Reflect-selected worker constructor",
-    "import * as threads from 'node:worker_threads'; const read = Reflect.get; " +
-    "const Thread = read(threads, 'Worker'); " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["unresolved Reflect-selected worker constructor",
-    "import * as threads from 'node:worker_threads'; declare const key: string; " +
-    "const Thread = Reflect.get(threads, key); " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["Reflect.construct selected worker constructor",
-    "import * as threads from 'node:worker_threads'; " +
-    "const Thread = Reflect.get(threads, 'Worker'); " +
-    "Reflect.construct(Thread, ['worker.js', { eval: true }]);",
-    "worker_threads inline evaluation is forbidden"],
-  ["Worker prototype constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "new Worker.prototype.constructor('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["bracket Worker prototype constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "new Worker['prototype']['constructor']('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["aliased Worker prototype constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const Thread = Worker.prototype.constructor; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["Reflect.construct Worker prototype constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "Reflect.construct(Worker.prototype.constructor, " +
-    "['worker.js', { eval: true }]);",
-    "worker_threads inline evaluation is forbidden"],
-  ["prototype object alias constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const proto = Worker.prototype; const Thread = proto.constructor; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["mutable prototype object alias constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "let proto = Worker.prototype; const Thread = proto.constructor; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["destructured prototype object constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const { prototype: proto } = Worker; const Thread = proto.constructor; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["member-held prototype object constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const holder = { proto: Worker.prototype }; " +
-    "const Thread = holder.proto.constructor; " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["conditional prototype object constructor",
-    "import { Worker } from 'node:worker_threads'; declare const flag: boolean; " +
-    "const proto = flag ? Worker.prototype : Worker.prototype; " +
-    "const Thread = proto.constructor; new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["parameter prototype object constructor",
-    "import { Worker } from 'node:worker_threads'; " +
-    "function launch(proto: any) { new proto.constructor('worker.js', " +
-    "{ eval: true }); } launch(Worker.prototype);",
-    "worker_threads inline evaluation is forbidden"],
-  ["mutable namespace alias",
-    "import * as threads from 'node:worker_threads'; " +
-    "let namespace = threads; new namespace.Worker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["reassigned namespace member",
-    "import * as threads from 'node:worker_threads'; " +
-    "const namespace = { Worker: class {} }; namespace.Worker = threads.Worker; " +
-    "new namespace.Worker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["spread namespace",
-    "import * as threads from 'node:worker_threads'; " +
-    "const namespace = { ...threads, type: 'module' }; " +
-    "new namespace.Worker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["rest-copied CommonJS namespace",
-    "const threads = require('node:worker_threads'); " +
-    "const { ...namespace } = threads; " +
-    "new namespace.Worker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["destructured namespace constructor",
-    "import * as threads from 'node:worker_threads'; " +
-    "const { Worker: Thread } = threads; new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["CommonJS namespace constructor",
-    "const threads = require('node:worker_threads'); " +
-    "new threads.Worker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["CommonJS mutable namespace alias",
-    "const threads = require('node:worker_threads'); " +
-    "let namespace = threads; new namespace.Worker('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["CommonJS destructured constructor",
-    "const { Worker: Thread } = require('node:worker_threads'); " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["mutable CommonJS destructured constructor",
-    "let { Worker: Thread } = require('node:worker_threads'); " +
-    "new Thread('worker.js', { eval: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["immutable options alias",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options = { eval: true }; new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["conditional options",
-    "import { Worker } from 'node:worker_threads'; declare const condition: boolean; " +
-    "new Worker('worker.js', condition ? { eval: true } : { eval: false });",
-    "worker_threads inline evaluation is forbidden"],
-  ["conditional known and unresolved options",
-    "import { Worker } from 'node:worker_threads'; " +
-    "import { getOptions } from './options.js'; declare const chooseSafe: boolean; " +
-    "const options = chooseSafe ? { eval: false } : getOptions(); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline-evaluation options are unproven"],
-  ["computed evaluation option",
-    "import { Worker } from 'node:worker_threads'; " +
-    "new Worker('worker.js', { ['eval']: true });",
-    "worker_threads inline evaluation is forbidden"],
-  ["spread evaluation options",
-    "import { Worker } from 'node:worker_threads'; declare const options: any; " +
-    "new Worker('worker.js', { ...options });",
-    "worker_threads inline-evaluation options are unproven"],
-  ["prototype evaluation option",
-    "import { Worker } from 'node:worker_threads'; " +
-    "new Worker('worker.js', { __proto__: { eval: true } });",
-    "worker_threads inline evaluation is forbidden"],
-  ["known spread evaluation options",
-    "import { Worker } from 'node:worker_threads'; const options = { eval: true }; " +
-    "new Worker('worker.js', { ...options });",
-    "worker_threads inline evaluation is forbidden"],
-["whole argument-list spread",
-"import { Worker } from 'node:worker_threads'; " +
-"new Worker(...['worker.js', { eval: true }]);",
-"worker_threads inline evaluation is forbidden"],
-["aliased argument-list spread",
-"import { Worker } from 'node:worker_threads'; " +
-"const args = ['worker.js', { eval: true }]; new Worker(...args);",
-"worker_threads inline evaluation is forbidden"],
-["unresolved argument-list spread",
-"import { Worker } from 'node:worker_threads'; declare const args: any[]; " +
-"new Worker(...args);",
-"worker_threads inline-evaluation options are unproven"],
-["known option after unresolved argument-list spread",
-"import { Worker } from 'node:worker_threads'; declare const args: any[]; " +
-"new Worker(...args, { eval: false });",
-"worker_threads inline-evaluation options are unproven"],
-  ["mutable evaluation option",
-    "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
-    "options.eval = true; new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-["joined computed evaluation option",
-"import { Worker } from 'node:worker_threads'; const options = {}; " +
-"const key = ['e', 'v', 'a', 'l'].join(''); options[key] = true; " +
-"new Worker('worker.js', options);",
-"worker_threads inline evaluation is forbidden"],
-["array-alias evaluation option",
-"import { Worker } from 'node:worker_threads'; const parts = ['e', 'v', 'a', 'l']; " +
-"const options = {}; options[parts.join('')] = true; new Worker('worker.js', options);",
-"worker_threads inline evaluation is forbidden"],
-["concatenated computed evaluation option",
-"import { Worker } from 'node:worker_threads'; const options = {}; " +
-"options['ev' + 'al'] = true; new Worker('worker.js', options);",
-"worker_threads inline evaluation is forbidden"],
-["mutated array-selected evaluation option",
-"import { Worker } from 'node:worker_threads'; const parts = ['safe']; " +
-"parts[0] = 'eval'; const options = {}; " +
-"options[parts.join('')] = true; new Worker('worker.js', options);",
-"worker_threads inline-evaluation options are unproven"],
-["helper-mutated array-selected evaluation option",
-"import { Worker } from 'node:worker_threads'; const parts = ['safe']; enable(); " +
-"const options = {}; options[parts.join('')] = true; " +
-"new Worker('worker.js', options); function enable() { parts[0] = 'eval'; }",
-"worker_threads inline-evaluation options are unproven"],
-["unknown computed evaluation option",
-"import { Worker } from 'node:worker_threads'; const options = {}; " +
-"declare const key: string; options[key] = true; new Worker('worker.js', options);",
-"worker_threads inline-evaluation options are unproven"],
-  ["aliased mutable evaluation option",
-    "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
-    "const alias = options; alias.eval = true; new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-["member-held option mutation",
-"import { Worker } from 'node:worker_threads'; const options = {}; " +
-"const holder = { options }; holder.options.eval = true; " +
-"new Worker('worker.js', options);",
-"worker_threads inline evaluation is forbidden"],
-["destructured member-held option mutation",
-"import { Worker } from 'node:worker_threads'; const options = {}; " +
-"const holder = { options }; const { options: alias } = holder; " +
-"alias.eval = true; new Worker('worker.js', options);",
-"worker_threads inline evaluation is forbidden"],
-["inherited prototype mutation",
-"import { Worker } from 'node:worker_threads'; const prototype = {}; " +
-"const options = Object.create(prototype); prototype.eval = true; " +
-"new Worker('worker.js', options);",
-"worker_threads inline evaluation is forbidden"],
-["local option mutator",
-"import { Worker } from 'node:worker_threads'; " +
-"function enable(value) { value.eval = true; } const options = {}; " +
-"enable(options); new Worker('worker.js', options);",
-"worker_threads inline evaluation is forbidden"],
-  ["member-held option method mutation",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = { enable() { this.eval = true; } }; " +
-    "options.enable(); new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["assigned member-held option method mutation",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = {}; options.enable = function () { this.eval = true; }; " +
-    "options.enable(); new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["Reflect.apply option method mutation",
-    "import { Worker } from 'node:worker_threads'; " +
-    "const options: any = { enable() { this.eval = true; } }; " +
-    "Reflect.apply(options.enable, options, []); new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["computed member-held option method mutation",
-    "import { Worker } from 'node:worker_threads'; declare const key: string; " +
-    "const options: any = { enable() { this[key] = true; } }; " +
-    "options.enable(); new Worker('worker.js', options);",
-    "worker_threads inline-evaluation options are unproven"],
-  ["unresolved member-held option method",
-    "import { Worker } from 'node:worker_threads'; import { load } from './load.js'; " +
-    "const options: any = {}; options.enable = load; options.enable(); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline-evaluation options are unproven"],
-  ["unknown member-held option method",
-    "import { Worker } from 'node:worker_threads'; declare const key: string; " +
-    "const options: any = {}; options[key](); new Worker('worker.js', options);",
-    "worker_threads inline-evaluation options are unproven"],
-["chained local option mutator",
-"import { Worker } from 'node:worker_threads'; " +
-"function enable(value) { value.eval = true; } " +
-"function outer(value) { enable(value); } const options = {}; " +
-"outer(options); new Worker('worker.js', options);",
-"worker_threads inline evaluation is forbidden"],
-  ["String-selected evaluation option",
-    "import { Worker } from 'node:worker_threads'; const options = {}; " +
-    "options[String('eval')] = true; new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["Object.assign evaluation option",
-    "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
-    "Object.assign(options, { eval: true }); new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["Reflect.set evaluation option",
-    "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
-    "Reflect.set(options, 'eval', true); new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["defineProperty evaluation option",
-    "import { Worker } from 'node:worker_threads'; const options = { eval: false }; " +
-    "Object.defineProperty(options, 'eval', { value: true }); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["Reflect.defineProperty evaluation option",
-    "import { Worker } from 'node:worker_threads'; const options = {}; " +
-    "Reflect.defineProperty(options, 'eval', { value: true }); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["unresolved Object.defineProperty key",
-    "import { Worker } from 'node:worker_threads'; const options = {}; " +
-    "const key = process.env.WORKER_OPTION_KEY; " +
-    "Object.defineProperty(options, key, { value: true }); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline-evaluation options are unproven"],
-  ["resolved Object.defineProperty key alias",
-    "import { Worker } from 'node:worker_threads'; const options = {}; " +
-    "const key = 'eval'; " +
-    "Object.defineProperty(options, key, { value: true }); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["unresolved Reflect.defineProperty key",
-    "import { Worker } from 'node:worker_threads'; const options = {}; " +
-    "const key = process.env.WORKER_OPTION_KEY; " +
-    "Reflect.defineProperty(options, key, { value: true }); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline-evaluation options are unproven"],
-  ["unresolved direct Object.defineProperty key",
-    "import { Worker } from 'node:worker_threads'; const options = {}; " +
-    "Object.defineProperty(options, process.env.WORKER_OPTION_KEY, " +
-    "{ value: true }); new Worker('worker.js', options);",
-    "worker_threads inline-evaluation options are unproven"],
-  ["defineProperties evaluation option",
-    "import { Worker } from 'node:worker_threads'; const options = {}; " +
-    "Object.defineProperties(options, { eval: { value: true } }); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["getter-backed defineProperties evaluation option",
-    "import { Worker } from 'node:worker_threads'; const options = {}; " +
-    "Object.defineProperties(options, { get eval() { return { value: true }; } }); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["setPrototypeOf evaluation option",
-    "import { Worker } from 'node:worker_threads'; const options = {}; " +
-    "Object.setPrototypeOf(options, { eval: true }); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline evaluation is forbidden"],
-  ["dynamically named Reflect.set option",
-    "import { Worker } from 'node:worker_threads'; const options = {}; " +
-    "declare const key: string; Reflect.set(options, key, false); " +
-    "new Worker('worker.js', options);",
-    "worker_threads inline-evaluation options"],
-  ["unresolved evaluation options",
-    "import { Worker } from 'node:worker_threads'; declare const options: any; " +
-    "new Worker('worker.js', options);",
-"worker_threads inline-evaluation options are unproven"],
-["conditional unresolved Object.assign options",
-"import { Worker } from 'node:worker_threads'; declare const choose: boolean; " +
-"declare function loadOptions(): any; const options = Object.assign({}, " +
-"choose ? { eval: false } : loadOptions()); new Worker('worker.js', options);",
-"worker_threads inline-evaluation options are unproven"],
-["conditional unresolved Object.create options",
-"import { Worker } from 'node:worker_threads'; declare const choose: boolean; " +
-"declare function loadOptions(): any; const options = Object.create(" +
-"choose ? { eval: false } : loadOptions()); new Worker('worker.js', options);",
-"worker_threads inline-evaluation options are unproven"],
-["conditional unresolved local-factory options",
-"import { Worker } from 'node:worker_threads'; declare const choose: boolean; " +
-"declare function loadOptions(): any; function getOptions() { " +
-"return choose ? { eval: false } : loadOptions(); } " +
-"new Worker('worker.js', getOptions());",
-"worker_threads inline-evaluation options are unproven"],
-["factory-created mutated options",
-"import { Worker } from 'node:worker_threads'; function getOptions(): any { " +
-"const options: any = {}; options.eval = true; return options; } " +
-"new Worker('worker.js', getOptions());",
-"worker_threads inline evaluation is forbidden"],
-["factory-created cyclic mutated options",
-"import { Worker } from 'node:worker_threads'; function getOptions(): any { " +
-"const options: any = {}; options.self = options; options.eval = true; return options; } " +
-"new Worker('worker.js', getOptions());",
-"worker_threads inline evaluation is forbidden"],
- ["immediately invoked factory-created mutated options",
-  "import { Worker } from 'node:worker_threads'; " +
-  "new Worker('worker.js', (() => { const options: any = {}; " +
-  "options.eval = true; return options; })());",
-  "worker_threads inline evaluation is forbidden"],
- ["immediately invoked factory computed eval mutation",
-  "import { Worker } from 'node:worker_threads'; " +
-  "new Worker('worker.js', (() => { const options: any = {}; " +
-  "options[String('eval')] = true; return options; })());",
-  "worker_threads inline evaluation is forbidden"],
- ["immediately invoked factory Reflect.set eval mutation",
-  "import { Worker } from 'node:worker_threads'; " +
-  "new Worker('worker.js', (() => { const options: any = {}; " +
-  "Reflect.set(options, 'eval', true); return options; })());",
-  "worker_threads inline evaluation is forbidden"],
- ["comma-wrapped Reflect.set eval mutation",
-  "import { Worker } from 'node:worker_threads'; " +
-  "new Worker('worker.js', (() => { const options: any = {}; " +
-  "(0, Reflect.set)(options, 'eval', true); return options; })());",
-  "worker_threads inline evaluation is forbidden"],
- ["Object.assign-copied factory eval mutation",
-  "import { Worker } from 'node:worker_threads'; " +
-  "new Worker('worker.js', Object.assign({}, (() => { const options: any = {}; " +
-  "options.eval = true; return options; })()));",
-  "worker_threads inline evaluation is forbidden"],
- ["hoisted factory declared after Worker call",
-  "import { Worker } from 'node:worker_threads'; " +
-  "new Worker('worker.js', make()); " +
-  "function make(): any { const options: any = {}; options.eval = true; return options; }",
-  "worker_threads inline evaluation is forbidden"],
- ["hoisted factory calling a local mutator",
-  "import { Worker } from 'node:worker_threads'; " +
-  "new Worker('worker.js', make()); function make(): any { const options: any = {}; " +
-  "const mutate = () => { options.eval = true; }; mutate(); return options; }",
-  "worker_threads inline evaluation is forbidden"],
-["local Worker constructor parameter",
-"import { Worker } from 'node:worker_threads'; " +
-"function launch(Ctor, options) { new Ctor('worker.js', options); } " +
-"launch(Worker, { eval: true });",
-"worker_threads inline evaluation is forbidden"],
-["destructured Worker constructor and options parameters",
-"import { Worker } from 'node:worker_threads'; " +
-"function launch({ Ctor, options }) { new Ctor('worker.js', options); } " +
-"launch({ Ctor: Worker, options: { eval: true } });",
-"worker_threads inline evaluation is forbidden"],
-["chained local Worker constructor parameter",
-"import { Worker } from 'node:worker_threads'; " +
-"function launch(Ctor, options) { new Ctor('worker.js', options); } " +
-"function outer(Ctor, options) { launch(Ctor, options); } " +
-"outer(Worker, { eval: true });",
-"worker_threads inline evaluation is forbidden"],
-["local worker namespace parameter",
-"import * as threads from 'node:worker_threads'; " +
-"function launch(namespace, options) { new namespace.Worker('worker.js', options); } " +
-"launch(threads, { eval: true });",
-"worker_threads inline evaluation is forbidden"],
-["String-selected worker member",
-"import * as threads from 'node:worker_threads'; " +
-"new threads[String('Worker')]('worker.js', { eval: true });",
-"worker_threads inline evaluation is forbidden"]
-])("rejects worker inline evaluation through %s", (_name, source, expected) => {
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
-    .some((finding) => finding.includes(expected))).toBe(true);
-});
-test("rejects worker constructor exports from audited supervisor sources", () => {
-  const sources = new Map(SUPERVISOR_SOURCES.map((path) => [path, ""]));
-  sources.set(
-    "src/services/windows-process-host.ts",
-    "import { Worker } from 'node:worker_threads'; export { Worker };"
-  );
-  sources.set(
-    "src/services/validation-service.ts",
-    "import { Worker as ExportedWorker } from './windows-process-host.js'; " +
-      "new ExportedWorker('worker.js', { eval: true });"
-  );
-
-  const findings = inspectSupervisorSources((path) => sources.get(path) ?? "");
-  expect(findings.some((finding) =>
-    finding.includes("runtime worker_threads capability re-export is forbidden")))
-    .toBe(true);
-});
-test.each([
-  "export { Worker } from 'node:worker_threads';",
-  "export { Worker as Thread } from 'node:worker_threads';",
-  "export { isMainThread as Worker } from 'node:worker_threads';",
-  "export * from 'node:worker_threads';",
-  "export * as threads from 'node:worker_threads';"
-])("rejects worker capability module re-export %s", (source) => {
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
-    .some((finding) => finding.includes("runtime worker_threads capability re-export")))
-    .toBe(true);
-});
-test.each([
-  ["default export", "export default Worker;"],
-  ["exported immutable alias", "export const Thread = Worker;"],
-  ["exported factory", "export const getWorker = () => Worker;"],
-  ["exported function", "export function getWorker() { return Worker; }"],
-  ["exported helper value", "const getWorker = () => Worker; export function exported() { return getWorker; }"],
-  ["member-held exported factory", "const getWorker = () => Worker; export const tools = { make: () => getWorker() };"],
-  ["array-held constructor", "export const runtime = [Worker];"],
-  ["class-held constructor", "export class Box { static make() { return Worker; } }"],
-  ["class heritage", "export class Box extends Worker {}"],
-  ["class constructor member", "export class Box { constructor() { this.make = Worker; } }"],
-  ["class static block member", "export class Box { static { this.make = Worker; } }"],
-["local class binding", "class Box { static make() { return Worker; } } export { Box };"],
-  ["bound constructor", "export const make = Worker.bind(null);"],
-  ["bound constructor argument", "const wrap = (value) => value; export const make = wrap.bind(null, Worker);"]
-])("rejects worker capability %s", (_name, declaration) => {
-  const source = "import { Worker } from 'node:worker_threads'; " + declaration;
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
-    .some((finding) => finding.includes("runtime worker_threads capability re-export")))
-    .toBe(true);
-});
-test("accepts worker module exports that exclude constructor capability", () => {
-  const source = [
-    "import { isMainThread } from 'node:worker_threads';",
-    "export { isMainThread };",
-    "export { parentPort as workerParentPort } from 'node:worker_threads';",
-    "export type { Worker } from 'node:worker_threads';",
-    "export const mainThreadValue = isMainThread;",
-    "export const getMainThread = () => isMainThread;",
-    "export function readMainThread() { return isMainThread; }",
-    "const getMainThread = () => isMainThread;",
-    "export const safeTools = { make: getMainThread };",
-    "export const safeRuntime = [isMainThread];",
-    "export class SafeBox { static read() { return isMainThread; } }",
-    "export class SafeExtended extends Array {}",
-    "export class SafeMembers { constructor() { this.value = 1; } static { this.other = 2; } }",
-  "class LocalSafeBox { static read() { return isMainThread; } } export { LocalSafeBox };",
-    "export const safeBound = getMainThread.bind(null);",
-    "export default 1;"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual([]);
-});
-test("resolves long bounded local option alias chains without truncating", () => {
-  const hopCount = 130;
-  const sourceFor = (value) => "import { Worker } from 'node:worker_threads'; " +
-    Array.from({ length: hopCount }, (_, index) => index === hopCount - 1
-      ? `function hop${index}(value) { value.eval = ${value}; }`
-      : `function hop${index}(value) { hop${index + 1}(value); }`)
-      .join(" ") +
-    " const options = {}; hop0(options); new Worker('worker.js', options);";
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", sourceFor(true))
-    .some((finding) => finding.includes("worker_threads inline evaluation is forbidden")))
-    .toBe(true);
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", sourceFor(false)))
-    .toEqual([]);
-}, 20_000);
-test("accepts worker construction without inline evaluation", () => {
-  const source = [
-    "import { Worker as NamedWorker } from 'node:worker_threads';",
-    "import * as threads from 'node:worker_threads';",
-    "const WorkerConstructor = NamedWorker;",
-    "new WorkerConstructor(new URL('./worker.mjs', import.meta.url));",
-    "let MutableWorkerConstructor = NamedWorker;",
-    "new MutableWorkerConstructor('./worker.mjs', { eval: false });",
-    "let MutableThreads = threads;",
-    "new MutableThreads.Worker('./worker.mjs', { eval: false });",
-    "new NamedWorker('./worker.mjs');",
-    "new NamedWorker('./worker.mjs', { type: 'module' });",
-    "new NamedWorker.prototype.constructor('./worker.mjs', { eval: false });",
-    "const safeProto = NamedWorker.prototype;",
-    "const SafeAliasedThread = safeProto.constructor;",
-    "new SafeAliasedThread('./worker.mjs', { eval: false });",
-    "const { prototype: SafeDestructuredPrototype } = NamedWorker;",
-    "const SafeDestructuredThread = SafeDestructuredPrototype.constructor;",
-    "new SafeDestructuredThread('./worker.mjs', { eval: false });",
-    "const safePrototypeHolder = { proto: NamedWorker.prototype };",
-    "const SafeHeldThread = safePrototypeHolder.proto.constructor;",
-    "new SafeHeldThread('./worker.mjs', { eval: false });",
-    "const SafeConditionalPrototype = useFirstSafeOptions ? " +
-      "NamedWorker.prototype : NamedWorker.prototype;",
-    "const SafeConditionalThread = SafeConditionalPrototype.constructor;",
-    "new SafeConditionalThread('./worker.mjs', { eval: false });",
-    "function launchSafePrototype(proto: any) { " +
-      "new proto.constructor('./worker.mjs', { eval: false }); }",
-    "launchSafePrototype(NamedWorker.prototype);",
-    "const safeOptions = { eval: false };",
-    "new NamedWorker('./worker.mjs', safeOptions);",
-    "new NamedWorker('./worker.mjs', { ...safeOptions });",
-    "const { Worker: NamespacedWorker } = threads;",
-    "new NamespacedWorker('./worker.mjs', { eval: false });",
-    "let AssignedWorker; AssignedWorker = NamedWorker;",
-    "new AssignedWorker('./worker.mjs', { eval: false });",
-    "let { Worker: MutableCommonJsWorker } = require('node:worker_threads');",
-    "new MutableCommonJsWorker('./worker.mjs', { eval: false });",
-    "const CommaWorker = (0, NamedWorker);",
-    "new CommaWorker('./worker.mjs', { eval: false });",
-    "const workers = { Worker: NamedWorker };",
-    "new workers.Worker('./worker.mjs', { eval: false });",
-    "const reassignedWorkers = { Worker: class {} }; reassignedWorkers.Worker = threads.Worker;",
-    "new reassignedWorkers.Worker('./worker.mjs', { eval: false });",
-    "const copiedThreads = { ...threads, type: 'module' };",
-    "new copiedThreads.Worker('./worker.mjs', { eval: false });",
-    "const getWorker = () => NamedWorker;",
-    "new (getWorker())('./worker.mjs', { eval: false });",
-    "const arrayWorker = [NamedWorker][0];",
-    "new arrayWorker('./worker.mjs', { eval: false });",
-"const boundWorker = NamedWorker.bind(null, './worker.mjs', { eval: false });",
-"new boundWorker();",
-    "const methodOptions: any = {",
-    "  markEnabled() { this.enabled = true; },",
-    "  disableEvaluation() { this.eval = false; }",
-    "};",
-    "methodOptions.markEnabled();",
-    "methodOptions.disableEvaluation();",
-    "new NamedWorker('./worker.mjs', methodOptions);",
-    "const makeSafeValue = (value: any) => value;",
-    "const safeFunctionHolder = { make: makeSafeValue.bind(null, 7) };",
-    "safeFunctionHolder.make();",
-    "class OrdinaryConstructor {}",
-    "const FrozenOrdinaryConstructor = Object.freeze(OrdinaryConstructor);",
-    "new FrozenOrdinaryConstructor();",
-    "const frozenOrdinaryObject = Object.freeze({ value: 1 });",
-    "const safeMutationOptions: any = { eval: false, count: 0 };",
-    "safeMutationOptions.count++;",
-    "safeMutationOptions.count += 1;",
-    "safeMutationOptions.eval = false;",
-    "new NamedWorker('./worker.mjs', safeMutationOptions);",
-    "const lateMutationOptions: any = { enable() { this.eval = true; } };",
-    "new NamedWorker('./worker.mjs', lateMutationOptions);",
-    "lateMutationOptions.enable();",
-    "const safeMutablePrototypeOptions: any = Object.create({});",
-    "let safeMutablePrototypeAlias = " +
-      "Object.getPrototypeOf(safeMutablePrototypeOptions);",
-    "safeMutablePrototypeAlias = {};",
-    "safeMutablePrototypeAlias.eval = true;",
-    "new NamedWorker('./worker.mjs', safeMutablePrototypeOptions);",
-    "const safeConditionalPrototypeOptions = {};",
-    "const safeConditionalPrototypeAlias = useFirstSafeOptions ? " +
-      "Object.getPrototypeOf(safeConditionalPrototypeOptions) : " +
-      "Object.getPrototypeOf(safeConditionalPrototypeOptions);",
-    "safeConditionalPrototypeAlias.eval = false;",
-    "new NamedWorker('./worker.mjs', safeConditionalPrototypeOptions);",
-    "const { value: DescriptorWorker } = " +
-      "Reflect.getOwnPropertyDescriptor({ Worker: NamedWorker }, 'Worker')!;",
-    "new DescriptorWorker('./worker.mjs', { eval: false });",
-    "const DescriptorValueWorker = " +
-      "Reflect.getOwnPropertyDescriptor({ Worker: NamedWorker }, 'Worker')!.value;",
-    "new DescriptorValueWorker('./worker.mjs', { eval: false });",
-    "const { value: ObjectDescriptorWorker } = " +
-      "Object.getOwnPropertyDescriptor({ Worker: NamedWorker }, 'Worker')!;",
-    "new ObjectDescriptorWorker('./worker.mjs', { eval: false });",
-    "const ObjectDescriptorValueWorker = " +
-      "Object.getOwnPropertyDescriptor({ Worker: NamedWorker }, 'Worker')!.value;",
-    "new ObjectDescriptorValueWorker('./worker.mjs', { eval: false });",
-    "const safeNonWorkerDescriptorKey = 'constructor';",
-    "const SafeNonWorkerDescriptor = Object.getOwnPropertyDescriptor(",
-    "  { Worker: NamedWorker }, safeNonWorkerDescriptorKey)!.value;",
-    "new SafeNonWorkerDescriptor('./worker.mjs', { eval: true });",
-    "const { value: SafeObjectDescriptorWorker } = Object.getOwnPropertyDescriptor(",
-    "  { Worker: class SafeWorker {} }, 'Worker')!;",
-    "new SafeObjectDescriptorWorker('./worker.mjs', { eval: true });",
-    "const { value: SafeDescriptorWorker } = Reflect.getOwnPropertyDescriptor(",
-    "  { Worker: class SafeWorker {} }, 'Worker')!;",
-    "new SafeDescriptorWorker('./worker.mjs', { eval: true });",
-    "const safeBind = NamedWorker.bind;",
-    "const safeStoredBoundWorker = safeBind(null, './worker.mjs', { eval: false });",
-    "new safeStoredBoundWorker();",
-    "const safeCallBoundWorker = NamedWorker.bind.call(null, './worker.mjs', { eval: false });",
-    "new safeCallBoundWorker();",
-    "const safeApplyBoundWorker = NamedWorker.bind.apply(null, ['./worker.mjs', { eval: false }]);",
-    "new safeApplyBoundWorker();",
-    "const safeReflectBoundWorker = Reflect.apply(NamedWorker.bind, null, ['./worker.mjs', { eval: false }]);",
-    "new safeReflectBoundWorker();",
-    "class SafeRunner extends NamedWorker {}",
-    "new SafeRunner('./worker.mjs', { eval: false });",
-    "class SafeSubclassSuper extends NamedWorker { constructor() { super('./worker.mjs', { eval: false }); } }",
-    "new SafeSubclassSuper();",
-    "class SafeStaticInstall { static { this.Ctor = NamedWorker; } }",
-    "new SafeStaticInstall.Ctor('./worker.mjs', { eval: false });",
-    "class SafeInstanceInstall { constructor() { this.Ctor = NamedWorker; } }",
-    "new (new SafeInstanceInstall().Ctor)('./worker.mjs', { eval: false });",
-    "class SafeGetterInstall { static get Ctor() { return NamedWorker; } }",
-    "new SafeGetterInstall.Ctor('./worker.mjs', { eval: false });",
-"class SafeWorkerBase { static Ctor = NamedWorker; }",
-"class SafeInheritedInstall extends SafeWorkerBase {}",
-"new SafeInheritedInstall.Ctor('./worker.mjs', { eval: false });",
-"const SafeHeritageAlias = SafeWorkerBase;",
-"class SafeAliasInstall extends SafeHeritageAlias {}",
-"new SafeAliasInstall.Ctor('./worker.mjs', { eval: false });",
-"class SafeAssignedHeritage { static Ctor = NamedWorker; }",
-"class SafeHeritageSnapshot extends SafeAssignedHeritage {}",
-"class SafeReplacementHeritage { static Ctor = class {}; }",
-"SafeAssignedHeritage = SafeReplacementHeritage;",
-"new SafeHeritageSnapshot.Ctor('./worker.mjs', { eval: false });",
-"class ShadowedSafeInstall extends SafeWorkerBase { static Ctor = class {}; }",
-"new ShadowedSafeInstall.Ctor('./worker.mjs', { eval: true });",
-"class SafeStaticBlockBase { static { this.Ctor = NamedWorker; } }",
-"class SafeInheritedStaticBlock extends SafeStaticBlockBase {}",
-"new SafeInheritedStaticBlock.Ctor('./worker.mjs', { eval: false });",
-"class SafeConstructorBase { constructor() { this.Ctor = NamedWorker; } }",
-"class SafeInheritedConstructor extends SafeConstructorBase {}",
-"new (new SafeInheritedConstructor().Ctor)('./worker.mjs', { eval: false });",
-"class SafePrivateInstall { static #Ctor = NamedWorker; static getCtor() { return this.#Ctor; } }",
-"new (SafePrivateInstall.getCtor())('./worker.mjs', { eval: false });",
-"class SafePrivateBase { #Ctor = NamedWorker; getCtor() { return this.#Ctor; } }",
-"class SafePrivateChild extends SafePrivateBase {}",
-"new (new SafePrivateChild().getCtor())('./worker.mjs', { eval: false });",
-  "class SafePrivateConstructorInstall { #Ctor; constructor() { this.#Ctor = NamedWorker; } getCtor() { return this.#Ctor; } }",
-  "new (new SafePrivateConstructorInstall().getCtor())('./worker.mjs', { eval: false });",
-  "class SafePrivateStaticBlockInstall { static #Ctor; static { this.#Ctor = NamedWorker; } static getCtor() { return this.#Ctor; } }",
-  "new (SafePrivateStaticBlockInstall.getCtor())('./worker.mjs', { eval: false });",
-  "class SafeNullishInstall { constructor() { this.Ctor ??= NamedWorker; } }",
-  "new (new SafeNullishInstall().Ctor)('./worker.mjs', { eval: false });",
-  "class SafeOrStaticInstall { static { this.Ctor ||= NamedWorker; } }",
-  "new SafeOrStaticInstall.Ctor('./worker.mjs', { eval: false });",
-    "const { ...commonJsNamespace } = require('node:worker_threads');",
-    "new commonJsNamespace.Worker('./worker.mjs', { eval: false });",
-    "Reflect.construct(NamedWorker, ['./worker.mjs', { eval: false }]);",
-    "new NamedWorker('./worker.mjs', undefined);",
-    "const inheritedSafeOptions = { __proto__: { eval: false } };",
-    "new NamedWorker('./worker.mjs', inheritedSafeOptions);",
-    "const mutatedSafeOptions = {};",
-    "Object.assign(mutatedSafeOptions, { type: 'module' });",
-    "Reflect.set(mutatedSafeOptions, 'type', 'module');",
-    "Object.defineProperty(mutatedSafeOptions, 'type', { value: 'module' });",
-    "Reflect.defineProperty(mutatedSafeOptions, 'type', { value: 'module' });",
-    "const safeNamedDescriptorKey = 'type';",
-    "Object.defineProperty(mutatedSafeOptions, safeNamedDescriptorKey, " +
-      "{ value: 'module' });",
-    "Reflect.defineProperty(mutatedSafeOptions, safeNamedDescriptorKey, " +
-      "{ value: 'module' });",
-    "const unrelatedDescriptorTarget = {};",
-    "Object.defineProperty(unrelatedDescriptorTarget, " +
-      "process.env.WORKER_OPTION_KEY, { value: true });",
-    "Object.defineProperties(mutatedSafeOptions, { eval: { value: false } });",
-    "Object.defineProperties(mutatedSafeOptions, { get eval() { return { value: false }; } });",
-    "Object.setPrototypeOf(mutatedSafeOptions, { eval: false });",
-    "mutatedSafeOptions[String('eval')] = false;",
-    "new NamedWorker('./worker.mjs', mutatedSafeOptions);",
-"new NamedWorker(...['./worker.mjs', { eval: false }]);",
-"const safeArgumentList = ['./worker.mjs', { eval: false }];",
-"new NamedWorker(...safeArgumentList);",
-"declare const useFirstSafeOptions: boolean;",
-"const safeConditionalOptions = useFirstSafeOptions ? { eval: false } : {};",
-"new NamedWorker('./worker.mjs', safeConditionalOptions);",
-  "const safeAssignedOptions = Object.assign({}, useFirstSafeOptions ? { eval: false } : {});",
-  "new NamedWorker('./worker.mjs', safeAssignedOptions);",
-  "const safeCreatedOptions = Object.create(useFirstSafeOptions ? { eval: false } : {});",
-  "new NamedWorker('./worker.mjs', safeCreatedOptions);",
-  "function safeFactoryOptions() { return useFirstSafeOptions ? { eval: false } : {}; }",
-  "new NamedWorker('./worker.mjs', safeFactoryOptions());",
-  "function safeMutatedFactoryOptions(): any { const options: any = {}; options.eval = false; return options; }",
-  "new NamedWorker('./worker.mjs', safeMutatedFactoryOptions());",
-  "function safeCyclicFactoryOptions(): any { const options: any = {}; options.self = options; options.eval = false; return options; }",
-  "new NamedWorker('./worker.mjs', safeCyclicFactoryOptions());",
-  "function safeMultiFactoryOptions(alternate: boolean): any { const first: any = { eval: false }; const second: any = {}; if (alternate) return second; return first; }",
-  "new NamedWorker('./worker.mjs', safeMultiFactoryOptions(false));",
-"const safeHolderOptions = {}; const safeHolder = { options: safeHolderOptions };",
-"safeHolder.options.eval = false; new NamedWorker('./worker.mjs', safeHolderOptions);",
-"const safeAliasOptions = {}; const safeAliasHolder = { options: safeAliasOptions };",
-"const { options: safeAlias } = safeAliasHolder; safeAlias.eval = false;",
-"new NamedWorker('./worker.mjs', safeAliasOptions);",
-"const safePrototype = {}; const inheritedMutationOptions = Object.create(safePrototype);",
-"safePrototype.eval = false; new NamedWorker('./worker.mjs', inheritedMutationOptions);",
-"function enableSafely(value) { value.eval = false; }",
-"const locallyMutatedOptions = {}; enableSafely(locallyMutatedOptions);",
-"new NamedWorker('./worker.mjs', locallyMutatedOptions);",
-"const joinedSafeOptions = {}; const joinedSafeKey = ['e', 'v', 'a', 'l'].join('');",
-"joinedSafeOptions[joinedSafeKey] = false;",
-"new NamedWorker('./worker.mjs', joinedSafeOptions);",
-"const safeKeyParts = ['e', 'v', 'a', 'l']; const aliasKeyOptions = {};",
-"aliasKeyOptions[safeKeyParts.join('')] = false;",
-"new NamedWorker('./worker.mjs', aliasKeyOptions);",
-"declare const safeExternalKey: string; const safeUnrelatedOptions = {};",
-"safeUnrelatedOptions[safeExternalKey] = true;",
-"new NamedWorker('./worker.mjs', { eval: false });",
-"function launchSafe(Ctor, options) { new Ctor('./worker.mjs', options); }",
-"launchSafe(NamedWorker, { eval: false });",
-  "function launchSafeAliases(Ctor, options) { const W = Ctor; const o = options; new W('./worker.mjs', o); }",
-  "launchSafeAliases(NamedWorker, { eval: false });",
-  "function launchSafeDestructured({ Ctor, options }) { new Ctor('./worker.mjs', options); }",
-  "launchSafeDestructured({ Ctor: NamedWorker, options: { eval: false } });",
-"function launchSafeNamespace(namespace, options) {",
-"  new namespace.Worker('./worker.mjs', options);",
-"}",
-"launchSafeNamespace(threads, { eval: false });",
-"new threads[String('Worker')]('./worker.mjs', { eval: false });",
-"new NamedWorker('./worker.mjs', { [String('eval')]: false });",
-    "const inlineEvaluation = false;",
-    "new threads.Worker('./worker.mjs', { eval: inlineEvaluation });",
-    "const mutableSafeOptions = { eval: false };",
-    "mutableSafeOptions.eval = false;",
-    "new NamedWorker('./worker.mjs', mutableSafeOptions);"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
-}, 20_000);
-test("accepts a shadowed Object.freeze wrapper around Worker", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "{",
-    "  const Object = { freeze(value: any) { return value; } };",
-    "  const WrappedWorker = Object.freeze(Worker);",
-    "  new WrappedWorker('./worker.mjs', { eval: false });",
-    "}"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual([]);
-});
-test("does not treat a shadowed Object.freeze result as Worker", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "const Object = { freeze(_value: any) { return class SafeWorker {}; } };",
-    "const SafeWorker = Object.freeze(Worker);",
-    "new SafeWorker('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual([]);
-});
-test("rejects Worker evaluation after a freeze write through a rebound Object alias", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "let O: any = Object;",
-    "O = { freeze: (_value: any) => class SafeWorker {} };",
-    "O.freeze = (_value: any) => class SafeWorker {};",
-    "const SafeWorker = Object.freeze(Worker);",
-    "new SafeWorker(\"console.log('worker executed')\", { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual(expect.arrayContaining([
-      expect.stringContaining("worker_threads inline evaluation is forbidden")
-    ]));
-});
-
-test("preserves a genuine Object.freeze replacement made before alias rebind", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "let O: any = Object;",
-    "O.freeze = (_value: any) => class SafeWorker {};",
-    "O = {};",
-    "const SafeWorker = Object.freeze(Worker);",
-    "new SafeWorker('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual([]);
-});
-
-test("fails closed when an Object alias may have been rebound before its freeze write", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "declare const rebind: boolean;",
-    "let O: any = Object;",
-    "if (rebind) O = {};",
-    "O.freeze = (_value: any) => class SafeWorker {};",
-    "const FrozenWorker = Object.freeze(Worker);",
-    "new FrozenWorker('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual(expect.arrayContaining([
-      expect.stringContaining("worker_threads inline evaluation is forbidden")
-    ]));
-});
-
-test("preserves Worker identity through unmodified Object.freeze", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "const FrozenWorker = Object.freeze(Worker);",
-    "new FrozenWorker('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual(expect.arrayContaining([
-      expect.stringContaining("worker_threads inline evaluation is forbidden")
-    ]));
-});
-test("accepts an overwritten Object.freeze alias returning a safe constructor", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "const O: any = Object;",
-    "O.freeze = (_value: any) => class SafeWorker {};",
-    "const SafeWorker = O.freeze(Worker);",
-    "new SafeWorker('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual([]);
-});
-test("accepts a direct Object.freeze replacement returning a safe constructor", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "Object.freeze = (_value: any) => class SafeWorker {};",
-    "const SafeWorker = Object.freeze(Worker);",
-    "new SafeWorker('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual([]);
-});
-test("rejects an overwritten Object.freeze alias that returns Worker", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "const O: any = Object;",
-    "O.freeze = (_value: any) => Worker;",
-    "const ReturnedWorker = O.freeze(Worker);",
-    "new ReturnedWorker('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual(expect.arrayContaining([
-      expect.stringContaining("worker_threads inline evaluation is forbidden")
-    ]));
-});
-test("fails closed when an overwritten Object.freeze result is unresolved", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "declare const replacement: any;",
-    "const O: any = Object;",
-    "O.freeze = replacement;",
-    "const UnknownWorker = O.freeze(Worker);",
-    "new UnknownWorker('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual(expect.arrayContaining([
-      expect.stringMatching(
-        /worker_threads inline-evaluation options are unproven|worker_threads inline evaluation is forbidden/
-      )
-    ]));
-});
-test("uses the Object.freeze intrinsic only before a later replacement", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "class SafeConstructor {}",
-    "const FrozenSafeConstructor = Object.freeze(SafeConstructor);",
-    "Object.freeze = (_value: any) => Worker;",
-    "new FrozenSafeConstructor('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual([]);
-});
-test("does not let an uncalled replacement shadow the Object.freeze intrinsic", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "function replaceFreeze() {",
-    "  Object.freeze = (_value: any) => class SafeWorker {};",
-    "}",
-    "const FrozenWorker = Object.freeze(Worker);",
-    "new FrozenWorker('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual(expect.arrayContaining([
-      expect.stringContaining("worker_threads inline evaluation is forbidden")
-    ]));
-});
-test("does not treat a conditional Object.freeze write as definite", () => {
-  const shortCircuitSource = [
-    "import { Worker } from 'node:worker_threads';",
-    "declare const replaceFreeze: boolean;",
-    "replaceFreeze && (Object.freeze = (_value: any) => class SafeWorker {});",
-    "const FrozenWorker = Object.freeze(Worker);",
-    "new FrozenWorker('worker.js', { eval: true });"
-  ].join("\n");
-  const ifBranchSource = [
-    "import { Worker } from 'node:worker_threads';",
-    "declare const replaceFreeze: boolean;",
-    "if (replaceFreeze) Object.freeze = (_value: any) => class SafeWorker {};",
-    "const FrozenWorker = Object.freeze(Worker);",
-    "new FrozenWorker('worker.js', { eval: true });"
-  ].join("\n");
-  for (const source of [shortCircuitSource, ifBranchSource]) {
-    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-      .toEqual(expect.arrayContaining([
-        expect.stringContaining("worker_threads inline evaluation is forbidden")
-      ]));
-  }
-});
-test("fails closed when a function may read Object.freeze after a later write", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "class SafeConstructor {}",
-    "function constructLater() {",
-    "  const MaybeWorker = Object.freeze(SafeConstructor);",
-    "  new MaybeWorker('worker.js', { eval: true });",
-    "}",
-    "Object.freeze = (_value: any) => Worker;",
-    "constructLater();"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual(expect.arrayContaining([
-      expect.stringMatching(
-        /worker_threads inline-evaluation options are unproven|worker_threads inline evaluation is forbidden/
-      )
-    ]));
-});
-test("accepts safe options when Object.freeze identity is unresolved", () => {
-  const source = [
-    "function replaceFreeze() {",
-    "  Object.freeze = (_value: any) => class SafeWorker {};",
-    "}",
-    "class SafeConstructor {}",
-    "const FrozenSafeConstructor = Object.freeze(SafeConstructor);",
-    "new FrozenSafeConstructor('worker.js', { eval: false });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual([]);
-});
-test("fails closed when a loop may skip an Object.freeze write", () => {
-  const source = [
-    "import { Worker } from 'node:worker_threads';",
-    "declare const keepLooping: boolean;",
-    "while (keepLooping) {",
-    "  Object.freeze = (_value: any) => class SafeWorker {};",
-    "}",
-    "const FrozenWorker = Object.freeze(Worker);",
-    "new FrozenWorker('worker.js', { eval: true });"
-  ].join("\n");
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
-    .toEqual(expect.arrayContaining([
-      expect.stringMatching(
-        /worker_threads inline-evaluation options are unproven|worker_threads inline evaluation is forbidden/
-      )
-    ]));
-});
 test("accepts unrelated bound member-held constructors", () => {
   const source = [
     "const make = () => class Ordinary {}.bind(null);",
@@ -1879,90 +555,7 @@ test("accepts unrelated bound member-held constructors", () => {
   expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
     .toEqual([]);
 });
- test("accepts immediately invoked factory options without inline evaluation", () => {
- expect(inspectSupervisorSource("src/services/windows-process-host.ts",
- "import { Worker } from 'node:worker_threads'; " +
- "new Worker('worker.js', (() => { const options: any = {}; " +
- "options.type = 'module'; options.eval = false; return options; })());")).toEqual([]);
- });
-
- test.each([
-  ["Object.assign-copied factory",
-   "import { Worker } from 'node:worker_threads'; " +
-   "new Worker('worker.js', Object.assign({}, (() => { const options: any = {}; " +
-   "options.eval = false; return options; })()));"],
-  ["hoisted factory declared after Worker call",
-   "import { Worker } from 'node:worker_threads'; " +
-   "new Worker('worker.js', make()); " +
-   "function make(): any { const options: any = {}; options.eval = false; return options; }"],
-  ["hoisted factory mutation after unconditional return",
-   "import { Worker } from 'node:worker_threads'; " +
-   "new Worker('worker.js', make()); " +
-   "function make(): any { const options: any = {}; return options; options.eval = true; }"],
-  ["comma-wrapped Reflect.set factory",
-   "import { Worker } from 'node:worker_threads'; " +
-   "new Worker('worker.js', (() => { const options: any = {}; " +
-   "(0, Reflect.set)(options, 'eval', false); return options; })());"],
-  ["Object.create worker namespace",
-   "import * as threads from 'node:worker_threads'; " +
-   "const namespace = Object.create(threads); " +
-   "new namespace.Worker('worker.js', { eval: false });"],
-  ["setPrototypeOf worker namespace",
-   "import * as threads from 'node:worker_threads'; const namespace = {}; " +
-   "Object.setPrototypeOf(namespace, threads); " +
-   "new namespace.Worker('worker.js', { eval: false });"],
-  ["prototype-assigned Worker options",
-    "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
-    "options.__proto__ = { eval: false }; new Worker('worker.js', options);"],
-  ["Reflect.set prototype-assigned Worker options",
-    "import { Worker } from 'node:worker_threads'; const options: any = {}; " +
-    "Reflect.set(options, '__proto__', { eval: false }); new Worker('worker.js', options);"],
-  ["inherited Worker options member",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); options.__proto__.eval = false; " +
-    "new Worker('worker.js', options);"],
-  ["prototype member alias",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); const alias = options.__proto__; " +
-    "alias.eval = false; new Worker('worker.js', options);"],
-  ["getPrototypeOf alias",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); " +
-    "const alias = Object.getPrototypeOf(options); alias.eval = false; " +
-    "new Worker('worker.js', options);"],
-  ["destructured prototype alias",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); " +
-    "const { __proto__: alias } = options; alias.eval = false; " +
-    "new Worker('worker.js', options);"],
-  ["reassigned destructured prototype alias",
-    "import { Worker } from 'node:worker_threads'; const proto: any = {}; " +
-    "const options: any = Object.create(proto); " +
-    "let { __proto__: alias } = options; alias = {}; alias.eval = true; " +
-    "new Worker('worker.js', options);"],
-  ["Reflect-selected worker constructor",
-   "import * as threads from 'node:worker_threads'; " +
-   "const Thread = Reflect.get(threads, 'Worker'); " +
-   "new Thread('worker.js', { eval: false });"],
-  ["aliased Reflect-selected worker constructor",
-   "import * as threads from 'node:worker_threads'; const read = Reflect.get; " +
-   "const Thread = read(threads, 'Worker'); new Thread('worker.js', { eval: false });"],
-  ["unresolved Reflect-selected worker constructor",
-   "import * as threads from 'node:worker_threads'; declare const key: string; " +
-   "const Thread = Reflect.get(threads, key); new Thread('worker.js', { eval: false });"],
-  ["Reflect.construct selected worker constructor",
-   "import * as threads from 'node:worker_threads'; " +
-   "const Thread = Reflect.get(threads, 'Worker'); " +
-   "Reflect.construct(Thread, ['worker.js', { eval: false }]);"],
-  ["hoisted factory calling a safe local mutator",
-   "import { Worker } from 'node:worker_threads'; " +
-   "new Worker('worker.js', make()); function make(): any { const options: any = {}; " +
-   "const mutate = () => { options.eval = false; }; mutate(); return options; }"]
- ])("accepts safe %s options without inline evaluation", (_name, source) => {
-  expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
- });
-
-test("accepts type-only node:module imports", () => {
+ test("accepts type-only node:module imports", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts",
       "import type { Module } from 'node:module';")).toEqual([]);
     expect(inspectSupervisorSource("src/services/windows-process-host.ts",
@@ -2984,4 +1577,198 @@ test('rejects capability-bearing array read before a later safe write', () => {
     ].join("\n");
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).toEqual([]);
   }, 20_000);
+
+  test.each([
+    ["named Worker import", "import { Worker } from 'node:worker_threads';"],
+    ["aliased Worker import", "import { Worker as Thread } from 'worker_threads';"],
+    ["namespace import", "import * as threads from 'node:worker_threads';"],
+    ["alternate namespace import", "import * as threads from 'worker_threads';"],
+    ["default import", "import threads from 'worker_threads';"],
+    ["alternate default import", "import threads from 'node:worker_threads';"],
+    ["side-effect import", "import 'node:worker_threads';"],
+    ["alternate side-effect import", "import 'worker_threads';"],
+    ["parentPort import", "import { parentPort } from 'worker_threads';"],
+    ["alternate parentPort import", "import { parentPort } from 'node:worker_threads';"],
+    ["other runtime export import", "import { threadId } from 'node:worker_threads';"],
+    ["alternate nonallowlisted runtime export",
+      "import { threadId } from 'worker_threads';"],
+    ["safe Worker construction with eval false",
+      "import { Worker } from 'node:worker_threads'; " +
+        "new Worker('worker.js', { eval: false });"],
+    ["Worker construction with eval true",
+      "import { Worker } from 'worker_threads'; " +
+        "new Worker('worker.js', { eval: true });"]
+  ])("rejects runtime Worker module capability through %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+      .some((finding) => finding.includes("runtime worker_threads capability is forbidden")))
+      .toBe(true);
+  });
+
+  test.each([
+    ["worker_threads whole-module load", "const threads = require('worker_threads');"],
+    ["node:worker_threads whole-module load",
+      "const threads = require('node:worker_threads');"],
+    ["worker_threads destructuring",
+      "const { Worker: Thread } = require('worker_threads');"],
+    ["node:worker_threads destructuring",
+      "const { Worker: Thread } = require('node:worker_threads');"],
+    ["statically computed module name",
+      "require('node:' + 'worker_threads');"],
+    ["immutable module-name alias",
+      "const moduleName = 'node:worker_threads'; require(moduleName);"]
+  ])("rejects CommonJS Worker loading through %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+      .some((finding) => finding.includes("runtime worker_threads capability is forbidden")))
+      .toBe(true);
+  });
+
+  test("keeps unresolved CommonJS module loading fail-closed", () => {
+    const findings = inspectSupervisorSource(
+      "src/services/windows-process-host.ts",
+      "declare const moduleName: string; require(moduleName);"
+    );
+    expect(findings.some((finding) => finding.includes("dynamic require is forbidden")))
+      .toBe(true);
+  });
+
+  test("rejects dynamic Worker module loading", () => {
+    expect(inspectSupervisorSource(
+      "src/services/windows-process-host.ts",
+      "const workerModule = import('node:worker_threads');"
+    ).some((finding) => finding.includes("dynamic import is forbidden")))
+      .toBe(true);
+  });
+
+  test("rejects aliases that could hide CommonJS Worker loading", () => {
+    expect(inspectSupervisorSource(
+      "src/services/windows-process-host.ts",
+      "const load = require; load('node:worker_threads');"
+    ).some((finding) => finding.includes("aliasing require to bypass import inspection")))
+      .toBe(true);
+  });
+
+  test("rejects process.getBuiltinModule as a Worker loading route", () => {
+    expect(inspectSupervisorSource(
+      "src/services/windows-process-host.ts",
+      "process.getBuiltinModule('node:worker_threads').Worker;"
+    ).some((finding) => finding.includes("process.getBuiltinModule is forbidden")))
+      .toBe(true);
+  });
+
+  test("rejects createRequire as a Worker loading route", () => {
+    expect(inspectSupervisorSource(
+      "src/services/windows-process-host.ts",
+      "import { createRequire } from 'node:module'; " +
+        "const load = createRequire(import.meta.url); load('node:worker_threads');"
+    ).some((finding) => finding.includes("node:module loading is forbidden")))
+      .toBe(true);
+  });
+
+  test.each([
+    ["Worker re-export", "export { Worker } from 'node:worker_threads';"],
+    ["aliased Worker re-export", "export { Worker as Thread } from 'worker_threads';"],
+    ["parentPort re-export", "export { parentPort } from 'node:worker_threads';"],
+    ["star re-export", "export * from 'worker_threads';"],
+    ["namespace re-export", "export * as threads from 'node:worker_threads';"],
+    ["empty runtime re-export", "export {} from 'worker_threads';"]
+  ])("rejects nonallowlisted runtime Worker module re-export: %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+      .some((finding) => finding.includes("runtime worker_threads capability re-export is forbidden")))
+      .toBe(true);
+  });
+
+  test.each(["node:worker_threads", "worker_threads"])(
+    "allows only the named isMainThread runtime import and re-export from %s",
+    (moduleName) => {
+      const source = [
+        "import { isMainThread as mainThread } from '" + moduleName + "';",
+        "export { mainThread as isMainThread };",
+        "export { isMainThread as reportedMainThread } from '" + moduleName + "';"
+      ].join("\n");
+      expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+        .toEqual([]);
+    }
+  );
+
+  test("does not let isMainThread authorize other runtime exports from the module", () => {
+    const source = [
+      "import { isMainThread, parentPort } from 'node:worker_threads';",
+      "export { isMainThread };"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+      .some((finding) => finding.includes("runtime worker_threads capability is forbidden")))
+      .toBe(true);
+  });
+
+  test("allows type-only Worker imports and re-exports", () => {
+    const source = [
+      "import type { Worker } from 'node:worker_threads';",
+      "import { type Worker as WorkerType } from 'worker_threads';",
+      "export type { Worker, WorkerType };",
+      "export type { Worker as ExportedWorker } from 'node:worker_threads';",
+      "type Thread = import('worker_threads').Worker;",
+      "import type ThreadTypes = require('node:worker_threads');",
+      "type ImportedThread = ThreadTypes.Worker;"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .toEqual([]);
+  });
+
+  test("rejects the reproduced Object.assign freeze replacement because Worker is imported", () => {
+    const source = [
+      "import { Worker } from 'node:worker_threads';",
+      "Object.assign(Object, { freeze: (_value: any) => Worker });",
+      "const Fake = Object.freeze(class Safe {});",
+      "new Fake('payload', { eval: true });"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)
+      .some((finding) => finding.includes("runtime worker_threads capability is forbidden")))
+      .toBe(true);
+  });
+
+  test("accepts unrelated local constructors and coincidental Worker names", () => {
+    const source = [
+      "function Worker() { return 1; }",
+      "class Thread { constructor() {} }",
+      "new Worker();",
+      "new Thread();",
+      "const local = { parentPort() { return undefined; } };",
+      "local.parentPort();"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .toEqual([]);
+  });
+
+  test("checks runtime Worker module loads in every audited supervisor source", () => {
+    const sources = new Map(SUPERVISOR_SOURCES.map((path) => [
+      path,
+      "import { Worker } from 'node:worker_threads';"
+    ]));
+    const findings = inspectSupervisorSources((path) => sources.get(path) ?? "");
+    expect(findings.filter((finding) =>
+      finding.includes("runtime worker_threads capability is forbidden")))
+      .toHaveLength(SUPERVISOR_SOURCES.length);
+  });
+
+  test.each([
+    ["direct module.require",
+      "const { Worker } = module.require('node:worker_threads');"],
+    ["immutable module alias",
+      "const nodeModule = module; const load = nodeModule.require; " +
+        "const { Worker } = load('worker_threads');"],
+    ["destructured module.require",
+      "const { require: load } = module; const { Worker } = load('node:worker_threads');"]
+  ])("rejects CommonJS Worker loading through %s", (_name, source) => {
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .not.toEqual([]);
+  });
+
+  test("accepts a local object method named require", () => {
+    const source = [
+      "const module = { require() { return {}; } };",
+      "module.require();"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .toEqual([]);
+  });
 });
