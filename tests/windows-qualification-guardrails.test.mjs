@@ -9,6 +9,50 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const load = () => yaml.load(readFileSync(join(root, ".github/workflows/ci.yml"), "utf8"));
 const inspect = (workflow) => inspectQualificationWorkflow(workflow);
 
+const linuxBuildContracts = [
+  { label: "legacy", name: "Build", command: "npm run build" },
+  {
+    label: "distribution",
+    name: "Distribution build and health smoke",
+    command: "npm run verify:dist"
+  }
+];
+
+function workflowWithLinuxBuildContract(contract) {
+  const workflow = load();
+  const steps = workflow.jobs.test.steps;
+  const matches = steps.flatMap((step, index) =>
+    linuxBuildContracts.some((candidate) => candidate.name === step?.name) ? [index] : []);
+  if (matches.length !== 1) {
+    throw new Error(`Expected one existing Linux build fixture step; found ${matches.length}`);
+  }
+
+  const index = matches[0];
+  steps[index] = {
+    ...steps[index],
+    name: contract.name,
+    run: contract.command
+  };
+  return workflow;
+}
+
+function linuxBuildStep(workflow, contract) {
+  const matches = workflow.jobs.test.steps.filter((step) => step?.name === contract.name);
+  if (matches.length !== 1) {
+    throw new Error(`Expected one Linux build fixture step named ${contract.name}; found ${matches.length}`);
+  }
+  return matches[0];
+}
+
+function removeLinuxBuildStep(workflow, contract) {
+  const steps = workflow.jobs.test.steps;
+  const index = steps.indexOf(linuxBuildStep(workflow, contract));
+  if (index < 0) {
+    throw new Error(`Could not locate selected Linux build fixture step named ${contract.name}`);
+  }
+  steps.splice(index, 1);
+}
+
 function windowsStep(workflow, name) {
   const step = workflow.jobs["windows-test"].steps.find((item) => item.name === name);
   if (!step) throw new Error("Missing fixture step " + name);
@@ -884,13 +928,64 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
     20_000
   );
 
-  test("accepts current-main distribution build and health smoke contract", () => {
-    const workflow = load();
-    const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
-    build.name = "Distribution build and health smoke";
-    build.run = "npm run verify:dist";
-    expect(inspect(workflow)).toEqual([]);
-  }, 20_000);
+  for (const contract of linuxBuildContracts) {
+    describe(`${contract.label} Linux build contract`, () => {
+      const alternateContract = linuxBuildContracts.find((candidate) => candidate !== contract);
+
+      test("accepts the complete contract", () => {
+        const workflow = workflowWithLinuxBuildContract(contract);
+        expect(inspect(workflow)).toEqual([]);
+      }, 20_000);
+
+      test.each([
+        ["missing build step", (workflow) => {
+          removeLinuxBuildStep(workflow, contract);
+        }, "exactly one required build or distribution verification step"],
+        ["duplicate build step", (workflow) => {
+          const step = linuxBuildStep(workflow, contract);
+          workflow.jobs.test.steps.push({ ...step });
+        }, "exactly one required build or distribution verification step"],
+        ["name paired with the other command", (workflow) => {
+          linuxBuildStep(workflow, contract).name = alternateContract.name;
+        }, "approved build verification command"],
+        ["command paired with the other name", (workflow) => {
+          linuxBuildStep(workflow, contract).run = alternateContract.command;
+        }, "approved build verification command"],
+        ["command substitution", (workflow) => {
+          linuxBuildStep(workflow, contract).run = `${contract.command} && echo skipped`;
+        }, "approved build verification command"],
+        ["conditional build step", (workflow) => {
+          linuxBuildStep(workflow, contract).if = "false";
+        }, "conditional or optional build or distribution verification step"],
+        ["optional build step", (workflow) => {
+          linuxBuildStep(workflow, contract)["continue-on-error"] = true;
+        }, "conditional or optional build or distribution verification step"]
+      ])("rejects %s", (_mutation, mutate, expected) => {
+        const workflow = workflowWithLinuxBuildContract(contract);
+        expect(inspect(workflow)).toEqual([]);
+
+        mutate(workflow);
+
+        const findings = inspect(workflow);
+        expect(findings.some((finding) => finding.includes(expected))).toBe(true);
+      }, 20_000);
+
+      test("rejects a weakened verify:dist script", () => {
+        const workflow = workflowWithLinuxBuildContract(contract);
+        expect(inspect(workflow)).toEqual([]);
+
+        const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+        packageJson.scripts["verify:dist"] = "npm run build";
+        const findings = inspectQualificationWorkflow(
+          workflow,
+          undefined,
+          () => JSON.stringify(packageJson)
+        );
+        expect(findings.some((finding) =>
+          finding.includes("verify:dist must build and smoke-test the distribution"))).toBe(true);
+      }, 20_000);
+    });
+  }
 
 test.each([
   ["Node 20.x", { "node-version": "20.x" }],
@@ -907,76 +1002,10 @@ test.each([
   );
 }, 20_000);
 
-  test.each([
-    ["missing build verification", (workflow) => {
-      workflow.jobs.test.steps.splice(
-        workflow.jobs.test.steps.findIndex((step) => step.name === "Build"), 1
-      );
-    }, "exactly one required build or distribution verification step"],
-    ["duplicate build verification", (workflow) => {
-      const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
-      build.name = "Distribution build and health smoke";
-      build.run = "npm run verify:dist";
-      workflow.jobs.test.steps.push({ ...build });
-    }, "exactly one required build or distribution verification step"],
-    ["mismatched legacy step", (workflow) => {
-      workflow.jobs.test.steps.find((step) => step.name === "Build").run =
-        "npm run verify:dist";
-    }, "approved build verification command"],
-    ["mismatched current-main step", (workflow) => {
-      const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
-      build.name = "Distribution build and health smoke";
-    }, "approved build verification command"],
-    ["command substitution", (workflow) => {
-      const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
-      build.name = "Distribution build and health smoke";
-      build.run = "npm run verify:dist && echo skipped";
-    }, "approved build verification command"],
-    ["conditional current-main step", (workflow) => {
-      const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
-      build.name = "Distribution build and health smoke";
-      build.run = "npm run verify:dist";
-      build.if = "false";
-    }, "conditional or optional build or distribution verification step"]
-  ])("rejects %s", (_name, mutate, expected) => {
-    const workflow = load();
-    mutate(workflow);
-    expect(inspect(workflow).some((finding) => finding.includes(expected))).toBe(true);
-  }, 20_000);
-
   test("accepts an empty GitHub matrix exclusion list", () => {
     const workflow = load();
     workflow.jobs["windows-test"].strategy.matrix.exclude = [];
     expect(inspect(workflow)).toEqual([]);
-  }, 20_000);
-
-  test("rejects a weakened verify:dist script", () => {
-    const workflow = load();
-    const build = workflow.jobs.test.steps.find((step) => step.name === "Build");
-    build.name = "Distribution build and health smoke";
-    build.run = "npm run verify:dist";
-    const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-    packageJson.scripts["verify:dist"] = "npm run build";
-    const findings = inspectQualificationWorkflow(
-      workflow,
-      (path) => readFileSync(join(root, path), "utf8"),
-      JSON.stringify(packageJson)
-    );
-    expect(findings.some((finding) =>
-      finding.includes("verify:dist must build and smoke-test the distribution"))).toBe(true);
-  }, 20_000);
-
-  test("rejects weakened verify:dist script under legacy build contract", () => {
-    const workflow = load();
-    const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-    packageJson.scripts["verify:dist"] = "npm run build";
-    const findings = inspectQualificationWorkflow(
-      workflow,
-      (path) => readFileSync(join(root, path), "utf8"),
-      JSON.stringify(packageJson)
-    );
-    expect(findings.some((finding) =>
-      finding.includes("verify:dist must build and smoke-test the distribution"))).toBe(true);
   }, 20_000);
 
   test("rejects loss of a required Windows suite", () => {
