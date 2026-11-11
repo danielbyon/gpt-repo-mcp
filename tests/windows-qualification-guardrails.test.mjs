@@ -144,7 +144,7 @@ const checkoutSourceIdentityOverrides = [
 ];
 
 const secondaryCheckoutSourceOverrides = [
-  ["ref override", { ref: "release/qualification" }],
+  ["ref override", { ref: "main" }],
   ["repository override", { repository: "attacker/other-repo" }],
   ["malformed input mapping", null]
 ];
@@ -828,6 +828,20 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
         ? `${platform} Checkout with inputs must be a mapping`
         : `${platform} Checkout must use the triggering workflow repository and event revision; remove with.ref and with.repository overrides`;
       expect(inspectQualificationWorkflow(workflow)).toContain(expected);
+    },
+    20_000
+  );
+
+  test.each(nodeMatrixJobs)(
+    "accepts a differently named secondary Checkout without source overrides in the %s job",
+    (_platform, jobName) => {
+      const workflow = load();
+      workflow.jobs[jobName].steps.push({
+        name: "Additional checkout",
+        uses: "actions/checkout@v6",
+        with: {}
+      });
+      expect(inspectQualificationWorkflow(workflow)).toEqual([]);
     },
     20_000
   );
