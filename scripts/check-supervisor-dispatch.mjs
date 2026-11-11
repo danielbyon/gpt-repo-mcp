@@ -1098,9 +1098,6 @@ function staticStringAtInspectionOf(input, seen = new Set()) {
       !(statement.modifiers ?? []).some((modifier) =>
         modifier.kind === ts.SyntaxKind.ExportKeyword);
   };
-const hasExportModifier = (node) =>
-  (node.modifiers ?? []).some((modifier) =>
-    modifier.kind === ts.SyntaxKind.ExportKeyword);
   const memberAccess = (node) => {
     if (ts.isPropertyAccessExpression(node)) {
       return { receiver: node.expression, property: node.name.text };
@@ -1301,31 +1298,6 @@ const functionArgumentsPlanOf = (identifier, seen = new Set()) => {
     const next = new Set(seen);
     next.add(identifier);
     return functionArgumentsPlanOf(binding.node.initializer, next);
-  }
-  return undefined;
-};
-const localClassMemberTargetOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return undefined;
-  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
-    return { classNode: node, instance: false };
-  }
-  if (ts.isNewExpression(node)) {
-    const target = localClassMemberTargetOf(node.expression, seen);
-    return target ? { classNode: target.classNode, instance: true } : undefined;
-  }
-  if (!ts.isIdentifier(node)) return undefined;
-  const binding = resolveBinding(node);
-  if (!binding?.node || seen.has(binding.node)) return undefined;
-  if (ts.isClassDeclaration(binding.node) || ts.isClassExpression(binding.node)) {
-    return { classNode: binding.node, instance: false };
-  }
-  if ((binding.kind === "variable" || binding.kind === "opaque") &&
-      ts.isVariableDeclaration(binding.node) &&
-      ts.isIdentifier(binding.node.name) && binding.node.initializer) {
-    const next = new Set(seen);
-    next.add(binding.node);
-    return localClassMemberTargetOf(binding.node.initializer, next);
   }
   return undefined;
 };
@@ -1598,30 +1570,6 @@ const localClassMemberValuesOf = (input, property, seen = new Set()) => {
   const resolution = localClassMemberTargetsOf(node, seen);
   return resolution.targets.flatMap((target) =>
     localClassMemberValuesForTargetOf(target, property, node));
-};
-const localClassMemberUnresolvedOf = (input, property, seen = new Set()) => {
-  if (!hasLocalClasses) return false;
-  const node = unwrap(input);
-  if (!node) return false;
-  if (node.kind === ts.SyntaxKind.ThisKeyword) {
-    const context = localClassMemberTargetFromThisOf(node, property);
-    if (!context) return false;
-    const next = new Set(seen);
-    next.delete(context.owner);
-    next.add(node);
-    if (context.privateAccess) {
-      return Boolean(localClassMemberResolutionOf(
-        context.target.classNode, property, context.target.instance
-      )?.unresolved);
-    }
-    return thisArgumentsOf(context.owner).some((receiver) =>
-      localClassMemberUnresolvedOf(receiver, property, next));
-  }
-  const targets = localClassMemberTargetsOf(node, seen);
-  return targets.unresolved || targets.targets.some((target) =>
-    Boolean(localClassMemberResolutionOf(
-      target.classNode, property, target.instance
-    )?.unresolved));
 };
   const memberValueCandidatesOf = (input, property, seen = new Set()) => {
     const node = unwrap(input);
@@ -2982,111 +2930,6 @@ const inspectCapabilityArrayDestructuring = (target, source) => {
     return Boolean(member && ["Object", "Reflect"].includes(member.property) &&
       globalObjectOf(member.receiver, seen));
   };
-const globalObjectConstructorOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return false;
-  if (assignmentReferenceKey(node) === "global:Object") return true;
-  const next = new Set(seen);
-  next.add(node);
-  if (ts.isIdentifier(node)) {
-    const binding = resolveBinding(node);
-    if (!binding?.node || seen.has(binding.node) ||
-        !(ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node))) {
-      return false;
-    }
-    return [
-      ...activeBindingValuesOf(binding.node, node),
-      ...(parameterValueArguments.get(binding.node) ?? [])
-    ].some((value) => globalObjectConstructorOf(value, next));
-  }
-  const member = memberAccess(node);
-  return Boolean(member?.property === "Object" &&
-    globalObjectOf(member.receiver, next));
-};
-const statementBlockOf = (input) => {
-  let statement = input;
-  while (statement && !ts.isStatement(statement)) statement = statement.parent;
-  if (!statement || !(ts.isExpressionStatement(statement) ||
-      ts.isVariableStatement(statement))) return undefined;
-  const block = statement.parent;
-  return ts.isBlock(block) || ts.isSourceFile(block) ? block : undefined;
-};
-const definiteAssignmentBlockOf = (input) => {
-  let statement = input;
-  while (statement && !ts.isStatement(statement)) {
-    if (ts.isConditionalExpression(statement) ||
-        (ts.isBinaryExpression(statement) && [
-          ts.SyntaxKind.AmpersandAmpersandToken,
-          ts.SyntaxKind.BarBarToken,
-          ts.SyntaxKind.QuestionQuestionToken,
-          ts.SyntaxKind.AmpersandAmpersandEqualsToken,
-          ts.SyntaxKind.BarBarEqualsToken,
-          ts.SyntaxKind.QuestionQuestionEqualsToken
-        ].includes(statement.operatorToken.kind))) return undefined;
-    statement = statement.parent;
-  }
-  if (!statement || !(ts.isExpressionStatement(statement) ||
-      ts.isVariableStatement(statement))) return undefined;
-  const block = statement.parent;
-  if (!(ts.isBlock(block) || ts.isSourceFile(block))) return undefined;
-  const statementIndex = block.statements.indexOf(statement);
-  if (statementIndex < 0 || block.statements.slice(0, statementIndex).some((prior) =>
-    ts.isReturnStatement(prior) || ts.isThrowStatement(prior) ||
-    ts.isBreakStatement(prior) || ts.isContinueStatement(prior))) return undefined;
-  return block;
-};
-const objectFreezeMutationStatusOf = (input, seen = new Set()) => {
-  const node = unwrap(input);
-  if (!node || seen.has(node)) return undefined;
-  const next = new Set(seen);
-  next.add(node);
-  const member = memberAccess(node);
-  if (member?.property === "freeze" &&
-      globalObjectConstructorOf(member.receiver)) {
-    const referenceBlock = statementBlockOf(node);
-    const referenceStart = node.getStart(file);
-    const objectFreezeWrites = memberAssignmentTargets.flatMap((assignment) => {
-      if (assignment.property !== "freeze") return [];
-      const receiverIdentity = objectFreezeMutationReceiverIdentityAtOf(
-        assignment.receiver, assignment.node
-      );
-      return receiverIdentity === "unrelated"
-        ? []
-        : [{ ...assignment, receiverIdentity }];
-    });
-    const referenceFunction = enclosingFunctionOf(node);
-    if (referenceFunction && objectFreezeWrites.some((assignment) =>
-      enclosingFunctionOf(assignment.node) !== referenceFunction)) {
-      return "unresolved";
-    }
-    const writes = objectFreezeWrites.filter((assignment) =>
-      assignment.node.getStart(file) < referenceStart);
-    if (writes.length === 0) return "unmodified";
-    if (writes.some((assignment) =>
-      assignment.receiverIdentity === "unresolved")) return "unresolved";
-    // A write in another block may not run before this call.
-    if (referenceBlock && writes.every((assignment) =>
-      definiteAssignmentBlockOf(assignment.node) === referenceBlock)) return "replaced";
-    return "unresolved";
-  }
-  if (!ts.isIdentifier(node)) return undefined;
-  const binding = resolveBinding(node);
-  if (!binding?.node || seen.has(binding.node) ||
-      !(ts.isVariableDeclaration(binding.node) || ts.isParameter(binding.node))) {
-    return undefined;
-  }
-  const statuses = [
-    ...activeBindingValuesOf(binding.node, node),
-    ...(parameterValueArguments.get(binding.node) ?? [])
-  ].map((value) => objectFreezeMutationStatusOf(value, next)).filter(Boolean);
-  const distinctStatuses = new Set(statuses);
-  if (distinctStatuses.size > 1 || distinctStatuses.has("unresolved")) {
-    return "unresolved";
-  }
-  return distinctStatuses.values().next().value;
-};
-const objectFreezeOverwrittenBeforeOf = (input) =>
-  ["replaced", "unresolved"].includes(objectFreezeMutationStatusOf(input));
 const staticMethodReferenceOf = (
   input, property, ownerOf, seen = new Set()
 ) => {
@@ -3104,9 +2947,7 @@ const staticMethodReferenceOf = (
   }
   const member = memberAccess(node);
   if (member) {
-    if (member.property === property && ownerOf(member.receiver, next) &&
-        !(property === "freeze" &&
-          objectFreezeOverwrittenBeforeOf(node))) return true;
+    if (member.property === property && ownerOf(member.receiver, next)) return true;
     if (memberValueCandidatesOf(member.receiver, member.property, next)
       .some((value) => staticMethodReferenceOf(value, property, ownerOf, next))) {
       return true;
