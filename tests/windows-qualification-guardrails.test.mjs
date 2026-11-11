@@ -125,6 +125,41 @@ const nodeSetupOrderingCases = nodeMatrixJobs.flatMap(([platform, jobName]) =>
   nodeSetupOrderingMutations.map(([mutation, apply]) =>
     [platform, jobName, mutation, apply]));
 
+const checkoutSourceIdentityOverrides = [
+  ["ref main", "ref", "main"],
+  ["ref another branch", "ref", "release/qualification"],
+  ["ref refs/heads/main", "ref", "refs/heads/main"],
+  ["ref fixed SHA", "ref", "0123456789abcdef0123456789abcdef01234567"],
+  ["ref expression", "ref", "${{ github.event.pull_request.head.sha }}"],
+  ["ref github.head_ref", "ref", "${{ github.head_ref }}"],
+  ["ref github.sha", "ref", "${{ github.sha }}"],
+  ["repository literal", "repository", "attacker/other-repo"],
+  ["repository expression", "repository", "${{ github.repository }}"],
+  ["empty ref", "ref", ""],
+  ["null ref", "ref", null],
+  ["empty repository", "repository", ""],
+  ["null repository", "repository", null],
+  ["uppercase REF input", "REF", "main"],
+  ["mixed-case Repository input", "RePository", "attacker/other-repo"]
+];
+
+const checkoutSourceIdentityCases = nodeMatrixJobs.flatMap(([platform, jobName]) =>
+  checkoutSourceIdentityOverrides.map(([mutation, key, value]) =>
+    [platform, jobName, mutation, key, value]));
+
+const malformedCheckoutInputValues = [
+  ["null", null],
+  ["undefined", undefined],
+  ["scalar", "ref: main"],
+  ["array", []],
+  ["number", 1],
+  ["date", new Date(0)]
+];
+
+const malformedCheckoutInputCases = nodeMatrixJobs.flatMap(([platform, jobName]) =>
+  malformedCheckoutInputValues.map(([kind, value]) =>
+    [platform, jobName, kind, value]));
+
 // Populate the parser cache before Vitest applies the per-test timeout. The
 // first repository inspection parses several large test files.
 inspect(load());
@@ -730,7 +765,7 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
   });
 
   test("accepts the checked-in Linux and scoped Windows matrix", () => {
-    expect(inspect(load())).toEqual([]);
+    expect(inspectQualificationWorkflow(load())).toEqual([]);
   }, 20_000);
 
   test.each(ineffectiveNodeSetupCases)(
@@ -753,6 +788,57 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
         finding.includes(platform) &&
         (finding.includes("Checkout") || finding.includes("Node setup"))
       )).toBe(true);
+    },
+    20_000
+  );
+
+  test.each(checkoutSourceIdentityCases)(
+    "rejects Checkout %s override in the %s job (%s)",
+    (platform, jobName, _mutation, key, value) => {
+      const workflow = load();
+      const checkout = workflow.jobs[jobName].steps[0];
+      checkout.with = { ...(checkout.with ?? {}), [key]: value };
+      expect(inspectQualificationWorkflow(workflow)).toContain(
+        `${platform} Checkout must use the triggering workflow repository and event revision; remove with.ref and with.repository overrides`
+      );
+    },
+    20_000
+  );
+
+  test.each(malformedCheckoutInputCases)(
+    "rejects malformed Checkout inputs in the %s job (%s)",
+    (platform, jobName, _kind, value) => {
+      const workflow = load();
+      workflow.jobs[jobName].steps[0].with = value;
+      expect(inspectQualificationWorkflow(workflow)).toContain(
+        `${platform} Checkout with inputs must be a mapping`
+      );
+    },
+    20_000
+  );
+
+  test.each(nodeMatrixJobs)(
+    "accepts unrelated Checkout inputs in the %s job",
+    (_platform, jobName) => {
+      const workflow = load();
+      const checkout = workflow.jobs[jobName].steps[0];
+      checkout.with = { ...(checkout.with ?? {}), "fetch-depth": 0 };
+      expect(inspectQualificationWorkflow(workflow)).toEqual([]);
+    },
+    20_000
+  );
+
+  test.each(nodeMatrixJobs)(
+    "rejects combined Checkout ref and repository overrides in the %s job",
+    (platform, jobName) => {
+      const workflow = load();
+      workflow.jobs[jobName].steps[0].with = {
+        ref: "main",
+        repository: "attacker/other-repo"
+      };
+      expect(inspectQualificationWorkflow(workflow)).toContain(
+        `${platform} Checkout must use the triggering workflow repository and event revision; remove with.ref and with.repository overrides`
+      );
     },
     20_000
   );

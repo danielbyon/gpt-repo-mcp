@@ -5650,9 +5650,28 @@ function mandatoryStep(steps, name, findings, platform) {
   return step;
 }
 
+/** Keep Checkout bound to the workflow event by leaving ref and repository at their action defaults. */
+function validateCheckoutSourceIdentity(checkout, findings, platform) {
+  if (!checkout || !Object.hasOwn(checkout, "with")) return;
+  const inputs = checkout.with;
+  if (!inputs || typeof inputs !== "object" || Array.isArray(inputs) ||
+      ![Object.prototype, null].includes(Object.getPrototypeOf(inputs))) {
+    findings.push(platform + " Checkout with inputs must be a mapping");
+    return;
+  }
+
+  if (Object.keys(inputs).some((key) => {
+    const normalized = key.toLowerCase();
+    return normalized === "ref" || normalized === "repository";
+  })) {
+    findings.push(platform + " Checkout must use the triggering workflow repository and event revision; remove with.ref and with.repository overrides");
+  }
+}
+
 function mandatoryNodeSetupStep(steps, findings, platform) {
   // Setup Node immediately after checkout so no other job step can run first.
   const checkout = mandatoryStep(steps, "Checkout", findings, platform);
+  validateCheckoutSourceIdentity(checkout, findings, platform);
   if (checkout?.uses !== "actions/checkout@v6" || steps[0] !== checkout) {
     findings.push(platform + " must begin with the approved repository Checkout action");
   }
