@@ -5650,6 +5650,50 @@ function mandatoryStep(steps, name, findings, platform) {
   return step;
 }
 
+function mandatoryNodeSetupStep(steps, findings, platform) {
+  // Setup Node immediately after checkout so no other job step can run first.
+  const checkout = mandatoryStep(steps, "Checkout", findings, platform);
+  if (checkout?.uses !== "actions/checkout@v6" || steps[0] !== checkout) {
+    findings.push(platform + " must begin with the approved repository Checkout action");
+  }
+
+  const setupSteps = steps.filter((step) => {
+    if (typeof step?.uses !== "string") return false;
+    const action = step.uses.split("@", 1)[0].toLowerCase();
+    return action === "actions/setup-node" || action.endsWith("/setup-node");
+  });
+  if (setupSteps.length !== 1) {
+    findings.push(platform + " must have exactly one effective actions/setup-node step");
+    return;
+  }
+
+  const setup = setupSteps[0];
+  if (setup.uses !== "actions/setup-node@v4") {
+    findings.push(platform + " Node setup must use the approved actions/setup-node@v4 action");
+  }
+  if (Object.hasOwn(setup, "if") ||
+      (Object.hasOwn(setup, "continue-on-error") && setup["continue-on-error"] !== false)) {
+    findings.push(platform + " Node setup cannot be conditional or optional");
+  }
+  if (setup.with?.["node-version"] !== "${{ matrix.node-version }}") {
+    findings.push(platform + " Node setup must use matrix.node-version directly");
+  }
+
+  const install = mandatoryStep(steps, "Install dependencies", findings, platform);
+  if (install?.run?.trim() !== "npm ci") {
+    findings.push(platform + " must run npm ci after Node setup");
+  }
+
+  const setupIndex = steps.indexOf(setup);
+  if (steps[1] !== setup) {
+    findings.push(platform + " Node setup must immediately follow repository Checkout");
+  }
+  const installIndex = steps.indexOf(install);
+  if (install && setupIndex >= installIndex) {
+    findings.push(platform + " Node setup must precede dependency installation");
+  }
+}
+
 function mandatoryJob(jobs, name, runner, findings) {
   const job = jobs?.[name];
   if (!job || !Array.isArray(job.steps)) {
@@ -5689,6 +5733,8 @@ export function inspectQualificationWorkflow(workflow, readTest = (path) =>
   }
   const linux = mandatoryJob(workflow?.jobs, "test", "ubuntu-latest", findings);
   const windows = mandatoryJob(workflow?.jobs, "windows-test", "windows-2025", findings);
+  mandatoryNodeSetupStep(linux, findings, "Linux");
+  mandatoryNodeSetupStep(windows, findings, "Windows");
   for (const [steps, platform] of [[linux, "Linux"], [windows, "Windows"]]) {
     const guard = mandatoryStep(steps, "Validation security and CI coverage guardrails", findings, platform);
     if (guard?.run?.trim() !== "npm run check:validation-guardrails") {

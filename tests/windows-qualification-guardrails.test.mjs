@@ -15,6 +15,116 @@ function windowsStep(workflow, name) {
   return step;
 }
 
+function nodeSetupStep(workflow, jobName) {
+  const step = workflow.jobs[jobName].steps.find((item) => item.name === "Setup Node");
+  if (!step) throw new Error("Missing Node setup fixture step for " + jobName);
+  return step;
+}
+
+const nodeMatrixJobs = [
+  ["Linux", "test"],
+  ["Windows", "windows-test"]
+];
+
+const ineffectiveNodeSetupMutations = [
+  ["pins Node to 18.x", (workflow, jobName) => {
+    nodeSetupStep(workflow, jobName).with["node-version"] = "18.x";
+  }],
+  ["removes setup-node", (workflow, jobName) => {
+    workflow.jobs[jobName].steps = workflow.jobs[jobName].steps.filter(
+      (step) => step.name !== "Setup Node");
+  }],
+  ["disables setup-node", (workflow, jobName) => {
+    nodeSetupStep(workflow, jobName).if = false;
+  }],
+  ["makes setup-node optional", (workflow, jobName) => {
+    nodeSetupStep(workflow, jobName)["continue-on-error"] = true;
+  }],
+  ["duplicates setup-node", (workflow, jobName) => {
+    const setup = nodeSetupStep(workflow, jobName);
+    const index = workflow.jobs[jobName].steps.indexOf(setup);
+    workflow.jobs[jobName].steps.splice(index + 1, 0, {
+      ...setup,
+      with: { ...setup.with }
+    });
+  }],
+  ["omits the matrix version input", (workflow, jobName) => {
+    delete nodeSetupStep(workflow, jobName).with["node-version"];
+  }],
+  ["references a different matrix field", (workflow, jobName) => {
+    nodeSetupStep(workflow, jobName).with["node-version"] = "${{ matrix.version }}";
+  }],
+  ["uses an unapproved setup-node action version", (workflow, jobName) => {
+    nodeSetupStep(workflow, jobName).uses = "actions/setup-node@v3";
+  }],
+  ["runs after mandatory npm execution", (workflow, jobName) => {
+    const steps = workflow.jobs[jobName].steps;
+    const setup = nodeSetupStep(workflow, jobName);
+    steps.splice(steps.indexOf(setup), 1);
+    const typecheckIndex = steps.findIndex((step) => step.name === "Typecheck");
+    steps.splice(typecheckIndex + 1, 0, setup);
+  }]
+];
+
+const ineffectiveNodeSetupCases = nodeMatrixJobs.flatMap(([platform, jobName]) =>
+  ineffectiveNodeSetupMutations.map(([mutation, apply]) =>
+    [platform, jobName, mutation, apply]));
+
+const nodeSetupOrderingMutations = [
+  ["shell-separated npm command", (workflow, jobName) => {
+    const steps = workflow.jobs[jobName].steps;
+    const setup = nodeSetupStep(workflow, jobName);
+    steps.splice(steps.indexOf(setup), 0, {
+      name: "Early preparation",
+      run: "echo preparing; npm ci"
+    });
+  }],
+  ["multiline shell commands", (workflow, jobName) => {
+    const steps = workflow.jobs[jobName].steps;
+    const setup = nodeSetupStep(workflow, jobName);
+    steps.splice(steps.indexOf(setup), 0, {
+      name: "Early preparation",
+      run: "echo preparing\nnpm ci"
+    });
+  }],
+  ["harmless executable step", (workflow, jobName) => {
+    const steps = workflow.jobs[jobName].steps;
+    const setup = nodeSetupStep(workflow, jobName);
+    steps.splice(steps.indexOf(setup), 0, {
+      name: "Early preparation",
+      run: "echo preparing"
+    });
+  }],
+  ["unapproved action", (workflow, jobName) => {
+    const steps = workflow.jobs[jobName].steps;
+    const setup = nodeSetupStep(workflow, jobName);
+    steps.splice(steps.indexOf(setup), 0, {
+      name: "Early action",
+      uses: "actions/cache@v4"
+    });
+  }],
+  ["setup after dependency installation", (workflow, jobName) => {
+    const steps = workflow.jobs[jobName].steps;
+    const setup = nodeSetupStep(workflow, jobName);
+    steps.splice(steps.indexOf(setup), 1);
+    const installIndex = steps.findIndex((step) => step.name === "Install dependencies");
+    steps.splice(installIndex + 1, 0, setup);
+  }],
+  ["unapproved first action", (workflow, jobName) => {
+    workflow.jobs[jobName].steps[0].uses = "example/unapproved@v1";
+  }],
+  ["conditionally skipped checkout", (workflow, jobName) => {
+    workflow.jobs[jobName].steps[0].if = false;
+  }],
+  ["optional checkout", (workflow, jobName) => {
+    workflow.jobs[jobName].steps[0]["continue-on-error"] = true;
+  }]
+];
+
+const nodeSetupOrderingCases = nodeMatrixJobs.flatMap(([platform, jobName]) =>
+  nodeSetupOrderingMutations.map(([mutation, apply]) =>
+    [platform, jobName, mutation, apply]));
+
 // Populate the parser cache before Vitest applies the per-test timeout. The
 // first repository inspection parses several large test files.
 inspect(load());
@@ -622,6 +732,30 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
   test("accepts the checked-in Linux and scoped Windows matrix", () => {
     expect(inspect(load())).toEqual([]);
   }, 20_000);
+
+  test.each(ineffectiveNodeSetupCases)(
+    "rejects ineffective Node setup in the %s job (%s) when it %s",
+    (_platform, jobName, _mutation, apply) => {
+      const workflow = load();
+      apply(workflow, jobName);
+      expect(inspect(workflow).some((finding) =>
+        finding.includes("Node setup") || finding.includes("actions/setup-node"))).toBe(true);
+    },
+    20_000
+  );
+
+  test.each(nodeSetupOrderingCases)(
+    "requires Checkout then Setup Node in the %s job (%s) for %s",
+    (platform, jobName, _mutation, apply) => {
+      const workflow = load();
+      apply(workflow, jobName);
+      expect(inspect(workflow).some((finding) =>
+        finding.includes(platform) &&
+        (finding.includes("Checkout") || finding.includes("Node setup"))
+      )).toBe(true);
+    },
+    20_000
+  );
 
   test("accepts current-main distribution build and health smoke contract", () => {
     const workflow = load();
