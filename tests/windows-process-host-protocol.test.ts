@@ -48,6 +48,24 @@ describe("decodeWindowsHostFrames", () => {
       .toThrow(/contradictory terminal result/i);
   });
 
+
+  test.each([
+    [0, 0, 0, "completed"],
+    [0, 7, 0, "completed"],
+    [1, 0, 2, "launch_failed"],
+    [2, 0, 5, "cleanup_unconfirmed"],
+    [3, 0, 0, "cancelled_before_start"],
+    [4, 1_223, 0, "cancelled_confirmed"],
+    [5, 0, 87, "supervision_failed"]
+  ])("preserves distinct valid supervisor result status %s", (status, exitCode, errorCode, expected) => {
+    expect(decodeWindowsHostFrames(resultFrame(status, exitCode, errorCode)).frames).toEqual([{
+      type: "result",
+      status: expected,
+      exit_code: exitCode,
+      error_code: errorCode
+    }]);
+  });
+
   test("keeps normal nonzero command exits as completed results", () => {
     expect(decodeWindowsHostFrames(resultFrame(0, 7, 0)).frames).toEqual([{
       type: "result",

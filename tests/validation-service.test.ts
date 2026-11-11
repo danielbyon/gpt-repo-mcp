@@ -17,6 +17,7 @@ import { copyNscbMakefileFixture } from "./fixtures/nscb-makefile.js";
 import { createTempDir } from "./fixtures/temp-dir.js";
 import { createExternalValidationCoordination, createTrustedTestRunner, withTrustedRunnerPath } from "./fixtures/validation-test-tools.js";
 import * as processExec from "../src/services/process-exec.js";
+import { runWindowsProcessWithTail } from "../src/services/windows-process-host.js";
 import { canonicalSha256, type ValidationSourceSnapshot } from "../src/services/validation-evidence.js";
 
 describe("ValidationService", () => {
@@ -727,6 +728,68 @@ describe("ValidationService", () => {
       await validationPromise.catch(() => undefined);
     }
   }, 5_000);
+
+  test("records Windows launch_failed as a failed validation artifact rather than supervision success", async () => {
+    // Build a valid native terminal frame, then exercise the real host adapter
+    // before passing its result through ValidationService's persistence boundary.
+    const payload = Buffer.alloc(9);
+    payload.writeUInt8(1, 0); // launch_failed
+    payload.writeUInt32LE(0, 1);
+    payload.writeUInt32LE(5, 5);
+    const frame = Buffer.alloc(14);
+    frame.writeUInt8(3, 0);
+    frame.writeUInt32LE(9, 1);
+    payload.copy(frame, 5);
+    const script = [
+      "process.stdin.once('data', () => {",
+      "process.stdin.destroy();",
+      "process.stdout.end(" + JSON.stringify(frame.toString("base64")) + ", 'base64');",
+      "});"
+    ].join(" ");
+    const mapped = await runWindowsProcessWithTail({
+      executable: process.execPath,
+      args: [],
+      cwd: process.cwd(),
+      env: process.env,
+      tail_bytes: 1_024,
+      timeout_ms: 5_000
+    }, {
+      executable: process.execPath,
+      args: ["-e", script]
+    });
+    expect(mapped).toMatchObject({
+      cleanup_confirmed: true, cancelled: false, timed_out: false
+    });
+    expect(mapped.exit_code).toBeUndefined();
+    expect(mapped.host_failure).toBeUndefined();
+    expect(mapped.stderr_tail).toContain("could not start the command (error 5)");
+
+    const root = await fixtureRepo({ scripts: { smoke: "echo should-not-run" } });
+    const spy = vi.spyOn(processExec, "runProcessWithTail").mockResolvedValue(mapped);
+    try {
+      const result = await service(root).validate({ repo_id: "fixture", profile: "smoke" });
+      expect(result.status).toBe("failed");
+      expect(result.counts).toMatchObject({ passed: 0, failed: 1 });
+      expect(result.commands[0]).toMatchObject({
+        status: "failed",
+        stderr_tail: expect.stringContaining("could not start the command (error 5)")
+      });
+      expect(result.commands[0]).not.toHaveProperty("exit_code");
+      expect(result.validation_artifact?.path).toBeTruthy();
+
+      const latest = JSON.parse(await readFile(
+        join(root, ".chatgpt", "validation", "latest.json"), "utf8"
+      ));
+      expect(latest.status).toBe("failed");
+      expect(latest.status).not.toBe("passed");
+      const artifact = JSON.parse(await readFile(
+        join(root, result.validation_artifact!.path), "utf8"
+      ));
+      expect(artifact.status).toBe("failed");
+    } finally {
+      spy.mockRestore();
+    }
+  });
 
   test("preserves the latest receipt when Windows cleanup is unconfirmed", async () => {
     const root = await fixtureRepo({ scripts: { smoke: "echo validation-complete" } });
