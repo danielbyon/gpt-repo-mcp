@@ -35,12 +35,17 @@ paths, per-file SHA-256 digests, and the bundle content digest.
 The inventory has explicit boundaries:
 
 - Tracked changes: the patch covers Git's differences from the specified
-  ancestor through the current index and worktree; restricted tracked paths
-  cause capture to fail.
+  ancestor through the current index and worktree. It is limited to 16 MiB;
+  restricted tracked paths cause capture to fail.
 - Ordinary untracked files: Git's non-ignored inventory is enumerated.
   Eligible source, tests, scripts, docs, native code, approved root files, and
-  workflow YAML are copied within size/count limits. Other ordinary untracked
-  paths appear under `excluded_untracked_paths`.
+  workflow YAML are copied within limits of 256 files, 16 MiB combined, and
+  2 MiB per file. Other ordinary untracked paths appear under
+  `excluded_untracked_paths`. The verifier requires safe relative path syntax
+  and permits restricted paths in this exclusion list.
+- References: available default documents and caller-supplied references are
+  limited to 16 files and 16 MiB combined, with a 2 MiB limit per file.
+  Included defaults count toward both limits.
 - Ignored source: a separate bounded Git-ignored inventory covers
   `src/`, `tests/`, `scripts/`, `docs/`, `native/`,
   `.github/workflows/`, and the named build definitions. Git can emit
@@ -61,8 +66,8 @@ The inventory has explicit boundaries:
   scanning: review every bundle before distribution.
 
 Both ordinary and scoped ignored inventories are captured again before
-completion. The output has bounded files and bytes, and incomplete captures
-are removed after a failure.
+completion. The creator and verifier enforce the file and byte limits above.
+The creator removes partial output after a failed capture.
 
 Keep the printed **manifest SHA-256** outside the bundle. Its integrity
 claim relies on obtaining the expected hash from a trusted independent

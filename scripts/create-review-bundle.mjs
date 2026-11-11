@@ -11,6 +11,8 @@ const MAX_PATCH_BYTES = 16 * 1024 * 1024;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_UNTRACKED_FILES = 256;
 const MAX_UNTRACKED_BYTES = 16 * 1024 * 1024;
+const MAX_REFERENCE_FILES = 16;
+const MAX_REFERENCE_BYTES = 16 * 1024 * 1024;
 const MAX_ENUMERATED_PATHS = 8_192;
 const IGNORED_INVENTORY_ROOTS = Object.freeze([
   "src/", "tests/", "scripts/", "docs/", "native/", ".github/workflows/",
@@ -318,10 +320,18 @@ export async function createReviewBundle({
         source_path: path, path: bundlePath, bytes: content.byteLength, sha256: sha256(content)
       });
     }
+    let referenceBytes = 0;
     for (const path of requestedReferences) {
       if (!existsSync(join(root, path)) && DEFAULT_REFERENCES.includes(path) &&
           !references.includes(path)) continue;
+      if (manifest.references.length >= MAX_REFERENCE_FILES) {
+        throw new Error("Review bundle exceeds the reference file count limit.");
+      }
       const content = await readBoundFile(root, path);
+      referenceBytes += content.byteLength;
+      if (referenceBytes > MAX_REFERENCE_BYTES) {
+        throw new Error("Review bundle exceeds the total reference byte limit.");
+      }
       const bundlePath = "references/" + path;
       await writeBundleFile(outputDirectory, bundlePath, content);
       manifest.references.push({
@@ -394,6 +404,12 @@ export async function verifyReviewBundle(directory, expectedManifestSha256) {
       manifest.redacted_ignored_count < 0) {
     throw new Error("Unsupported review-bundle manifest.");
   }
+  if (manifest.references.length > MAX_REFERENCE_FILES) {
+    throw new Error("Review bundle exceeds the reference file count limit.");
+  }
+  if (manifest.untracked_files.length > MAX_UNTRACKED_FILES) {
+    throw new Error("Review bundle exceeds the untracked-source file count limit.");
+  }
   const { content_digest_sha256: digest, ...unsigned } = manifest;
   if (sha256(JSON.stringify(unsigned)) !== digest) {
     throw new Error("Review bundle content manifest digest mismatch.");
@@ -401,6 +417,7 @@ export async function verifyReviewBundle(directory, expectedManifestSha256) {
   if (new Set(manifest.tracked_changed_paths).size !== manifest.tracked_changed_paths.length ||
       manifest.tracked_changed_paths.some(restricted) ||
       new Set(manifest.excluded_untracked_paths).size !== manifest.excluded_untracked_paths.length ||
+      manifest.excluded_untracked_paths.some((path) => !isSafeRelative(path)) ||
       new Set(manifest.excluded_ignored_paths).size !== manifest.excluded_ignored_paths.length ||
       manifest.excluded_ignored_paths.some((path) =>
         restricted(path.endsWith("/") ? path.slice(0, -1) : path))) {
@@ -423,13 +440,29 @@ export async function verifyReviewBundle(directory, expectedManifestSha256) {
     }
   }
   const entries = [manifest.tracked_patch, ...manifest.untracked_files, ...manifest.references];
+  let untrackedBytes = 0;
+  let referenceBytes = 0;
   for (const entry of entries) {
-    if (!entry || !isSafeRelative(entry.path) || restricted(entry.path) ||
+    if (!entry || !Number.isSafeInteger(entry.bytes) || entry.bytes < 0 ||
+        !isSafeRelative(entry.path) || restricted(entry.path) ||
         (entry !== manifest.tracked_patch &&
           !entry.path.startsWith("untracked/") && !entry.path.startsWith("references/"))) {
       throw new Error("Invalid review-bundle manifest entry.");
     }
-    const bytes = await readBoundFile(root, entry.path, MAX_PATCH_BYTES);
+    const maxBytes = entry === manifest.tracked_patch ? MAX_PATCH_BYTES : MAX_FILE_BYTES;
+    const bytes = await readBoundFile(root, entry.path, maxBytes);
+    if (manifest.untracked_files.includes(entry)) {
+      untrackedBytes += bytes.byteLength;
+      if (untrackedBytes > MAX_UNTRACKED_BYTES) {
+        throw new Error("Review bundle exceeds the total untracked-source byte limit.");
+      }
+    }
+    if (manifest.references.includes(entry)) {
+      referenceBytes += bytes.byteLength;
+      if (referenceBytes > MAX_REFERENCE_BYTES) {
+        throw new Error("Review bundle exceeds the total reference byte limit.");
+      }
+    }
     if (bytes.byteLength !== entry.bytes || sha256(bytes) !== entry.sha256) {
       throw new Error("Review-bundle content mismatch: " + entry.path);
     }
