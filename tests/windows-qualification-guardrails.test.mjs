@@ -143,9 +143,19 @@ const checkoutSourceIdentityOverrides = [
   ["mixed-case Repository input", "RePository", "attacker/other-repo"]
 ];
 
+const secondaryCheckoutSourceOverrides = [
+  ["ref override", { ref: "release/qualification" }],
+  ["repository override", { repository: "attacker/other-repo" }],
+  ["malformed input mapping", null]
+];
+
 const checkoutSourceIdentityCases = nodeMatrixJobs.flatMap(([platform, jobName]) =>
   checkoutSourceIdentityOverrides.map(([mutation, key, value]) =>
     [platform, jobName, mutation, key, value]));
+
+const secondaryCheckoutSourceCases = nodeMatrixJobs.flatMap(([platform, jobName]) =>
+  secondaryCheckoutSourceOverrides.map(([mutation, inputs]) =>
+    [platform, jobName, mutation, inputs]));
 
 const malformedCheckoutInputValues = [
   ["null", null],
@@ -801,6 +811,23 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
       expect(inspectQualificationWorkflow(workflow)).toContain(
         `${platform} Checkout must use the triggering workflow repository and event revision; remove with.ref and with.repository overrides`
       );
+    },
+    20_000
+  );
+
+  test.each(secondaryCheckoutSourceCases)(
+    "rejects a second Checkout source override in the %s job (%s): %s",
+    (platform, jobName, _mutation, inputs) => {
+      const workflow = load();
+      workflow.jobs[jobName].steps.push({
+        name: "Secondary checkout",
+        uses: "actions/checkout@v6",
+        with: inputs
+      });
+      const expected = inputs === null
+        ? `${platform} Checkout with inputs must be a mapping`
+        : `${platform} Checkout must use the triggering workflow repository and event revision; remove with.ref and with.repository overrides`;
+      expect(inspectQualificationWorkflow(workflow)).toContain(expected);
     },
     20_000
   );

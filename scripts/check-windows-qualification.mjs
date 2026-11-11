@@ -5650,7 +5650,7 @@ function mandatoryStep(steps, name, findings, platform) {
   return step;
 }
 
-/** Keep Checkout bound to the workflow event by leaving ref and repository at their action defaults. */
+/** Keep every Checkout action bound to the workflow event by leaving ref and repository at action defaults. */
 function validateCheckoutSourceIdentity(checkout, findings, platform) {
   if (!checkout || !Object.hasOwn(checkout, "with")) return;
   const inputs = checkout.with;
@@ -5671,7 +5671,11 @@ function validateCheckoutSourceIdentity(checkout, findings, platform) {
 function mandatoryNodeSetupStep(steps, findings, platform) {
   // Setup Node immediately after checkout so no other job step can run first.
   const checkout = mandatoryStep(steps, "Checkout", findings, platform);
-  validateCheckoutSourceIdentity(checkout, findings, platform);
+  for (const step of Array.isArray(steps) ? steps : []) {
+    if (typeof step?.uses !== "string" ||
+        step.uses.trim().split("@", 1)[0].toLowerCase() !== "actions/checkout") continue;
+    validateCheckoutSourceIdentity(step, findings, platform);
+  }
   if (checkout?.uses !== "actions/checkout@v6" || steps[0] !== checkout) {
     findings.push(platform + " must begin with the approved repository Checkout action");
   }
