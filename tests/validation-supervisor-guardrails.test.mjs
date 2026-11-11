@@ -456,6 +456,30 @@ test("accepts ordinary helper arguments and member factories", () => {
     expect(inspectSupervisorSource("src/services/windows-process-host.ts", source)).not.toEqual([]);
   });
 
+  test("accepts an ordinary local function named createRequire", () => {
+    const source = [
+      "function createRequire() {",
+      "  return 42;",
+      "}",
+      "createRequire();"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .toEqual([]);
+  });
+
+  test("accepts an ordinary local method named _parse", () => {
+    const source = [
+      "const object = {",
+      "  _parse() {",
+      "    return 42;",
+      "  }",
+      "};",
+      "object._parse();"
+    ].join("\n");
+    expect(inspectSupervisorSource("src/services/windows-process-host.ts", source))
+      .toEqual([]);
+  });
+
   test.each(["node:module", "module"])("rejects aliased createRequire imports from %s", (module) => {
     const source = [
       `import { createRequire as loadModule } from '${module}';`,

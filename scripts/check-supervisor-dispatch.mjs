@@ -4823,7 +4823,9 @@ if (ts.isVariableDeclaration(node) && node.initializer &&
           requireReferenceOf(node.arguments[0])) {
         add(node, "dynamic require forbidden in supervisor source");
       }
-      if (called === "createRequire" || called === "_parse") {
+      // Keep unresolved capability names fail-closed while allowing known local functions.
+      if ((called === "createRequire" || called === "_parse") &&
+          !functionValueOf(node.expression)) {
         add(node, "indirect process loading, eval, or private shim parsing is forbidden");
       }
       const indirectReflective = invoked && ["apply", "bind", "call"].includes(
