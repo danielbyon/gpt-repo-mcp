@@ -14,6 +14,8 @@ const MAX_UNTRACKED_BYTES = 16 * 1024 * 1024;
 const MAX_REFERENCE_FILES = 16;
 const MAX_REFERENCE_BYTES = 16 * 1024 * 1024;
 const MAX_ENUMERATED_PATHS = 8_192;
+const MISSING_TRACKED_MODE = "000000";
+const REGULAR_TRACKED_MODES = new Set(["100644", "100755"]);
 const IGNORED_INVENTORY_ROOTS = Object.freeze([
   "src/", "tests/", "scripts/", "docs/", "native/", ".github/workflows/",
   "Makefile", "Justfile", "package.json", "Cargo.toml"
@@ -54,10 +56,16 @@ function gitText(root, args) {
   return git(root, args).toString("utf8").trim();
 }
 
-function nulPaths(bytes) {
+function nulFields(bytes) {
   const text = bytes.toString("utf8");
   if (text.includes("\uFFFD")) throw new Error("Git emitted a path that is not valid UTF-8.");
-  return text.split("\0").filter(Boolean).sort();
+  if (text.length === 0) return [];
+  if (!text.endsWith("\0")) throw new Error("Git emitted malformed NUL-delimited metadata.");
+  return text.slice(0, -1).split("\0");
+}
+
+function nulPaths(bytes) {
+  return nulFields(bytes).filter(Boolean).sort();
 }
 
 function isSafeRelative(path) {
@@ -143,6 +151,170 @@ function changedPaths(root, baseSha) {
   return nulPaths(git(root, ["diff", "--name-only", "-z", baseSha, "--"]));
 }
 
+function rawTrackedChanges(root, diffArgs) {
+  const fields = nulFields(git(root, [
+    "diff", "--raw", "--no-abbrev", "--no-renames", "-z", ...diffArgs, "--"
+  ], { maxBuffer: MAX_PATCH_BYTES * 2 }));
+  if (fields.length % 2 !== 0) throw new Error("Git emitted incomplete tracked-file metadata.");
+
+  const changes = [];
+  for (let index = 0; index < fields.length; index += 2) {
+    const match = /^:(\d{6}) (\d{6}) \S+ \S+ ([A-Z])$/.exec(fields[index]);
+    const path = fields[index + 1];
+    if (!match || !isSafeRelative(path)) {
+      throw new Error("Git emitted malformed tracked-file metadata.");
+    }
+    changes.push({
+      path,
+      old_mode: match[1],
+      new_mode: match[2],
+      status: match[3]
+    });
+  }
+  return changes;
+}
+
+function trackedDiffMetadata(root, baseSha, headSha) {
+  return {
+    committed: rawTrackedChanges(root, [baseSha, headSha]),
+    index: rawTrackedChanges(root, ["--cached", baseSha]),
+    worktree: rawTrackedChanges(root, [baseSha])
+  };
+}
+
+function assertTrackedModes(metadata) {
+  for (const change of Object.values(metadata).flat()) {
+    if (!["A", "D", "M", "T"].includes(change.status)) {
+      throw new Error("Tracked change has unsupported Git status: " + change.path);
+    }
+    for (const mode of [change.old_mode, change.new_mode]) {
+      if (mode !== MISSING_TRACKED_MODE && !REGULAR_TRACKED_MODES.has(mode)) {
+        throw new Error("Tracked change uses prohibited Git file mode " + mode + ": " + change.path);
+      }
+    }
+  }
+}
+
+function trackedBaseModes(metadata) {
+  const modes = new Map();
+  for (const change of Object.values(metadata).flat()) {
+    const prior = modes.get(change.path);
+    if (prior !== undefined && prior !== change.old_mode) {
+      throw new Error("Git tracked-file metadata disagrees on the selected base: " + change.path);
+    }
+    modes.set(change.path, change.old_mode);
+  }
+  return modes;
+}
+
+function trackedWorktreeChanges(metadata) {
+  return new Map(metadata.worktree.map((change) => [change.path, change]));
+}
+
+async function trackedPathState(root, path, baseMode, worktreeChange, affectedPaths) {
+  function missingState() {
+    if (worktreeChange?.status === "D" &&
+        worktreeChange.new_mode === MISSING_TRACKED_MODE &&
+        worktreeChange.old_mode !== MISSING_TRACKED_MODE) {
+      return { path, kind: "git-deletion" };
+    }
+    if (!worktreeChange && baseMode === MISSING_TRACKED_MODE) {
+      return { path, kind: "absent-from-selected-base-and-worktree" };
+    }
+    throw new Error("Tracked source is missing without a Git-recorded deletion: " + path);
+  }
+
+  let parent = root;
+  const parts = path.split("/");
+  for (const part of parts.slice(0, -1)) {
+    parent = join(parent, part);
+    let info;
+    try {
+      info = await lstat(parent);
+    } catch (error) {
+      if (error.code === "ENOENT") return missingState();
+      throw error;
+    }
+    if (info.isSymbolicLink()) {
+      throw new Error("Tracked source has a symlinked ancestor: " + path);
+    }
+    if (!info.isDirectory()) {
+      if (info.isFile()) return missingState();
+      throw new Error("Tracked source has an unsupported ancestor file type: " + path);
+    }
+  }
+
+  let info;
+  try {
+    info = await lstat(join(root, path));
+  } catch (error) {
+    if (error.code === "ENOENT") return missingState();
+    throw error;
+  }
+  if (info.isSymbolicLink()) throw new Error("Tracked source is a symlink: " + path);
+  if (info.isFile()) {
+    if (info.nlink !== 1) {
+      throw new Error("Tracked source is not a singly linked regular file: " + path);
+    }
+    return {
+      path,
+      kind: "regular-file",
+      device: info.dev,
+      inode: info.ino,
+      mode: info.mode,
+      links: info.nlink,
+      size: info.size
+    };
+  }
+  if (info.isDirectory() && worktreeChange?.new_mode === MISSING_TRACKED_MODE &&
+      affectedPaths.some((candidate) => candidate !== path && candidate.startsWith(path + "/"))) {
+    return {
+      path,
+      kind: "synthetic-directory-ancestor",
+      device: info.dev,
+      inode: info.ino,
+      mode: info.mode,
+      links: info.nlink
+    };
+  }
+  throw new Error("Tracked source is not a regular file: " + path);
+}
+
+async function trackedSourceSnapshot(root, baseSha, headSha, changed) {
+  const metadata = trackedDiffMetadata(root, baseSha, headSha);
+  assertTrackedModes(metadata);
+  const baseModes = trackedBaseModes(metadata);
+  const affectedPaths = [...new Set([
+    ...changed,
+    ...Object.values(metadata).flat().map((change) => change.path)
+  ])].sort();
+  const worktreeChanges = trackedWorktreeChanges(metadata);
+  const sources = [];
+  for (const path of affectedPaths) {
+    if (!baseModes.has(path)) {
+      throw new Error("Git tracked-file metadata omitted the selected base mode: " + path);
+    }
+    sources.push(await trackedPathState(
+      root, path, baseModes.get(path), worktreeChanges.get(path), affectedPaths
+    ));
+  }
+  return { metadata, sources };
+}
+
+function validCommitIdentity(value) {
+  return typeof value === "string" && /^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(value) &&
+    !/^0+$/.test(value);
+}
+
+function assertCommitIdentities(manifest) {
+  const baseSha = manifest?.base_sha;
+  const headSha = manifest?.head_sha;
+  if (!validCommitIdentity(baseSha) || !validCommitIdentity(headSha) ||
+      baseSha.length !== headSha.length) {
+    throw new Error("Review-bundle commit identities must be full, nonzero hexadecimal Git object IDs of the same format.");
+  }
+}
+
 function boundedPaths(bytes) {
   const entries = nulPaths(bytes);
   if (entries.length > MAX_ENUMERATED_PATHS) {
@@ -210,8 +382,15 @@ async function validateSnapshot(root, baseSha, snapshot) {
   if (gitText(root, ["rev-parse", "--verify", "HEAD"]) !== snapshot.head_sha) {
     throw new Error("HEAD changed during review-bundle capture.");
   }
+  const currentPaths = changedPaths(root, baseSha);
+  const currentTrackedSources = await trackedSourceSnapshot(
+    root, baseSha, snapshot.head_sha, currentPaths
+  );
+  if (JSON.stringify(currentTrackedSources) !== JSON.stringify(snapshot.tracked_source_snapshot)) {
+    throw new Error("Tracked source state changed during review-bundle capture.");
+  }
   if (sha256(trackedDiff(root, baseSha)) !== snapshot.tracked_patch.sha256 ||
-      JSON.stringify(changedPaths(root, baseSha)) !== JSON.stringify(snapshot.tracked_changed_paths) ||
+      JSON.stringify(currentPaths) !== JSON.stringify(snapshot.tracked_changed_paths) ||
       JSON.stringify(untrackedPaths(root)) !== JSON.stringify(snapshot.all_untracked_paths) ||
       JSON.stringify(ignoredPaths(root)) !== JSON.stringify(snapshot.all_ignored_paths)) {
     throw new Error("Git worktree changed during review-bundle capture.");
@@ -258,6 +437,7 @@ export async function createReviewBundle({
   for (const path of paths) {
     if (restricted(path)) throw new Error("Tracked change crosses the review safety boundary: " + path);
   }
+  const trackedSources = await trackedSourceSnapshot(root, baseSha, headSha, paths);
   const allUntracked = untrackedPaths(root);
   for (const path of allUntracked) {
     if (!isSafeRelative(path)) throw new Error("Git worktree contains unsafe untracked path syntax.");
@@ -341,7 +521,10 @@ export async function createReviewBundle({
 
     if (beforeFinalSnapshot) await beforeFinalSnapshot(root);
     await validateSnapshot(root, baseSha, {
-      ...manifest, all_untracked_paths: allUntracked, all_ignored_paths: allIgnored
+      ...manifest,
+      tracked_source_snapshot: trackedSources,
+      all_untracked_paths: allUntracked,
+      all_ignored_paths: allIgnored
     });
     const contentDigest = sha256(JSON.stringify(manifest));
     const encoded = Buffer.from(JSON.stringify({
@@ -394,6 +577,7 @@ export async function verifyReviewBundle(directory, expectedManifestSha256) {
     throw new Error("Review bundle manifest digest mismatch.");
   }
   const manifest = JSON.parse(manifestBytes.toString("utf8"));
+  assertCommitIdentities(manifest);
   if (manifest.schema_version !== 2 || !Array.isArray(manifest.tracked_changed_paths) ||
       !Array.isArray(manifest.untracked_files) || !Array.isArray(manifest.references) ||
       !Array.isArray(manifest.excluded_untracked_paths) ||

@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { link, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdtemp, mkdir, readFile, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import process from "node:process";
 import { join } from "node:path";
@@ -26,6 +26,19 @@ async function writeResignedManifest(output, manifest) {
   const resigned = resignedManifest(manifest);
   await writeFile(join(output, "manifest.json"), resigned.bytes);
   return resigned.sha256;
+}
+
+function deterministicBinary(length) {
+  const bytes = Buffer.alloc(length);
+  let state = 0x13579bdf;
+  for (let index = 0; index < bytes.length; index++) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    bytes[index] = (state >>> 24) & 0xff;
+  }
+  bytes[0] = 0;
+  return bytes;
 }
 
 afterEach(async () => {
@@ -97,6 +110,62 @@ describe("content-addressed worktree review bundles", () => {
       .rejects.toThrow(/content mismatch/i);
     await expect(verifyReviewBundle(f.output, "0".repeat(64)))
       .rejects.toThrow(/manifest digest mismatch/i);
+  });
+
+  for (const field of ["base_sha", "head_sha"]) {
+    test(`rejects invalid ${field} values with recomputed manifest digests`, async () => {
+      const f = await fixture();
+      await createReviewBundle({ cwd: f.root, base: f.base, output: f.output });
+      const original = JSON.parse(await readFile(join(f.output, "manifest.json"), "utf8"));
+      const invalidValues = [
+        { label: "omitted", omit: true },
+        { label: "null", value: null },
+        { label: "nonstring", value: 23 },
+        { label: "empty", value: "" },
+        { label: "abbreviated", value: "abc123" },
+        { label: "nonhex", value: "g".repeat(40) },
+        { label: "zero SHA-1 sentinel", value: "0".repeat(40) },
+        { label: "zero SHA-256 sentinel", value: "0".repeat(64) }
+      ];
+
+      for (const invalid of invalidValues) {
+        const manifest = JSON.parse(JSON.stringify(original));
+        if (invalid.omit) delete manifest[field];
+        else manifest[field] = invalid.value;
+        const digest = await writeResignedManifest(f.output, manifest);
+        await expect(verifyReviewBundle(f.output, digest), `${field}: ${invalid.label}`)
+          .rejects.toThrow(/commit identit/i);
+      }
+    });
+  }
+
+  test("accepts full SHA-1 and SHA-256 identities, including equal base and head", async () => {
+    const f = await fixture();
+    await createReviewBundle({ cwd: f.root, base: f.base, output: f.output });
+    const original = JSON.parse(await readFile(join(f.output, "manifest.json"), "utf8"));
+
+    for (const [baseSha, headSha] of [
+      ["a".repeat(40), "a".repeat(40)],
+      ["b".repeat(64), "c".repeat(64)]
+    ]) {
+      const manifest = JSON.parse(JSON.stringify(original));
+      manifest.base_sha = baseSha;
+      manifest.head_sha = headSha;
+      const digest = await writeResignedManifest(f.output, manifest);
+      await expect(verifyReviewBundle(f.output, digest))
+        .resolves.toMatchObject({ verified: true, base_sha: baseSha, head_sha: headSha });
+    }
+  });
+
+  test("rejects mixed full object-ID widths with recomputed manifest digests", async () => {
+    const f = await fixture();
+    await createReviewBundle({ cwd: f.root, base: f.base, output: f.output });
+    const manifest = JSON.parse(await readFile(join(f.output, "manifest.json"), "utf8"));
+    manifest.base_sha = "a".repeat(40);
+    manifest.head_sha = "b".repeat(64);
+    const digest = await writeResignedManifest(f.output, manifest);
+
+    await expect(verifyReviewBundle(f.output, digest)).rejects.toThrow(/commit identit/i);
   });
 
   test("does not write review bundles inside the source checkout", async () => {
@@ -183,6 +252,128 @@ describe("content-addressed worktree review bundles", () => {
       .rejects.toThrow(/singly linked regular file/);
     await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
     expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+  });
+
+  test("rejects a changed tracked hard link before exporting outside bytes", async () => {
+    const f = await fixture();
+    const trackedPath = join(f.root, "src", "app.ts");
+    const outsidePath = join(f.parent, "outside-hardlink.txt");
+    const payload = "ARTIFICIAL_OUTSIDE_HARDLINK_FIXTURE\n";
+    await writeFile(outsidePath, payload);
+    await unlink(trackedPath);
+    await link(outsidePath, trackedPath);
+    const before = runGit(f.root, ["status", "--porcelain"]);
+
+    await expect(createReviewBundle({ cwd: f.root, base: f.base, output: f.output }))
+      .rejects.toThrow(/tracked source is not a singly linked regular file/i);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+    expect(await readFile(outsidePath, "utf8")).toBe(payload);
+    expect(await readFile(trackedPath, "utf8")).toBe(payload);
+  });
+
+  test.skipIf(process.platform === "win32")("rejects a tracked symlink without exporting its target text", async () => {
+    const f = await fixture();
+    const trackedPath = join(f.root, "src", "app.ts");
+    const outsidePath = join(f.parent, "outside-symlink-target.txt");
+    const targetText = "ARTIFICIAL_OUTSIDE_SYMLINK_TARGET\n";
+    await writeFile(outsidePath, targetText);
+    await unlink(trackedPath);
+    await symlink(outsidePath, trackedPath);
+    const before = runGit(f.root, ["status", "--porcelain"]);
+
+    await expect(createReviewBundle({ cwd: f.root, base: f.base, output: f.output }))
+      .rejects.toThrow(/tracked source is a symlink|prohibited Git file mode/i);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+    expect(await readFile(outsidePath, "utf8")).toBe(targetText);
+    expect(await readFile(trackedPath, "utf8")).toBe(targetText);
+  });
+
+  test.skipIf(process.platform === "win32")("rejects a changed tracked path reached through a symlinked ancestor", async () => {
+    const f = await fixture();
+    const sourceDirectory = join(f.root, "src");
+    const movedDirectory = join(f.root, "src-real");
+    await rename(sourceDirectory, movedDirectory);
+    await symlink(movedDirectory, sourceDirectory, "dir");
+    const before = runGit(f.root, ["status", "--porcelain"]);
+
+    await expect(createReviewBundle({ cwd: f.root, base: f.base, output: f.output }))
+      .rejects.toThrow(/symlinked ancestor/i);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+  });
+
+  test.each(["staged", "committed"])("rejects a Git-recorded symlink mode in the %s", async (state) => {
+    const f = await fixture();
+    const outsidePath = join(f.parent, "recorded-symlink-target.txt");
+    await writeFile(outsidePath, "ARTIFICIAL_GIT_SYMLINK_TARGET\n");
+    const blob = runGit(f.root, ["hash-object", "-w", outsidePath]);
+    runGit(f.root, ["update-index", "--add", "--cacheinfo", `120000,${blob},src/app.ts`]);
+    if (state === "committed") runGit(f.root, ["commit", "-qm", "record symlink mode"]);
+    const beforeHead = runGit(f.root, ["rev-parse", "HEAD"]);
+    const beforeStatus = runGit(f.root, ["status", "--porcelain"]);
+
+    await expect(createReviewBundle({ cwd: f.root, base: f.base, output: f.output }))
+      .rejects.toThrow(/prohibited Git file mode/i);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runGit(f.root, ["rev-parse", "HEAD"])).toBe(beforeHead);
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(beforeStatus);
+    expect(await readFile(outsidePath, "utf8")).toBe("ARTIFICIAL_GIT_SYMLINK_TARGET\n");
+  });
+
+  test("detects a persistent tracked hard-link change at the final snapshot", async () => {
+    const f = await fixture();
+    const trackedPath = join(f.root, "src", "app.ts");
+    const outsidePath = join(f.parent, "capture-hardlink.txt");
+    const original = await readFile(trackedPath);
+    const before = runGit(f.root, ["status", "--porcelain"]);
+
+    await expect(createReviewBundle({
+      cwd: f.root, base: f.base, output: f.output,
+      beforeFinalSnapshot: () => link(trackedPath, outsidePath)
+    })).rejects.toThrow(/tracked source is not a singly linked regular file/i);
+    await expect(stat(f.output)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runGit(f.root, ["status", "--porcelain"])).toBe(before);
+    expect(await readFile(trackedPath)).toEqual(original);
+    expect(await readFile(outsidePath)).toEqual(original);
+  });
+
+  test("accepts regular tracked deletion and preserves the deleted path in the patch", async () => {
+    const f = await fixture();
+    await unlink(join(f.root, "src", "app.ts"));
+
+    const result = await createReviewBundle({ cwd: f.root, base: f.base, output: f.output });
+    const manifest = JSON.parse(await readFile(join(f.output, "manifest.json"), "utf8"));
+    const patch = await readFile(join(f.output, "tracked.patch"), "utf8");
+    expect(manifest.tracked_changed_paths).toContain("src/app.ts");
+    expect(patch).toContain("deleted file mode 100644");
+    await expect(verifyReviewBundle(f.output, result.manifest_sha256))
+      .resolves.toMatchObject({ verified: true });
+  });
+
+  test("preserves tracked additions, renames, executable modes, and binary patches above 2 MiB", async () => {
+    const f = await fixture();
+    const originalPath = join(f.root, "src", "app.ts");
+    const renamedPath = join(f.root, "src", "renamed.ts");
+    const addedPath = join(f.root, "src", "added.ts");
+    const binaryPath = join(f.root, "src", "payload.bin");
+    await rename(originalPath, renamedPath);
+    await chmod(renamedPath, 0o755);
+    await writeFile(addedPath, "export const added = true;\n");
+    await writeFile(binaryPath, deterministicBinary(2 * 1024 * 1024 + 1));
+    runGit(f.root, ["add", "-A", "--", "src"]);
+
+    const result = await createReviewBundle({ cwd: f.root, base: f.base, output: f.output });
+    const patch = await readFile(join(f.output, "tracked.patch"));
+    const manifest = JSON.parse(await readFile(join(f.output, "manifest.json"), "utf8"));
+    expect(manifest.tracked_patch.bytes).toBeGreaterThan(2 * 1024 * 1024);
+    expect(patch.toString("utf8")).toContain("GIT binary patch");
+    expect(patch.toString("utf8")).toContain("100755");
+    expect(patch.toString("utf8")).toContain("src/added.ts");
+    expect(patch.toString("utf8")).toContain("src/renamed.ts");
+    await expect(verifyReviewBundle(f.output, result.manifest_sha256))
+      .resolves.toMatchObject({ verified: true });
   });
 
   test("detects duplicate and inconsistent manifest entries even with a recomputed digest", async () => {

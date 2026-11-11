@@ -34,9 +34,16 @@ paths, per-file SHA-256 digests, and the bundle content digest.
 
 The inventory has explicit boundaries:
 
-- Tracked changes: the patch covers Git's differences from the specified
-  ancestor through the current index and worktree. It is limited to 16 MiB;
-  restricted tracked paths cause capture to fail.
+- Tracked changes: `tracked.patch` is Git's binary diff from the selected
+  ancestor to the current worktree. Before generating it, the creator checks
+  changed path modes across base-to-HEAD, base-to-index, and base-to-worktree
+  metadata. It rejects symlinks, unsupported Git file modes, and existing paths
+  that are hard-linked, nonregular, or reached through a symlinked ancestor.
+  Git-recorded deletions are allowed. Regular additions, edits, renames,
+  executable-bit changes, and binary patches remain supported. Tracked patches
+  have a 16 MiB limit and no per-file copy limit; the 2 MiB per-file limit
+  applies to copied untracked files and references. Restricted tracked paths
+  cause capture to fail.
 - Ordinary untracked files: Git's non-ignored inventory is enumerated.
   Eligible source, tests, scripts, docs, native code, approved root files, and
   workflow YAML are copied within limits of 256 files, 16 MiB combined, and
@@ -65,9 +72,13 @@ The inventory has explicit boundaries:
   paths are never copied from the worktree. This is not secret-content
   scanning: review every bundle before distribution.
 
-Both ordinary and scoped ignored inventories are captured again before
-completion. The creator and verifier enforce the file and byte limits above.
-The creator removes partial output after a failed capture.
+Git stores symlink modes and their target text, but it does not store hard-link
+relationships. The creator checks tracked file types and link counts before
+patch creation and again at the final snapshot. It cannot recover historical
+hard-link state from Git blobs. Both ordinary and scoped ignored inventories
+are captured again before completion. The creator and verifier enforce the
+file and byte limits above. The creator removes partial output after a failed
+capture.
 
 Keep the printed **manifest SHA-256** outside the bundle. Its integrity
 claim relies on obtaining the expected hash from a trusted independent
@@ -84,13 +95,18 @@ node scripts/create-review-bundle.mjs verify \
 Verification checks the externally supplied manifest hash, manifest content
 digest, every referenced file hash, and the exact expected file inventory.
 Unexpected files, altered bytes, duplicate entries, and symlinked payload files
-cause verification to fail.
+cause verification to fail. The manifest must also contain nonzero full Git
+object IDs in `base_sha` and `head_sha`. Each ID must have 40 hexadecimal
+characters (SHA-1) or 64 (SHA-256), and both fields must use the same format.
+Equal identities are valid. These checks validate the fields' structure only.
+Verification runs offline and does not prove that either commit exists, that
+one is an ancestor of the other, or that they belong to a trusted repository.
+The creator resolves the base commit and checks its ancestry against HEAD.
 
-This is content-addressed integrity, not an unchangeable filesystem archive.
-The snapshot detects endpoint changes during capture but cannot prove that an
-external writer did not temporarily alter and then restore identical bytes
-between observations. The review evidence is bounded to the declared Git
-diff, ordinary untracked paths, and the scoped ignored inventory; it does not
-claim a full checkout archive or repository-wide ignored-file inventory. It also does not execute tests or provide independent
-approval. Record the resulting manifest hash with the reviewer verdict and
-rerun qualification when the candidate changes.
+Verification checks content integrity. It does not make the bundle directory
+immutable. Start and end snapshots cannot detect a writer that changes data and
+restores the same state between observations. The bundle covers declared Git
+changes, eligible untracked files, and the scoped ignored inventory. It does
+not contain a full checkout or a repository-wide ignored-file inventory.
+Verification does not run tests or approve the change. Record the manifest hash
+with the reviewer verdict and rerun qualification when the candidate changes.
