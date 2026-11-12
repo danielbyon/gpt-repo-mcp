@@ -4,8 +4,50 @@ import {
   requestAudit,
   withRequestTelemetry
 } from "../src/runtime/telemetry.js";
+import { redactSensitiveText } from "../src/runtime/result-envelope.js";
 
 describe("audit redaction", () => {
+  test("redacts supported absolute path roots without changing output labels", () => {
+    expect(redactSensitiveText("rustc=/Volumes/Test Scratch/tmp/run-42/bin/rustc threads=1"))
+      .toBe("rustc=[REDACTED_PATH] threads=1");
+    expect(redactSensitiveText('source="/Volumes/Test Scratch/tmp/validation runs/stdout.txt" status=failed'))
+      .toBe('source="[REDACTED_PATH]" status=failed');
+    expect(redactSensitiveText('source="/Volumes/Test\' Scratch/tmp/validation.txt" status=failed'))
+      .toBe('source="[REDACTED_PATH]" status=failed');
+    expect(redactSensitiveText('source="/Volumes/Test Scratch/folder\\"quoted/file.txt" status=failed'))
+      .toBe('source="[REDACTED_PATH]" status=failed');
+    expect(redactSensitiveText("source='/Volumes/Owner'\\''s Drive/file.txt' status=failed"))
+      .toBe("source='[REDACTED_PATH]' status=failed");
+    expect(redactSensitiveText("source=/Volumes/Test Scratch/Project, Final/report.txt threads=1"))
+      .toBe("source=[REDACTED_PATH] threads=1");
+    expect(redactSensitiveText("path=/Volumes/'Build Volume'/tmp/run-42/output.txt status=failed"))
+      .toBe("path=[REDACTED_PATH] status=failed");
+    expect(redactSensitiveText('source="/Volumes/Test Scratch/tmp/run status=failed" status=ok'))
+      .toBe('source="[REDACTED_PATH]" status=ok');
+    expect(redactSensitiveText("source=/Volumes/Build Scratch/tmp/Customer; Quarter/report.txt status=failed"))
+      .toBe("source=[REDACTED_PATH] status=failed");
+    expect(redactSensitiveText("source=/Volumes/Build Scratch/tmp/run status=failed/archive.txt result=ok"))
+      .toBe("source=[REDACTED_PATH] result=ok");
+    expect(redactSensitiveText("source=/Volumes/Build Scratch/tmp/dir: status=failed/file.txt result=ok"))
+      .toBe("source=[REDACTED_PATH] result=ok");
+    expect(redactSensitiveText("source=/Volumes/Test Scratch/tmp/run target=/Volumes/Other Drive/tmp/next status=ok"))
+      .toBe("source=[REDACTED_PATH] target=[REDACTED_PATH] status=ok");
+    expect(redactSensitiveText("source=/Volumes/Test Scratch/tmp/run url=https://example.test/Volumes/releases/v1 status=ok"))
+      .toBe("source=[REDACTED_PATH] url=https://example.test/Volumes/releases/v1 status=ok");
+    expect(redactSensitiveText("asset=file:///Volumes/Build%20Scratch/Docs/plan.txt status=failed"))
+      .toBe("asset=file:///[REDACTED_PATH] status=failed");
+    expect(redactSensitiveText("volume=/Volumes/Test Scratch"))
+      .toBe("volume=[REDACTED_PATH]");
+    expect(redactSensitiveText("url=https://example.test/Volumes/releases/v1 status=ok"))
+      .toBe("url=https://example.test/Volumes/releases/v1 status=ok");
+    expect(redactSensitiveText("user=/Users/example/project home=/home/example/project tmp=/tmp/run-42"))
+      .toBe("user=[REDACTED_PATH] home=[REDACTED_PATH] tmp=[REDACTED_PATH]");
+    expect(redactSensitiveText("cache=C:\\Users\\example\\AppData\\Local\\Temp\\run-42 status=failed"))
+      .toBe("cache=[REDACTED_PATH] status=failed");
+    expect(redactSensitiveText("toolchain=1.98.1; threads=1; cargo-home-matches=true"))
+      .toBe("toolchain=1.98.1; threads=1; cargo-home-matches=true");
+  });
+
   test("redacts absolute paths and secret-looking values from audit event fields", () => {
     const event = createAuditEvent({
       tool: "repo_fetch_file",
