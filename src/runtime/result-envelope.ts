@@ -1,5 +1,6 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { redactSecretValues } from "../policies/secret-patterns.js";
+import { redactSensitiveText } from "./path-redaction.js";
+export { redactSensitiveText };
 import { RepoReaderError, toRepoReaderError } from "./errors.js";
 
 export type ToolContent = { type: "text"; text: string };
@@ -24,12 +25,6 @@ export type ErrorEnvelope = {
   };
   content: ToolContent[];
 };
-
-export function redactSensitiveText(value: string): string {
-  return redactSecretValues(value)
-    .replace(/(?:\/Users|\/home|\/private|\/var|\/tmp)\/[^\s"'`]+/g, "[REDACTED_PATH]")
-    .replace(/[A-Za-z]:\\[^\s"'`]+/g, "[REDACTED_PATH]");
-}
 
 export function createSuccessEnvelope<T>(
   structuredContent: T,

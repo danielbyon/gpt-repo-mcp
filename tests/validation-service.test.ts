@@ -649,6 +649,24 @@ describe("ValidationService", () => {
     expect(result.commands[0]?.stdout_tail?.length).toBeLessThanOrEqual(4000);
   });
 
+  test("redacts external-volume paths from validation stdout and stderr", async () => {
+    const root = await fixtureRepo({
+      scripts: {
+        smoke: "node -e \"console.log(JSON.stringify({stdout: '/Volumes/Test Scratch/tmp/validation runs/stdout.txt'})); console.error(JSON.stringify({stderr: '/Volumes/Test Scratch/tmp/validation runs/stderr.txt'}))\""
+      }
+    });
+
+    const result = await service(root).validate({ repo_id: "fixture", profile: "smoke" });
+
+    expect(result.commands[0]).toMatchObject({
+      status: "passed",
+      stdout_tail: expect.stringContaining('"stdout":"[REDACTED_PATH]"'),
+      stderr_tail: '{"stderr":"[REDACTED_PATH]"}'
+    });
+    expect(result.commands[0]?.stdout_tail).not.toContain("/Volumes/Test Scratch");
+    expect(result.commands[0]?.stderr_tail).not.toContain("/Volumes/Test Scratch");
+  });
+
   test("cancellation during command planning prevents a dry-run result", async () => {
     const root = await fixtureRepo({ scripts: { smoke: "echo should-not-run" } });
     const planningStarted = deferred<void>();
