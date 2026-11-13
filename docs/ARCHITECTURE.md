@@ -26,6 +26,7 @@ endpoint plus a local health route.
 - `src/services/*` contains filesystem, git, search, tree, read, write, project, task, decision, and advisory planning logic.
 - `src/policies/*` contains shared limits, excludes, write defaults, and secret patterns.
 - `src/runtime/*` contains context, structured errors, result envelopes, and audit logging.
+- `src/runtime/path-redaction.ts` scans diagnostic text for sensitive paths. `file-uri-redaction.ts` handles file URI hosts and encoded paths, while `path-redaction-boundaries.ts` recognizes quoted paths and output fields. `result-envelope.ts` re-exports the sanitizer.
 
 ## Tool Registration Flow
 
