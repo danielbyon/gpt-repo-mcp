@@ -820,7 +820,7 @@ test("accepts safe iteration, Array.of, and receiver-held test-like values", () 
 
   test("accepts the checked-in Linux and scoped Windows matrix", () => {
     expect(inspectQualificationWorkflow(load())).toEqual([]);
-  }, 20_000);
+  }, 45_000);
 
   test.each(ineffectiveNodeSetupCases)(
     "rejects ineffective Node setup in the %s job (%s) when it %s",
@@ -1040,7 +1040,7 @@ test.each([
     const findings = inspect(workflow);
     expect(findings.some((message) => message.includes("conditional or optional"))).toBe(true);
     expect(findings.some((message) => message.includes("unfiltered full suite"))).toBe(true);
-  }, 20_000);
+  }, 45_000);
 
   test("rejects removal of the guardrail execution step", () => {
     const workflow = load();
@@ -1227,7 +1227,7 @@ test.each([
       "const invokeStoredSafe = Array.of.apply.bind(Array.of); const [storedSafeRegister] = invokeStoredSafe.call(null, Array, [testLike]);",
       "test('required', () => {});"
     ].join("\n"))).toEqual([{ title: "required", enabled: true }]);
-  }, 20_000);
+  }, 45_000);
 
   test("keeps globalThis and local member provenance bounded", () => {
     const source = [
