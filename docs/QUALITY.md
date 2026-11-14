@@ -48,6 +48,10 @@ architecture, clear tool surface, and conservative safety model.
 - Do not weaken approved-root, path traversal, symlink, secret, denied glob, expected SHA, expected HEAD, or exact staged path checks.
 - Do not expose push, pull, reset, checkout, switch, rebase, merge, stash, clean, force, branch deletion, or arbitrary git command tools.
 - Prefer repo-relative paths in outputs and logs.
+- The supervisor guard checks these four sources for Worker module access: `src/services/process-exec.ts`, `src/services/windows-process-host.ts`, `src/services/node-runtime-resolver.ts`, and `src/services/validation-service.ts`. Their only permitted runtime `worker_threads` export is the named `isMainThread` value. Type-only Worker references, imports, and re-exports are erased before execution and remain allowed.
+- Runtime namespace, default, side-effect, CommonJS, and unapproved named imports from `node:worker_threads` or `worker_threads` are rejected. CommonJS destructuring, `module.require`, and statically resolved aliases are covered. Re-exports are limited to named `isMainThread` exports; star and other runtime re-exports are rejected. Dynamic imports, `node:module`/`createRequire`, and `process.getBuiltinModule` remain prohibited by the existing loading checks.
+- This policy intentionally prohibits Worker construction even when inline evaluation is disabled. None of the four audited sources needs Worker construction, and a module restriction is easier to enforce reliably than tracking constructor identity and every option mutation. The rejected alternative was to retain safe Worker construction and extend reflective mutation analysis for APIs such as `Object.assign`, `Reflect.set`, and `Object.defineProperty`.
+- The guard fails closed when a CommonJS module source cannot be resolved statically or when a runtime export form cannot be checked. Its guarantee covers statically identifiable loading and re-export syntax in the four audited files. It does not analyze transitive modules or prove what an arbitrary caller may pass through a function parameter.
 - Keep generated backups and cleanup artifacts out of commits unless explicitly reviewed.
 
 ## Native Dependency Clearance
@@ -83,12 +87,15 @@ Run the focused checks for the area changed, then run:
 
 ```bash
 npm run typecheck
+npm run check:validation-guardrails
 npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts
 npm run lint
 npm run check:public
 npm run verify:dist
 git diff --check
 ```
+
+`npm run check:validation-guardrails` statically checks the supervisor dispatch boundary and Windows qualification workflow. A checker change needs a focused rejection fixture plus an accepted control for nearby ordinary syntax. Include aliases, destructuring, and shell quoting when they can carry the guarded capability.
 
 Run service tests when touching service behavior:
 

@@ -13,12 +13,19 @@ Run focused checks while developing, then run the relevant broader checks before
 
 ```bash
 npm run typecheck
+npm run check:validation-guardrails
 npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts
 npm run lint
 npm run build
 ```
 
 Use targeted tests for the area you changed before broad validation.
+
+## Validation Guardrails
+
+`npm run check:validation-guardrails` parses the supervisor sources and CI workflow without executing repository code. It rejects process capability loading through aliases, property values, or destructuring; dynamic evaluation and function construction; shell launch options; and runtime Worker module access outside the named `isMainThread` allowlist. The Windows check also rejects exclusive or dynamically selected Vitest declarations, selector mutations caused by PowerShell string substitution, and missing mandatory regression cases.
+
+Keep each accepted syntax rule paired with a rejection fixture and an accepted control. When a new syntax form can reach a guarded capability, add both cases before changing the checker.
 
 ## Safety Rules
 

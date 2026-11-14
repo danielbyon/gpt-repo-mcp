@@ -46,6 +46,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "check:public": "node scripts/check-public.mjs",
+    "check:validation-guardrails": "node scripts/check-supervisor-dispatch.mjs && node scripts/check-windows-qualification.mjs",
     "security:scan": "node scripts/oss-security-scan.mjs",
     "test": "vitest run",
     "verify:dist": "npm run build && node scripts/smoke-dist-server.mjs",

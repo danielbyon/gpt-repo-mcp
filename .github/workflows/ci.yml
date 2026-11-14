@@ -38,6 +38,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Validation security and CI coverage guardrails
+        run: npm run check:validation-guardrails
+
       - name: Contract tests
         run: npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts
 
@@ -91,6 +94,9 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      - name: Validation security and CI coverage guardrails
+        run: npm run check:validation-guardrails
 
       - name: Build production package and Windows helper
         run: npm run build
