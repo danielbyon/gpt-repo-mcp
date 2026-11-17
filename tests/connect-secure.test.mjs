@@ -1,30 +1,572 @@
 import { EventEmitter, once } from "node:events";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { Buffer } from "node:buffer";
+import { performance } from "node:perf_hooks";
 import process from "node:process";
 import { existsSync, watch } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { PassThrough } from "node:stream";
+import { TextDecoder } from "node:util";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, test } from "vitest";
+import { redactSensitiveText } from "../src/runtime/path-redaction.ts";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const connectScript = join(repoRoot, "scripts", "connect-secure.mjs");
+const OUTPUT_CAPTURE_SETTLEMENT_TIMEOUT_MS = 250;
+const MAX_DIAGNOSTIC_STREAM_BYTES = 8 * 1024;
 const fixtures = new Set();
 const launchers = new Set();
 const reservedServers = new Set();
 
+/** Keep fixtures for unconfirmed launchers and report every teardown failure. */
 afterEach(async () => {
-  for (const launcher of launchers) await stopLauncher(launcher);
-  launchers.clear();
-  await Promise.all([...reservedServers].map((server) => new Promise((resolveClose) => server.close(resolveClose))));
-  reservedServers.clear();
-  await Promise.all([...fixtures].map((path) => rm(path, { recursive: true, force: true })));
-  fixtures.clear();
+  const cleanupErrors = [];
+  for (const launcher of launchers) {
+    try {
+      await stopLauncher(launcher);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  const servers = [...reservedServers];
+  const serverResults = await Promise.allSettled(servers.map((server) => new Promise((resolveClose, rejectClose) => {
+    server.close((error) => error?.code === "ERR_SERVER_NOT_RUNNING"
+      ? resolveClose()
+      : error ? rejectClose(error) : resolveClose());
+  })));
+  serverResults.forEach((result, index) => {
+    if (result.status === "fulfilled") reservedServers.delete(servers[index]);
+    else cleanupErrors.push(result.reason);
+  });
+  if (launchers.size === 0) {
+    const fixturePaths = [...fixtures];
+    const fixtureResults = await Promise.allSettled(fixturePaths.map((path) => rm(path, { recursive: true, force: true })));
+    fixtureResults.forEach((result, index) => {
+      if (result.status === "fulfilled") fixtures.delete(fixturePaths[index]);
+      else cleanupErrors.push(result.reason);
+    });
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, `Secure connector test cleanup failed in ${cleanupErrors.length} operation(s).`);
+  }
 });
 
 describe("secure connector startup order", () => {
+  test("reports the exit tuple and both output streams when readiness is absent", async () => {
+    let stdout = "";
+    let stderr = "";
+    const child = spawn(process.execPath, [
+      "-e",
+      'process.stdout.write("final stdout"); process.stderr.write("final stderr"); process.exit(7);'
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const launcher = {
+      child,
+      output: () => `${stdout}${stderr}`,
+      stdout: () => stdout,
+      stderr: () => stderr
+    };
+    const childClosed = once(child, "close");
+    let watchdog;
+    const outcome = await Promise.race([
+      waitForOutput(launcher, "readiness marker"),
+      new Promise((resolveOutcome) => {
+        watchdog = globalThis.setTimeout(() => resolveOutcome({ kind: "watchdog" }), 250);
+      })
+    ]);
+    globalThis.clearTimeout(watchdog);
+    await childClosed;
+
+    expect(outcome).toMatchObject({
+      kind: "closed",
+      code: 7,
+      signal: null
+    });
+    expect(stdout).toBe("final stdout");
+    expect(stderr).toBe("final stderr");
+  });
+
+  test("keeps cleanup unverified for empty or malformed process-group snapshots", () => {
+    expect(processGroupHasLiveMembers("", 42)).toBe(true);
+    expect(processGroupHasLiveMembers("ps: invalid output", 42)).toBe(true);
+    expect(processGroupHasLiveMembers("21 S\nmalformed", 42)).toBe(true);
+    expect(processGroupHasLiveMembers("21 S\n", 42)).toBe(false);
+    expect(processGroupHasLiveMembers("42 S\n", 42)).toBe(true);
+    expect(processGroupHasLiveMembers("42 Z\n", 42)).toBe(false);
+  });
+
+  test("settles readiness waiting on launcher exit while a descendant holds output pipes", async () => {
+    let stdout = "";
+    let stderr = "";
+    const startedAt = performance.now();
+    const timeline = { closedAfterMs: null, exitCode: null, signal: null };
+    const child = spawn(process.execPath, [
+      "-e",
+      'const { spawn } = require("node:child_process"); spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 1500)"], { stdio: "inherit" }); setTimeout(() => process.exit(7), 25);'
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("exit", (code, signal) => {
+      timeline.exitCode = code;
+      timeline.signal = signal;
+    });
+    child.once("close", () => { timeline.closedAfterMs = performance.now() - startedAt; });
+    const launcher = {
+      child,
+      startedAt,
+      timeline,
+      stdout: () => stdout,
+      stderr: () => stderr,
+      output: () => `${stdout}${stderr}`
+    };
+    const childClosed = once(child, "close");
+
+    try {
+      const outcome = await waitForOutput(launcher, "readiness marker");
+      expect(outcome).toMatchObject({
+        kind: "closed",
+        code: 7,
+        signal: null,
+        outputCapture: { status: "incomplete", complete: false }
+      });
+      expect(timeline.closedAfterMs).toBeNull();
+    } finally {
+      await childClosed;
+    }
+  }, 10_000);
+
+  test("bounds final output settlement after child exit while inherited streams remain open", async () => {
+    const fixture = await createFixture();
+    const child = new EventEmitter();
+    const stdoutStream = new PassThrough();
+    const stderrStream = new PassThrough();
+    stdoutStream.setEncoding("utf8");
+    stderrStream.setEncoding("utf8");
+    child.stdout = stdoutStream;
+    child.stderr = stderrStream;
+    child.exitCode = null;
+    child.signalCode = null;
+
+    let stdout = "";
+    let stderr = "";
+    const startedAt = performance.now();
+    const startedAtEpochMs = Date.now();
+    const timeline = {
+      startedAt: new Date(startedAtEpochMs).toISOString(),
+      exitedAfterMs: null,
+      closedAfterMs: null,
+      exitCode: null,
+      signal: null,
+      closeCode: null,
+      closeSignal: null
+    };
+    stdoutStream.on("data", (chunk) => { stdout += chunk; });
+    stderrStream.on("data", (chunk) => { stderr += chunk; });
+    const launcher = {
+      id: "late-stream-output",
+      child,
+      fixture,
+      secrets: [],
+      startedAt,
+      startedAtEpochMs,
+      timeline,
+      stdout: () => stdout,
+      stderr: () => stderr,
+      output: () => `${stdout}${stderr}`
+    };
+    const childClosed = once(child, "close");
+    const streamCloses = Promise.all([once(stdoutStream, "close"), once(stderrStream, "close")]);
+
+    globalThis.setTimeout(() => {
+      stdoutStream.write("early stdout");
+      stderrStream.write("early stderr");
+      child.exitCode = 7;
+      timeline.exitedAfterMs = performance.now() - startedAt;
+      timeline.exitCode = 7;
+      child.emit("exit", 7, null);
+
+      globalThis.setTimeout(() => {
+        stdoutStream.write("late stdout");
+        stderrStream.write("late stderr");
+      }, 20);
+      globalThis.setTimeout(async () => {
+        stdoutStream.end();
+        stderrStream.end();
+        await streamCloses;
+        timeline.closedAfterMs = performance.now() - startedAt;
+        timeline.closeCode = 7;
+        timeline.closeSignal = null;
+        child.emit("close", 7, null);
+      }, 1_500);
+    }, 0);
+
+    try {
+      const readinessStartedAt = performance.now();
+      const outcome = await waitForOutput(launcher, "readiness marker");
+      expect(outcome).toMatchObject({
+        kind: "closed",
+        code: 7,
+        signal: null,
+        outputCapture: {
+          status: "incomplete",
+          complete: false,
+          reason: "streams_open_after_child_exit"
+        }
+      });
+      expect(outcome.stdout).not.toContain("late stdout");
+      expect(performance.now() - readinessStartedAt).toBeLessThan(750);
+
+      const diagnosticsStartedAt = performance.now();
+      const diagnostics = await collectLauncherDiagnostics(launcher);
+      expect(diagnostics.outputCapture).toMatchObject({
+        status: "incomplete",
+        complete: false,
+        reason: "stream_close_timeout",
+        settlementTimeoutMs: 250,
+        streamsClosed: { stdout: false, stderr: false }
+      });
+      expect(diagnostics.stdout).toContain("late stdout");
+      expect(diagnostics.stderr).toContain("late stderr");
+      expect(performance.now() - diagnosticsStartedAt).toBeLessThan(750);
+
+      await childClosed;
+      expect(timeline.closedAfterMs).not.toBeNull();
+    } finally {
+      await childClosed;
+    }
+  }, 5_000);
+
+  test("returns redacted launcher output, marker state, and stage timing", async () => {
+    const fixture = await createFixture();
+    const secret = "synthetic-launcher-secret-7f8a";
+    await writeFile(fixture.paths.mcpReadyFile, JSON.stringify({ token: secret, state: "ready" }), "utf8");
+
+    let stdout = "";
+    let stderr = "";
+    const startedAtEpochMs = Date.now() - 1_000;
+    const startedAt = performance.now();
+    const timeline = {
+      startedAt: new Date(startedAtEpochMs).toISOString(),
+      spawnedAfterMs: 0,
+      exitedAfterMs: null,
+      closedAfterMs: null
+    };
+    const child = spawn(process.execPath, [
+      "-e",
+      `process.stdout.write(${JSON.stringify(`final stdout ${secret}`)}); process.stderr.write(${JSON.stringify(`final stderr ${secret}`)}); process.exit(7);`
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("exit", (code, signal) => {
+      timeline.exitedAfterMs = performance.now() - startedAt;
+      timeline.exitCode = code;
+      timeline.signal = signal;
+    });
+    child.once("close", (code, signal) => {
+      timeline.closedAfterMs = performance.now() - startedAt;
+      timeline.closeCode = code;
+      timeline.closeSignal = signal;
+    });
+    const launcher = {
+      id: "diagnostic-capture",
+      child,
+      fixture,
+      secrets: [secret],
+      startedAt,
+      startedAtEpochMs,
+      timeline,
+      stdout: () => stdout,
+      stderr: () => stderr,
+      output: () => `${stdout}${stderr}`
+    };
+    const outcome = await waitForOutput(launcher, "readiness marker");
+    expect(outcome).toMatchObject({ kind: "closed", code: 7, signal: null });
+    if (timeline.closedAfterMs === null) await once(child, "close");
+
+    const diagnostics = await collectLauncherDiagnostics(launcher);
+    const serialized = JSON.stringify(diagnostics);
+    expect(diagnostics).toMatchObject({
+      exit: { code: 7, signal: null },
+      markers: { mcpReady: { state: "json", value: { token: "[REDACTED_SECRET]", state: "ready" } } }
+    });
+    expect(diagnostics.stdout).toContain("[REDACTED]");
+    expect(diagnostics.stderr).toContain("[REDACTED]");
+    expect(diagnostics.stageTimings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ stage: "mcpReady", elapsedFromLauncherStartMs: expect.any(Number) })
+    ]));
+    expect(serialized).not.toContain(secret);
+  });
+
+  test("redacts escaped secrets from nested diagnostics and marker values", () => {
+    const diagnosticSecret = 'generic:"quoted"\\path\nwith\ttabs\u0000control';
+    const markerSecret = 'marker:"quoted"\\path\r\nwith\u0001control';
+    const secrets = [diagnosticSecret, markerSecret];
+    const diagnostic = {
+      details: { nested: [{ value: diagnosticSecret }, "keep-array-item"] },
+      markers: { mcpReady: { state: "json", value: [{ description: markerSecret }, "ready"] } }
+    };
+
+    const redacted = redactDiagnosticValue(diagnostic, secrets);
+    const serialized = JSON.stringify(redacted);
+
+    for (const secret of secrets) {
+      expect(serialized).not.toContain(secret);
+      expect(serialized).not.toContain(JSON.stringify(secret).slice(1, -1));
+    }
+    expect(redacted).toEqual({
+      details: { nested: [{ value: "[REDACTED]" }, "keep-array-item"] },
+      markers: { mcpReady: { state: "json", value: [{ description: "[REDACTED]" }, "ready"] } }
+    });
+  });
+
+  test("redacts a secret when a bounded marker ends inside a UTF-8 character", async () => {
+    const secret = "synthetic-π-secret";
+    const partialSecret = Buffer.from(secret).subarray(0, Buffer.byteLength("synthetic-") + 1);
+    const markerContents = Buffer.concat([Buffer.from("diagnostic "), partialSecret]);
+    const marker = await readMarkerSnapshot("synthetic-marker", [secret], {
+      openFile: async () => ({
+        stat: async () => ({ mtimeMs: 1_234, size: markerContents.length + 1 }),
+        read: async (buffer, offset) => ({
+          bytesRead: markerContents.copy(buffer, offset)
+        }),
+        close: async () => {}
+      })
+    });
+
+    expect(marker.truncated).toBe(true);
+    expect(marker.value).toBe("diagnostic [REDACTED]");
+  });
+
+  test("redacts a secret when bounded output ends inside a UTF-8 character", () => {
+    const secret = "synthetic-π-secret";
+    const partialSecret = Buffer.from(secret).subarray(0, Buffer.byteLength("synthetic-") + 1);
+    const capturedBytes = Buffer.concat([Buffer.from("diagnostic "), partialSecret]);
+    const capture = createBoundedCapture(capturedBytes.length);
+    capture.append(Buffer.concat([capturedBytes, Buffer.from(" beyond limit") ]));
+
+    const snapshot = capture.snapshot([secret]);
+
+    expect(snapshot.truncated).toBe(true);
+    expect(snapshot.text).toBe("diagnostic [REDACTED]");
+  });
+
+  test("collects bare environment secrets for password and private-key names", () => {
+    const environment = {
+      DB_PWD: "synthetic-db-password",
+      PRIVATE_KEY: "synthetic-private-key",
+      LOG_LEVEL: "debug"
+    };
+
+    expect(collectSecretValues(environment)).toEqual([
+      "synthetic-db-password",
+      "synthetic-private-key"
+    ]);
+  });
+
+  test("redacts a partial secret at the bounded marker boundary", async () => {
+    const secret = "synthetic-marker-boundary-secret";
+    const partialSecret = secret.slice(0, 12);
+    const markerContents = Buffer.from(`${"x".repeat(4_096 - partialSecret.length)}${secret}`);
+    const marker = await readMarkerSnapshot("synthetic-marker", [secret], {
+      openFile: async () => ({
+        stat: async () => ({ mtimeMs: 1_234, size: markerContents.length }),
+        read: async (buffer, offset, length) => ({
+          bytesRead: markerContents.copy(buffer, offset, 0, Math.min(length, markerContents.length))
+        }),
+        close: async () => {}
+      })
+    });
+
+    expect(marker.truncated).toBe(true);
+    expect(marker.value.endsWith("[REDACTED]")).toBe(true);
+    expect(marker.value).not.toContain(partialSecret);
+  });
+
+  test("redacts a partial secret after a short read from an oversized marker", async () => {
+    const secret = "synthetic-marker-boundary-secret";
+    const partialSecret = secret.slice(0, 12);
+    const markerContents = Buffer.from(`diagnostic ${partialSecret}`);
+    const marker = await readMarkerSnapshot("synthetic-marker", [secret], {
+      openFile: async () => ({
+        stat: async () => ({ mtimeMs: 1_234, size: 5_000 }),
+        read: async (buffer, offset) => ({ bytesRead: markerContents.copy(buffer, offset) }),
+        close: async () => {}
+      })
+    });
+
+    expect(marker.truncated).toBe(true);
+    expect(marker.value.endsWith("[REDACTED]")).toBe(true);
+    expect(marker.value).not.toContain(partialSecret);
+  });
+
+  test("redacts a partial secret after a short read from a small marker", async () => {
+    const secret = "synthetic-marker-boundary-secret";
+    const partialSecret = secret.slice(0, 12);
+    const markerContents = Buffer.from(`diagnostic ${partialSecret}`);
+    const markerSize = 100;
+    expect(markerContents.length).toBeLessThan(markerSize);
+    const marker = await readMarkerSnapshot("synthetic-marker", [secret], {
+      openFile: async () => ({
+        stat: async () => ({ mtimeMs: 1_234, size: markerSize }),
+        read: async (buffer, offset, length) => ({
+          bytesRead: markerContents.copy(buffer, offset, 0, Math.min(length, markerContents.length))
+        }),
+        close: async () => {}
+      })
+    });
+
+    expect(marker).toMatchObject({ sizeBytes: markerSize, truncated: true });
+    expect(marker.value.endsWith("[REDACTED]")).toBe(true);
+    expect(marker.value).not.toContain(partialSecret);
+  });
+
+  test("preserves complete JSON values when the marker file is truncated after them", async () => {
+    const secret = "synthetic-marker-boundary-secret";
+    const completeValue = `complete-${secret.slice(0, 12)}`;
+    const json = JSON.stringify({ label: completeValue });
+    const markerContents = Buffer.from(`${json}${" ".repeat(4_097 - json.length)}`);
+    const marker = await readMarkerSnapshot("synthetic-marker", [secret], {
+      openFile: async () => ({
+        stat: async () => ({ mtimeMs: 1_234, size: markerContents.length }),
+        read: async (buffer, offset, length) => ({
+          bytesRead: markerContents.copy(buffer, offset, 0, Math.min(length, markerContents.length))
+        }),
+        close: async () => {}
+      })
+    });
+
+    expect(marker).toMatchObject({
+      state: "json",
+      truncated: true,
+      value: { label: completeValue }
+    });
+  });
+
+  test("safely represents circular and unsupported diagnostic values", () => {
+    const circular = { label: "safe" };
+    circular.self = circular;
+    const diagnostic = {
+      circular,
+      unsupported: {
+        bigint: 1n,
+        callback: () => "must not serialize",
+        symbol: Symbol("unsupported"),
+        missing: undefined
+      }
+    };
+
+    const redacted = redactDiagnosticValue(diagnostic);
+
+    expect(redacted).toEqual({
+      circular: { label: "safe", self: "[Circular]" },
+      unsupported: {
+        bigint: "[UNSUPPORTED:bigint]",
+        callback: "[UNSUPPORTED:function]",
+        symbol: "[UNSUPPORTED:symbol]",
+        missing: "[UNSUPPORTED:undefined]"
+      }
+    });
+    expect(() => JSON.stringify(redacted)).not.toThrow();
+  });
+
+  test("reports marker-handle close failures without dropping the marker snapshot", async () => {
+    const markerContents = Buffer.from(JSON.stringify({ state: "ready" }));
+    const marker = await readMarkerSnapshot("synthetic-marker", [], {
+      openFile: async () => ({
+        stat: async () => ({ mtimeMs: 1_234, size: markerContents.length }),
+        read: async (buffer, offset, length) => ({
+          bytesRead: markerContents.copy(buffer, offset, 0, Math.min(length, markerContents.length))
+        }),
+        close: async () => {
+          throw Object.assign(new Error("synthetic marker close failure"), { code: "EIO" });
+        }
+      })
+    });
+
+    expect(marker).toMatchObject({
+      state: "close_error",
+      previousState: "json",
+      value: { state: "ready" },
+      modifiedAtEpochMs: 1_234,
+      closeErrorCode: "EIO"
+    });
+  });
+
+  test("preserves cleanup and diagnostic failures together", async () => {
+    const fixture = await createFixture();
+    const launcher = startLauncher(fixture, { MCP_STARTUP_WAIT_TIMEOUT: "5s" });
+    await writeFile(fixture.paths.mcpBoundMarker, "not-json", "utf8");
+    Object.defineProperty(launcher.child, "stdout", {
+      configurable: true,
+      get() { throw new Error("synthetic diagnostic capture failure"); }
+    });
+
+    let failure;
+    try {
+      await stopLauncher(launcher);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    const messages = failure.errors.map((error) => error.message).join(" ");
+    expect(messages).toContain("invalid_process_marker");
+    expect(messages).toContain("synthetic diagnostic capture failure");
+    expect(failure.errors.length).toBe(2);
+    launchers.delete(launcher);
+  });
+
+  test("retains launcher tracking when exit cannot be confirmed", async () => {
+    const fixture = await createFixture();
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    child.kill = () => true;
+    const launcher = {
+      id: "unconfirmed-launcher-exit",
+      child,
+      fixture,
+      secrets: [],
+      startedAt: performance.now(),
+      startedAtEpochMs: Date.now(),
+      timeline: {
+        startedAt: new Date().toISOString(),
+        exitCode: null,
+        signal: null,
+        closeCode: null,
+        closeSignal: null
+      },
+      stdout: () => "",
+      stderr: () => "",
+      output: () => ""
+    };
+    launchers.add(launcher);
+
+    let failure;
+    try {
+      await stopLauncher(launcher);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure.errors.map((error) => error.message).join(" ")).toContain("launcher_exit_unconfirmed");
+    expect(launchers.has(launcher)).toBe(true);
+    launchers.delete(launcher);
+  }, 10_000);
+
   test("waits for complete marker contents after observing an empty file", async () => {
     const fixture = await createFixture();
     const markerPath = join(fixture.root, "complete-marker");
@@ -68,6 +610,66 @@ describe("secure connector startup order", () => {
     expect(child.listenerCount("exit")).toBe(0);
   });
 
+  test("rejects a complete readiness marker when the launcher exits during the read", async () => {
+    const fixture = await createFixture();
+    const markerPath = join(fixture.root, "readiness-race-marker");
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    let watcher;
+    const launcher = { child, output: () => "launcher output" };
+    const markerRead = async () => {
+      child.exitCode = 0;
+      child.emit("exit", 0, null);
+      return "ready";
+    };
+    const waiting = waitForFile(markerPath, launcher, "ready", {
+      readFile: markerRead,
+      requireLauncherAlive: true,
+      watch: () => {
+        watcher = new EventEmitter();
+        watcher.close = () => undefined;
+        return watcher;
+      }
+    });
+
+    await expect(waiting).rejects.toThrow(/Launcher exited before .* was complete[\s\S]*launcher output/);
+    expect(child.listenerCount("exit")).toBe(0);
+    expect(watcher.listenerCount("error")).toBe(0);
+  });
+
+  test("does not report buffered readiness output after the launcher closes", async () => {
+    const child = new EventEmitter();
+    child.exitCode = 0;
+    child.signalCode = null;
+    const launcher = {
+      child,
+      timeline: { closedAfterMs: 10, closeCode: 0, closeSignal: null },
+      output: () => "Secure MCP Tunnel passed readiness",
+      stdout: () => "Secure MCP Tunnel passed readiness",
+      stderr: () => ""
+    };
+
+    await expect(waitForOutput(launcher, "Secure MCP Tunnel passed readiness"))
+      .resolves.toMatchObject({ kind: "closed", code: 0, signal: null });
+  });
+
+  test("requires the launcher to remain open when a readiness check expects success", async () => {
+    const child = new EventEmitter();
+    child.exitCode = 0;
+    child.signalCode = null;
+    const launcher = {
+      child,
+      timeline: { closedAfterMs: 10, closeCode: 0, closeSignal: null },
+      output: () => "Secure MCP Tunnel passed readiness",
+      stdout: () => "Secure MCP Tunnel passed readiness",
+      stderr: () => ""
+    };
+
+    await expect(waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness"))
+      .rejects.toThrow("did not remain open through readiness output");
+  });
+
   test("rejects an incomplete marker if the launcher exits and cleans up the watcher", async () => {
     const fixture = await createFixture();
     const markerPath = join(fixture.root, "incomplete-marker");
@@ -105,13 +707,13 @@ describe("secure connector startup order", () => {
     const fixture = await createFixture();
     const launcher = startLauncher(fixture);
     try {
-      await waitForFile(fixture.paths.mcpProbeMarker, launcher, "probe-seen");
+      await waitForFile(fixture.paths.mcpProbeMarker, launcher, "probe-seen", { requireLauncherAlive: true });
       expect(existsSync(fixture.paths.tunnelStartedMarker)).toBe(false);
 
       await writeFile(fixture.paths.mcpReadyFile, "ready", "utf8");
-      await waitForFile(fixture.paths.tunnelStartedMarker, launcher, isCompleteJsonObject);
-      await waitForFile(fixture.paths.tunnelReadyMarker, launcher, "ready");
-      await waitForOutput(launcher, "Secure MCP Tunnel passed readiness");
+      await waitForFile(fixture.paths.tunnelStartedMarker, launcher, isCompleteJsonObject, { requireLauncherAlive: true });
+      await waitForFile(fixture.paths.tunnelReadyMarker, launcher, "ready", { requireLauncherAlive: true });
+      await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
 
       const tunnelStart = JSON.parse(await readFile(fixture.paths.tunnelStartedMarker, "utf8"));
       expect(tunnelStart).toMatchObject({
@@ -150,7 +752,7 @@ describe("secure connector startup order", () => {
       TMP: tmpdir()
     });
     try {
-      await waitForOutput(launcher, "Secure MCP Tunnel passed readiness");
+      await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
       const helperCalls = (await readFile(fixture.paths.tunnelHelperLog, "utf8")).trim().split("\n");
       expect(helperCalls.length).toBeGreaterThanOrEqual(3);
 
@@ -185,7 +787,7 @@ describe("secure connector startup order", () => {
       TUNNEL_TEST_HEALTH_MODE: "hang"
     });
     try {
-      const helperPid = Number(await waitForFile(fixture.paths.tunnelHelperPidMarker, launcher, isPositiveIntegerText));
+      const helperPid = Number(await waitForFile(fixture.paths.tunnelHelperPidMarker, launcher, isPositiveIntegerText, { requireLauncherAlive: true }));
       const launcherExit = once(launcher.child, "exit");
       launcher.child.kill("SIGTERM");
       const [code] = await launcherExit;
@@ -205,7 +807,7 @@ describe("secure connector startup order", () => {
       REPO_READER_PUBLIC_PATH_TOKEN: "legacy token/42"
     });
     try {
-      await waitForOutput(launcher, "Secure MCP Tunnel passed readiness");
+      await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
       expect(await readFile(fixture.paths.mcpRouteMarker, "utf8")).toBe("/t/legacy%20token%2F42/mcp");
       const launcherExit = once(launcher.child, "exit");
       launcher.child.kill("SIGTERM");
@@ -233,7 +835,7 @@ describe("secure connector startup order", () => {
     await writeFile(fixture.paths.mcpReadyFile, "ready", "utf8");
     const launcher = startLauncher(fixture, { TUNNEL_TEST_EXIT_EARLY: "0" });
     try {
-      await waitForFile(fixture.paths.tunnelStartedMarker, launcher, isCompleteJsonObject);
+      await waitForFile(fixture.paths.tunnelStartedMarker, launcher, isCompleteJsonObject, { requireLauncherAlive: true });
       const [code] = await waitForLauncherExit(launcher);
       expect(code, launcher.output()).not.toBe(0);
       expect(existsSync(fixture.paths.tunnelReadyMarker)).toBe(false);
@@ -248,7 +850,7 @@ describe("secure connector startup order", () => {
     await writeFile(fixture.paths.mcpReadyFile, "ready", "utf8");
     const launcher = startLauncher(fixture, { HEALTH_LISTEN_ADDR: ":0" });
     try {
-      await waitForOutput(launcher, "Secure MCP Tunnel passed readiness");
+      await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
       expect(JSON.parse(await readFile(fixture.paths.tunnelStartedMarker, "utf8")).listenAddr).toBe(":0");
       expect(existsSync(fixture.paths.tunnelReadyMarker)).toBe(true);
       const launcherExit = once(launcher.child, "exit");
@@ -269,7 +871,7 @@ describe("secure connector startup order", () => {
       HEALTH_UNIX_SOCKET: null
     });
     try {
-      await waitForOutput(launcher, "Secure MCP Tunnel passed readiness");
+      await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
       expect(JSON.parse(await readFile(fixture.paths.tunnelStartedMarker, "utf8")).listenAddr)
         .toBe(`127.0.0.1:${configuredPort}`);
       const launcherExit = once(launcher.child, "exit");
@@ -289,7 +891,7 @@ describe("secure connector startup order", () => {
       HEALTH_UNIX_SOCKET: null
     });
     try {
-      await waitForOutput(launcher, "Secure MCP Tunnel passed readiness");
+      await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
       const tunnelStart = JSON.parse(await readFile(fixture.paths.tunnelStartedMarker, "utf8"));
       expect(tunnelStart).not.toHaveProperty("listenAddr");
       expect(tunnelStart.unixSocket).toBe(fixture.paths.healthSocket);
@@ -308,7 +910,7 @@ describe("secure connector startup order", () => {
     await writeFile(fixture.paths.profileFile, `health:\n  listen_addr: 127.0.0.1:${configuredPort}\n`, "utf8");
     const launcher = startLauncher(fixture, { HEALTH_LISTEN_ADDR: "127.0.0.1:0" });
     try {
-      await waitForOutput(launcher, "Secure MCP Tunnel passed readiness");
+      await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
       expect(JSON.parse(await readFile(fixture.paths.tunnelStartedMarker, "utf8")).listenAddr).toBe("127.0.0.1:0");
       const launcherExit = once(launcher.child, "exit");
       launcher.child.kill("SIGTERM");
@@ -424,7 +1026,7 @@ describe("secure connector startup order", () => {
     await writeFile(fixture.paths.mcpReadyFile, "ready", "utf8");
     const launcher = startLauncher(fixture, { TUNNEL_TEST_HEALTH_MODE: "hang" });
     try {
-      const helperPid = Number(await waitForFile(fixture.paths.tunnelHelperPidMarker, launcher, isPositiveIntegerText));
+      const helperPid = Number(await waitForFile(fixture.paths.tunnelHelperPidMarker, launcher, isPositiveIntegerText, { requireLauncherAlive: true }));
       const launcherExit = once(launcher.child, "exit");
       launcher.child.kill("SIGTERM");
       const [code] = await launcherExit;
@@ -466,13 +1068,13 @@ describe("secure connector startup order", () => {
       HEALTH_URL_FILE: callerUrlFile
     });
     try {
-      await waitForFile(fixture.paths.tunnelStartedMarker, launcher, isCompleteJsonObject);
+      await waitForFile(fixture.paths.tunnelStartedMarker, launcher, isCompleteJsonObject, { requireLauncherAlive: true });
       const tunnelStart = JSON.parse(await readFile(fixture.paths.tunnelStartedMarker, "utf8"));
       expect(tunnelStart.listenAddr).toBe("127.0.0.1:0");
       expect(tunnelStart.urlFile).toBe(callerUrlFile);
-      await waitForFile(fixture.paths.tunnelReadyMarker, launcher, "ready");
+      await waitForFile(fixture.paths.tunnelReadyMarker, launcher, "ready", { requireLauncherAlive: true });
       expect(await readFile(callerUrlFile, "utf8")).not.toBe("http://127.0.0.1:1\n");
-      await waitForOutput(launcher, "Secure MCP Tunnel passed readiness");
+      await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
       const launcherExit = once(launcher.child, "exit");
       const mcpStopped = waitForFile(fixture.paths.mcpStoppedMarker, launcher, "stopped");
       const tunnelStopped = waitForFile(fixture.paths.tunnelStoppedMarker, launcher, "stopped");
@@ -497,7 +1099,7 @@ describe("secure connector startup order", () => {
     });
     try {
       const outcome = await Promise.race([
-        waitForOutput(launcher, "Secure MCP Tunnel passed readiness").then(() => "ready"),
+        waitForOutput(launcher, "Secure MCP Tunnel passed readiness").then((result) => result.kind === "output" ? "ready" : result.kind === "closed" ? "exited" : result.kind),
         once(launcher.child, "exit").then(() => "exited")
       ]);
 
@@ -515,7 +1117,7 @@ describe("secure connector startup order", () => {
     const launcher = startLauncher(fixture, { MCP_TEST_HEALTH_OWNER_MODE: "different-process" });
     try {
       const outcome = await Promise.race([
-        waitForOutput(launcher, "Secure MCP Tunnel passed readiness").then(() => "ready"),
+        waitForOutput(launcher, "Secure MCP Tunnel passed readiness").then((result) => result.kind === "output" ? "ready" : result.kind === "closed" ? "exited" : result.kind),
         once(launcher.child, "exit").then(() => "exited")
       ]);
 
@@ -539,17 +1141,39 @@ describe("secure connector startup order", () => {
     expect(existsSync(fixture.paths.tunnelStartedMarker)).toBe(false);
   });
 
+  test("rejects readiness when the launcher exits after the marker read", async () => {
+    const fixture = await createFixture();
+    const port = await reservePort();
+    const afterMarkerRead = async (launcher) => {
+      const exited = once(launcher.child, "exit");
+      expect(launcher.child.kill("SIGKILL")).toBe(true);
+      await exited;
+    };
+
+    await expect(assertHealthProfileReady(
+      fixture,
+      "health:\n  listen_addr: env:TEST_PROFILE_HEALTH_ADDR\n",
+      {
+        HEALTH_LISTEN_ADDR: null,
+        HEALTH_UNIX_SOCKET: null,
+        TEST_PROFILE_HEALTH_ADDR: `127.0.0.1:${port}`
+      },
+      { listenAddr: `127.0.0.1:${port}` },
+      { afterMarkerRead }
+    )).rejects.toThrow("exited during readiness validation");
+  });
+
   test("resolves an env reference for the selected TCP health listener", async () => {
     const fixture = await createFixture();
     const port = await reservePort();
 
     const marker = await assertHealthProfileReady(
       fixture,
-      "health:\n  listen_addr: EnV:ISSUE42_PROFILE_HEALTH_ADDR\n",
+      "health:\n  listen_addr: EnV:TEST_PROFILE_HEALTH_ADDR\n",
       {
         HEALTH_LISTEN_ADDR: null,
         HEALTH_UNIX_SOCKET: null,
-        ISSUE42_PROFILE_HEALTH_ADDR: `127.0.0.1:${port}`
+        TEST_PROFILE_HEALTH_ADDR: `127.0.0.1:${port}`
       },
       { listenAddr: `127.0.0.1:${port}` }
     );
@@ -612,11 +1236,11 @@ describe("secure connector startup order", () => {
 
     const marker = await assertHealthProfileReady(
       fixture,
-      "health:\n  listen_addr: env:ISSUE42_PROFILE_HEALTH_ADDR\n",
+      "health:\n  listen_addr: env:TEST_PROFILE_HEALTH_ADDR\n",
       {
         HEALTH_LISTEN_ADDR: `127.0.0.1:${overridePort}`,
         HEALTH_UNIX_SOCKET: null,
-        ISSUE42_PROFILE_HEALTH_ADDR: `127.0.0.1:${profilePort}`
+        TEST_PROFILE_HEALTH_ADDR: `127.0.0.1:${profilePort}`
       },
       { listenAddr: `127.0.0.1:${overridePort}` }
     );
@@ -674,19 +1298,66 @@ describe("secure connector startup order", () => {
       privateValue
     );
   });
+
+  test("treats a malformed managed-process marker as a cleanup failure", async () => {
+    const fixture = await createFixture();
+    await writeFile(fixture.paths.mcpReadyFile, "ready", "utf8");
+    const launcher = startLauncher(fixture);
+    const markerPath = fixture.paths.tunnelStartedMarker;
+    await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
+    await waitForFile(markerPath, launcher, isCompleteJsonObject, { requireLauncherAlive: true });
+    const originalMarker = await readFile(markerPath, "utf8");
+    await writeFile(markerPath, "{", "utf8");
+
+    try {
+      await expect(stopLauncher(launcher)).rejects.toThrow("cleanup was incomplete");
+    } finally {
+      await writeFile(markerPath, originalMarker, "utf8");
+      launcher.stopPromise = null;
+    }
+  });
+
+  test("treats a missing managed-process marker after readiness as a cleanup failure", async () => {
+    const fixture = await createFixture();
+    await writeFile(fixture.paths.mcpReadyFile, "ready", "utf8");
+    const launcher = startLauncher(fixture);
+    const markerPath = fixture.paths.tunnelStartedMarker;
+    await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
+    await waitForFile(markerPath, launcher, isCompleteJsonObject, { requireLauncherAlive: true });
+    const originalMarker = await readFile(markerPath, "utf8");
+    await rm(markerPath);
+
+    try {
+      await expect(stopLauncher(launcher)).rejects.toThrow("cleanup was incomplete");
+    } finally {
+      await writeFile(markerPath, originalMarker, "utf8");
+      launcher.stopPromise = null;
+    }
+  }, 10_000);
 });
 
-async function assertHealthProfileReady(fixture, profile, overrides, expected) {
+/** Accept the health marker only while its launcher is alive; tests can trigger an exit after the asynchronous read. */
+async function assertHealthProfileReady(fixture, profile, overrides, expected, { afterMarkerRead } = {}) {
   await writeFile(fixture.paths.mcpReadyFile, "ready", "utf8");
   await writeFile(fixture.paths.profileFile, profile, "utf8");
   const launcher = startLauncher(fixture, overrides);
   try {
-    const outcome = await Promise.race([
-      waitForOutput(launcher, "Secure MCP Tunnel passed readiness").then(() => "ready"),
-      once(launcher.child, "exit").then(() => "exited")
-    ]);
-    expect(outcome).toBe("ready");
-    const marker = JSON.parse(await readFile(fixture.paths.tunnelStartedMarker, "utf8"));
+    const outcome = await waitForOutput(launcher, "Secure MCP Tunnel passed readiness");
+    if (outcome.kind !== "output") {
+      const diagnostic = await collectLauncherDiagnostics(launcher, { readinessOutcome: outcome });
+      throw new Error(`Secure connector exited before readiness: ${JSON.stringify(diagnostic)}`);
+    }
+    const markerContents = await readFile(fixture.paths.tunnelStartedMarker, "utf8");
+    await afterMarkerRead?.(launcher);
+    if (launcher.child.exitCode !== null || launcher.child.signalCode !== null
+      || launcher.timeline.exitedAfterMs !== null) {
+      const diagnostic = await collectLauncherDiagnostics(launcher, {
+        readinessOutcome: outcome,
+        markerValidation: "launcher_exited"
+      });
+      throw new Error(`Secure connector exited during readiness validation: ${JSON.stringify(diagnostic)}`);
+    }
+    const marker = JSON.parse(markerContents);
     expect(marker).toMatchObject(expected);
     return marker;
   } finally {
@@ -759,8 +1430,8 @@ async function createFixture() {
   return { root, bin, paths, tunnelClient };
 }
 
+/** Start the connector fixture with separate bounded stdout and stderr captures. */
 function startLauncher(fixture, overrides = {}) {
-  let output = "";
   const env = {
     ...process.env,
     PATH: `${fixture.bin}:${process.env.PATH ?? ""}`,
@@ -790,14 +1461,43 @@ function startLauncher(fixture, overrides = {}) {
   for (const [key, value] of Object.entries(overrides)) {
     if (value === null) delete env[key];
   }
+  const secrets = collectSecretValues(env);
+  const stdout = createBoundedCapture(MAX_DIAGNOSTIC_STREAM_BYTES);
+  const stderr = createBoundedCapture(MAX_DIAGNOSTIC_STREAM_BYTES);
+  const combined = createBoundedCapture(2 * MAX_DIAGNOSTIC_STREAM_BYTES);
+  const startedAt = performance.now();
+  const startedAtEpochMs = Date.now();
+  const timeline = { startedAt: new Date(startedAtEpochMs).toISOString(), spawnedAfterMs: null, exitedAfterMs: null, closedAfterMs: null };
   const child = spawn(process.execPath, [connectScript], {
     cwd: fixture.root,
     env,
     stdio: ["ignore", "pipe", "pipe"]
   });
-  child.stdout.on("data", (chunk) => { output += chunk.toString(); });
-  child.stderr.on("data", (chunk) => { output += chunk.toString(); });
-  const launcher = { child, output: () => output, fixture };
+  child.stdout.on("data", (chunk) => { stdout.append(chunk); combined.append(chunk); });
+  child.stderr.on("data", (chunk) => { stderr.append(chunk); combined.append(chunk); });
+  child.once("spawn", () => { timeline.spawnedAfterMs = performance.now() - startedAt; });
+  child.once("exit", (code, signal) => {
+    timeline.exitedAfterMs = performance.now() - startedAt;
+    timeline.exitCode = code;
+    timeline.signal = signal;
+  });
+  child.once("close", (code, signal) => {
+    timeline.closedAfterMs = performance.now() - startedAt;
+    timeline.closeCode = code;
+    timeline.closeSignal = signal;
+  });
+  const launcher = {
+    id: randomUUID(),
+    child,
+    fixture,
+    secrets,
+    startedAt,
+    startedAtEpochMs,
+    timeline,
+    stdout: () => stdout.snapshot(secrets),
+    stderr: () => stderr.snapshot(secrets),
+    output: () => combined.snapshot(secrets).text
+  };
   launchers.add(launcher);
   return launcher;
 }
@@ -1073,7 +1773,7 @@ async function assertProfileDirectorySelection(fixture, { platform, selectedDir,
     ...overrides
   });
   try {
-    await waitForOutput(launcher, "Secure MCP Tunnel passed readiness");
+    await waitForSuccessfulReadiness(launcher, "Secure MCP Tunnel passed readiness");
     const tunnelStart = JSON.parse(await readFile(fixture.paths.tunnelStartedMarker, "utf8"));
     expect(tunnelStart.profile).toBe("issue-42-test-profile");
     expect(tunnelStart.profilePath).toBe(selectedProfile);
@@ -1107,6 +1807,7 @@ function isPositiveIntegerText(contents) {
   return /^[1-9]\d*$/.test(contents.trim());
 }
 
+/** Wait for marker contents and optionally require the launcher to stay alive. */
 async function waitForFile(path, launcher, expected, dependencies = {}) {
   if (typeof expected !== "string" && typeof expected !== "function") {
     throw new TypeError("waitForFile requires expected marker contents or a predicate");
@@ -1114,6 +1815,7 @@ async function waitForFile(path, launcher, expected, dependencies = {}) {
   const matchesExpected = typeof expected === "function" ? expected : (contents) => contents === expected;
   const readMarker = dependencies.readFile ?? readFile;
   const watchMarker = dependencies.watch ?? watch;
+  const requireLauncherAlive = dependencies.requireLauncherAlive === true;
 
   return new Promise((resolveRead, reject) => {
     let settled = false;
@@ -1141,12 +1843,18 @@ async function waitForFile(path, launcher, expected, dependencies = {}) {
     const incompleteError = () => new Error(
       `Launcher exited before ${path} was complete (code=${exitDetails.code}, signal=${exitDetails.signal}).\n${launcher.output()}`
     );
+    const launcherExited = () => exitDetails !== undefined
+      || Boolean(launcher?.child && (
+        (launcher.child.exitCode !== null && launcher.child.exitCode !== undefined)
+        || (launcher.child.signalCode !== null && launcher.child.signalCode !== undefined)
+      ));
 
     const readAndCheck = async () => {
       try {
         const contents = await readMarker(path, "utf8");
         if (matchesExpected(contents)) {
-          finish(undefined, contents);
+          if (requireLauncherAlive && launcherExited()) finish(incompleteError());
+          else finish(undefined, contents);
         } else if (exitDetails && !readAgain) {
           finish(incompleteError());
         }
@@ -1190,8 +1898,11 @@ async function waitForFile(path, launcher, expected, dependencies = {}) {
     try {
       watcher = watchMarker(dirname(path), () => requestRead());
       watcher.on("error", onWatcherError);
-      launcher?.child.once("exit", onExit);
-      if (launcher?.child.exitCode !== null || launcher?.child.signalCode !== null) {
+      launcher?.child?.once("exit", onExit);
+      if (launcher?.child && (
+        (launcher.child.exitCode !== null && launcher.child.exitCode !== undefined)
+        || (launcher.child.signalCode !== null && launcher.child.signalCode !== undefined)
+      )) {
         onExit(launcher.child.exitCode, launcher.child.signalCode);
       }
       requestRead();
@@ -1201,38 +1912,368 @@ async function waitForFile(path, launcher, expected, dependencies = {}) {
   });
 }
 
-async function waitForOutput(launcher, fragment) {
-  if (launcher.output().includes(fragment)) return;
-  await new Promise((resolveOutput) => {
-    const check = () => {
-      if (!launcher.output().includes(fragment)) return;
-      launcher.child.stdout.off("data", check);
-      launcher.child.stderr.off("data", check);
-      resolveOutput();
-    };
-    launcher.child.stdout.on("data", check);
-    launcher.child.stderr.on("data", check);
-    check();
+function waitForSuccessfulReadiness(launcher, fragment) {
+  return waitForOutput(launcher, fragment).then(async (result) => {
+    if (result.kind !== "output") {
+      const diagnostics = await collectLauncherDiagnostics(launcher, { readinessOutcome: result });
+      throw new Error(`Launcher did not remain open through readiness output: ${JSON.stringify(diagnostics)}.`);
+    }
+    return result;
   });
 }
 
-async function stopLauncher(launcher) {
-  const { child, fixture } = launcher;
-  if (child.exitCode === null && child.signalCode === null) {
-    const exited = once(child, "exit");
-    child.kill("SIGTERM");
-    await exited;
+/** Resolve on expected output or child exit; stream completeness is reported separately. */
+function waitForOutput(launcher, fragment) {
+  const hasExited = () => launcher.timeline?.closedAfterMs !== null
+    && launcher.timeline?.closedAfterMs !== undefined
+    || (launcher.child.exitCode !== null && launcher.child.exitCode !== undefined)
+    || (launcher.child.signalCode !== null && launcher.child.signalCode !== undefined);
+  const closedOutcome = (code, signal, closeObserved = false) => ({
+    kind: "closed",
+    code: code ?? launcher.timeline?.closeCode ?? launcher.child.exitCode ?? null,
+    signal: signal ?? launcher.timeline?.closeSignal ?? launcher.child.signalCode ?? null,
+    stdout: outputText(launcher.stdout()),
+    stderr: outputText(launcher.stderr()),
+    outputCapture: outputCaptureSummary(launcher, {
+      closeObserved,
+      reason: "streams_open_after_child_exit"
+    }),
+    elapsedMs: launcherElapsedMs(launcher)
+  });
+  if (launcher.output().includes(fragment)) {
+    return Promise.resolve(hasExited() ? closedOutcome() : { kind: "output", elapsedMs: launcherElapsedMs(launcher) });
   }
-  for (const markerPath of [fixture.paths.mcpBoundMarker, fixture.paths.tunnelStartedMarker]) {
+  if (hasExited()) return Promise.resolve(closedOutcome());
+  return new Promise((resolveOutput) => {
+    let settled = false;
+    const cleanup = () => {
+      launcher.child.stdout?.off("data", check);
+      launcher.child.stderr?.off("data", check);
+      launcher.child.off("exit", onExit);
+      launcher.child.off("close", onClose);
+      launcher.child.off("error", onError);
+    };
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveOutput(result);
+    };
+    const check = () => {
+      if (launcher.output().includes(fragment)) {
+        finish(hasExited() ? closedOutcome() : { kind: "output", elapsedMs: launcherElapsedMs(launcher) });
+      }
+    };
+    const onClose = (code, signal) => finish(closedOutcome(code, signal, true));
+    const onExit = (code, signal) => finish(closedOutcome(code, signal));
+    const onError = (error) => finish({
+      kind: "error",
+      message: error instanceof Error ? error.message : "Child process error.",
+      stdout: outputText(launcher.stdout()),
+      stderr: outputText(launcher.stderr()),
+      outputCapture: outputCaptureSummary(launcher, { reason: "child_error_before_stream_close" }),
+      elapsedMs: launcherElapsedMs(launcher)
+    });
+    launcher.child.stdout?.on("data", check);
+    launcher.child.stderr?.on("data", check);
+    launcher.child.once("exit", onExit);
+    launcher.child.once("close", onClose);
+    launcher.child.once("error", onError);
+    if (hasExited()) {
+      finish(closedOutcome());
+    } else {
+      check();
+    }
+  });
+}
+
+/** Mark output complete only after the child closes or every available stream closes. */
+function outputCaptureSummary(launcher, {
+  closeObserved = false,
+  reason = "streams_open_at_snapshot",
+  settlementTimeoutMs = null,
+  settledAfterMs = null
+} = {}) {
+  const stdoutClosed = launcher.child.stdout ? launcher.child.stdout.closed === true : null;
+  const stderrClosed = launcher.child.stderr ? launcher.child.stderr.closed === true : null;
+  const complete = closeObserved || launcher.timeline?.closedAfterMs != null
+    || (stdoutClosed !== null || stderrClosed !== null)
+      && (stdoutClosed === null || stdoutClosed) && (stderrClosed === null || stderrClosed);
+  return {
+    status: complete ? "complete" : "incomplete",
+    complete,
+    reason: complete ? null : reason,
+    settlementTimeoutMs,
+    settledAfterMs,
+    streamsClosed: { stdout: stdoutClosed, stderr: stderrClosed }
+  };
+}
+
+/** Wait briefly for output streams to close before recording their final diagnostics. */
+function settleLauncherOutput(launcher, timeoutMs = OUTPUT_CAPTURE_SETTLEMENT_TIMEOUT_MS) {
+  const startedAt = performance.now();
+  const current = outputCaptureSummary(launcher);
+  if (current.complete) {
+    return Promise.resolve(outputCaptureSummary(launcher, {
+      settlementTimeoutMs: timeoutMs,
+      settledAfterMs: 0
+    }));
+  }
+
+  return new Promise((resolveOutput) => {
+    let settled = false;
+    let timer;
+    const finish = (closeObserved, reason) => {
+      if (settled) return;
+      settled = true;
+      globalThis.clearTimeout(timer);
+      launcher.child.off("close", onClose);
+      resolveOutput(outputCaptureSummary(launcher, {
+        closeObserved,
+        reason,
+        settlementTimeoutMs: timeoutMs,
+        settledAfterMs: Math.max(0, performance.now() - startedAt)
+      }));
+    };
+    const onClose = () => finish(true, null);
+    launcher.child.once("close", onClose);
+    timer = globalThis.setTimeout(() => finish(false, "stream_close_timeout"), timeoutMs);
+    if (outputCaptureSummary(launcher).complete) finish(false, null);
+  });
+}
+
+function stopLauncher(launcher) {
+  if (!launcher.stopPromise) {
+    launcher.stopPromise = stopLauncherOnce(launcher).catch((error) => {
+      launcher.stopPromise = undefined;
+      throw error;
+    });
+  }
+  return launcher.stopPromise;
+}
+
+/** Stop the launcher and verify marker-owned process groups are gone. */
+async function stopLauncherOnce(launcher) {
+  const { child, fixture } = launcher;
+  const cleanup = { launcherSignal: null, processGroups: [], errors: [] };
+  if (child.exitCode === null && child.signalCode === null) {
+    cleanup.launcherSignal = "SIGTERM";
+    child.kill("SIGTERM");
+    let exit = await waitForChildExit(child, 2_000);
+    if (!exit) {
+      cleanup.launcherSignal = "SIGKILL";
+      child.kill("SIGKILL");
+      exit = await waitForChildExit(child, 2_000);
+    }
+    if (!exit) cleanup.errors.push("launcher_exit_unconfirmed");
+  }
+  const managedProcessMarkers = [
+    {
+      markerPath: fixture.paths.mcpBoundMarker,
+      downstreamMarkers: [fixture.paths.mcpProbeMarker, fixture.paths.mcpRouteMarker,
+        fixture.paths.tunnelStartedMarker, fixture.paths.tunnelReadyMarker, fixture.paths.tunnelHelperPidMarker]
+    },
+    {
+      markerPath: fixture.paths.tunnelStartedMarker,
+      downstreamMarkers: [fixture.paths.tunnelReadyMarker, fixture.paths.tunnelHelperPidMarker]
+    }
+  ];
+  for (const { markerPath, downstreamMarkers } of managedProcessMarkers) {
     try {
       const marker = JSON.parse(await readFile(markerPath, "utf8"));
+      if (!Number.isSafeInteger(marker?.pid) || marker.pid < 1) throw new TypeError("Managed process marker has no valid pid.");
       if (process.platform !== "win32") {
-        try { process.kill(-marker.pid, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+        const group = { marker: markerPath, pid: marker.pid, signal: "SIGKILL" };
+        try {
+          process.kill(-marker.pid, "SIGKILL");
+          group.signalSent = true;
+        } catch (error) {
+          if (error?.code === "ESRCH") group.alreadyExited = true;
+          else {
+            group.error = error?.code ?? "signal_error";
+            cleanup.errors.push(group.error);
+          }
+        }
+        group.stillRunning = !(await waitForProcessGroupExit(marker.pid, 2_000));
+        cleanup.processGroups.push(group);
       }
     } catch (error) {
-      if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+      if (error?.code === "ENOENT") {
+        const laterStageObserved = downstreamMarkers.some((path) => existsSync(path));
+        cleanup.processGroups.push({
+          marker: markerPath,
+          status: laterStageObserved ? "missing_after_later_stage" : "absent_without_later_stage_evidence"
+        });
+        if (laterStageObserved) cleanup.errors.push("process_marker_missing_after_later_stage");
+      } else {
+        cleanup.errors.push(error instanceof SyntaxError || error instanceof TypeError
+          ? "invalid_process_marker"
+          : error?.code ?? "marker_cleanup_error");
+      }
     }
   }
+  const cleanupIncomplete = cleanup.errors.length > 0 || cleanup.processGroups.some((group) => group.stillRunning);
+  const failures = [];
+  if (cleanupIncomplete) {
+    let diagnosticSuffix = "";
+    try {
+      const diagnostics = await collectLauncherDiagnostics(launcher, { cleanup });
+      diagnosticSuffix = ` Diagnostics: ${JSON.stringify(diagnostics)}`;
+    } catch (error) {
+      failures.push(error);
+    }
+    const safeCleanup = redactDiagnosticValue(cleanup, launcher.secrets);
+    failures.unshift(new Error(`Secure connector cleanup was incomplete: ${JSON.stringify(safeCleanup)}${diagnosticSuffix}`));
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Secure connector cleanup was incomplete.");
+  }
+  launchers.delete(launcher);
+}
+
+/** Capture redacted streams, marker snapshots, stage timing, and stream-settlement state. */
+async function collectLauncherDiagnostics(launcher, extra = {}) {
+  const outputCapture = await settleLauncherOutput(launcher);
+  const markerEntries = launcher.fixture?.paths ? Object.entries({
+    mcpReady: launcher.fixture.paths.mcpReadyFile,
+    mcpBound: launcher.fixture.paths.mcpBoundMarker,
+    mcpProbe: launcher.fixture.paths.mcpProbeMarker,
+    mcpRoute: launcher.fixture.paths.mcpRouteMarker,
+    mcpBindError: launcher.fixture.paths.mcpBindErrorMarker,
+    mcpStopped: launcher.fixture.paths.mcpStoppedMarker,
+    tunnelStarted: launcher.fixture.paths.tunnelStartedMarker,
+    tunnelReady: launcher.fixture.paths.tunnelReadyMarker,
+    tunnelHelperPid: launcher.fixture.paths.tunnelHelperPidMarker,
+    tunnelStopped: launcher.fixture.paths.tunnelStoppedMarker
+  }) : [];
+  const markers = Object.fromEntries(await Promise.all(markerEntries.map(async ([name, path]) => [name, await readMarkerSnapshot(path, launcher.secrets)])));
+  const stageTimings = Object.entries(markers)
+    .filter(([, marker]) => Number.isFinite(marker.modifiedAtEpochMs))
+    .map(([name, marker]) => ({
+      stage: name,
+      markerModifiedAt: new Date(marker.modifiedAtEpochMs).toISOString(),
+      elapsedFromLauncherStartMs: Math.max(0, marker.modifiedAtEpochMs - launcher.startedAtEpochMs)
+    }));
+  return redactDiagnosticValue({
+    schemaVersion: 1,
+    launcherId: launcher.id,
+    testName: expect.getState().currentTestName ?? null,
+    startedAt: launcher.timeline.startedAt,
+    pid: launcher.child.pid ?? null,
+    exit: { code: launcher.timeline.exitCode ?? null, signal: launcher.timeline.signal ?? null },
+    close: { code: launcher.timeline.closeCode ?? null, signal: launcher.timeline.closeSignal ?? null },
+    timeline: launcher.timeline,
+    stdout: launcher.stdout(),
+    stderr: launcher.stderr(),
+    outputCapture,
+    markers,
+    stageTimings,
+    ...extra
+  }, launcher.secrets);
+}
+
+/** Read a bounded marker snapshot and record read or close failures with its timestamp. */
+async function readMarkerSnapshot(path, secrets, { openFile = open } = {}) {
+  let handle;
+  let snapshot;
+  try {
+    handle = await openFile(path, "r");
+    const info = await handle.stat();
+    const buffer = Buffer.alloc(4_097);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const truncated = info.size > bytesRead || bytesRead > 4_096;
+    const contents = decodeDiagnosticBytes(buffer.subarray(0, Math.min(bytesRead, 4_096)), truncated);
+    let value = contents;
+    let state = contents.length === 0 ? "empty" : "text";
+    if (contents.length > 0) {
+      try {
+        value = JSON.parse(contents);
+        state = "json";
+      } catch {
+        if (!truncated && contents.trimStart().startsWith("{")) state = "invalid_json";
+      }
+    }
+    snapshot = {
+      state,
+      value: redactDiagnosticValue(value, secrets, { truncated: truncated && state === "text" }),
+      modifiedAtEpochMs: info.mtimeMs,
+      sizeBytes: info.size,
+      truncated
+    };
+  } catch (error) {
+    snapshot = error?.code === "ENOENT"
+      ? { state: "absent", value: null, modifiedAtEpochMs: null, sizeBytes: 0, truncated: false }
+      : { state: "read_error", errorCode: error?.code ?? "unknown", modifiedAtEpochMs: null, sizeBytes: null, truncated: false };
+  }
+  try {
+    await handle?.close();
+  } catch (error) {
+    return {
+      ...snapshot,
+      state: "close_error",
+      previousState: snapshot.state,
+      closeErrorCode: error?.code ?? "unknown"
+    };
+  }
+  return snapshot;
+}
+
+function launcherElapsedMs(launcher) {
+  return Math.max(0, performance.now() - (launcher.startedAt ?? performance.now()));
+}
+
+function outputText(value) {
+  return typeof value === "string" ? value : String(value?.text ?? "");
+}
+
+function isProcessGroupRunning(pid) {
+  try {
+    process.kill(-pid, 0);
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    if (error?.code !== "EPERM") return true;
+  }
+  try {
+    const processStates = execFileSync("ps", ["-Ao", "pgid=,stat="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1_000
+    });
+    return processGroupHasLiveMembers(processStates, pid);
+  } catch {
+    return true;
+  }
+}
+
+/** Return the launcher's exit tuple, or null if it misses the bounded wait. */
+async function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
+  return new Promise((resolveExit) => {
+    let settled = false;
+    const finish = (exit) => {
+      if (settled) return;
+      settled = true;
+      globalThis.clearTimeout(timer);
+      child.off("exit", onExit);
+      resolveExit(exit);
+    };
+    const onExit = (code, signal) => finish({ code, signal });
+    const timer = globalThis.setTimeout(() => finish(null), timeoutMs);
+    child.once("exit", onExit);
+    if (child.exitCode !== null || child.signalCode !== null) onExit(child.exitCode, child.signalCode);
+  });
+}
+
+/** Return true only after no live member remains in the process group. */
+async function waitForProcessGroupExit(pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessGroupRunning(pid)) return true;
+    await new Promise((resolveDelay) => globalThis.setTimeout(resolveDelay, 25));
+  }
+  return !isProcessGroupRunning(pid);
 }
 
 function isPidRunning(pid) {
@@ -1243,4 +2284,176 @@ function isPidRunning(pid) {
     if (error?.code === "ESRCH") return false;
     throw error;
   }
+}
+
+/** Collect values from sensitive-looking environment keys so diagnostics can redact bare echoes. */
+function collectSecretValues(environment) {
+  return [...new Set(Object.entries(environment)
+    .filter(([name, value]) => /(?:api[_-]?key|access[_-]?token|auth[_-]?token|bearer[_-]?token|client[_-]?secret|refresh[_-]?token|private[_-]?key|token|secret|password|passwd|pwd|credential|cookie|authorization)/i.test(name)
+      && typeof value === "string" && value.length > 0)
+    .map(([, value]) => value))];
+}
+
+function redactDiagnosticText(value, secrets = [], { truncated = false } = {}) {
+  let text = String(value ?? "");
+  const literalSecrets = [...new Set(secrets.filter((secret) => typeof secret === "string" && secret.length > 0))]
+    .sort((left, right) => right.length - left.length);
+  for (const secret of literalSecrets) text = text.split(secret).join("[REDACTED]");
+  text = redactSensitiveText(text).replace(/\bBearer\s+[-A-Za-z0-9._~+/]+=*/gi, "Bearer [REDACTED]");
+  if (truncated) {
+    for (const secret of literalSecrets) {
+      const maxOverlap = Math.min(secret.length - 1, text.length);
+      for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+        if (text.endsWith(secret.slice(0, overlap))) {
+          text = `${text.slice(0, -overlap)}[REDACTED]`;
+          break;
+        }
+      }
+    }
+  }
+  return text;
+}
+
+/** Decode captured bytes without inventing text for a truncated UTF-8 suffix. */
+function decodeDiagnosticBytes(bytes, truncated) {
+  return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes, { stream: truncated });
+}
+
+/**
+ * Redact string data before JSON serialization so escaping cannot hide a registered secret.
+ * Preserve JSON-compatible structure and replace cycles or unsupported values with fixed markers.
+ */
+function redactDiagnosticValue(value, secrets = [], { truncated = false } = {}) {
+  const activeObjects = new WeakSet();
+
+  const sanitize = (candidate) => {
+    if (typeof candidate === "string") return redactDiagnosticText(candidate, secrets, { truncated });
+    if (candidate === null || typeof candidate === "boolean" || typeof candidate === "number") return candidate;
+    if (typeof candidate === "undefined") return "[UNSUPPORTED:undefined]";
+    if (typeof candidate === "bigint") return "[UNSUPPORTED:bigint]";
+    if (typeof candidate === "function") return "[UNSUPPORTED:function]";
+    if (typeof candidate === "symbol") return "[UNSUPPORTED:symbol]";
+    if (typeof candidate !== "object") return "[UNSUPPORTED]";
+
+    if (activeObjects.has(candidate)) return "[Circular]";
+    activeObjects.add(candidate);
+    try {
+      if (Array.isArray(candidate)) {
+        let length;
+        try {
+          length = candidate.length;
+        } catch {
+          return "[UNREADABLE]";
+        }
+        const sanitized = [];
+        Object.defineProperty(sanitized, "toJSON", { value: undefined });
+        for (let index = 0; index < length; index += 1) {
+          try {
+            sanitized.push(sanitize(candidate[index]));
+          } catch {
+            sanitized.push("[UNREADABLE]");
+          }
+        }
+        return sanitized;
+      }
+
+      let prototype;
+      let keys;
+      try {
+        prototype = Object.getPrototypeOf(candidate);
+        keys = Object.keys(candidate);
+      } catch {
+        return "[UNREADABLE]";
+      }
+      if (prototype !== Object.prototype && prototype !== null) return "[UNSUPPORTED:object]";
+
+      const sanitized = Object.create(null);
+      for (const key of keys) {
+        const safeKey = redactDiagnosticText(key, secrets, { truncated });
+        let safeValue;
+        try {
+          safeValue = sanitize(candidate[key]);
+        } catch {
+          safeValue = "[UNREADABLE]";
+        }
+        Object.defineProperty(sanitized, safeKey, {
+          value: safeValue,
+          enumerable: true,
+          configurable: true,
+          writable: true
+        });
+      }
+      return sanitized;
+    } catch {
+      return "[UNREADABLE]";
+    } finally {
+      activeObjects.delete(candidate);
+    }
+  };
+
+  let safeValue;
+  try {
+    safeValue = sanitize(value);
+  } catch {
+    safeValue = "[UNREADABLE]";
+  }
+
+  let serialized;
+  try {
+    serialized = JSON.stringify(safeValue);
+  } catch {
+    serialized = JSON.stringify("[UNREADABLE]");
+  }
+
+  try {
+    return JSON.parse(redactDiagnosticText(serialized, []));
+  } catch {
+    return "[UNREADABLE]";
+  }
+}
+
+/** Capture at most maxBytes while continuing to drain the child stream. */
+function createBoundedCapture(maxBytes) {
+  const chunks = [];
+  let bytesCaptured = 0;
+  let totalBytes = 0;
+  let truncated = false;
+  return {
+    append(value) {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
+      totalBytes += chunk.length;
+      const remaining = maxBytes - bytesCaptured;
+      if (remaining <= 0) {
+        truncated ||= chunk.length > 0;
+        return;
+      }
+      const retained = chunk.subarray(0, remaining);
+      chunks.push(retained);
+      bytesCaptured += retained.length;
+      truncated ||= retained.length < chunk.length;
+    },
+    snapshot(secrets = []) {
+      const raw = decodeDiagnosticBytes(Buffer.concat(chunks, bytesCaptured), truncated);
+      return {
+        text: redactDiagnosticText(raw, secrets, { truncated }),
+        bytesCaptured,
+        totalBytes,
+        maxBytes,
+        truncated
+      };
+    }
+  };
+}
+
+/** Treat empty or malformed process output as live until cleanup can be verified. */
+function processGroupHasLiveMembers(processStates, groupId) {
+  const lines = processStates.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return true;
+  for (const line of lines) {
+    const match = line.trim().match(/^(\d+)\s+(\S+)$/);
+    if (!match) return true;
+    const [, candidateGroup, state] = match;
+    if (Number(candidateGroup) === groupId && !state.startsWith("Z")) return true;
+  }
+  return false;
 }

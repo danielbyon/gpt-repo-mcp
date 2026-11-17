@@ -1,14 +1,86 @@
 import { EventEmitter, once } from "node:events";
 import process from "node:process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { watch } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
+import { clearTimeout, setTimeout } from "node:timers";
 import { describe, expect, test, vi } from "vitest";
 import { createConnectorRuntime, getManagedProcessTreeStatus, isManagedProcessTreeAlive, signalManagedProcessTree } from "../scripts/connector-runtime.mjs";
 import { getSupervisedProcessTreeStatus, spawnSupervisedProcess, waitForManagedTarget } from "../scripts/secure-process-supervisor.mjs";
+
+/** Creates a test-local ps probe for deterministic owned-group observations. */
+async function createProcessGroupProbe(fixture, mode) {
+  const binDirectory = join(fixture, "bin");
+  const targetPidPath = join(fixture, "target.pid");
+  const executablePath = join(binDirectory, "ps");
+  await mkdir(binDirectory, { recursive: true });
+  await writeFile(executablePath, `#!/bin/sh
+    if [ "$TEST_PROCESS_GROUP_PROBE_MODE" = "unavailable" ]; then
+      exit 1
+    fi
+    IFS= read -r target_pid < "$TEST_PROCESS_GROUP_TARGET_PID" || [ -n "$target_pid" ] || exit 2
+    case "$target_pid" in
+      ""|*[!0-9]*) exit 2 ;;
+    esac
+    printf "%s %s\\n" "$PPID" "$PPID"
+    if kill -0 "$target_pid" 2>/dev/null; then
+      printf "%s %s\\n" "$target_pid" "$PPID"
+    fi
+  `);
+  await chmod(executablePath, 0o755);
+  return { binDirectory, mode, targetPidPath };
+}
+
+function spawnWithProcessGroupProbe(probe, args) {
+  const keys = [
+    "PATH",
+    "TEST_PROCESS_GROUP_PROBE_MODE",
+    "TEST_PROCESS_GROUP_TARGET_PID"
+  ];
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  process.env.PATH = [probe.binDirectory, dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter);
+  process.env.TEST_PROCESS_GROUP_PROBE_MODE = probe.mode;
+  process.env.TEST_PROCESS_GROUP_TARGET_PID = probe.targetPidPath;
+  try {
+    return spawnSupervisedProcess(process.execPath, args);
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+/** Resolves when a supervised child writes a marker, with a finite timeout. */
+function waitForOutput(stream, marker, timeoutMs = 2_000) {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      stream.off("data", onData);
+      stream.off("end", onEnd);
+      stream.off("error", onError);
+      if (error) reject(error);
+      else resolve(output);
+    };
+    const onData = (chunk) => {
+      output += chunk.toString();
+      if (output.includes(marker)) finish();
+    };
+    const onEnd = () => finish(new Error(`Child output ended before marker ${marker}.`));
+    const onError = (error) => finish(error);
+    const timeout = setTimeout(() => finish(new Error(`Timed out waiting for child output marker ${marker}.`)), timeoutMs);
+    stream.on("data", onData);
+    stream.once("end", onEnd);
+    stream.once("error", onError);
+  });
+}
 
 describe("connector runtime", () => {
   test("prefixes complete and trailing output lines and exposes each line", async () => {
@@ -398,20 +470,81 @@ describe("connector runtime", () => {
   });
 
   test.skipIf(process.platform === "win32")("verifies forced termination of a lone target before retiring its group", async () => {
-    const child = spawnSupervisedProcess(process.execPath, [
+    const fixture = await mkdtemp(join(tmpdir(), "connector-lone-target-"));
+    const probe = await createProcessGroupProbe(fixture, "target-only");
+    const child = spawnWithProcessGroupProbe(probe, [
       "-e",
-      "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"
+      "process.on('SIGTERM', () => process.stdout.write('TERM_RECEIVED\\n')); process.stdout.write('TARGET_READY\\n'); setInterval(() => {}, 1000)"
     ]);
-    await waitForManagedTarget(child, { timeoutMs: 2_000 });
-    signalManagedProcessTree(child, "SIGTERM");
-    signalManagedProcessTree(child, "SIGKILL");
-    await once(child, "close");
+    const closed = once(child, "close");
+    const targetReady = waitForOutput(child.stdout, "TARGET_READY");
+    let termAcknowledged = false;
+    const prematureKills = [];
+    const sendOriginal = child.send.bind(child);
+    const send = vi.spyOn(child, "send").mockImplementation((message, ...args) => {
+      if (message?.type === "signal" && message.signal === "SIGKILL" && !termAcknowledged) {
+        prematureKills.push(message.signal);
+      }
+      return sendOriginal(message, ...args);
+    });
 
-    expect(getManagedProcessTreeStatus(child, process.platform)).toBe("verified-complete");
-    const send = vi.spyOn(child, "send");
-    signalManagedProcessTree(child, "SIGTERM");
-    expect(send).not.toHaveBeenCalled();
-    send.mockRestore();
+    try {
+      const targetPid = await waitForManagedTarget(child, { timeoutMs: 2_000 });
+      expect(await targetReady).toContain("TARGET_READY");
+      await writeFile(probe.targetPidPath, String(targetPid));
+      const termOutput = waitForOutput(child.stdout, "TERM_RECEIVED").then((output) => {
+        termAcknowledged = true;
+        return output;
+      });
+      signalManagedProcessTree(child, "SIGTERM");
+      expect(await termOutput).toContain("TERM_RECEIVED");
+      signalManagedProcessTree(child, "SIGKILL");
+      await closed;
+
+      expect(prematureKills).toEqual([]);
+      expect(getManagedProcessTreeStatus(child, process.platform)).toBe("verified-complete");
+      const sendCountBeforeRetiredSignal = send.mock.calls.length;
+      signalManagedProcessTree(child, "SIGTERM");
+      expect(send).toHaveBeenCalledTimes(sendCountBeforeRetiredSignal);
+    } finally {
+      send.mockRestore();
+      if (getSupervisedProcessTreeStatus(child) === "active") {
+        signalManagedProcessTree(child, "SIGKILL");
+        await closed;
+      }
+      await rm(fixture, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform === "win32")("keeps cleanup unknown when process-group observation is unavailable", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "connector-unobservable-group-"));
+    const probe = await createProcessGroupProbe(fixture, "unavailable");
+    const child = spawnWithProcessGroupProbe(probe, [
+      "-e",
+      "process.on('SIGTERM', () => process.stdout.write('TERM_RECEIVED\\n')); process.stdout.write('TARGET_READY\\n'); setInterval(() => {}, 1000)"
+    ]);
+    const closed = once(child, "close");
+    const targetReady = waitForOutput(child.stdout, "TARGET_READY");
+
+    try {
+      const targetPid = await waitForManagedTarget(child, { timeoutMs: 2_000 });
+      expect(await targetReady).toContain("TARGET_READY");
+      await writeFile(probe.targetPidPath, String(targetPid));
+      const termOutput = waitForOutput(child.stdout, "TERM_RECEIVED");
+      signalManagedProcessTree(child, "SIGTERM");
+      expect(await termOutput).toContain("TERM_RECEIVED");
+      signalManagedProcessTree(child, "SIGKILL");
+      await closed;
+
+      expect(child.signalCode).toBe("SIGKILL");
+      expect(getManagedProcessTreeStatus(child, process.platform)).toBe("unknown");
+    } finally {
+      if (getSupervisedProcessTreeStatus(child) === "active") {
+        signalManagedProcessTree(child, "SIGKILL");
+        await closed;
+      }
+      await rm(fixture, { recursive: true, force: true });
+    }
   });
 
   test.skipIf(process.platform === "win32")("keeps cleanup unknown when forced termination includes descendants", async () => {
