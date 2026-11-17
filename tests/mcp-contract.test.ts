@@ -2,11 +2,11 @@ import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { SERVER_INSTRUCTIONS, createMcpServer } from "../src/register.js";
 import { RootRegistry } from "../src/services/root-registry.js";
 import { nonDestructiveMutationAnnotations, readOnlyAnnotations, safeMutationAnnotations, writeAnnotations } from "../src/tools/annotations.js";
@@ -1921,28 +1921,172 @@ describe("MCP contract", () => {
     }
   });
 
-  test("representative calls for every tool match their output schema", async () => {
-    const { client, close, head } = await connectFixtureServer();
+  test("fixture close removes its temporary repository root", async () => {
+    const fixture = await connectFixtureServer();
     try {
-      const calls = {
-        ...representativeCalls(head),
-        repo_write_codex_review: await representativeReviewWriteArgs(client)
-      };
-      for (const [name, args] of Object.entries(calls)) {
-        const result = await client.callTool({ name, arguments: args });
-        expect(result.isError, name).toBeUndefined();
-        expect(result.structuredContent, name).toBeDefined();
-
-        const definition = toolCatalog.find((tool) => tool.name === name);
-        expect(definition, name).toBeDefined();
-        const parsed = definition!.outputSchema.safeParse(result.structuredContent);
-        expect(parsed.error?.issues, name).toBeUndefined();
-        expect(result.content, name).toEqual([
-          expect.objectContaining({ type: "text", text: expect.any(String) })
-        ]);
-      }
+      await fixture.close();
+      await expect(access(fixture.root)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
-      await close();
+      await rm(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    }
+  });
+
+  describe.sequential("representative tool output schemas", () => {
+    const callGroups = [
+      {
+        name: "repository discovery and indexing",
+        tools: [
+          "repo_list_roots",
+          "repo_last_write",
+          "repo_tree",
+          "repo_search",
+          "repo_fetch_file",
+          "repo_read_many",
+          "repo_symbol_context",
+          "repo_code_index"
+        ]
+      },
+      {
+        name: "diagnostic and review",
+        tools: ["repo_failure_diagnose", "repo_semantic_review", "repo_ship_review"]
+      },
+      {
+        name: "Git state and dry-run write operations",
+        tools: [
+          "repo_git_status",
+          "repo_git_diff",
+          "repo_git_review",
+          "repo_git_restore_paths",
+          "repo_write_stage",
+          "repo_write_unstage",
+          "repo_write_commit",
+          "repo_write_stage_commit"
+        ]
+      },
+      {
+        name: "recovery, cleanup, and validation",
+        tools: ["repo_write_recover", "repo_cleanup_paths", "repo_validate"]
+      },
+      {
+        name: "work-session lifecycle",
+        tools: ["repo_start_work_session", "repo_update_work_session", "repo_current_work_session"]
+      },
+      {
+        name: "project context and planning",
+        tools: ["repo_project_brief", "repo_task_inventory", "repo_decision_memory", "repo_change_plan"]
+      },
+      {
+        name: "task, review, file, change, and handoff",
+        tools: [
+          "repo_prepare_codex_task",
+          "repo_write_codex_task",
+          "repo_codex_review",
+          "repo_write_file",
+          "repo_write_changes",
+          "repo_write_handoff",
+          "repo_write_codex_review"
+        ]
+      }
+    ] as const;
+
+    let fixture: Awaited<ReturnType<typeof connectFixtureServer>> | undefined;
+    let calls: Record<string, Record<string, unknown>> = {};
+    let sequenceFailed = false;
+    let setupController: AbortController | undefined;
+    let setupPromise: Promise<void> | undefined;
+    let setupFinished = false;
+
+    beforeAll(async () => {
+      setupController = new AbortController();
+      setupPromise = (async () => {
+        const connectedFixture = await connectFixtureServer(setupController!.signal);
+        fixture = connectedFixture;
+        try {
+          calls = {
+            ...representativeCalls(connectedFixture.head),
+            repo_write_codex_review: await representativeReviewWriteArgs(connectedFixture.client, setupController!.signal)
+          };
+        } catch (error) {
+          try {
+            await connectedFixture.close();
+          } catch (cleanupError) {
+            throw new AggregateError([error, cleanupError], "Representative fixture setup failed and cleanup was incomplete.");
+          }
+          throw error;
+        }
+      })();
+      try {
+        await setupPromise;
+      } finally {
+        setupFinished = true;
+      }
+    }, 5_000);
+
+    afterAll(async () => {
+      const setupWasPending = !setupFinished;
+      setupController?.abort();
+      let setupError: unknown;
+      if (setupPromise) {
+        try {
+          await setupPromise;
+        } catch (error) {
+          setupError = error;
+        }
+      }
+
+      let cleanupError: unknown;
+      try {
+        await fixture?.close();
+      } catch (error) {
+        cleanupError = error;
+      }
+
+      const errors = [
+        ...(setupWasPending && setupError && !isAbortError(setupError) ? [setupError] : []),
+        ...(cleanupError ? [cleanupError] : [])
+      ];
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) throw new AggregateError(errors, "Representative fixture teardown failed.");
+    }, 5_000);
+
+    afterEach(({ task }) => {
+      if (task.result?.state === "fail") sequenceFailed = true;
+    });
+
+    test("groups cover every representative tool exactly once in original order", () => {
+      const groupedToolNames = callGroups.flatMap((group) => group.tools);
+      const expectedToolNames = Object.keys(calls);
+
+      expect(groupedToolNames).toHaveLength(expectedToolNames.length);
+      expect(new Set(groupedToolNames).size).toBe(expectedToolNames.length);
+      expect(groupedToolNames).toEqual(expectedToolNames);
+    });
+
+    for (const group of callGroups) {
+      test(`${group.name} outputs match their advertised schemas`, async ({ signal }) => {
+        if (sequenceFailed) {
+          throw new Error("Representative sequence stopped after an earlier group failed.");
+        }
+        if (!fixture) throw new Error("Representative MCP fixture was not initialized.");
+
+        for (const name of group.tools) {
+          if (signal.aborted) throw signal.reason;
+          const args = calls[name];
+          if (!args) throw new Error(`Missing representative arguments for ${name}.`);
+
+          const result = await fixture.client.callTool({ name, arguments: args }, undefined, { signal });
+          expect(result.isError, name).toBeUndefined();
+          expect(result.structuredContent, name).toBeDefined();
+
+          const definition = toolCatalog.find((tool) => tool.name === name);
+          expect(definition, name).toBeDefined();
+          const parsed = definition!.outputSchema.safeParse(result.structuredContent);
+          expect(parsed.error?.issues, name).toBeUndefined();
+          expect(result.content, name).toEqual([
+            expect.objectContaining({ type: "text", text: expect.any(String) })
+          ]);
+        }
+      }, 5_000);
     }
   });
 
@@ -2009,7 +2153,7 @@ function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-async function representativeReviewWriteArgs(client: Client): Promise<Record<string, unknown>> {
+async function representativeReviewWriteArgs(client: Client, signal?: AbortSignal): Promise<Record<string, unknown>> {
   const runId = "2026-07-19T132500Z-representative-review";
   const task = await client.callTool({
     name: "repo_write_codex_task",
@@ -2037,7 +2181,7 @@ async function representativeReviewWriteArgs(client: Client): Promise<Record<str
       technical_acceptance_criteria: ["The no-change technical result is strictly bound."],
       runner: { mode: "manual" }
     }
-  });
+  }, undefined, { signal });
   expect(task.isError).toBeUndefined();
   const taskOutput = task.structuredContent as { result_json_path: string };
   const resultJson = {
@@ -2068,12 +2212,12 @@ async function representativeReviewWriteArgs(client: Client): Promise<Record<str
       content: `${JSON.stringify(resultJson, null, 2)}\n`,
       expected_missing: true
     }
-  });
+  }, undefined, { signal });
   expect(resultWrite.isError).toBeUndefined();
   const review = await client.callTool({
     name: "repo_codex_review",
     arguments: { repo_id: "fixture", run_id: runId }
-  });
+  }, undefined, { signal });
   expect(review.isError).toBeUndefined();
   const state = (review.structuredContent as { review_state: { status: string; state_sha256?: string } }).review_state;
   expect(state.status).toBe("available");
@@ -2211,73 +2355,205 @@ function representativeCalls(head: string): Record<string, Record<string, unknow
   };
 }
 
-async function connectFixtureServer() {
-  const root = await createRepoRoot();
-  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root, env: { PATH: process.env.PATH ?? "" } })).stdout.trim();
-  const registry = await RootRegistry.fromConfig({
-    repos: [{
-      repo_id: "fixture",
-      display_name: "Fixture Repo",
-      root,
-      writes: { enabled: true, allowed_globs: ["docs/**", "src/**", ".chatgpt/**"] },
-      operations: {
-        enabled: true,
-        git_stage_enabled: true,
-        git_commit_enabled: true,
-        cleanup_enabled: true,
-        validation_enabled: true
+async function connectFixtureServer(signal?: AbortSignal) {
+  throwIfAborted(signal);
+  const root = await createRepoRoot(signal);
+  let client: Client | undefined;
+  let server: ReturnType<typeof createMcpServer> | undefined;
+  let clientTransport: InMemoryTransport | undefined;
+  let serverTransport: InMemoryTransport | undefined;
+  let connected = false;
+  let observedCleanupErrors: unknown[] = [];
+  let cleanupPromise: Promise<unknown[]> | undefined;
+
+  const cleanup = async (): Promise<unknown[]> => {
+    if (cleanupPromise) return cleanupPromise;
+    const work = (async () => {
+    const errors: unknown[] = [];
+    const attempt = async (operation: () => Promise<void>): Promise<boolean> => {
+      try {
+        await operation();
+        return true;
+      } catch (error) {
+        errors.push(error);
+        return false;
       }
-    }],
-    limits: {}
-  });
-  const server = createMcpServer({ registry });
-  const client = new Client({ name: "contract-test-client", version: "0.1.0" });
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    };
+    const transport = clientTransport ?? serverTransport;
+    let transportCloseFailed = false;
 
-  await Promise.all([
-    server.connect(serverTransport),
-    client.connect(clientTransport)
-  ]);
-
-  return {
-    client,
-    head,
-    close: async () => {
-      await client.close();
-      await server.close();
-    }
+    if (!connected && transport) await attempt(() => transport.close());
+    if (client) transportCloseFailed = !(await attempt(() => client!.close())) || transportCloseFailed;
+    if (server) transportCloseFailed = !(await attempt(() => server!.close())) || transportCloseFailed;
+    if (connected && transportCloseFailed && transport) await attempt(() => transport.close());
+    await attempt(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }));
+    return errors;
+    })();
+    cleanupPromise = work.then((errors) => {
+      // Keep each cleanup failure visible when a later attempt succeeds.
+      observedCleanupErrors = [...observedCleanupErrors, ...errors];
+      if (errors.length > 0) cleanupPromise = undefined;
+      return observedCleanupErrors;
+    });
+    return cleanupPromise;
   };
+  const cleanupOnAbort = (): void => { void cleanup(); };
+  signal?.addEventListener("abort", cleanupOnAbort, { once: true });
+
+  try {
+    throwIfAborted(signal);
+    const head = (await awaitWithAbort(
+      execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal }),
+      signal
+    )).stdout.trim();
+    const registry = await awaitWithAbort(RootRegistry.fromConfig({
+      repos: [{
+        repo_id: "fixture",
+        display_name: "Fixture Repo",
+        root,
+        writes: { enabled: true, allowed_globs: ["docs/**", "src/**", ".chatgpt/**"] },
+        operations: {
+          enabled: true,
+          git_stage_enabled: true,
+          git_commit_enabled: true,
+          cleanup_enabled: true,
+          validation_enabled: true
+        }
+      }],
+      limits: {}
+    }), signal);
+    throwIfAborted(signal);
+    server = createMcpServer({ registry });
+    client = new Client({ name: "contract-test-client", version: "0.1.0" });
+    [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await awaitWithAbort(Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport)
+    ]), signal);
+    throwIfAborted(signal);
+    connected = true;
+
+    let closed = false;
+    return {
+      client,
+      head,
+      root,
+      close: async () => {
+        if (closed) return;
+        const errors = await cleanup();
+        if (errors.length > 0) throw new AggregateError(errors, "MCP contract fixture cleanup failed.");
+        closed = true;
+      }
+    };
+  } catch (error) {
+    const cleanupErrors = await cleanup();
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([error, ...cleanupErrors], "MCP contract fixture setup failed and cleanup was incomplete.");
+    }
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", cleanupOnAbort);
+  }
 }
 
-async function createRepoRoot() {
+async function createRepoRoot(signal?: AbortSignal) {
+  throwIfAborted(signal);
   const root = await mkdtemp(join(tmpdir(), "gpt-repo-mcp-contract-"));
-  await mkdir(join(root, "src"), { recursive: true });
-  await mkdir(join(root, "docs"), { recursive: true });
-  await mkdir(join(root, ".chatgpt", "tool-tests"), { recursive: true });
-  await writeFile(join(root, "README.md"), "# Fixture\n");
-  await writeFile(join(root, "docs", "ARCHITECTURE.md"), "# Architecture\nDecision: keep tools read-only.\nConvention: use contracts first.\n");
-  await writeFile(join(root, "TODO.md"), "- [ ] Wire repo_task_inventory\n");
-  await writeFile(join(root, "package.json"), JSON.stringify({
-    type: "module",
-    scripts: {
-      build: "tsc",
-      test: "vitest",
-      smoke: "node -e \"console.log('smoke ok')\""
-    },
-    dependencies: {
-      "@modelcontextprotocol/sdk": "^1.0.0"
+  try {
+    throwIfAborted(signal);
+    await mkdir(join(root, "src"), { recursive: true });
+    throwIfAborted(signal);
+    await mkdir(join(root, "docs"), { recursive: true });
+    throwIfAborted(signal);
+    await mkdir(join(root, ".chatgpt", "tool-tests"), { recursive: true });
+    throwIfAborted(signal);
+    await writeFile(join(root, "README.md"), "# Fixture\n");
+    throwIfAborted(signal);
+    await writeFile(join(root, "docs", "ARCHITECTURE.md"), "# Architecture\nDecision: keep tools read-only.\nConvention: use contracts first.\n");
+    throwIfAborted(signal);
+    await writeFile(join(root, "TODO.md"), "- [ ] Wire repo_task_inventory\n");
+    throwIfAborted(signal);
+    await writeFile(join(root, "package.json"), JSON.stringify({
+      type: "module",
+      scripts: {
+        build: "tsc",
+        test: "vitest",
+        smoke: "node -e \"console.log('smoke ok')\""
+      },
+      dependencies: {
+        "@modelcontextprotocol/sdk": "^1.0.0"
+      }
+    }, null, 2));
+    throwIfAborted(signal);
+    await writeFile(join(root, "src", "app.ts"), "export const fixture = true;\n");
+    throwIfAborted(signal);
+    await execFileAsync("git", ["init"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
+    throwIfAborted(signal);
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
+    throwIfAborted(signal);
+    await execFileAsync("git", ["config", "user.name", "Test User"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
+    throwIfAborted(signal);
+    await execFileAsync("git", ["add", "--", "README.md", "docs/ARCHITECTURE.md", "TODO.md", "package.json", "src/app.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
+    throwIfAborted(signal);
+    await execFileAsync("git", ["commit", "-m", "initial"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
+    throwIfAborted(signal);
+    await writeFile(join(root, "src-placeholder.txt"), "changed\n");
+    throwIfAborted(signal);
+    await writeFile(join(root, "docs", "staged.md"), "staged\n");
+    throwIfAborted(signal);
+    await writeFile(join(root, "docs", "write-dry-run.md"), "planned\n");
+    throwIfAborted(signal);
+    await writeFile(join(root, ".chatgpt", "tool-tests", "cleanup.txt"), "temporary\n");
+    throwIfAborted(signal);
+    await execFileAsync("git", ["add", "--", "docs/staged.md"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
+    throwIfAborted(signal);
+    return root;
+  } catch (error) {
+    try {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "MCP contract fixture creation failed and its temporary repository could not be removed.");
     }
-  }, null, 2));
-  await writeFile(join(root, "src", "app.ts"), "export const fixture = true;\n");
-  await execFileAsync("git", ["init"], { cwd: root, env: { PATH: process.env.PATH ?? "" } });
-  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root, env: { PATH: process.env.PATH ?? "" } });
-  await execFileAsync("git", ["config", "user.name", "Test User"], { cwd: root, env: { PATH: process.env.PATH ?? "" } });
-  await execFileAsync("git", ["add", "--", "README.md", "docs/ARCHITECTURE.md", "TODO.md", "package.json", "src/app.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "" } });
-  await execFileAsync("git", ["commit", "-m", "initial"], { cwd: root, env: { PATH: process.env.PATH ?? "" } });
-  await writeFile(join(root, "src-placeholder.txt"), "changed\n");
-  await writeFile(join(root, "docs", "staged.md"), "staged\n");
-  await writeFile(join(root, "docs", "write-dry-run.md"), "planned\n");
-  await writeFile(join(root, ".chatgpt", "tool-tests", "cleanup.txt"), "temporary\n");
-  await execFileAsync("git", ["add", "--", "docs/staged.md"], { cwd: root, env: { PATH: process.env.PATH ?? "" } });
-  return root;
+    throw error;
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+function abortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error("Fixture setup was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+    const onAbort = (): void => {
+      cleanup();
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      }
+    );
+  });
 }
