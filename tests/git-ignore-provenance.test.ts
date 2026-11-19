@@ -272,17 +272,23 @@ describe("Git-native ignored candidate provenance through MCP", () => {
     expect(queries.length).toBeLessThan(4);
   });
 
-  test("real unreported scope and unauthorized result paths remain blocking", async () => {
+  test("real unreported scope remains blocking after a genuine attestation", async () => {
     const f = await fixture("home");
     await f.startRun();
     await writeFile(join(f.root, "src", "app.ts"), "export const value = 2;\n");
     await f.attest(["src/app.ts"]);
-    await f.metadata();
     await writeFile(join(f.root, "src", "unreported.ts"), "export const unreported = true;\n");
     const ship = await f.call("repo_ship_review", { run_id: RUN });
     expect(ship.git_review.delegation_gate.status).toBe("blocked");
     expect(ship.ship_readiness.status).toBe("review_required");
     expect(ship.ship_readiness.reasons).toContain("DELEGATION_REVIEW_GATE_BLOCKED");
+  });
+
+  test("unauthorized result paths fail technical review after a genuine attestation", async () => {
+    const f = await fixture("home");
+    await f.startRun();
+    await writeFile(join(f.root, "src", "app.ts"), "export const value = 2;\n");
+    await f.attest(["src/app.ts"]);
     await writeV3Result(f.root, RUN, { changed_files: ["src/app.ts", "outside.py"] });
     const review = await f.call("repo_codex_review", { run_id: RUN });
     expect(review.technical_readiness.status).toBe("failed");
