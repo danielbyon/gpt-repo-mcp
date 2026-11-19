@@ -2711,6 +2711,42 @@ describe("fixture teardown", () => {
     cleanup.resolve();
   });
 
+  test("cleanup rejection after the deadline remains in the teardown result", async () => {
+    const cleanup = createDeferred<void>();
+    const cleanupStarted = createDeferred<void>();
+    const deadline = controlledDeadline();
+    const cleanupError = new Error("cleanup rejected after the teardown deadline");
+    const reportLateCleanupFailure = vi.fn();
+    const finalization = finalizeFixtureTeardown(makeInput({
+      setupPromise: Promise.resolve({ id: "fixture" }),
+      setupWasPending: false,
+      cleanup: () => {
+        cleanupStarted.resolve();
+        return cleanup.promise;
+      },
+      reportLateCleanupFailure,
+      deadline: deadline.deadline
+    }));
+
+    await cleanupStarted.promise;
+    deadline.expire();
+    let finalizationError: unknown;
+    try {
+      await finalization;
+    } catch (error) {
+      finalizationError = error;
+    }
+    expect(finalizationError).toBeInstanceOf(AggregateError);
+    expect((finalizationError as AggregateError).message).toMatch(/cleanup completion was not confirmed/i);
+    expect(reportLateCleanupFailure).not.toHaveBeenCalled();
+
+    cleanup.reject(cleanupError);
+    await expect(cleanup.promise).rejects.toBe(cleanupError);
+    expect(reportLateCleanupFailure).toHaveBeenCalledOnce();
+    expect(reportLateCleanupFailure).toHaveBeenCalledWith(cleanupError);
+    expect((finalizationError as AggregateError).errors).toContain(cleanupError);
+  });
+
   test("setup and cleanup failures are both preserved", async () => {
     const setupError = new Error("setup rejected");
     const cleanupError = new Error("cleanup rejected");
@@ -2828,6 +2864,11 @@ async function finalizeFixtureTeardown<T>(input: {
   });
 
   const cleanup = observeFixtureOperation(invokeFixtureOperation(input.cleanup));
+  cleanup.settled.then((cleanupOutcome) => {
+    if (timedOut && cleanupOutcome.status === "rejected") {
+      recordLateCleanupFailure(cleanupOutcome.reason);
+    }
+  });
   const completion = Promise.all([finalizedSetup, cleanup.settled]);
   const waited = await waitForFixtureCompletion(completion, deadline.promise);
   deadline.cancel();
