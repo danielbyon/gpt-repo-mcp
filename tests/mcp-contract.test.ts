@@ -6,7 +6,7 @@ import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import { SERVER_INSTRUCTIONS, createMcpServer } from "../src/register.js";
 import { RootRegistry } from "../src/services/root-registry.js";
 import { nonDestructiveMutationAnnotations, readOnlyAnnotations, safeMutationAnnotations, writeAnnotations } from "../src/tools/annotations.js";
@@ -1545,39 +1545,88 @@ describe("MCP contract", () => {
     }
   });
 
-  test("public review tools default to compact and expose full only when requested", async () => {
-    const { client, close } = await connectFixtureServer();
-    try {
-      const compactGit = await client.callTool({
+  describe.sequential("public review detail", () => {
+    let fixture: Awaited<ReturnType<typeof connectFixtureServer>> | undefined;
+    let fixtureOwner: ReturnType<typeof createFixtureResourceOwner> | undefined;
+    let setupController: AbortController | undefined;
+    let setupPromise: Promise<Awaited<ReturnType<typeof connectFixtureServer>>> | undefined;
+    let setupFinished = false;
+    let teardownStarted = false;
+    let sequenceFailed = false;
+
+    beforeAll(async () => {
+      setupController = new AbortController();
+      const owner = createFixtureResourceOwner();
+      fixtureOwner = owner;
+      setupPromise = connectFixtureServer(setupController.signal, owner).then((candidate) => {
+        if (!teardownStarted) fixture = candidate;
+        return candidate;
+      });
+      void setupPromise.then(
+        () => { setupFinished = true; },
+        () => { setupFinished = true; }
+      );
+      await setupPromise;
+    }, 5_000);
+
+    afterAll(async () => {
+      teardownStarted = true;
+      await finalizeFixtureTeardown({
+        setupPromise,
+        setupWasPending: !setupFinished,
+        abort: () => setupController?.abort(),
+        cleanup: async () => {
+          const errors = await fixtureOwner?.cleanup();
+          if (errors && errors.length > 0) throw new AggregateError(errors, "MCP contract fixture cleanup failed.");
+        },
+        cleanupLateFixture: async (lateFixture) => lateFixture.close(),
+        reportLateCleanupFailure: (error) => console.error("MCP contract fixture cleanup failed after its deadline.", error)
+      });
+    }, 5_000);
+
+    afterEach(({ task }) => {
+      if (task.result?.state === "fail") sequenceFailed = true;
+    });
+
+    const fixtureForTest = () => {
+      return requireFixtureForRequest(fixture, sequenceFailed, teardownStarted);
+    };
+
+    test("repo_git_review defaults to compact", async ({ signal }) => {
+      const result = await fixtureForTest().client.callTool({
         name: "repo_git_review",
         arguments: { repo_id: "fixture" }
-      });
-      expect(compactGit.structuredContent).toMatchObject({ ok: true, detail: "compact" });
+      }, undefined, { signal });
+      expect(result.structuredContent).toMatchObject({ ok: true, detail: "compact" });
+    }, 5_000);
 
-      const fullGit = await client.callTool({
+    test("repo_git_review honors full detail", async ({ signal }) => {
+      const result = await fixtureForTest().client.callTool({
         name: "repo_git_review",
         arguments: { repo_id: "fixture", detail: "full" }
-      });
-      expect(fullGit.structuredContent).toMatchObject({ ok: true, detail: "full" });
+      }, undefined, { signal });
+      expect(result.structuredContent).toMatchObject({ ok: true, detail: "full" });
+    }, 5_000);
 
-      const compactShip = await client.callTool({
+    test("repo_ship_review defaults to compact fields", async ({ signal }) => {
+      const result = await fixtureForTest().client.callTool({
         name: "repo_ship_review",
         arguments: { repo_id: "fixture" }
-      });
-      expect(compactShip.structuredContent).toMatchObject({ ok: true, detail: "compact" });
-      expect(compactShip.structuredContent).not.toHaveProperty("delegation_gate");
-      expect(compactShip.structuredContent).not.toHaveProperty("review_loop");
+      }, undefined, { signal });
+      expect(result.structuredContent).toMatchObject({ ok: true, detail: "compact" });
+      expect(result.structuredContent).not.toHaveProperty("delegation_gate");
+      expect(result.structuredContent).not.toHaveProperty("review_loop");
+    }, 5_000);
 
-      const fullShip = await client.callTool({
+    test("repo_ship_review includes full detail fields when requested", async ({ signal }) => {
+      const result = await fixtureForTest().client.callTool({
         name: "repo_ship_review",
         arguments: { repo_id: "fixture", detail: "full" }
-      });
-      expect(fullShip.structuredContent).toMatchObject({ ok: true, detail: "full" });
-      expect(fullShip.structuredContent).toHaveProperty("delegation_gate");
-      expect(fullShip.structuredContent).toHaveProperty("review_loop");
-    } finally {
-      await close();
-    }
+      }, undefined, { signal });
+      expect(result.structuredContent).toMatchObject({ ok: true, detail: "full" });
+      expect(result.structuredContent).toHaveProperty("delegation_gate");
+      expect(result.structuredContent).toHaveProperty("review_loop");
+    }, 5_000);
   });
 
   test("repo_write_changes prevalidation prevents partial writes", async () => {
@@ -1993,19 +2042,27 @@ describe("MCP contract", () => {
     let calls: Record<string, Record<string, unknown>> = {};
     let sequenceFailed = false;
     let setupController: AbortController | undefined;
-    let setupPromise: Promise<void> | undefined;
+    let fixtureOwner: ReturnType<typeof createFixtureResourceOwner> | undefined;
+    let setupPromise: Promise<Awaited<ReturnType<typeof connectFixtureServer>>> | undefined;
     let setupFinished = false;
+    let teardownStarted = false;
 
     beforeAll(async () => {
       setupController = new AbortController();
+      const owner = createFixtureResourceOwner();
+      fixtureOwner = owner;
       setupPromise = (async () => {
-        const connectedFixture = await connectFixtureServer(setupController!.signal);
+        const connectedFixture = await connectFixtureServer(setupController!.signal, owner);
+        if (teardownStarted) return connectedFixture;
         fixture = connectedFixture;
         try {
-          calls = {
-            ...representativeCalls(connectedFixture.head),
-            repo_write_codex_review: await representativeReviewWriteArgs(connectedFixture.client, setupController!.signal)
-          };
+          const reviewWriteArgs = await representativeReviewWriteArgs(connectedFixture.client, setupController!.signal);
+          if (!teardownStarted) {
+            calls = {
+              ...representativeCalls(connectedFixture.head),
+              repo_write_codex_review: reviewWriteArgs
+            };
+          }
         } catch (error) {
           try {
             await connectedFixture.close();
@@ -2014,39 +2071,28 @@ describe("MCP contract", () => {
           }
           throw error;
         }
+        return connectedFixture;
       })();
-      try {
-        await setupPromise;
-      } finally {
-        setupFinished = true;
-      }
+      void setupPromise.then(
+        () => { setupFinished = true; },
+        () => { setupFinished = true; }
+      );
+      await setupPromise;
     }, 5_000);
 
     afterAll(async () => {
-      const setupWasPending = !setupFinished;
-      setupController?.abort();
-      let setupError: unknown;
-      if (setupPromise) {
-        try {
-          await setupPromise;
-        } catch (error) {
-          setupError = error;
-        }
-      }
-
-      let cleanupError: unknown;
-      try {
-        await fixture?.close();
-      } catch (error) {
-        cleanupError = error;
-      }
-
-      const errors = [
-        ...(setupWasPending && setupError && !isAbortError(setupError) ? [setupError] : []),
-        ...(cleanupError ? [cleanupError] : [])
-      ];
-      if (errors.length === 1) throw errors[0];
-      if (errors.length > 1) throw new AggregateError(errors, "Representative fixture teardown failed.");
+      teardownStarted = true;
+      await finalizeFixtureTeardown({
+        setupPromise,
+        setupWasPending: !setupFinished,
+        abort: () => setupController?.abort(),
+        cleanup: async () => {
+          const errors = await fixtureOwner?.cleanup();
+          if (errors && errors.length > 0) throw new AggregateError(errors, "MCP contract fixture cleanup failed.");
+        },
+        cleanupLateFixture: async (lateFixture) => lateFixture.close(),
+        reportLateCleanupFailure: (error) => console.error("MCP contract fixture cleanup failed after its deadline.", error)
+      });
     }, 5_000);
 
     afterEach(({ task }) => {
@@ -2355,58 +2401,674 @@ function representativeCalls(head: string): Record<string, Record<string, unknow
   };
 }
 
-async function connectFixtureServer(signal?: AbortSignal) {
-  throwIfAborted(signal);
-  const root = await createRepoRoot(signal);
+describe("fixture teardown", () => {
+  function makeInput<T>(options: {
+    setupPromise?: Promise<T>;
+    setupWasPending: boolean;
+    abort?: () => void;
+    cleanup?: () => Promise<void>;
+    cleanupLateFixture?: (fixture: T) => Promise<void>;
+    reportLateCleanupFailure?: (error: unknown) => void;
+    deadline?: { promise: Promise<void>; cancel: () => void };
+  }) {
+    return {
+      setupPromise: options.setupPromise,
+      setupWasPending: options.setupWasPending,
+      abort: options.abort ?? (() => {}),
+      cleanup: options.cleanup ?? (async () => {}),
+      cleanupLateFixture: options.cleanupLateFixture ?? (async () => {}),
+      reportLateCleanupFailure: options.reportLateCleanupFailure ?? (() => {}),
+      deadline: options.deadline ?? controlledDeadline().deadline
+    };
+  }
+
+  test("normal setup closes the fixture once", async () => {
+    const fixture = { id: "fixture" };
+    const close = vi.fn(async () => {});
+    const abort = vi.fn();
+
+    await finalizeFixtureTeardown(makeInput({
+      setupPromise: Promise.resolve(fixture),
+      setupWasPending: false,
+      abort,
+      cleanup: close,
+      cleanupLateFixture: async () => {
+        throw new Error("completed setup must not be treated as late");
+      }
+    }));
+
+    expect(abort).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  test("partial fixture roots stay owned until setup activity settles", async () => {
+    const owner = createFixtureResourceOwner();
+    const root = await mkdtemp(join(tmpdir(), "mcp-contract-owner-"));
+    const setupOperation = createDeferred<void>();
+    owner.setRoot(root);
+    const trackedSetup = owner.track(() => setupOperation.promise);
+    const cleanup = owner.cleanup();
+
+    await expect(access(root)).resolves.toBeUndefined();
+    setupOperation.resolve();
+    await trackedSetup;
+    await expect(cleanup).resolves.toEqual([]);
+    await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("fixture transports stay open until tracked setup settles", async () => {
+    const owner = createFixtureResourceOwner();
+    const root = await mkdtemp(join(tmpdir(), "mcp-contract-owner-"));
+    const setupOperation = createDeferred<void>();
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const closeTransport = vi.spyOn(clientTransport, "close");
+    owner.setRoot(root);
+    owner.setTransports(clientTransport, serverTransport);
+    const trackedSetup = owner.track(() => setupOperation.promise);
+    const cleanup = owner.cleanup();
+
+    try {
+      await expect(owner.track(async () => {})).rejects.toThrow(/cleanup has begun/i);
+      expect(closeTransport).not.toHaveBeenCalled();
+      await expect(access(root)).resolves.toBeUndefined();
+    } finally {
+      setupOperation.resolve();
+      await trackedSetup;
+      await cleanup;
+      expect(closeTransport).toHaveBeenCalled();
+      closeTransport.mockRestore();
+    }
+
+    await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("connected setup still pending after hook cancellation is cleaned and reported", async () => {
+    const controller = new AbortController();
+    const owner = createFixtureResourceOwner();
+    const connected = createDeferred<{
+      fixture: Awaited<ReturnType<typeof connectFixtureServer>>;
+      transports: readonly InMemoryTransport[];
+    }>();
+    const setupGate = createDeferred<void>();
+    const setupPromise = connectFixtureServer(controller.signal, owner, async (fixture, transports) => {
+      connected.resolve({ fixture, transports });
+      await setupGate.promise;
+    });
+    let setupSettled = false;
+    void setupPromise.then(
+      () => { setupSettled = true; },
+      () => { setupSettled = true; }
+    );
+
+    const { fixture, transports } = await connected.promise;
+    const transportClose = transports.map((transport) => vi.spyOn(transport, "close"));
+    const deadline = controlledDeadline();
+    const cleanupFinished = createDeferred<void>();
+    let unownedRoot: string | undefined;
+    let failure: unknown;
+    let testFailed = false;
+    const cleanupFailures: unknown[] = [];
+    try {
+      unownedRoot = await mkdtemp(join(tmpdir(), "mcp-contract-unowned-"));
+      const finalization = finalizeFixtureTeardown({
+        setupPromise,
+        setupWasPending: true,
+        abort: () => controller.abort(),
+        cleanup: async () => {
+          const errors = await owner.cleanup();
+          cleanupFinished.resolve();
+          if (errors.length > 0) throw new AggregateError(errors, "MCP contract fixture cleanup failed.");
+        },
+        cleanupLateFixture: async (lateFixture) => lateFixture.close(),
+        reportLateCleanupFailure: (error) => cleanupFailures.push(error),
+        deadline: deadline.deadline
+      });
+
+      // The unresolved setup gate represents initialization past the beforeAll deadline.
+      await cleanupFinished.promise;
+      expect(setupSettled).toBe(false);
+      for (const close of transportClose) expect(close).toHaveBeenCalled();
+      await expect(access(fixture.root)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(unownedRoot)).resolves.toBeUndefined();
+
+      deadline.expire();
+      let finalizationError: unknown;
+      try {
+        await finalization;
+      } catch (error) {
+        finalizationError = error;
+      }
+      const finalizationErrors = finalizationError instanceof AggregateError
+        ? finalizationError.errors
+        : [finalizationError];
+      expect(finalizationErrors.map((error) => error instanceof Error ? error.message : String(error)))
+        .toEqual(["Fixture setup settlement was not confirmed before the teardown deadline."]);
+      expect(setupSettled).toBe(false);
+
+      setupGate.resolve();
+      await expect(setupPromise).rejects.toMatchObject({ name: "AbortError" });
+    } catch (error) {
+      failure = error;
+      testFailed = true;
+    } finally {
+      controller.abort();
+      setupGate.resolve();
+      await setupPromise.catch(() => {});
+      try {
+        for (const cleanupError of await owner.cleanup()) {
+          cleanupFailures.push(cleanupError);
+        }
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+      if (unownedRoot) {
+        try {
+          await rm(unownedRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+        } catch (error) {
+          cleanupFailures.push(error);
+        }
+      }
+      for (const close of transportClose) close.mockRestore();
+    }
+    if (testFailed || cleanupFailures.length > 0) {
+      const failures = [];
+      if (testFailed) failures.push(failure);
+      if (cleanupFailures.length > 0) {
+        failures.push(new AggregateError(cleanupFailures, "MCP fixture cleanup failed."));
+      }
+      if (failures.length === 1) throw failures[0];
+      throw new AggregateError(failures, "Fixture test and cleanup both failed.");
+    }
+  });
+
+  test("setup rejection is preserved after cleanup is attempted", async () => {
+    const setupError = new Error("setup rejected");
+    const cleanup = vi.fn(async () => {});
+
+    await expect(finalizeFixtureTeardown(makeInput({
+      setupPromise: Promise.reject(setupError),
+      setupWasPending: false,
+      cleanup
+    }))).rejects.toBe(setupError);
+
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  test("unsettled setup reports cleanup as unconfirmed at the deadline", async () => {
+    const setup = createDeferred<{ id: string }>();
+    const deadline = controlledDeadline();
+    const cleanupStarted = createDeferred<void>();
+    const cleanup = vi.fn(async () => {
+      cleanupStarted.resolve();
+    });
+    const finalization = finalizeFixtureTeardown(makeInput({
+      setupPromise: setup.promise,
+      setupWasPending: true,
+      cleanup,
+      deadline: deadline.deadline
+    }));
+
+    await cleanupStarted.promise;
+    deadline.expire();
+    await expect(finalization).rejects.toThrow(/setup settlement was not confirmed/i);
+    setup.reject(makeAbortError());
+  });
+
+  test("late fixture cleanup rejection is reported after finalization times out", async () => {
+    const setup = createDeferred<{ id: string }>();
+    const deadline = controlledDeadline();
+    const cleanupError = new Error("late cleanup rejected");
+    const reported = createDeferred<unknown>();
+    const finalization = finalizeFixtureTeardown(makeInput({
+      setupPromise: setup.promise,
+      setupWasPending: true,
+      deadline: deadline.deadline,
+      cleanupLateFixture: async () => { throw cleanupError; },
+      reportLateCleanupFailure: (error) => reported.resolve(error)
+    }));
+
+    deadline.expire();
+    let finalizationError: unknown;
+    try {
+      await finalization;
+    } catch (error) {
+      finalizationError = error;
+    }
+    setup.resolve({ id: "late fixture" });
+    await expect(reported.promise).resolves.toBe(cleanupError);
+    expect(finalizationError).toBeInstanceOf(AggregateError);
+    expect((finalizationError as AggregateError).errors).toContain(cleanupError);
+  });
+
+  test("cancellation during partial setup still runs cleanup", async () => {
+    const controller = new AbortController();
+    let partialSetup = false;
+    let cleanupObservedPartialSetup = false;
+    const setupPromise = new Promise<{ id: string }>((_resolve, reject) => {
+      partialSetup = true;
+      controller.signal.addEventListener("abort", () => reject(makeAbortError()), { once: true });
+    });
+
+    await finalizeFixtureTeardown(makeInput({
+      setupPromise,
+      setupWasPending: true,
+      abort: () => controller.abort(),
+      cleanup: async () => {
+        cleanupObservedPartialSetup = partialSetup && controller.signal.aborted;
+      }
+    }));
+
+    expect(cleanupObservedPartialSetup).toBe(true);
+  });
+
+  test("late setup settlement closes the fixture and fails visibly", async () => {
+    const setup = createDeferred<{ id: string }>();
+    const deadline = controlledDeadline();
+    const fixture = { id: "late fixture" };
+    const closeLate = vi.fn(async () => {});
+    const finalization = finalizeFixtureTeardown(makeInput({
+      setupPromise: setup.promise,
+      setupWasPending: true,
+      cleanupLateFixture: closeLate,
+      deadline: deadline.deadline
+    }));
+
+    setup.resolve(fixture);
+    await expect(finalization).rejects.toThrow(/setup completed after teardown began/i);
+    expect(closeLate).toHaveBeenCalledOnce();
+    expect(closeLate).toHaveBeenCalledWith(fixture);
+  });
+
+  test("cleanup rejection remains visible", async () => {
+    const cleanupError = new Error("cleanup rejected");
+
+    await expect(finalizeFixtureTeardown(makeInput({
+      setupPromise: Promise.resolve({ id: "fixture" }),
+      setupWasPending: false,
+      cleanup: async () => {
+        throw cleanupError;
+      }
+    }))).rejects.toBe(cleanupError);
+  });
+
+  test("cleanup non-settlement is reported as unconfirmed", async () => {
+    const cleanup = createDeferred<void>();
+    const deadline = controlledDeadline();
+    const cleanupStarted = createDeferred<void>();
+    const finalization = finalizeFixtureTeardown(makeInput({
+      setupPromise: Promise.resolve({ id: "fixture" }),
+      setupWasPending: false,
+      cleanup: () => {
+        cleanupStarted.resolve();
+        return cleanup.promise;
+      },
+      deadline: deadline.deadline
+    }));
+
+    await cleanupStarted.promise;
+    deadline.expire();
+    await expect(finalization).rejects.toThrow(/cleanup completion was not confirmed/i);
+    cleanup.resolve();
+  });
+
+  test("setup and cleanup failures are both preserved", async () => {
+    const setupError = new Error("setup rejected");
+    const cleanupError = new Error("cleanup rejected");
+
+    let thrown: unknown;
+    try {
+      await finalizeFixtureTeardown(makeInput({
+        setupPromise: Promise.reject(setupError),
+        setupWasPending: false,
+        cleanup: async () => {
+          throw cleanupError;
+        }
+      }));
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).errors).toEqual([setupError, cleanupError]);
+  });
+
+  test("a failed sequence cannot start another request", () => {
+    let requestCount = 0;
+    const startRequest = () => {
+      requireFixtureForRequest({ id: "fixture" }, true, false);
+      requestCount += 1;
+    };
+
+    expect(startRequest).toThrow(/stopped after an earlier request failed/i);
+    expect(requestCount).toBe(0);
+    expect(() => requireFixtureForRequest({ id: "fixture" }, false, true)).toThrow(/teardown has started/i);
+  });
+});
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function controlledDeadline() {
+  const signal = createDeferred<void>();
+  return {
+    deadline: { promise: signal.promise, cancel: () => {} },
+    expire: () => signal.resolve()
+  };
+}
+
+function makeAbortError(): Error {
+  const error = new Error("setup canceled");
+  error.name = "AbortError";
+  return error;
+}
+
+type FixtureOperationOutcome<T> =
+  | { status: "pending" }
+  | { status: "fulfilled"; value: T }
+  | { status: "rejected"; reason: unknown };
+
+type FixtureDeadline = { promise: Promise<void>; cancel: () => void };
+
+/** Bounds setup and cleanup settlement and keeps late cleanup failures in the timeout result. */
+async function finalizeFixtureTeardown<T>(input: {
+  setupPromise?: Promise<T>;
+  setupWasPending: boolean;
+  abort: () => void;
+  cleanup: () => Promise<void>;
+  cleanupLateFixture: (fixture: T) => Promise<void>;
+  reportLateCleanupFailure: (error: unknown) => void;
+  deadline?: FixtureDeadline;
+}): Promise<void> {
+  const deadline = input.deadline ?? createFixtureDeadline(4_000);
+  const errors: unknown[] = [];
+
+  try {
+    input.abort();
+  } catch (error) {
+    errors.push(error);
+  }
+
+  const setup = observeFixtureOperation(input.setupPromise ?? Promise.resolve(undefined as T));
+  let lateCleanup: ReturnType<typeof observeFixtureOperation<void>> | undefined;
+  let timedOut = false;
+  let timeoutFailure: AggregateError | undefined;
+  const recordLateCleanupFailure = (error: unknown): void => {
+    if (!timedOut) return;
+    const recordedErrors = timeoutFailure?.errors ?? errors;
+    if (!recordedErrors.includes(error)) recordedErrors.push(error);
+    try {
+      input.reportLateCleanupFailure(error);
+    } catch (reportError) {
+      console.error("Could not report late MCP fixture cleanup failure.", reportError);
+    }
+  };
+  const finalizedSetup = setup.settled.then(async (outcome) => {
+    if (input.setupWasPending && outcome.status === "fulfilled") {
+      const cleanupPromise = invokeFixtureOperation(() => input.cleanupLateFixture(outcome.value));
+      lateCleanup = observeFixtureOperation(cleanupPromise);
+      lateCleanup.settled.then((cleanupOutcome) => {
+        if (timedOut && cleanupOutcome.status === "rejected") {
+          recordLateCleanupFailure(cleanupOutcome.reason);
+        }
+      });
+      return {
+        kind: "late" as const,
+        setup: outcome,
+        cleanup: await lateCleanup.settled
+      };
+    }
+    return { kind: "settled" as const, setup: outcome };
+  });
+
+  const cleanup = observeFixtureOperation(invokeFixtureOperation(input.cleanup));
+  const completion = Promise.all([finalizedSetup, cleanup.settled]);
+  const waited = await waitForFixtureCompletion(completion, deadline.promise);
+  deadline.cancel();
+
+  if (waited.status === "error") {
+    errors.push(waited.reason);
+  } else if (waited.status === "deadline") {
+    timedOut = true;
+    const setupOutcome = setup.outcome();
+    if (setupOutcome.status === "pending") {
+      errors.push(new Error("Fixture setup settlement was not confirmed before the teardown deadline."));
+    } else if (setupOutcome.status === "rejected" && !(input.setupWasPending && isAbortError(setupOutcome.reason))) {
+      errors.push(setupOutcome.reason);
+    } else if (setupOutcome.status === "fulfilled" && input.setupWasPending) {
+      errors.push(new Error("Fixture setup completed after teardown began."));
+    }
+
+    const cleanupOutcome = cleanup.outcome();
+    if (cleanupOutcome.status === "pending") {
+      errors.push(new Error("Fixture cleanup completion was not confirmed before the teardown deadline."));
+    } else if (cleanupOutcome.status === "rejected") {
+      errors.push(cleanupOutcome.reason);
+    }
+
+    const lateCleanupOutcome = lateCleanup?.outcome();
+    if (lateCleanupOutcome?.status === "pending") {
+      errors.push(new Error("Late fixture cleanup completion was not confirmed before the teardown deadline."));
+    } else if (lateCleanupOutcome?.status === "rejected") {
+      errors.push(lateCleanupOutcome.reason);
+    }
+  } else {
+    const [setupResult, cleanupResult] = waited.value;
+    if (setupResult.kind === "late") {
+      errors.push(new Error("Fixture setup completed after teardown began."));
+      if (setupResult.cleanup.status === "rejected") errors.push(setupResult.cleanup.reason);
+    } else if (setupResult.setup.status === "rejected") {
+      if (!(input.setupWasPending && isAbortError(setupResult.setup.reason))) errors.push(setupResult.setup.reason);
+    }
+    if (cleanupResult.status === "rejected") errors.push(cleanupResult.reason);
+  }
+
+  if (timedOut && errors.length > 0) {
+    const message = errors.find((error): error is Error => error instanceof Error)?.message ??
+      "Fixture teardown did not complete before its deadline.";
+    timeoutFailure = new AggregateError(errors, message);
+    throw timeoutFailure;
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, "Fixture teardown did not complete cleanly.");
+}
+
+function observeFixtureOperation<T>(operation: Promise<T>) {
+  let outcome: FixtureOperationOutcome<T> = { status: "pending" };
+  const settled = Promise.resolve(operation).then(
+    (value): FixtureOperationOutcome<T> => {
+      outcome = { status: "fulfilled", value };
+      return outcome;
+    },
+    (reason): FixtureOperationOutcome<T> => {
+      outcome = { status: "rejected", reason };
+      return outcome;
+    }
+  );
+  return { settled, outcome: () => outcome };
+}
+
+function invokeFixtureOperation<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return Promise.resolve(operation());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+function waitForFixtureCompletion<T>(
+  completion: Promise<T>,
+  deadline: Promise<void>
+): Promise<{ status: "completed"; value: T } | { status: "deadline" } | { status: "error"; reason: unknown }> {
+  return new Promise((resolve) => {
+    let decided = false;
+    completion.then(
+      (value) => {
+        if (decided) return;
+        decided = true;
+        resolve({ status: "completed", value });
+      },
+      (reason: unknown) => {
+        if (decided) return;
+        decided = true;
+        resolve({ status: "error", reason });
+      }
+    );
+    deadline.then(
+      () => {
+        if (decided) return;
+        decided = true;
+        resolve({ status: "deadline" });
+      },
+      () => {
+        if (decided) return;
+        decided = true;
+        resolve({ status: "error", reason: new Error("Fixture teardown deadline failed.") });
+      }
+    );
+  });
+}
+
+function createFixtureDeadline(timeoutMs: number): FixtureDeadline {
+  let timer: ReturnType<typeof setTimeout>;
+  const promise = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  return { promise, cancel: () => clearTimeout(timer) };
+}
+
+function requireFixtureForRequest<T>(fixture: T | undefined, sequenceFailed: boolean, teardownStarted: boolean): T {
+  if (teardownStarted) throw new Error("Public review fixture teardown has started.");
+  if (sequenceFailed) throw new Error("Public review sequence stopped after an earlier request failed.");
+  if (!fixture) throw new Error("Public review fixture was not initialized.");
+  return fixture;
+}
+
+/** Tracks fixture resources. Cleanup waits for active setup, closes resources, then removes the temporary root. */
+function createFixtureResourceOwner() {
+  let root: string | undefined;
   let client: Client | undefined;
   let server: ReturnType<typeof createMcpServer> | undefined;
   let clientTransport: InMemoryTransport | undefined;
   let serverTransport: InMemoryTransport | undefined;
   let connected = false;
-  let observedCleanupErrors: unknown[] = [];
   let cleanupPromise: Promise<unknown[]> | undefined;
+  const observedCleanupErrors: unknown[] = [];
+  let activeSetupOperations = 0;
+  let cleanupStarted = false;
+  const setupIdleWaiters = new Set<() => void>();
 
-  const cleanup = async (): Promise<unknown[]> => {
-    if (cleanupPromise) return cleanupPromise;
-    const work = (async () => {
-    const errors: unknown[] = [];
-    const attempt = async (operation: () => Promise<void>): Promise<boolean> => {
-      try {
-        await operation();
-        return true;
-      } catch (error) {
-        errors.push(error);
-        return false;
+  const track = <T>(operation: () => Promise<T>): Promise<T> => {
+    if (cleanupStarted) return Promise.reject(new Error("Fixture setup cannot start after cleanup has begun."));
+    activeSetupOperations += 1;
+    return invokeFixtureOperation(operation).finally(() => {
+      activeSetupOperations -= 1;
+      if (activeSetupOperations === 0) {
+        for (const resolve of setupIdleWaiters) resolve();
+        setupIdleWaiters.clear();
       }
-    };
-    const transport = clientTransport ?? serverTransport;
-    let transportCloseFailed = false;
-
-    if (!connected && transport) await attempt(() => transport.close());
-    if (client) transportCloseFailed = !(await attempt(() => client!.close())) || transportCloseFailed;
-    if (server) transportCloseFailed = !(await attempt(() => server!.close())) || transportCloseFailed;
-    if (connected && transportCloseFailed && transport) await attempt(() => transport.close());
-    await attempt(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }));
-    return errors;
-    })();
-    cleanupPromise = work.then((errors) => {
-      // Keep each cleanup failure visible when a later attempt succeeds.
-      observedCleanupErrors = [...observedCleanupErrors, ...errors];
-      if (errors.length > 0) cleanupPromise = undefined;
-      return observedCleanupErrors;
     });
+  };
+
+  const waitForSetupIdle = (): Promise<void> => {
+    if (activeSetupOperations === 0) return Promise.resolve();
+    return new Promise((resolve) => setupIdleWaiters.add(resolve));
+  };
+
+  const cleanup = (): Promise<unknown[]> => {
+    if (cleanupPromise) return cleanupPromise;
+    cleanupStarted = true;
+    const errors: unknown[] = [];
+    const attempt = (operation: () => Promise<void>, onSuccess?: () => void, onFailure?: () => void): Promise<boolean> => {
+      return invokeFixtureOperation(operation).then(
+        () => {
+          onSuccess?.();
+          return true;
+        },
+        (error) => {
+          errors.push(error);
+          observedCleanupErrors.push(error);
+          onFailure?.();
+          return false;
+        }
+      );
+    };
+
+    const closeOwnedResources = async (): Promise<void> => {
+      const transport = clientTransport ?? serverTransport;
+      let fallbackPromise: Promise<boolean> | undefined;
+      const startFallback = (): void => {
+        if (connected && transport && !fallbackPromise) {
+          fallbackPromise = attempt(() => transport.close(), () => {
+            if (clientTransport === transport) clientTransport = undefined;
+            if (serverTransport === transport) serverTransport = undefined;
+          });
+        }
+      };
+      const closeAttempts: Promise<boolean>[] = [];
+      if (!connected && transport) {
+        closeAttempts.push(attempt(() => transport.close(), () => {
+          if (clientTransport === transport) clientTransport = undefined;
+          if (serverTransport === transport) serverTransport = undefined;
+        }));
+      }
+      if (client) closeAttempts.push(attempt(() => client!.close(), () => { client = undefined; }, startFallback));
+      if (server) closeAttempts.push(attempt(() => server!.close(), () => { server = undefined; }, startFallback));
+
+      const closeResults = await Promise.all(closeAttempts);
+      if (connected && closeResults.some((succeeded) => !succeeded)) startFallback();
+      if (fallbackPromise) await fallbackPromise;
+    };
+    const removeRoot = waitForSetupIdle().then(closeOwnedResources).then(() => {
+      if (!root) return true;
+      const ownedRoot = root;
+      return attempt(
+        () => rm(ownedRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }),
+        () => { if (root === ownedRoot) root = undefined; }
+      );
+    });
+
+    const work = removeRoot.then(() => [...observedCleanupErrors]);
+    cleanupPromise = work.finally(() => { cleanupPromise = undefined; });
     return cleanupPromise;
   };
-  const cleanupOnAbort = (): void => { void cleanup(); };
-  signal?.addEventListener("abort", cleanupOnAbort, { once: true });
 
+  return {
+    track,
+    setRoot: (value: string) => { root = value; },
+    setClient: (value: Client) => { client = value; },
+    setServer: (value: ReturnType<typeof createMcpServer>) => { server = value; },
+    setTransports: (clientValue: InMemoryTransport, serverValue: InMemoryTransport) => {
+      clientTransport = clientValue;
+      serverTransport = serverValue;
+    },
+    markConnected: () => { connected = true; },
+    cleanup
+  };
+}
+
+async function connectFixtureServer(
+  signal?: AbortSignal,
+  owner: ReturnType<typeof createFixtureResourceOwner> = createFixtureResourceOwner(),
+  afterConnected?: (
+    fixture: { client: Client; head: string; root: string; close: () => Promise<void> },
+    transports: readonly InMemoryTransport[]
+  ) => Promise<void>
+) {
   try {
     throwIfAborted(signal);
+    const root = await createRepoRoot(signal, owner);
     const head = (await awaitWithAbort(
-      execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal }),
+      owner.track(() => execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal })),
       signal
     )).stdout.trim();
-    const registry = await awaitWithAbort(RootRegistry.fromConfig({
+    const registry = await awaitWithAbort(owner.track(() => RootRegistry.fromConfig({
       repos: [{
         repo_id: "fixture",
         display_name: "Fixture Repo",
@@ -2421,102 +3083,102 @@ async function connectFixtureServer(signal?: AbortSignal) {
         }
       }],
       limits: {}
-    }), signal);
+    })), signal);
     throwIfAborted(signal);
-    server = createMcpServer({ registry });
-    client = new Client({ name: "contract-test-client", version: "0.1.0" });
-    [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const server = createMcpServer({ registry });
+    const client = new Client({ name: "contract-test-client", version: "0.1.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    owner.setServer(server);
+    owner.setClient(client);
+    owner.setTransports(clientTransport, serverTransport);
 
-    await awaitWithAbort(Promise.all([
-      server.connect(serverTransport),
-      client.connect(clientTransport)
-    ]), signal);
+    const serverConnection = owner.track(() => server.connect(serverTransport));
+    const clientConnection = owner.track(() => client.connect(clientTransport));
+    await awaitWithAbort(Promise.all([serverConnection, clientConnection]), signal);
     throwIfAborted(signal);
-    connected = true;
+    owner.markConnected();
 
     let closed = false;
-    return {
+    const fixture = {
       client,
       head,
       root,
       close: async () => {
         if (closed) return;
-        const errors = await cleanup();
+        const errors = await owner.cleanup();
         if (errors.length > 0) throw new AggregateError(errors, "MCP contract fixture cleanup failed.");
         closed = true;
       }
     };
+    await afterConnected?.(fixture, [clientTransport, serverTransport]);
+    throwIfAborted(signal);
+    return fixture;
   } catch (error) {
-    const cleanupErrors = await cleanup();
+    const cleanupErrors = await owner.cleanup();
     if (cleanupErrors.length > 0) {
       throw new AggregateError([error, ...cleanupErrors], "MCP contract fixture setup failed and cleanup was incomplete.");
     }
     throw error;
-  } finally {
-    signal?.removeEventListener("abort", cleanupOnAbort);
   }
 }
 
-async function createRepoRoot(signal?: AbortSignal) {
+async function createRepoRoot(signal: AbortSignal | undefined, owner: ReturnType<typeof createFixtureResourceOwner>) {
   throwIfAborted(signal);
-  const root = await mkdtemp(join(tmpdir(), "gpt-repo-mcp-contract-"));
-  try {
-    throwIfAborted(signal);
-    await mkdir(join(root, "src"), { recursive: true });
-    throwIfAborted(signal);
-    await mkdir(join(root, "docs"), { recursive: true });
-    throwIfAborted(signal);
-    await mkdir(join(root, ".chatgpt", "tool-tests"), { recursive: true });
-    throwIfAborted(signal);
-    await writeFile(join(root, "README.md"), "# Fixture\n");
-    throwIfAborted(signal);
-    await writeFile(join(root, "docs", "ARCHITECTURE.md"), "# Architecture\nDecision: keep tools read-only.\nConvention: use contracts first.\n");
-    throwIfAborted(signal);
-    await writeFile(join(root, "TODO.md"), "- [ ] Wire repo_task_inventory\n");
-    throwIfAborted(signal);
-    await writeFile(join(root, "package.json"), JSON.stringify({
-      type: "module",
-      scripts: {
-        build: "tsc",
-        test: "vitest",
-        smoke: "node -e \"console.log('smoke ok')\""
-      },
-      dependencies: {
-        "@modelcontextprotocol/sdk": "^1.0.0"
-      }
-    }, null, 2));
-    throwIfAborted(signal);
-    await writeFile(join(root, "src", "app.ts"), "export const fixture = true;\n");
-    throwIfAborted(signal);
-    await execFileAsync("git", ["init"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
-    throwIfAborted(signal);
-    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
-    throwIfAborted(signal);
-    await execFileAsync("git", ["config", "user.name", "Test User"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
-    throwIfAborted(signal);
-    await execFileAsync("git", ["add", "--", "README.md", "docs/ARCHITECTURE.md", "TODO.md", "package.json", "src/app.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
-    throwIfAborted(signal);
-    await execFileAsync("git", ["commit", "-m", "initial"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
-    throwIfAborted(signal);
-    await writeFile(join(root, "src-placeholder.txt"), "changed\n");
-    throwIfAborted(signal);
-    await writeFile(join(root, "docs", "staged.md"), "staged\n");
-    throwIfAborted(signal);
-    await writeFile(join(root, "docs", "write-dry-run.md"), "planned\n");
-    throwIfAborted(signal);
-    await writeFile(join(root, ".chatgpt", "tool-tests", "cleanup.txt"), "temporary\n");
-    throwIfAborted(signal);
-    await execFileAsync("git", ["add", "--", "docs/staged.md"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal });
-    throwIfAborted(signal);
-    return root;
-  } catch (error) {
-    try {
-      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
-    } catch (cleanupError) {
-      throw new AggregateError([error, cleanupError], "MCP contract fixture creation failed and its temporary repository could not be removed.");
+  const root = await owner.track(async () => {
+    const createdRoot = await mkdtemp(join(tmpdir(), "gpt-repo-mcp-contract-"));
+    owner.setRoot(createdRoot);
+    return createdRoot;
+  });
+  const run = <T>(operation: () => Promise<T>) => owner.track(operation);
+
+  throwIfAborted(signal);
+  await run(() => mkdir(join(root, "src"), { recursive: true }));
+  throwIfAborted(signal);
+  await run(() => mkdir(join(root, "docs"), { recursive: true }));
+  throwIfAborted(signal);
+  await run(() => mkdir(join(root, ".chatgpt", "tool-tests"), { recursive: true }));
+  throwIfAborted(signal);
+  await run(() => writeFile(join(root, "README.md"), "# Fixture\n"));
+  throwIfAborted(signal);
+  await run(() => writeFile(join(root, "docs", "ARCHITECTURE.md"), "# Architecture\nDecision: keep tools read-only.\nConvention: use contracts first.\n"));
+  throwIfAborted(signal);
+  await run(() => writeFile(join(root, "TODO.md"), "- [ ] Wire repo_task_inventory\n"));
+  throwIfAborted(signal);
+  await run(() => writeFile(join(root, "package.json"), JSON.stringify({
+    type: "module",
+    scripts: {
+      build: "tsc",
+      test: "vitest",
+      smoke: "node -e \"console.log('smoke ok')\""
+    },
+    dependencies: {
+      "@modelcontextprotocol/sdk": "^1.0.0"
     }
-    throw error;
-  }
+  }, null, 2)));
+  throwIfAborted(signal);
+  await run(() => writeFile(join(root, "src", "app.ts"), "export const fixture = true;\n"));
+  throwIfAborted(signal);
+  await awaitWithAbort(run(() => execFileAsync("git", ["init"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal })), signal);
+  throwIfAborted(signal);
+  await awaitWithAbort(run(() => execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal })), signal);
+  throwIfAborted(signal);
+  await awaitWithAbort(run(() => execFileAsync("git", ["config", "user.name", "Test User"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal })), signal);
+  throwIfAborted(signal);
+  await awaitWithAbort(run(() => execFileAsync("git", ["add", "--", "README.md", "docs/ARCHITECTURE.md", "TODO.md", "package.json", "src/app.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal })), signal);
+  throwIfAborted(signal);
+  await awaitWithAbort(run(() => execFileAsync("git", ["commit", "-m", "initial"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal })), signal);
+  throwIfAborted(signal);
+  await run(() => writeFile(join(root, "src-placeholder.txt"), "changed\n"));
+  throwIfAborted(signal);
+  await run(() => writeFile(join(root, "docs", "staged.md"), "staged\n"));
+  throwIfAborted(signal);
+  await run(() => writeFile(join(root, "docs", "write-dry-run.md"), "planned\n"));
+  throwIfAborted(signal);
+  await run(() => writeFile(join(root, ".chatgpt", "tool-tests", "cleanup.txt"), "temporary\n"));
+  throwIfAborted(signal);
+  await awaitWithAbort(run(() => execFileAsync("git", ["add", "--", "docs/staged.md"], { cwd: root, env: { PATH: process.env.PATH ?? "" }, signal })), signal);
+  throwIfAborted(signal);
+  return root;
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
