@@ -20,6 +20,14 @@ export function spawnSupervisedProcess(command, args, options = {}) {
     stdio: ["ignore", "pipe", "pipe", "ipc"],
     windowsHide: true
   });
+  return registerSupervisedProcess(child, command, args, options);
+}
+
+/** Registers a supervisor child with the shared parent-side IPC state machine. */
+export function registerSupervisedProcess(child, command, args, options = {}) {
+  if (!child || typeof child.send !== "function") {
+    throw new TypeError("A supervisor child with an IPC channel is required.");
+  }
   const state = {
     status: "active",
     targetPid: undefined,
@@ -179,7 +187,13 @@ function waitForChildSpawn(child, options) {
   });
 }
 
-async function runSupervisor() {
+/** Runs isolated supervisor logic with a statically supplied scanner for tests. */
+export function runSupervisorWithScanner(scanner) {
+  if (typeof scanner !== "function") throw new TypeError("A process-group scanner function is required.");
+  return runSupervisor(scanner);
+}
+
+async function runSupervisor(scanner = spawnSync) {
   let target;
   let targetExit;
   let targetClosed = false;
@@ -232,7 +246,7 @@ async function runSupervisor() {
 
   function stopDirectTargetIfExclusive() {
     try {
-      const members = scanOwnedProcessGroup();
+      const members = scanOwnedProcessGroup(scanner);
       if (members.length === 0) return true;
       if (target && Number.isInteger(target.pid) && members.length === 1 && members[0].pid === target.pid) {
         target.kill("SIGKILL");
@@ -290,7 +304,7 @@ async function runSupervisor() {
     while (performance.now() < deadline) {
       let members;
       try {
-        members = scanOwnedProcessGroup();
+        members = scanOwnedProcessGroup(scanner);
       } catch {
         members = undefined;
       }
@@ -366,8 +380,8 @@ async function runSupervisor() {
   }
 }
 
-function scanOwnedProcessGroup() {
-  const result = spawnSync("ps", ["-A", "-o", "pid=", "-o", "pgid="], {
+function scanOwnedProcessGroup(scanner) {
+  const result = scanner("ps", ["-A", "-o", "pid=", "-o", "pgid="], {
     encoding: "utf8",
     timeout: GROUP_SCAN_TIMEOUT_MS,
     windowsHide: true,
