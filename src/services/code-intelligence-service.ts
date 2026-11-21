@@ -3,8 +3,7 @@ import type { CodeIndexAction, CodeIndexResult } from "../contracts/code-index.c
 import type { CodeIntelligenceProvider, SymbolContextInput } from "../contracts/symbol-context.contract.js";
 import type { RepoConfig } from "./root-registry.js";
 import { findCodebaseMemoryProject, type CodebaseMemoryClient, type CodebaseMemoryClientFactory } from "./codebase-memory-client.js";
-import { CodebaseMemoryIndexService, type RegisteredRepoResolver } from "./codebase-memory-index-service.js";
-import type { TaskExecutionProviderGuard } from "./task-execution-boundary.js";
+import { CodebaseMemoryIndexService } from "./codebase-memory-index-service.js";
 
 const MAX_GRAPH_DEFINITIONS = 50;
 const MAX_TRACED_SYMBOLS = 8;
@@ -21,8 +20,7 @@ export class CodeIntelligenceService {
 
   async enrich(
     repo: RepoConfig,
-    input: SymbolContextInput,
-    taskExecution?: TaskExecutionProviderGuard
+    input: SymbolContextInput
   ): Promise<CodeIntelligenceProvider> {
     if (this.indexService.isRunning(repo.root)) {
       return fallback("indexing", true, "Codebase Memory indexing is in progress.");
@@ -30,7 +28,6 @@ export class CodeIntelligenceService {
 
     let client: CodebaseMemoryClient | undefined;
     const deadline = Date.now() + this.queryTimeoutMs;
-    await taskExecution?.revalidateBeforeProvider();
     try {
       client = await this.clientFactory(repo.root);
       const project = await findCodebaseMemoryProject(client, repo.root, remainingTimeout(deadline));
@@ -58,8 +55,8 @@ export class CodeIntelligenceService {
     }
   }
 
-  async index(repo: RepoConfig, action: CodeIndexAction, resolveRegisteredRepo?: RegisteredRepoResolver): Promise<CodeIndexResult> {
-    return this.indexService.index(repo, action, resolveRegisteredRepo);
+  async index(repo: RepoConfig, action: CodeIndexAction): Promise<CodeIndexResult> {
+    return this.indexService.index(repo, action);
   }
 
   private async searchDefinitions(

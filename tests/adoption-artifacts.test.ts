@@ -1,45 +1,20 @@
 import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import {
-  ADOPTION_CONTROL_ROOT,
-  MAX_ADOPTION_ID_LENGTH,
-  adoptionArtifactPath,
-  assertAdoptionId,
-  isAdoptionControlArtifact
-} from "../src/policies/adoption-artifacts.js";
+import { isAdoptionControlArtifact } from "../src/policies/adoption-artifacts.js";
 import { IgnoreEngine } from "../src/services/ignore-engine.js";
 import { PathSandbox } from "../src/services/path-sandbox.js";
 import { createTempDir } from "./fixtures/temp-dir.js";
 
 describe("adoption control artifacts", () => {
   test("recognizes the normalized adoption namespace and rejects lookalike siblings", () => {
-    expect(isAdoptionControlArtifact(ADOPTION_CONTROL_ROOT)).toBe(true);
+    expect(isAdoptionControlArtifact(".chatgpt/adoptions")).toBe(true);
     expect(isAdoptionControlArtifact("./.CHATGPT/Adoptions/adoption-1/candidate.json")).toBe(true);
     expect(isAdoptionControlArtifact(".chatgpt\\adoptions\\adoption-1\\candidate.json")).toBe(true);
     expect(isAdoptionControlArtifact("/.chatgpt/adoptions/adoption-1/candidate.json")).toBe(true);
     expect(isAdoptionControlArtifact(".chatgpt/adoptions-other/candidate.json")).toBe(false);
     expect(isAdoptionControlArtifact(".chatgpt/control/adoptions/candidate.json")).toBe(false);
     expect(isAdoptionControlArtifact("docs/adoptions/candidate.json")).toBe(false);
-  });
-
-  test("validates identifiers and artifact names before constructing paths", () => {
-    expect(adoptionArtifactPath("adoption-1", "candidate.json"))
-      .toBe(".chatgpt/adoptions/adoption-1/candidate.json");
-
-    for (const invalidId of ["", "-adoption", "adoption_1", "Adoption-1", "adoption/1",
-      "a".repeat(MAX_ADOPTION_ID_LENGTH + 1)]) {
-      expect(() => assertAdoptionId(invalidId)).toThrow("ADOPTION_ID_INVALID");
-    }
-
-    for (const invalidName of ["", "../candidate.json", "Candidate.json", "candidate/child.json",
-      "candidate name.json", "candidate..json", "a".repeat(81)]) {
-      expect(() => adoptionArtifactPath("adoption-1", invalidName))
-        .toThrow("ADOPTION_ARTIFACT_NAME_INVALID");
-    }
-
-    expect(() => adoptionArtifactPath("adoption/1", "candidate.json"))
-      .toThrow("ADOPTION_ID_INVALID");
   });
 
   test("classifies adoption artifacts as internal and permits neighboring paths", () => {

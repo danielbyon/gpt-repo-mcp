@@ -4,7 +4,7 @@ import { describe, expect, test } from "vitest";
 describe("ESLint private research boundary", () => {
   test("ignores private .scratch research globally", async () => {
     const eslint = new ESLint({ cwd: process.cwd(), warnIgnored: false });
-    expect(await eslint.isPathIgnored(".scratch/linked-worktree-support/baseline/OWNER_CAPTURE.mjs")).toBe(true);
+    expect(await eslint.isPathIgnored(".scratch/research/notes.mjs")).toBe(true);
     const results = await eslint.lintText("const unused = 1;\n", {
       filePath: ".scratch/lint-boundary-fixture.mjs"
     });
@@ -25,9 +25,9 @@ describe("ESLint private research boundary", () => {
   test("keeps project source, scripts, tests, and JavaScript modules under lint", async () => {
     const eslint = new ESLint({ cwd: process.cwd() });
     for (const path of [
-      "src/adoption/adoption-service.ts",
+      "src/services/root-registry.ts",
       "scripts/check-public.mjs",
-      "tests/adoption-slice-a.test.ts",
+      "tests/path-sandbox.test.ts",
       "eslint.config.js"
     ]) {
       expect(await eslint.isPathIgnored(path), path).toBe(false);

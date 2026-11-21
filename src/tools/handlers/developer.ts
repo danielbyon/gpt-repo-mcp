@@ -117,12 +117,11 @@ export const contextMapHandler: ToolHandler = async (input, context) => safeTool
   return createSuccessEnvelope(result, `Returned context map with ${result.import_edges.length} import edges.`);
 });
 
-export const symbolContextHandler: ToolHandler = async (input, context, taskExecution) => safeTool<SymbolContextInput>("repo_symbol_context", input, async (args) => {
-  await taskExecution?.revalidateBeforeProvider();
+export const symbolContextHandler: ToolHandler = async (input, context) => safeTool<SymbolContextInput>("repo_symbol_context", input, async (args) => {
   const repo = context.registry.get(args.repo_id);
   const native = await new SymbolContextService(repo.root, new PathSandbox(repo.root)).analyze(args);
   const provider = context.codeIntelligence
-    ? await context.codeIntelligence.enrich(repo, args, taskExecution)
+    ? await context.codeIntelligence.enrich(repo, args)
     : { name: "native" as const, status: "native_only" as const, index_available: false, warnings: [] };
   const result = { ...native, provider, warnings: [...new Set([...native.warnings, ...provider.warnings])].sort() };
   audit({ tool: "repo_symbol_context", repo_id: args.repo_id, paths: args.paths, counts: { definitions: result.definitions.length, relations: result.references.length + result.calls.length }, truncated: result.truncated, warnings: result.warnings });
@@ -195,7 +194,7 @@ export const changePlanHandler: ToolHandler = async (input, context) => safeTool
   return createSuccessEnvelope(result, `Returned change plan with ${result.proposed_steps.length} steps.`);
 });
 
-export const validateHandler: ToolHandler = async (input, context, _taskExecution, signal) => safeTool<ValidateInput>("repo_validate", input, async (args) => {
+export const validateHandler: ToolHandler = async (input, context, signal) => safeTool<ValidateInput>("repo_validate", input, async (args) => {
   const repo = context.registry.get(args.repo_id);
   const result = await new ValidationService(repo.root, new OperationsPolicy(repo.operations)).validate(args, { signal });
   audit({ tool: "repo_validate", repo_id: args.repo_id, counts: result.counts, warnings: result.warnings });

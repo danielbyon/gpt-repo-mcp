@@ -6,7 +6,7 @@ import { safeTool, type ToolHandler } from "../handler-support.js";
 export const codeIndexHandler: ToolHandler = async (input, context) => safeTool<CodeIndexInput>("repo_code_index", input, async (args) => {
   const repo = context.registry.get(args.repo_id);
   const result = context.codeIntelligence
-    ? await context.codeIntelligence.index(repo, args.action, () => context.registry.get(args.repo_id))
+    ? await context.codeIntelligence.index(repo, args.action)
     : {
         ok: true as const,
         repo_id: args.repo_id,
