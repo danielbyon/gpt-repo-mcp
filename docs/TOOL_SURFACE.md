@@ -238,9 +238,8 @@ exclude untracked generated Delegation control artifacts such as
 `RESULT.json`; tracked files at those paths remain covered.
 
 The source comparison uses bounded snapshots before and after execution. It
-does not reliably detect a change that is reverted between snapshots. Slice A
-does not bind selected worktrees or isolated instances; that work remains with
-Issue #25.
+does not reliably detect a change that is reverted between snapshots. Validation
+runs against the configured root for the requested repository ID.
 
 ### `repo_failure_diagnose`
 

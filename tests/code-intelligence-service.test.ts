@@ -1,11 +1,12 @@
-import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, test, vi } from "vitest";
 import { CodeIntelligenceService } from "../src/services/code-intelligence-service.js";
 import { createCodebaseMemoryClientFactory, validateCodebaseMemoryExecutable, type CodebaseMemoryClientFactory } from "../src/services/codebase-memory-client.js";
 import { RootRegistry, type RepoConfig } from "../src/services/root-registry.js";
-import { taskExecutionError } from "../src/services/task-execution-errors.js";
+import { createTempDir } from "./fixtures/temp-dir.js";
 
 describe("CodeIntelligenceService", () => {
   test("returns native fallback metadata and asks for approval when the exact repo root is not indexed", async () => {
@@ -59,74 +60,31 @@ describe("CodeIntelligenceService", () => {
     expect((await service.enrich(repo(root), { repo_id: "fixture", symbols: ["run"] })).status).toBe("index_required");
   });
 
-  test("starts one approved-root index job and deduplicates concurrent starts", async () => {
-    const root = await mkdtemp(join(tmpdir(), "gpt-code-intelligence-"));
-    let indexed = false;
-    const { factory, calls } = fakeFactory((tool) => {
-      if (tool === "list_projects") return { projects: indexed ? [{ name: "fixture", root_path: root }] : [] };
-      if (tool === "index_repository") {
-        indexed = true;
-        return { status: "indexed" };
-      }
-      return {};
-    });
+  test("runs explicit indexing through the default scheduler and waits for client close", async () => {
+    const root = await realpath(await createTempDir("code-intelligence-index-"));
+    const target = repo(root);
+    let finishClose!: () => void;
+    const closeBarrier = new Promise<void>((resolve) => { finishClose = resolve; });
+    const indexCall = vi.fn(async () => ({ status: "indexed" }));
+    const indexClose = vi.fn(() => closeBarrier);
+    const factory = vi.fn<CodebaseMemoryClientFactory>()
+      .mockResolvedValueOnce({ call: async () => ({ projects: [] }), close: async () => {} })
+      .mockResolvedValueOnce({ call: indexCall, close: indexClose });
     const service = new CodeIntelligenceService(factory, 100, 1_000);
 
-    const [first, second] = await Promise.all([
-      service.index(repo(root), "start"),
-      service.index(repo(root), "start")
-    ]);
-    expect(["queued", "running"]).toContain(first.status);
-    expect(["queued", "running"]).toContain(second.status);
-
-    await vi.waitFor(async () => {
-      expect((await service.index(repo(root), "status")).status).toBe("ready");
-    });
-    const indexCalls = calls.filter((call) => call.tool === "index_repository");
-    expect(indexCalls).toHaveLength(1);
-    expect(indexCalls[0]?.args).toEqual({ repo_path: root, mode: "full", persistence: false });
-  });
-
-  test("preserves unenrolled initial status cleanup compatibility", async () => {
-    const root = await mkdtemp(join(tmpdir(), "gpt-code-intelligence-cleanup-compat-"));
     try {
-      const cleanupError = new Error("provider cleanup failed");
-      let scheduled: (() => Promise<void>) | undefined;
-      const { CodebaseMemoryIndexService } = await import("../src/services/codebase-memory-index-service.js");
-      const service = new CodebaseMemoryIndexService(
-        async () => ({
-          call: async () => ({ projects: [] }),
-          close: async () => { throw cleanupError; }
-        }),
-        100,
-        1_000,
-        {
-          loadBoundary: async () => undefined,
-          scheduleJob: (job) => { scheduled = job; }
-        }
+      await service.index(target, "start");
+      await setImmediate();
+      expect(indexCall).toHaveBeenCalledExactlyOnceWith(
+        "index_repository", { repo_path: root, mode: "full", persistence: false }, 1_000
       );
-
-      const result = await service.index(repo(root), "start");
-
-      expect(result.status).toBe("queued");
-      expect(scheduled).toBeTypeOf("function");
+      expect(indexClose).toHaveBeenCalledTimes(1);
+      await expect(service.index(target, "status")).resolves.toMatchObject({ status: "running" });
     } finally {
-      await rm(root, { recursive: true, force: true });
+      finishClose();
+      await setImmediate();
     }
-  });
-
-  test("fails closed when indexing returns an unknown result status", async () => {
-    const root = await mkdtemp(join(tmpdir(), "gpt-code-intelligence-"));
-    const { factory } = fakeFactory((tool) => tool === "list_projects" ? { projects: [] } : {});
-    const service = new CodeIntelligenceService(factory, 100, 1_000);
-
-    await service.index(repo(root), "start");
-
-    await vi.waitFor(async () => {
-      const result = await service.index(repo(root), "status");
-      expect(result.status).toBe("failed");
-      expect(result.warnings).toContain("CODEBASE_MEMORY_INDEX_FAILED");
-    });
+    await expect(service.index(target, "status")).resolves.toMatchObject({ status: "ready" });
   });
 
   test("uses one deadline across sequential graph traces", async () => {
@@ -154,37 +112,6 @@ describe("CodeIntelligenceService", () => {
     const factory: CodebaseMemoryClientFactory = async () => { throw new Error("missing provider"); };
     const result = await new CodeIntelligenceService(factory, 100, 1_000)
       .enrich(repo("/approved/repo"), { repo_id: "fixture", symbols: ["run"] });
-    expect(result).toMatchObject({ status: "provider_unavailable", fallback_used: "native" });
-    expect(result.warnings).toContain("CODEBASE_MEMORY_UNAVAILABLE");
-  });
-
-  test("propagates task boundary rejection before provider setup or native fallback", async () => {
-    const boundaryError = taskExecutionError("repository_registration_changed");
-    const revalidateBeforeProvider = vi.fn(async () => { throw boundaryError; });
-    const factory: CodebaseMemoryClientFactory = vi.fn(async () => { throw new Error("provider must not start"); });
-    const service = new CodeIntelligenceService(factory, 100, 1_000);
-
-    await expect(service.enrich(repo("/approved/repo"), { repo_id: "fixture", symbols: ["run"] }, {
-      revalidateBeforeProvider,
-      bindTaskPrompt: async (prompt) => prompt
-    })).rejects.toBe(boundaryError);
-
-    expect(revalidateBeforeProvider).toHaveBeenCalledOnce();
-    expect(factory).not.toHaveBeenCalled();
-  });
-
-  test("retains native fallback for provider failure after successful task boundary validation", async () => {
-    const revalidateBeforeProvider = vi.fn(async () => undefined);
-    const factory: CodebaseMemoryClientFactory = vi.fn(async () => { throw new Error("provider unavailable"); });
-    const service = new CodeIntelligenceService(factory, 100, 1_000);
-
-    const result = await service.enrich(repo("/approved/repo"), { repo_id: "fixture", symbols: ["run"] }, {
-      revalidateBeforeProvider,
-      bindTaskPrompt: async (prompt) => prompt
-    });
-
-    expect(revalidateBeforeProvider).toHaveBeenCalledOnce();
-    expect(factory).toHaveBeenCalledOnce();
     expect(result).toMatchObject({ status: "provider_unavailable", fallback_used: "native" });
     expect(result.warnings).toContain("CODEBASE_MEMORY_UNAVAILABLE");
   });

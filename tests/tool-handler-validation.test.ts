@@ -7,20 +7,10 @@ import { withRequestTelemetry } from "../src/runtime/telemetry.js";
 import type { RuntimeContext } from "../src/runtime/context.js";
 import { toolCatalog } from "../src/tools/catalog.js";
 import { registerCatalogTool } from "../src/tools/define-tool.js";
-import { TASK_EXECUTION_POLICIES, TASK_EXECUTION_TOOL_NAMES } from "../src/tools/task-execution-policy.js";
 import type { ToolDefinition } from "../src/tools/tool-definition.js";
 import { gitStatusHandler } from "../src/tools/handlers.js";
 
 describe("tool handler validation boundary", () => {
-  test("keeps every enrolled tool on the central execution policy map", () => {
-    const mappedNames = Object.keys(TASK_EXECUTION_POLICIES).sort();
-    const enrolledNames = toolCatalog.filter((tool) => tool.taskExecution).map((tool) => tool.name).sort();
-    expect(mappedNames).toEqual([...TASK_EXECUTION_TOOL_NAMES].sort());
-    expect(enrolledNames).toEqual(mappedNames);
-    expect(toolCatalog.find((tool) => tool.name === "repo_review_patchset")?.taskExecution?.({ repo_id: "fixture-repo" }))
-      .toEqual({ repo_id: "fixture-repo", operation: "patchset_review" });
-  });
-
   test("validates input against the tool contract before using runtime services", async () => {
     let registryUsed = false;
     const context = {
@@ -44,45 +34,62 @@ describe("tool handler validation boundary", () => {
     expect(structured.error.code).toBe("VALIDATION_ERROR");
   });
 
-  test("validates task metadata input before selecting an enrolled operation", async () => {
-    const sourceTool = toolCatalog.find((tool) => tool.name === "repo_validate")!;
-    const taskExecution = vi.fn(sourceTool.taskExecution);
-    const handler = vi.fn(sourceTool.handler);
-    const tool: ToolDefinition = { ...sourceTool, taskExecution, handler };
-    let invoke: ((args: unknown) => Promise<CallToolResult>) | undefined;
+  test("dispatches patchset review with ordinary tool arguments", async () => {
+    const tool = toolCatalog.find(({ name }) => name === "repo_review_patchset")!;
+    const handler = vi.fn<ToolDefinition["handler"]>().mockResolvedValue({
+      content: [{ type: "text", text: "reviewed" }]
+    });
+    let invoke!: (args: unknown) => Promise<CallToolResult>;
     const server = {
-      registerTool: (_name: string, _config: unknown, callback: (args: unknown) => Promise<CallToolResult>) => {
-        invoke = callback;
-      }
+      registerTool: (_name: string, _config: unknown, callback: typeof invoke) => { invoke = callback; }
     } as unknown as McpServer;
-    const context = {
-      registry: { get: vi.fn(), list: vi.fn() }
-    } as unknown as RuntimeContext;
+    const context = { registry: { get: vi.fn() } } as unknown as RuntimeContext;
 
-    registerCatalogTool(server, context, tool);
-    const result = await invoke!({ repo_id: 42 });
-
-    expect(result.isError).toBe(true);
-    expect(result.structuredContent).toMatchObject({ error: { code: "VALIDATION_ERROR" } });
-    expect(taskExecution).not.toHaveBeenCalled();
-    expect(handler).not.toHaveBeenCalled();
+    registerCatalogTool(server, context, { ...tool, handler });
+    const args = { repo_id: "fixture-repo", patchset_id: "patchset-fixture" };
+    await expect(invoke(args)).resolves.toMatchObject({ content: [{ type: "text", text: "reviewed" }] });
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler.mock.calls[0]?.slice(0, 2)).toEqual([args, context]);
     expect(context.registry.get).not.toHaveBeenCalled();
   });
 
+  test.each([false, true])("disposes both signal listeners when a handler settles (throws: %s)", async (throws) => {
+    const tool = toolCatalog.find(({ name }) => name === "repo_list_roots")!;
+    const protocol = new AbortController();
+    const http = new AbortController();
+    const removeProtocol = vi.spyOn(protocol.signal, "removeEventListener");
+    const removeHttp = vi.spyOn(http.signal, "removeEventListener");
+    let invoke!: (args: unknown, extra: { signal: AbortSignal }) => Promise<CallToolResult>;
+    const server = {
+      registerTool: (_name: string, _config: unknown, callback: typeof invoke) => { invoke = callback; }
+    } as unknown as McpServer;
+    const handler: ToolDefinition["handler"] = async () => {
+      if (throws) throw new Error("handler failed");
+      return { content: [{ type: "text", text: "complete" }] };
+    };
+
+    registerCatalogTool(server, {} as RuntimeContext, { ...tool, handler });
+    const result = await withRequestTelemetry({ request_id: "disposal-test", abort_signal: http.signal },
+      () => invoke({}, { signal: protocol.signal }));
+    expect(Boolean(result.isError)).toBe(throws);
+    expect(removeProtocol).toHaveBeenCalledExactlyOnceWith("abort", expect.any(Function));
+    expect(removeHttp).toHaveBeenCalledExactlyOnceWith("abort", expect.any(Function));
+  });
 
   test("forwards protocol cancellation to the catalog tool handler", async () => {
     const sourceTool = toolCatalog.find((tool) => tool.name === "repo_list_roots")!;
     const server = new McpServer({ name: "cancellation-test", version: "0.1.0" });
     let receivedSignal: AbortSignal | undefined;
-    let markStarted!: () => void;
-    const started = new Promise<void>((resolve) => { markStarted = resolve; });
-    const handler: ToolDefinition["handler"] = async (_input, _context, _taskExecution, signal) => {
+    const started = deferred<void>();
+    const finished = deferred<void>();
+    const handler: ToolDefinition["handler"] = async (_input, _context, signal) => {
       receivedSignal = signal;
-      markStarted();
+      started.resolve();
       await new Promise<void>((resolve) => {
         if (signal?.aborted) resolve();
         else signal?.addEventListener("abort", () => resolve(), { once: true });
       });
+      finished.resolve();
       return { content: [{ type: "text", text: "cancelled" }] };
     };
     const tool: ToolDefinition = { ...sourceTool, handler };
@@ -94,9 +101,10 @@ describe("tool handler validation boundary", () => {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
       const request = client.callTool({ name: tool.name, arguments: {} }, undefined, { signal: controller.signal });
-      await started;
+      await started.promise;
       controller.abort();
       await expect(request).rejects.toThrow();
+      await finished.promise;
 
       expect(receivedSignal).toBeDefined();
       expect(receivedSignal?.aborted).toBe(true);
@@ -110,15 +118,16 @@ describe("tool handler validation boundary", () => {
     const sourceTool = toolCatalog.find((tool) => tool.name === "repo_list_roots")!;
     const server = new McpServer({ name: "server-cancellation-test", version: "0.1.0" });
     let receivedSignal: AbortSignal | undefined;
-    let markStarted!: () => void;
-    const started = new Promise<void>((resolve) => { markStarted = resolve; });
-    const handler: ToolDefinition["handler"] = async (_input, _context, _taskExecution, signal) => {
+    const started = deferred<void>();
+    const finished = deferred<void>();
+    const handler: ToolDefinition["handler"] = async (_input, _context, signal) => {
       receivedSignal = signal;
-      markStarted();
+      started.resolve();
       await new Promise<void>((resolve) => {
         if (signal?.aborted) resolve();
         else signal?.addEventListener("abort", () => resolve(), { once: true });
       });
+      finished.resolve();
       return { content: [{ type: "text", text: "closed" }] };
     };
     const tool: ToolDefinition = { ...sourceTool, handler };
@@ -129,9 +138,10 @@ describe("tool handler validation boundary", () => {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
       const request = client.callTool({ name: tool.name, arguments: {} });
-      await started;
+      await started.promise;
       await server.close();
       await expect(request).rejects.toThrow();
+      await finished.promise;
 
       expect(receivedSignal?.aborted).toBe(true);
     } finally {
@@ -143,15 +153,16 @@ describe("tool handler validation boundary", () => {
     const sourceTool = toolCatalog.find((tool) => tool.name === "repo_list_roots")!;
     const server = new McpServer({ name: "combined-signal-test", version: "0.1.0" });
     let receivedSignal: AbortSignal | undefined;
-    let markStarted!: () => void;
-    const started = new Promise<void>((resolve) => { markStarted = resolve; });
-    const handler: ToolDefinition["handler"] = async (_input, _context, _taskExecution, signal) => {
+    const started = deferred<void>();
+    const finished = deferred<void>();
+    const handler: ToolDefinition["handler"] = async (_input, _context, signal) => {
       receivedSignal = signal;
-      markStarted();
+      started.resolve();
       await new Promise<void>((resolve) => {
         if (signal?.aborted) resolve();
         else signal?.addEventListener("abort", () => resolve(), { once: true });
       });
+      finished.resolve();
       return { content: [{ type: "text", text: "ok" }] };
     };
     const tool: ToolDefinition = { ...sourceTool, handler };
@@ -166,13 +177,14 @@ describe("tool handler validation boundary", () => {
       const request = withRequestTelemetry({ request_id: "disconnect-test", abort_signal: httpController.signal }, () =>
         client.callTool({ name: tool.name, arguments: {} }, undefined, { signal: protocolController.signal })
       );
-      await started;
+      await started.promise;
       httpController.abort();
 
       expect(receivedSignal?.aborted).toBe(true);
       expect(protocolController.signal.aborted).toBe(false);
       protocolController.abort();
       await expect(request).rejects.toThrow();
+      await finished.promise;
     } finally {
       await client.close();
       await server.close();
@@ -189,7 +201,7 @@ describe("tool handler validation boundary", () => {
     const protocolController = new AbortController();
     const started = deferred<void>();
     let receivedSignal: AbortSignal | undefined;
-    const handler: ToolDefinition["handler"] = async (_input, _context, _taskExecution, signal) => {
+    const handler: ToolDefinition["handler"] = async (_input, _context, signal) => {
       receivedSignal = signal;
       started.resolve();
       await new Promise<void>((resolve) => {
@@ -239,7 +251,7 @@ describe("tool handler validation boundary", () => {
     const starts = new Map(calls.map((call) => [call, deferred<void>()]));
     const signals = new Map<string, AbortSignal>();
     const releases = new Map<string, () => void>();
-    const handler: ToolDefinition["handler"] = async (input, _context, _taskExecution, signal) => {
+    const handler: ToolDefinition["handler"] = async (input, _context, signal) => {
       const call = (input as { repo_id: string }).repo_id;
       signals.set(call, signal!);
       starts.get(call as typeof calls[number])?.resolve();
@@ -257,7 +269,7 @@ describe("tool handler validation boundary", () => {
       });
       return { content: [{ type: "text", text: call }] };
     };
-    const tool: ToolDefinition = { ...sourceTool, taskExecution: undefined, handler };
+    const tool: ToolDefinition = { ...sourceTool, handler };
     const firstHttp = new AbortController();
     const secondHttp = new AbortController();
     const firstProtocol = new AbortController();
