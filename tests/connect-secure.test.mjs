@@ -1358,8 +1358,8 @@ describe("secure connector startup order", () => {
     await writeFile(fixture.paths.mcpReadyFile, "ready", "utf8");
     const launcher = startLauncher(fixture, { TUNNEL_TEST_EXIT_EARLY: "0" });
     try {
-      await waitForFile(fixture.paths.tunnelStartedMarker, launcher, isCompleteJsonObject, { requireLauncherAlive: true });
       const [code] = await waitForLauncherExit(launcher);
+      await waitForFile(fixture.paths.tunnelStartedMarker, launcher, isCompleteJsonObject);
       expect(code, launcher.output()).not.toBe(0);
       expect(existsSync(fixture.paths.tunnelReadyMarker)).toBe(false);
       expect(launcher.output()).toContain("[tunnel] exited (code=0, signal=null)");
