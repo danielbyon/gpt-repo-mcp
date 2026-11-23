@@ -31,7 +31,7 @@ function combineAbortSignals(first?: AbortSignal, second?: AbortSignal): { signa
   return { signal: controller.signal, dispose };
 }
 
-export function registerCatalogTool(server: McpServer, context: RuntimeContext, tool: ToolDefinition): void {
+export function registerCatalogTool(server: McpServer, context: RuntimeContext | (() => RuntimeContext), tool: ToolDefinition): void {
   server.registerTool(
     tool.name,
     {
@@ -45,7 +45,8 @@ export function registerCatalogTool(server: McpServer, context: RuntimeContext, 
       const requestSignal = getRequestTelemetry()?.abort_signal;
       const composed = combineAbortSignals(extra?.signal, requestSignal);
       try {
-        return await tool.handler(args, context, composed.signal);
+        const requestContext = typeof context === "function" ? context() : context;
+        return await tool.handler(args, requestContext, composed.signal);
       } catch (error) {
         return createErrorEnvelope(toRepoReaderError(error));
       } finally {

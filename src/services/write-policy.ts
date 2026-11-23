@@ -5,8 +5,8 @@ import { IgnoreEngine } from "./ignore-engine.js";
 
 export type WritePolicyConfig = {
   enabled?: boolean;
-  allowed_globs?: string[];
-  denied_globs?: string[];
+  allowed_globs?: readonly string[];
+  denied_globs?: readonly string[];
   max_bytes_per_write?: number;
 };
 
@@ -26,8 +26,8 @@ export class WritePolicy {
   constructor(config: WritePolicyConfig = {}) {
     this.config = {
       enabled: config.enabled ?? DEFAULT_WRITE_POLICY.enabled,
-      allowed_globs: config.allowed_globs ?? [...DEFAULT_WRITE_POLICY.allowed_globs],
-      denied_globs: config.denied_globs ?? [...DEFAULT_WRITE_POLICY.denied_globs],
+      allowed_globs: [...(config.allowed_globs ?? DEFAULT_WRITE_POLICY.allowed_globs)],
+      denied_globs: [...(config.denied_globs ?? DEFAULT_WRITE_POLICY.denied_globs)],
       max_bytes_per_write: config.max_bytes_per_write ?? DEFAULT_WRITE_POLICY.max_bytes_per_write
     };
     this.allowedMatcher.add(this.config.allowed_globs);

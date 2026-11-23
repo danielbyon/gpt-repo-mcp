@@ -118,7 +118,7 @@ jobs:
         run: npm test -- tests/windows-process-host.test.ts tests/windows-process-host-protocol.test.ts tests/process-exec.test.ts --reporter=verbose
 
       - name: HTTP, MCP, and server boundary behavior
-        run: npm test -- tests/http-request-cancellation.test.ts tests/tool-handler-validation.test.ts tests/server-network-boundary.test.ts --reporter=verbose
+        run: npm test -- tests/http-request-cancellation.test.ts tests/tool-handler-validation.test.ts tests/server-network-boundary.test.ts tests/admitted-runtime-context.test.ts tests/mcp-configuration-activation.test.ts tests/configuration-revision-store.test.ts tests/root-registry-immutability.test.ts tests/configuration-background-work.test.ts --reporter=verbose
 
       - name: Validation cancellation and receipt gates
         run: npm test -- tests/validation-service.test.ts -t "cancellation|receipt|supervision|canonical make verify|overlapping validations" --reporter=verbose
