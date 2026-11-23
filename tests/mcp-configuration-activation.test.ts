@@ -63,8 +63,10 @@ test("keeps one HTTP session while each request uses its admitted configuration 
     expect(JSON.stringify(admittedAResult)).toContain("marker from old root");
 
     const rootsAfterRebind = await callRawTool(client, "repo_list_roots", {});
-    expect(JSON.stringify(rootsAfterRebind)).toContain(await realpath(fixture.newRoot));
-    expect(JSON.stringify(rootsAfterRebind)).not.toContain(await realpath(fixture.oldRoot));
+    const listedRoots = rootsAfterRebind.structuredContent as { repos: Array<{ root: string }> };
+    const rootPaths = listedRoots.repos.map(({ root }) => root);
+    expect(rootPaths).toContain(await realpath(fixture.newRoot));
+    expect(rootPaths).not.toContain(await realpath(fixture.oldRoot));
 
     const historicalArtifact = join(fixture.newRoot, ".chatgpt", "runs", "past", "prompt.md");
     await expect(access(historicalArtifact)).rejects.toMatchObject({ code: "ENOENT" });
