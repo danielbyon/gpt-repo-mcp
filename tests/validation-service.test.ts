@@ -1,4 +1,5 @@
 import { chmod, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { readFileSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { delimiter, dirname, join } from "node:path";
@@ -700,21 +701,25 @@ describe("ValidationService", () => {
     const parentPidPath = join(root, "parent.pid");
     const childReadyPath = join(root, "child.ready");
     const cleanupPath = join(root, "cleanup");
+    const signalPath = join(root, "process-signals.jsonl");
     await writeFile(cleanupPath, "wait");
+    const signalHandlerScript = (role: string) => process.platform === "linux"
+      ? `process.on('SIGTERM', () => { try { appendFileSync(${JSON.stringify(signalPath)}, JSON.stringify({ role: ${JSON.stringify(role)}, pid: process.pid, signal: 'SIGTERM', wallClockMs: Date.now(), monotonicNs: process.hrtime.bigint().toString() }) + "\\n"); } catch {} });`
+      : "process.on('SIGTERM', () => {});";
     const childScript = [
-      "const { readFileSync, watch, writeFileSync } = require('node:fs');",
+      "const { appendFileSync, readFileSync, watch, writeFileSync } = require('node:fs');",
       `const cleanupWatcher = watch(${JSON.stringify(cleanupPath)}, () => { cleanupWatcher.close(); process.exit(0); });`,
       `if (readFileSync(${JSON.stringify(cleanupPath)}, 'utf8') === 'stop') process.exit(0);`,
-      "process.on('SIGTERM', () => {});",
+      signalHandlerScript("child"),
       `writeFileSync(${JSON.stringify(childReadyPath)}, String(process.pid));`,
       "setInterval(() => {}, 1_000);"
     ].join("\n");
     const fixtureScript = [
       "const { spawn } = require('node:child_process');",
-      "const { readFileSync, watch, writeFileSync } = require('node:fs');",
+      "const { appendFileSync, readFileSync, watch, writeFileSync } = require('node:fs');",
       `const cleanupWatcher = watch(${JSON.stringify(cleanupPath)}, () => { cleanupWatcher.close(); process.exit(0); });`,
       `if (readFileSync(${JSON.stringify(cleanupPath)}, 'utf8') === 'stop') process.exit(0);`,
-      "process.on('SIGTERM', () => {});",
+      signalHandlerScript("parent"),
       `spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' });`,
       `writeFileSync(${JSON.stringify(parentPidPath)}, String(process.pid));`,
       "setInterval(() => {}, 1_000);"
@@ -728,22 +733,63 @@ describe("ValidationService", () => {
       timeout_ms: 1_500
     }, { signal: controller.signal });
 
+    let diagnosticGroupId: number | undefined;
+    let abortRequestedAt: { wallClockMs: number; monotonicNs: string } | undefined;
+    let diagnosticRejection: Promise<void> = Promise.resolve();
     try {
       const childPid = Number(await waitForFile(childReadyPath));
       const parentPid = Number(await waitForFile(parentPidPath));
+      const recordDiagnostic = (stage: string, details: Record<string, unknown> = {}) => {
+        diagnosticGroupId = recordLinuxProcessCancellationDiagnostic(
+          stage,
+          parentPid,
+          childPid,
+          signalPath,
+          diagnosticGroupId,
+          details
+        );
+      };
+      diagnosticRejection = validationPromise.then(
+        () => undefined,
+        (error: unknown) => {
+          recordDiagnostic("C_after_validation_rejection", {
+            abortRequestedAt,
+            validationError: processCancellationErrorDetails(error)
+          });
+        }
+      );
+
       expect(isProcessAlive(parentPid)).toBe(true);
       expect(isProcessAlive(childPid)).toBe(true);
+      recordDiagnostic("A_fixtures_confirmed_alive");
+      recordDiagnostic("B_immediately_before_abort");
+      abortRequestedAt = {
+        wallClockMs: Date.now(),
+        monotonicNs: process.hrtime.bigint().toString()
+      };
       controller.abort();
 
       await expect(validationPromise).rejects.toMatchObject({ name: "AbortError" });
-      expect(isProcessAlive(parentPid)).toBe(false);
-      expect(isProcessAlive(childPid)).toBe(false);
+      await diagnosticRejection;
+      const parentAliveAfter = isProcessAlive(parentPid);
+      recordDiagnostic("D_before_parent_liveness_assertion", {
+        pid: parentPid,
+        observedAlive: parentAliveAfter
+      });
+      expect(parentAliveAfter).toBe(false);
+      const childAliveAfter = isProcessAlive(childPid);
+      recordDiagnostic("D_before_child_liveness_assertion", {
+        pid: childPid,
+        observedAlive: childAliveAfter
+      });
+      expect(childAliveAfter).toBe(false);
       await expect(readFile(join(root, ".chatgpt", "validation", "latest.json"), "utf8"))
         .rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       controller.abort();
       await writeFile(cleanupPath, "stop");
       await validationPromise.catch(() => undefined);
+      await diagnosticRejection;
     }
   }, 5_000);
 
@@ -1994,6 +2040,181 @@ function isProcessAlive(pid: number): boolean {
     if (error instanceof Error && "code" in error && error.code === "ESRCH") return false;
     throw error;
   }
+}
+
+type LinuxProcessIdentity = {
+  pid: number;
+  comm: string;
+  state: string;
+  ppid: number;
+  pgrp: number;
+  session: number;
+  starttime: string;
+  cmdline?: string;
+  cmdlineTruncated?: boolean;
+};
+
+type LinuxProcessObservation = {
+  pid: number;
+  observedAt: { wallClockMs: number; monotonicNs: string };
+  killZero: { exists: boolean | null; errorCode?: string };
+  process?: LinuxProcessIdentity;
+  processErrorCode?: string;
+  cmdlineErrorCode?: string;
+};
+
+/** Pair each numeric PID with its /proc start time to identify later PID reuse. */
+function recordLinuxProcessCancellationDiagnostic(
+  stage: string,
+  parentPid: number,
+  childPid: number,
+  signalPath: string,
+  knownGroupId?: number,
+  details: Record<string, unknown> = {}
+): number | undefined {
+  if (process.platform !== "linux") return knownGroupId;
+  try {
+    const parent = linuxProcessObservation(parentPid);
+    const child = linuxProcessObservation(childPid);
+    const groupId = parent.process?.pgrp ?? child.process?.pgrp ?? knownGroupId;
+    let signalLog: string[] = [];
+    try {
+      signalLog = readFileSync(signalPath, "utf8").split("\n").filter(Boolean).slice(-8);
+    } catch {}
+
+    console.error("PROCESS_CANCELLATION_DIAGNOSTIC", JSON.stringify({
+      stage,
+      observedAt: { wallClockMs: Date.now(), monotonicNs: process.hrtime.bigint().toString() },
+      parent,
+      child,
+      processGroup: linuxProcessGroupObservation(groupId),
+      signalLog,
+      ...details
+    }));
+    return groupId;
+  } catch {
+    return knownGroupId;
+  }
+}
+
+function linuxProcessObservation(pid: number): LinuxProcessObservation {
+  const observation: LinuxProcessObservation = {
+    pid,
+    observedAt: { wallClockMs: Date.now(), monotonicNs: process.hrtime.bigint().toString() },
+    killZero: { exists: null }
+  };
+  try {
+    process.kill(pid, 0);
+    observation.killZero.exists = true;
+  } catch (error) {
+    const errorCode = processCancellationErrorCode(error);
+    observation.killZero = {
+      exists: errorCode === "ESRCH" ? false : errorCode === "EPERM" ? true : null,
+      ...(errorCode ? { errorCode } : {})
+    };
+  }
+
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const identity = parseLinuxProcessStat(pid, stat);
+    observation.process = identity;
+    try {
+      const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean).join(" ");
+      identity.cmdline = cmdline.slice(0, 2_048);
+      if (cmdline.length > 2_048) identity.cmdlineTruncated = true;
+    } catch (error) {
+      observation.cmdlineErrorCode = processCancellationErrorCode(error) ?? "unknown";
+    }
+  } catch (error) {
+    observation.processErrorCode = processCancellationErrorCode(error) ?? "unknown";
+  }
+  return observation;
+}
+
+function parseLinuxProcessStat(pid: number, stat: string): LinuxProcessIdentity {
+  const commStart = stat.indexOf("(");
+  const commEnd = stat.lastIndexOf(")");
+  if (commStart < 0 || commEnd <= commStart) throw new Error("invalid_stat");
+  const fields = stat.slice(commEnd + 2).trim().split(/\s+/);
+  if (fields.length <= 19) throw new Error("invalid_stat");
+  return {
+    pid,
+    comm: stat.slice(commStart + 1, commEnd),
+    state: fields[0]!,
+    ppid: Number(fields[1]),
+    pgrp: Number(fields[2]),
+    session: Number(fields[3]),
+    starttime: fields[19]!
+  };
+}
+
+function linuxProcessGroupObservation(groupId: number | undefined): {
+  groupId?: number;
+  killZero: { exists: boolean | null; errorCode?: string };
+  members: Array<Omit<LinuxProcessIdentity, "cmdline" | "cmdlineTruncated">>;
+  membersTruncated: boolean;
+  readErrorCode?: string;
+} {
+  const observation = {
+    ...(groupId ? { groupId } : {}),
+    killZero: { exists: null as boolean | null } as { exists: boolean | null; errorCode?: string },
+    members: [] as Array<Omit<LinuxProcessIdentity, "cmdline" | "cmdlineTruncated">>,
+    membersTruncated: false,
+    readErrorCode: undefined as string | undefined
+  };
+  if (!groupId) return observation;
+
+  try {
+    process.kill(-groupId, 0);
+    observation.killZero.exists = true;
+  } catch (error) {
+    const errorCode = processCancellationErrorCode(error);
+    observation.killZero = {
+      exists: errorCode === "ESRCH" ? false : errorCode === "EPERM" ? true : null,
+      ...(errorCode ? { errorCode } : {})
+    };
+  }
+
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      let identity: LinuxProcessIdentity;
+      try {
+        identity = parseLinuxProcessStat(Number(entry), readFileSync(`/proc/${entry}/stat`, "utf8"));
+      } catch {
+        continue;
+      }
+      if (identity.pgrp !== groupId) continue;
+      if (observation.members.length === 32) {
+        observation.membersTruncated = true;
+        break;
+      }
+      observation.members.push({
+        pid: identity.pid,
+        comm: identity.comm,
+        state: identity.state,
+        ppid: identity.ppid,
+        pgrp: identity.pgrp,
+        session: identity.session,
+        starttime: identity.starttime
+      });
+    }
+  } catch (error) {
+    observation.readErrorCode = processCancellationErrorCode(error) ?? "unknown";
+  }
+  return observation;
+}
+
+function processCancellationErrorCode(error: unknown): string | undefined {
+  if (error instanceof Error && "code" in error && typeof error.code === "string") return error.code;
+  if (error instanceof Error && error.message === "invalid_stat") return "invalid_stat";
+  return undefined;
+}
+
+function processCancellationErrorDetails(error: unknown): { name: string; code?: string } {
+  if (!(error instanceof Error)) return { name: typeof error };
+  const code = processCancellationErrorCode(error);
+  return { name: error.name, ...(code ? { code } : {}) };
 }
 
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
