@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import express, { type Request, type Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { selectServerConfigPath } from "./config/store.js";
 import { RootRegistry } from "./services/root-registry.js";
 import { CodeIntelligenceService } from "./services/code-intelligence-service.js";
 import { createCodebaseMemoryClientFactory } from "./services/codebase-memory-client.js";
@@ -21,14 +22,14 @@ import {
 
 const port = Number(process.env.PORT ?? 8787);
 const host = resolveServerHost(process.env);
-const configPath = process.env.GPT_REPO_CONFIG ?? process.env.REPO_READER_CONFIG;
+const configPath = selectServerConfigPath(process.env);
 const publicPathToken = process.env.GPT_REPO_PUBLIC_PATH_TOKEN ?? process.env.REPO_READER_PUBLIC_PATH_TOKEN;
 const maxSessions = readBoundedInteger("GPT_REPO_MAX_SESSIONS", 100, 1, 1_000);
 const sessionIdleTtlMs = readBoundedInteger("GPT_REPO_SESSION_IDLE_TTL_MS", 30 * 60_000, 1_000, 24 * 60 * 60_000);
 
-const registry = configPath
-  ? await RootRegistry.fromFile(configPath)
-  : await RootRegistry.fromConfig({ repos: [], limits: {} });
+const registry = configPath === undefined
+  ? await RootRegistry.fromConfig({ repos: [], limits: {} })
+  : await RootRegistry.fromFile(configPath);
 const codeIntelligenceConfig = registry.codeIntelligence;
 const codeIntelligence = codeIntelligenceConfig
   ? new CodeIntelligenceService(
