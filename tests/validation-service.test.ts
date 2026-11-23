@@ -2080,7 +2080,9 @@ function recordLinuxProcessCancellationDiagnostic(
     let signalLog: string[] = [];
     try {
       signalLog = readFileSync(signalPath, "utf8").split("\n").filter(Boolean).slice(-8);
-    } catch {}
+    } catch {
+      signalLog = ["unavailable"];
+    }
 
     console.error("PROCESS_CANCELLATION_DIAGNOSTIC", JSON.stringify({
       stage,
