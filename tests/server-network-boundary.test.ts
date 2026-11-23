@@ -138,6 +138,7 @@ describe("server network boundary", () => {
           repo_id: "fixture",
           display_name: "HTTP cancellation fixture",
           root: repoRoot,
+          allow_non_git: true,
           operations: { enabled: true, validation_enabled: true }
         }],
         limits: {}

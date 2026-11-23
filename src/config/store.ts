@@ -3,6 +3,11 @@ import { resolve } from "node:path";
 import { atomicWriteJson, isNotFoundError } from "../runtime/fs-helpers.js";
 import { RepoReaderConfigSchema, type RepoReaderConfig } from "./schema.js";
 
+/** Preserves GPT_REPO_CONFIG precedence, including when its value is empty. */
+export function selectServerConfigPath(env: NodeJS.ProcessEnv): string | undefined {
+  return env.GPT_REPO_CONFIG ?? env.REPO_READER_CONFIG;
+}
+
 export function resolveConfigPath(options: {
   cliConfigPath?: string;
   env: NodeJS.ProcessEnv;

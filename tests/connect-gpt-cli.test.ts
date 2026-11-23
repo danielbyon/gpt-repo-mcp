@@ -4,13 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
-import { runConnectGptCli } from "../src/cli/connect-gpt.js";
-
-type CliResult = {
-  code: number;
-  stdout: string;
-  stderr: string;
-};
+import { runCli } from "./helpers/connect-gpt-cli.js";
 
 describe("connect-gpt config CLI", () => {
   test.skipIf(process.platform === "win32")(
@@ -535,35 +529,4 @@ async function writeDoctorPackageJson(root: string): Promise<void> {
       test: "vitest run"
     }
   }, null, 2));
-}
-
-type TestDoctorChecks = {
-  ngrokInstalled?: () => Promise<boolean>;
-  hasActiveNgrokTunnel?: () => Promise<boolean>;
-  isPortInUse?: (port: number) => Promise<boolean>;
-  isGitWorktreeDirty?: (cwd: string) => Promise<boolean>;
-};
-
-async function runCli(
-  argv: string[],
-  cwd: string,
-  doctorChecks?: TestDoctorChecks,
-  env: NodeJS.ProcessEnv = {}
-): Promise<CliResult> {
-  const stdoutLines: string[] = [];
-  const stderrLines: string[] = [];
-
-  const code = await runConnectGptCli(argv, {
-    cwd,
-    env,
-    doctorChecks,
-    stdout: (line) => stdoutLines.push(line),
-    stderr: (line) => stderrLines.push(line)
-  });
-
-  return {
-    code,
-    stdout: stdoutLines.join("\n"),
-    stderr: stderrLines.join("\n")
-  };
 }
