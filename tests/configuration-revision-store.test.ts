@@ -211,6 +211,7 @@ test("serializes overlapping reloads before either later read or publication can
 
     const firstReload = store.reloadFromFile();
     await firstPreparationStarted.promise;
+    expect(store.capture()).toBe(initialState.effectiveHotRevision);
     const secondReload = store.reloadFromFile();
     await Promise.resolve();
     expect(reads).toBe(1);
