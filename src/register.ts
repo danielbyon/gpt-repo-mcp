@@ -6,7 +6,7 @@ import type { RuntimeContext } from "./runtime/context.js";
 
 export { SERVER_INSTRUCTIONS };
 
-export function createMcpServer(context: RuntimeContext): McpServer {
+export function createMcpServer(context: RuntimeContext | (() => RuntimeContext)): McpServer {
   const server = new McpServer(
     {
       name: "gpt-repo-mcp",

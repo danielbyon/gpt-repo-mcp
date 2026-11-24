@@ -137,15 +137,15 @@ describe("CodeIntelligenceService", () => {
 
   test("loads optional provider configuration through the runtime root registry", async () => {
     const root = await mkdtemp(join(tmpdir(), "gpt-code-intelligence-config-"));
-    const registry = await RootRegistry.fromConfig({
-      repos: [{ repo_id: "fixture", display_name: "Fixture", root }],
+    const prepared = await RootRegistry.prepareFromBuffer(Buffer.from(JSON.stringify({
+      repos: [{ repo_id: "fixture", display_name: "Fixture", root, allow_non_git: true }],
       limits: {},
       code_intelligence: {
         provider: "codebase_memory",
         executable: "/usr/local/bin/codebase-memory-mcp"
       }
-    });
-    expect(registry.codeIntelligence).toMatchObject({
+    })), "<test config>");
+    expect(prepared.codeIntelligence).toMatchObject({
       provider: "codebase_memory",
       executable: "/usr/local/bin/codebase-memory-mcp",
       query_timeout_ms: 3_000,

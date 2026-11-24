@@ -6,14 +6,14 @@ export type OperationsPolicyConfig = {
   git_stage_enabled?: boolean;
   git_commit_enabled?: boolean;
   validation_enabled?: boolean;
-  validation_test_path_globs?: string[];
+  validation_test_path_globs?: readonly string[];
   validation_profiles?: Partial<Record<
     "test" | "build" | "lint" | "typecheck" | "smoke" | "all",
     { runner: "make" | "just"; target: string }
   >>;
   max_paths_per_operation?: number;
   cleanup_enabled?: boolean;
-  cleanup_allowed_globs?: string[];
+  cleanup_allowed_globs?: readonly string[];
 };
 
 export type EffectiveOperationsPolicy = {
@@ -40,11 +40,11 @@ export class OperationsPolicy {
       git_stage_enabled: config.git_stage_enabled ?? DEFAULT_OPERATIONS_POLICY.git_stage_enabled,
       git_commit_enabled: config.git_commit_enabled ?? DEFAULT_OPERATIONS_POLICY.git_commit_enabled,
       validation_enabled: config.validation_enabled ?? DEFAULT_OPERATIONS_POLICY.validation_enabled,
-      validation_test_path_globs: config.validation_test_path_globs ?? [],
+      validation_test_path_globs: [...(config.validation_test_path_globs ?? [])],
       validation_profiles: config.validation_profiles ?? {},
       max_paths_per_operation: config.max_paths_per_operation ?? DEFAULT_OPERATIONS_POLICY.max_paths_per_operation,
       cleanup_enabled: config.cleanup_enabled ?? DEFAULT_OPERATIONS_POLICY.cleanup_enabled,
-      cleanup_allowed_globs: config.cleanup_allowed_globs ?? [...DEFAULT_OPERATIONS_POLICY.cleanup_allowed_globs]
+      cleanup_allowed_globs: [...(config.cleanup_allowed_globs ?? DEFAULT_OPERATIONS_POLICY.cleanup_allowed_globs)]
     };
   }
 

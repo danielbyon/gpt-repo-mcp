@@ -104,6 +104,9 @@ jobs:
           tests/windows-process-host.test.ts tests/windows-process-host-protocol.test.ts tests/process-exec.test.ts
           tests/http-request-cancellation.test.ts tests/tool-handler-validation.test.ts tests/server-network-boundary.test.ts
           tests/tool-contracts.test.ts tests/mcp-contract.test.ts tests/validation-receipt-mutations.test.ts
+          tests/admitted-runtime-context.test.ts tests/mcp-configuration-activation.test.ts
+          tests/configuration-revision-store.test.ts tests/root-registry-immutability.test.ts
+          tests/configuration-background-work.test.ts
           --reporter=verbose
 
       - name: Windows trusted dispatch, validation cancellation, and receipts
