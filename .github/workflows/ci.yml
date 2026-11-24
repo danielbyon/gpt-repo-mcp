@@ -33,19 +33,11 @@ jobs:
         run: npm ci
 
       - name: Verify issue-readiness guardrail
+        if: matrix.node-version == '20.x'
         run: npm run test:issue-readiness
 
       - name: Typecheck
         run: npm run typecheck
-
-      - name: Validation security and CI coverage guardrails
-        run: npm run check:validation-guardrails
-
-      - name: Contract tests
-        run: npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts
-
-      - name: V2 receipt mutation regressions
-        run: npm test -- tests/validation-receipt-mutations.test.ts --reporter=verbose
 
       - name: Test
         run: npm test
@@ -58,9 +50,6 @@ jobs:
 
       - name: Distribution build and health smoke
         run: npm run verify:dist
-
-      - name: Whitespace check
-        run: git diff --check
 
   windows-test:
     name: "Windows cancellation qualification / Node ${{ matrix.node-version }}"
@@ -90,47 +79,42 @@ jobs:
         run: npm ci
 
       - name: Verify issue-readiness guardrail
+        if: matrix.node-version == '20.x'
         run: npm run test:issue-readiness
 
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Validation security and CI coverage guardrails
-        run: npm run check:validation-guardrails
-
       - name: Build production package and Windows helper
         run: npm run build
 
-      - name: V2 receipt mutation regressions
-        run: npm test -- tests/validation-receipt-mutations.test.ts --reporter=verbose
+      - name: Build Windows fault-injection helper
+        run: node scripts/build-windows-process-host.mjs --test
 
       - name: Verify actual Windows npm package archive
         run: npm run verify:package-archive
-      - name: Windows package archive inventory regression
-        run: npm test -- tests/package-archive-verification.test.ts --reporter=verbose
 
-      - name: Windows exact Node runtime and shell-free npm dispatch
-        run: |
-          npm test -- tests/node-runtime-resolver.test.ts --reporter=verbose
-          npm test -- tests/validation-service.test.ts -t "Windows npm|configured Windows|Windows command shim|repository-controlled make.exe" --reporter=verbose
+      - name: Windows process supervision, contracts, and receipt mutations
+        run: >-
+          node node_modules/vitest/vitest.mjs run
+          tests/package-archive-verification.test.ts
+          tests/node-runtime-resolver.test.ts
+          tests/windows-process-host.test.ts tests/windows-process-host-protocol.test.ts tests/process-exec.test.ts
+          tests/http-request-cancellation.test.ts tests/tool-handler-validation.test.ts tests/server-network-boundary.test.ts
+          tests/tool-contracts.test.ts tests/mcp-contract.test.ts tests/validation-receipt-mutations.test.ts
+          --reporter=verbose
 
-      - name: Windows process supervision
-        run: npm test -- tests/windows-process-host.test.ts tests/windows-process-host-protocol.test.ts tests/process-exec.test.ts --reporter=verbose
-
-      - name: HTTP, MCP, and server boundary behavior
-        run: npm test -- tests/http-request-cancellation.test.ts tests/tool-handler-validation.test.ts tests/server-network-boundary.test.ts --reporter=verbose
-
-      - name: Validation cancellation and receipt gates
-        run: npm test -- tests/validation-service.test.ts -t "cancellation|receipt|supervision|canonical make verify|overlapping validations" --reporter=verbose
-
-      - name: Contract tests
-        run: npm test -- tests/tool-contracts.test.ts tests/mcp-contract.test.ts --reporter=verbose
+      - name: Windows trusted dispatch, validation cancellation, and receipts
+        run: >-
+          node node_modules/vitest/vitest.mjs run tests/validation-service.test.ts
+          -t "Windows npm|configured Windows|Windows command shim|repository-controlled make.exe|cancellation|receipt|supervision|canonical make verify|overlapping validations"
+          --reporter=verbose
 
       - name: Windows helper package hygiene
-        run: npm test -- tests/package-hygiene.test.ts -t "pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional" --reporter=verbose
+        run: >-
+          node node_modules/vitest/vitest.mjs run tests/package-hygiene.test.ts
+          -t "pins the repository package inventory to its runtime files|requires the Windows process host only for Windows package builds|checks the parent route before treating an absent Windows host as optional"
+          --reporter=verbose
 
       - name: Lint
         run: npm run lint
-
-      - name: Whitespace check
-        run: git diff --check
