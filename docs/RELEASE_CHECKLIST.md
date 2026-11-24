@@ -18,18 +18,11 @@ package from GPT Repo MCP.
 
 ## Verification
 
-Run from a clean checkout:
+Run [the required verification](QUALITY.md#required-verification) from a clean checkout, then run the release checks:
 
 ```bash
-npm ci
-npm run typecheck
-npm test
-npm run lint
-npm run check:public
-npm run verify:dist
 npm audit --omit=dev
 npm pack --dry-run
-git diff --check
 ```
 
 Review any full-audit development advisory against

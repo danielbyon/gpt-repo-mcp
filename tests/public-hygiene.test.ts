@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, parse, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
+import { createTempDir } from "./fixtures/temp-dir.js";
 import { manifestFiles, readScannableText } from "../scripts/check-public.mjs";
 import {
   foldPathForRestrictedComparison,
@@ -35,6 +36,39 @@ function withRealApprovedRootComponents<T>(
 }
 
 describe("public hygiene", () => {
+  test("public hygiene script rejects any tracked .chatgpt artifact", async () => {
+    const fixture = await createTempDir("public-check-");
+    const scriptPath = join(process.cwd(), "scripts", "check-public.mjs");
+    await execFileAsync("git", ["init"], { cwd: fixture });
+    await mkdir(join(fixture, ".chatgpt", "plans"), { recursive: true });
+    await writeFile(join(fixture, ".chatgpt", "plans", "private.md"), "# Private plan\n");
+    await execFileAsync("git", ["add", ".chatgpt/plans/private.md"], { cwd: fixture });
+
+    await expect(execFileAsync(process.execPath, [scriptPath], { cwd: fixture })).rejects.toMatchObject({
+      stderr: expect.stringContaining(".chatgpt/plans/private.md")
+    });
+  });
+
+  test("public hygiene script allows Promptiva only in LICENSE", async () => {
+    const scriptPath = join(process.cwd(), "scripts", "check-public.mjs");
+
+    const licenseFixture = await createTempDir("public-license-");
+    await execFileAsync("git", ["init"], { cwd: licenseFixture });
+    await writeFile(join(licenseFixture, "LICENSE"), "MIT License\n\nCopyright (c) 2026 Promptiva AB\n");
+    await execFileAsync("git", ["add", "LICENSE"], { cwd: licenseFixture });
+    await expect(execFileAsync(process.execPath, [scriptPath], { cwd: licenseFixture })).resolves.toMatchObject({
+      stdout: expect.stringContaining("Public hygiene check passed.")
+    });
+
+    const readmeFixture = await createTempDir("public-readme-");
+    await execFileAsync("git", ["init"], { cwd: readmeFixture });
+    await writeFile(join(readmeFixture, "README.md"), "Built by Promptiva AB\n");
+    await execFileAsync("git", ["add", "README.md"], { cwd: readmeFixture });
+    await expect(execFileAsync(process.execPath, [scriptPath], { cwd: readmeFixture })).rejects.toMatchObject({
+      stderr: expect.stringContaining("README.md: blocked public-release marker found: Promptiva")
+    });
+  });
+
   test("Git ignores bounded local config backup names", async () => {
 const sandbox = await createTempDirectory("public-hygiene-ignore-");
     try {
