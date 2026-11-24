@@ -93,7 +93,7 @@ git diff --check "$(git merge-base HEAD origin/main)"
 
 Use the candidate's base commit for the diff check so it includes committed and uncommitted tracked changes.
 
-CI runs the full Vitest suite on Linux with Node 20 and 22. On Windows Server 2025, both Node versions run the scoped process, server, contract, receipt, and package cases. Each Windows job builds the production and fault-injection helpers once, then checks the packed archive against the production helper digest. The issue-readiness CLI tests run on Node 20 on each OS.
+CI runs the full Vitest suite on Linux with Node 20 and 22. On Windows Server 2025, both Node versions run the scoped process, server, contract, receipt, and package cases. Each Windows job builds the production and fault-injection helpers once, then checks the packed archive against the production helper digest. The Windows network tests start the built server. The issue-readiness CLI tests run on Node 20 on each OS.
 
 ## Release Readiness Checklist
 

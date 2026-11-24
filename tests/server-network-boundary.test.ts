@@ -347,7 +347,11 @@ async function startServer(extraEnv: Record<string, string> = {}): Promise<Start
   await writeFile(configPath, JSON.stringify({ repos: [], limits: {} }), "utf8");
   let output = "";
   const outputEvents = new EventEmitter();
-  const child = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
+  // Windows CI builds the server before this suite. Reuse it to keep TypeScript loading outside each listener deadline.
+  const serverArgs = process.env.GPT_REPO_TEST_BUILT_SERVER === "1"
+    ? ["dist/server.js"]
+    : ["--import", "tsx", "src/server.ts"];
+  const child = spawn(process.execPath, serverArgs, {
     cwd: process.cwd(),
     env: {
       ...process.env,

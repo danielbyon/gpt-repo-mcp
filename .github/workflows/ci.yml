@@ -95,6 +95,8 @@ jobs:
         run: npm run verify:package-archive
 
       - name: Windows process supervision, contracts, and receipt mutations
+        env:
+          GPT_REPO_TEST_BUILT_SERVER: '1'
         run: >-
           node node_modules/vitest/vitest.mjs run
           tests/package-archive-verification.test.ts
