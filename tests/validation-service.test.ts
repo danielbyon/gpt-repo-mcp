@@ -1,4 +1,5 @@
-import { chmod, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { chmod, cp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { delimiter, dirname, join } from "node:path";
@@ -13,7 +14,6 @@ import { ValidateInputSchema, ValidationLatestPointerV2Schema, ValidationReceipt
 import { descriptions } from "../src/tools/descriptions.js";
 import type { NodeRuntimeResolverOptions } from "../src/services/node-runtime-resolver.js";
 import { waitForFile, waitForFileLineCount } from "./fixtures/file-event-wait.js";
-import { copyNscbMakefileFixture } from "./fixtures/nscb-makefile.js";
 import { createTempDir } from "./fixtures/temp-dir.js";
 import { createExternalValidationCoordination, createTrustedTestRunner, withTrustedRunnerPath } from "./fixtures/validation-test-tools.js";
 import * as processExec from "../src/services/process-exec.js";
@@ -733,11 +733,24 @@ describe("ValidationService", () => {
       const parentPid = Number(await waitForFile(parentPidPath));
       expect(isProcessAlive(parentPid)).toBe(true);
       expect(isProcessAlive(childPid)).toBe(true);
+      const pids = [parentPid, childPid];
+      const originalIdentities = process.platform === "linux" ? pids.map(readLinuxProcessIdentity) : undefined;
+      originalIdentities?.forEach((identity) => expect(identity).toBeDefined());
       controller.abort();
 
       await expect(validationPromise).rejects.toMatchObject({ name: "AbortError" });
-      expect(isProcessAlive(parentPid)).toBe(false);
-      expect(isProcessAlive(childPid)).toBe(false);
+      const present = pids.map(isProcessAlive);
+      if (originalIdentities) {
+        const observed = pids.map((pid, index) => present[index] ? readLinuxProcessIdentity(pid) : undefined);
+        for (const [index, identity] of observed.entries()) {
+          if (identity) {
+            expect(identity.startedAt, `PID ${pids[index]} remains in state ${identity.state} (PPID ${identity.ppid}, PGID ${identity.pgid})`)
+              .not.toBe(originalIdentities[index]!.startedAt);
+          }
+        }
+      } else {
+        expect(present).toEqual([false, false]);
+      }
       await expect(readFile(join(root, ".chatgpt", "validation", "latest.json"), "utf8"))
         .rejects.toMatchObject({ code: "ENOENT" });
     } finally {
@@ -1468,23 +1481,19 @@ describe("ValidationService", () => {
   expect(reviewWithoutRecordedHelper.ship_readiness.validation).toMatchObject({ status: "unverified", eligibility: "unverified" });
   });
 
-  test.skipIf(process.platform === "win32")("runs NSCB's exact Makefile all profile with pinned Rust tools and one test thread", async () => {
+  test.skipIf(process.platform === "win32")("runs the pinned Rust Make profile with literal Cargo arguments and one test thread", async () => {
     const root = await fixtureRepo({});
-    await copyNscbMakefileFixture(root);
-    await writeFile(join(root, ".gitignore"), "target/\n");
+    await cp(new URL("./fixtures/pinned-rust-make/", import.meta.url), root, { recursive: true });
+    await writeFile(join(root, ".gitignore"), "tests/test_smoke.py\n");
     await initializeGitFixture(root);
-    const cargoHome = await createTempDir("nscb-validation-cargo-home-");
-    const pythonBin = await createTempDir("nscb-validation-python-");
-    const python3 = join(pythonBin, "python3");
-    await writeFile(python3, `#!${process.execPath}\nconsole.log("python fixture: " + process.argv.slice(2).join(" "));\n`);
-    await chmod(python3, 0o755);
-    const rustupLogDirectory = await createTempDir("nscb-rustup-log-");
+    const cargoHome = await createTempDir("validation-cargo-home-");
+    const rustupLogDirectory = await createTempDir("validation-rustup-log-");
     const rustupLog = join(rustupLogDirectory, "calls.log");
     const rustTools = await createFakeRustToolchain("1.98.1", cargoHome, rustupLog);
-    const previous = captureEnv(["PATH", "CARGO_HOME", "CARGO_TARGET_DIR", "RUSTUP", "RUST_TEST_THREADS"]);
+    const previous = captureEnv(["PATH", "CARGO_HOME", "RUSTUP", "RUST_TEST_THREADS"]);
 
     try {
-      process.env.PATH = `${rustTools.bin}${delimiter}${pythonBin}${delimiter}${previous.PATH ?? ""}`;
+      process.env.PATH = `${rustTools.bin}${delimiter}${previous.PATH ?? ""}`;
       process.env.CARGO_HOME = cargoHome;
       process.env.RUSTUP = join(root, "untrusted-rustup");
       delete process.env.RUST_TEST_THREADS;
@@ -1515,12 +1524,18 @@ describe("ValidationService", () => {
           }
         }]
       });
-      expect(result.commands[0]?.stdout_tail).toContain("threads=1");
+      expect(result.commands[0]?.stdout_tail).toContain("toolchain=1.98.1; threads=1; rustc=[REDACTED_PATH]; cargo-home-matches=true");
+      expect(result.commands[0]?.stdout_tail).toContain('cargo args=["test","--all-features","--locked","--","--nocapture"]');
+      expect(result.commands[0]?.stderr_tail).toContain("test_discovery (test_smoke.SmokeTest");
+      expect(result.commands[0]?.stderr_tail).toContain("Ran 1 test");
       const rustupCalls = await readFile(rustupLog, "utf8");
       expect(rustupCalls).toContain("which --toolchain 1.98.1 cargo");
       expect(rustupCalls).toContain("which --toolchain 1.98.1 rustc");
       const receipt = JSON.parse(await readFile(join(root, result.validation_artifact!.path), "utf8")) as Record<string, unknown>;
-      expect(ValidationReceiptV2Schema.safeParse(receipt).success).toBe(true);
+      const evidence = ValidationReceiptV2Schema.parse(receipt).source_evidence;
+      for (const snapshot of [evidence.before, evidence.after]) {
+        expect(snapshot?.files).toContainEqual(expect.objectContaining({ path: "tests/test_smoke.py" }));
+      }
     } finally {
       restoreEnv(previous);
     }
@@ -1986,6 +2001,25 @@ describe("ValidationService", () => {
   });
 });
 
+function readLinuxProcessIdentity(pid: number) {
+  let stat: string;
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  // The command name can contain spaces and parentheses. The state follows its last closing parenthesis.
+  const commandEnd = stat.lastIndexOf(")");
+  const [state, ppid, pgid, ...fields] = stat.slice(commandEnd + 2).trimEnd().split(" ");
+  const startedAt = fields[16]; // Field 22 of /proc/<pid>/stat.
+  if (!stat.startsWith(`${pid} (`) || commandEnd < 0 || !/^[A-Za-z]$/.test(state ?? "") ||
+      !/^\d+$/.test(ppid ?? "") || !/^\d+$/.test(pgid ?? "") || !/^\d+$/.test(startedAt ?? "")) {
+    throw new Error(`Could not read process identity for PID ${pid}.`);
+  }
+  return { state, ppid, pgid, startedAt };
+}
+
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -2100,7 +2134,7 @@ async function createFakeRustToolchain(version: string, expectedCargoHome?: stri
   const rustfmt = join(toolchainBin, process.platform === "win32" ? "rustfmt.exe" : "rustfmt");
   const rustup = join(shimBin, process.platform === "win32" ? "rustup.exe" : "rustup");
   const cargoHomeCheck = `process.env.CARGO_HOME === ${JSON.stringify(expectedCargoHome ?? "")}`;
-  await writeFile(cargo, `#!${process.execPath}\nconst fs = require("node:fs");\nconst path = require("node:path");\nconst args = process.argv.slice(2);\nif (args[0] === "--version") console.log("cargo ${version} (fixture)");\nelse {\n  console.log("toolchain=" + process.env.RUSTUP_TOOLCHAIN + "; threads=" + process.env.RUST_TEST_THREADS + "; rustc=" + process.env.RUSTC + "; cargo-home-matches=" + (${cargoHomeCheck}));\n  if (args.includes("--list")) console.log("test fixture::smoke: test");\n  if (args[0] === "build") {\n    const binary = path.join(process.env.CARGO_TARGET_DIR || "target", "debug", "nscb");\n    fs.mkdirSync(path.dirname(binary), { recursive: true });\n    fs.writeFileSync(binary, "#!/bin/sh\\nexit 0\\n");\n    fs.chmodSync(binary, 0o755);\n  }\n}\n`);
+  await writeFile(cargo, `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args[0] === "--version") console.log("cargo ${version} (fixture)");\nelse {\n  console.log("toolchain=" + process.env.RUSTUP_TOOLCHAIN + "; threads=" + process.env.RUST_TEST_THREADS + "; rustc=" + process.env.RUSTC + "; cargo-home-matches=" + (${cargoHomeCheck}));\n  console.log("cargo args=" + JSON.stringify(args));\n}\n`);
   await writeFile(rustc, `#!${process.execPath}\nconsole.log("rustc ${version} (fixture)");\n`);
   await writeFile(rustfmt, `#!${process.execPath}\nconsole.log("rustfmt ${version} (fixture)");\n`);
   await writeFile(rustup, `#!${process.execPath}\nconst fs = require("node:fs");\nconst args = process.argv.slice(2);\nif (${JSON.stringify(rustupLogPath ?? "")} && args[0] === "which") fs.appendFileSync(${JSON.stringify(rustupLogPath ?? "")}, args.join(" ") + "\\n");\nif (args[0] === "--version") console.log("rustup 1.28.2 (fixture)");\nelse if (args[0] === "show") console.log("${version}-x86_64-unknown-linux-gnu (fixture)");\nelse if (args[0] === "which") {\n  const pinnedVersion = args[1] === "--toolchain" ? args[2] : process.env.RUSTUP_TOOLCHAIN;\n  const tool = args[1] === "--toolchain" ? args[3] : args[1];\n  if (pinnedVersion && pinnedVersion !== "${version}") process.exit(3);\n  const selected = { cargo: ${JSON.stringify(cargo)}, rustc: ${JSON.stringify(rustc)}, rustfmt: ${JSON.stringify(rustfmt)} }[tool];\n  if (selected) console.log(selected); else process.exit(2);\n} else process.exit(2);\n`);

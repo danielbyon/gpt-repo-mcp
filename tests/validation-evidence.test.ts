@@ -2,13 +2,11 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 import { ValidationEvidenceService } from "../src/services/validation-evidence.js";
-import { cleanupTempDirs, createTempDir } from "./fixtures/temp-dir.js";
+import { createTempDir } from "./fixtures/temp-dir.js";
 
 describe("ValidationEvidenceService", () => {
-  afterEach(async () => cleanupTempDirs());
-
   test("binds committed, staged, working-tree, untracked, mode, and symlink state", async () => {
     const root = await createTempDir("validation-evidence-");
     await mkdir(root, { recursive: true });

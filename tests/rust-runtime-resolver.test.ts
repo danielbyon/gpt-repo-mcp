@@ -1,16 +1,14 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { RustRuntimeResolver } from "../src/services/rust-runtime-resolver.js";
-import { copyNscbMakefileFixture, NSCB_MAKEFILE_SHA256, NSCB_RUST_TOOLCHAIN_SHA256 } from "./fixtures/nscb-makefile.js";
-import { cleanupTempDirs, createTempDir } from "./fixtures/temp-dir.js";
+import { createTempDir } from "./fixtures/temp-dir.js";
 
 const PIN = "1.98.1";
+const makeFixture = join(process.cwd(), "tests", "fixtures", "pinned-rust-make");
 
 describe("RustRuntimeResolver", () => {
-  afterEach(async () => cleanupTempDirs());
-
   test("resolves the exact root rust-toolchain.toml pin and selected Cargo and Rustc", async () => {
     const root = await createRuntimeFixture("rust-toolchain.toml", `[toolchain]\nchannel = "${PIN}"\n`);
     const cargoHome = join(root, "cargo-home");
@@ -91,16 +89,10 @@ describe("RustRuntimeResolver", () => {
       .rejects.toMatchObject({ code: "VALIDATION_RUST_TOOLCHAIN_MISMATCH" });
   });
 
-  test("resolves NSCB's exact pinned Makefile and maps unittest patterns under tests", async () => {
-    const fixtureRoot = join(process.cwd(), "tests", "fixtures", "nscb-makefile");
-    const makefile = await readFile(join(fixtureRoot, "Makefile"));
-    expect(createHash("sha256").update(makefile).digest("hex")).toBe(NSCB_MAKEFILE_SHA256);
-    const pin = await readFile(join(fixtureRoot, "rust-toolchain.toml"), "utf8");
-    expect(createHash("sha256").update(pin).digest("hex")).toBe(NSCB_RUST_TOOLCHAIN_SHA256);
-    expect(pin).toContain('channel = "1.98.1"');
-
+  test("resolves the pinned Rust Makefile assignment chain", async () => {
+    const pin = await readFile(join(makeFixture, "rust-toolchain.toml"), "utf8");
     const root = await createRuntimeFixture("rust-toolchain.toml", pin);
-    await copyNscbMakefileFixture(root);
+    await cp(makeFixture, root, { recursive: true });
     const runTool = fakeRustup(root, PIN);
     const cargoPath = await realpath(join(root, "toolchain", "bin", executableName("cargo")));
     const rustcPath = await realpath(join(root, "toolchain", "bin", executableName("rustc")));
@@ -118,8 +110,6 @@ describe("RustRuntimeResolver", () => {
       cargo: { version: PIN, real_path: cargoPath },
       rustc: { version: PIN, real_path: rustcPath }
     });
-    await expect(readFile(join(root, "test_content_policy.py"))).rejects.toMatchObject({ code: "ENOENT" });
-    expect((await readFile(join(root, "tests", "test_content_policy.py"))).byteLength).toBeGreaterThan(0);
   });
 
   test("resolves aligned Just imports relative to each containing Justfile", async () => {
@@ -195,10 +185,9 @@ describe("RustRuntimeResolver", () => {
       .rejects.toMatchObject({ code: "VALIDATION_RUST_TOOLCHAIN_MISMATCH" });
   });
 
-  test("rejects untrusted substitutions in an otherwise aligned NSCB Makefile", async () => {
-    const fixtureRoot = join(process.cwd(), "tests", "fixtures", "nscb-makefile");
-    const original = await readFile(join(fixtureRoot, "Makefile"), "utf8");
-    const pin = await readFile(join(fixtureRoot, "rust-toolchain.toml"), "utf8");
+  test("rejects untrusted substitutions in the pinned Rust Makefile", async () => {
+    const original = await readFile(join(makeFixture, "Makefile"), "utf8");
+    const pin = await readFile(join(makeFixture, "rust-toolchain.toml"), "utf8");
     const untrustedRecipes = [
       original.replace("override RUST_TOOLCHAIN := 1.98.1", "override RUST_TOOLCHAIN := 1.99.0"),
       original.replace(
@@ -212,7 +201,6 @@ describe("RustRuntimeResolver", () => {
 
     for (const recipe of untrustedRecipes) {
       const root = await createRuntimeFixture("rust-toolchain.toml", pin);
-      await copyNscbMakefileFixture(root);
       await writeFile(join(root, "Makefile"), recipe);
       await expect(new RustRuntimeResolver(root, {
         env: { PATH: join(root, "bin") },
