@@ -151,6 +151,10 @@ export async function selectConfigurationAdminTarget(options: {
 
   const live = probed.filter((entry): entry is typeof entry & { result: ConfigurationAdminProbeResult } => entry.result !== undefined);
   if (live.length === 0 && options.instancePid !== undefined) {
+    const explicitProbeError = probed.length === 1 ? probed[0].error : undefined;
+    if (explicitProbeError instanceof ConfigurationAdminIpcError && explicitProbeError.phase === "pre-dispatch") {
+      throw explicitProbeError;
+    }
     throw new ConfigurationAdminTargetError("INSTANCE_UNAVAILABLE", `Server PID ${options.instancePid} could not be verified at its discovered endpoint.`);
   }
 

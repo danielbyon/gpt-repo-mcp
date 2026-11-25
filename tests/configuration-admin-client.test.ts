@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import type { ConfigurationSourceIdentity } from "../src/config/config-source-identity.js";
 import type { ConfigurationAdminDiscoveryRecord, ConfigurationAdminProbeResult } from "../src/runtime/configuration-admin-client.js";
+import { ConfigurationAdminIpcError } from "../src/runtime/configuration-admin-error.js";
 import { readConfigurationAdminRecords, sendConfigurationAdminRequest } from "../src/runtime/configuration-admin-host.js";
 import type { ConfigurationAdminRequest, ConfigurationAdminResponse } from "../src/runtime/configuration-admin-protocol.js";
 
@@ -133,6 +134,22 @@ describe("configuration admin target selection", () => {
       instancePid: 41,
       probe: async (entry) => probe(entry, source("/configs/other.json"))
     })).rejects.toMatchObject({ code: "SOURCE_MISMATCH" });
+  });
+
+  test("preserves a pre-dispatch probe error for an explicitly selected PID", async () => {
+    const client = await import("../src/runtime/configuration-admin-client.js");
+    const denied = new ConfigurationAdminIpcError(
+      "WINDOWS_PIPE_ACCESS_DENIED",
+      "pre-dispatch",
+      "Windows denied access to the owner-local administrative pipe."
+    );
+
+    await expect(client.selectConfigurationAdminTarget({
+      records: [record(41, "instance-a")],
+      selectedSourceIdentity: sourceA,
+      instancePid: 41,
+      probe: async () => { throw denied; }
+    })).rejects.toBe(denied);
   });
 
   test("reports no matching source when discovery has no verified candidate", async () => {

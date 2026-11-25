@@ -21,6 +21,7 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
     const fixtureId = randomUUID().replaceAll("-", "");
     const userName = `CodexIpc${fixtureId.slice(0, 12)}`;
     const password = `Aa1!${randomBytes(8).toString("base64url").slice(0, 10)}`;
+    const restrictedPaths: string[] = [];
     expect(password).toHaveLength(14);
     const ownerLocalAppData = await createOwnerLocalAppData();
     const fixtureRoot = join(publicRoot, `gpt-repo-admin-security-${fixtureId}`);
@@ -90,7 +91,7 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
       fixtureMayBeRestricted = true;
       const serverOwnerSid = ownerSid;
       if (!serverOwnerSid) throw new Error("The production server owner SID was not established.");
-      await writeOutsiderRecord(outsiderLocalAppData, outsiderSid, serverOwnerSid, ownerRecord);
+      await writeOutsiderRecord(outsiderLocalAppData, outsiderSid, serverOwnerSid, ownerRecord, restrictedPaths);
       await writeFile(launcherPath, outsiderLauncherSource, "utf8");
       await writeFile(fixturePath, JSON.stringify({
         expectedSid: outsiderSid,
@@ -145,7 +146,7 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
     }
     if (fixtureMayBeRestricted && ownerSid) {
       try {
-      await takeFixtureOwnership(fixtureRoot, ownerSid);
+        await takeFixtureOwnership(fixtureRoot, ownerSid, restrictedPaths);
       } catch (error) {
         cleanupErrors.push(error);
         canRemoveFixture = false;
@@ -303,7 +304,8 @@ async function writeOutsiderRecord(
   localAppData: string,
   outsiderSid: string,
   ownerSid: string,
-  record: { server_pid: number; helper_pid: number; instance_id: string; endpoint: string }
+  record: { server_pid: number; helper_pid: number; instance_id: string; endpoint: string },
+  restrictedPaths: string[]
 ): Promise<void> {
   const recordPath = join(localAppData, "GPTRepoMCP", "admin", `server-${record.server_pid}-${record.instance_id}.record`);
   const contents = [
@@ -317,13 +319,12 @@ async function writeOutsiderRecord(
   await writeFile(recordPath, contents, "utf8");
   const administrationRoot = join(localAppData, "GPTRepoMCP");
   const administrationDirectory = join(administrationRoot, "admin");
-  setOutsiderPathAcl(recordPath, outsiderSid, ownerSid);
-  setOutsiderPathAcl(administrationDirectory, outsiderSid, ownerSid);
-  setOutsiderPathAcl(administrationRoot, outsiderSid, ownerSid);
-  setOutsiderPathAcl(localAppData, outsiderSid, ownerSid);
+  for (const path of [recordPath, administrationDirectory, administrationRoot, localAppData]) {
+    setOutsiderPathAcl(path, outsiderSid, ownerSid, restrictedPaths);
+  }
 }
 
-function setOutsiderPathAcl(path: string, outsiderSid: string, ownerSid: string): void {
+function setOutsiderPathAcl(path: string, outsiderSid: string, ownerSid: string, restrictedPaths: string[]): void {
   const permission = "F";
   execFileSync("icacls.exe", [
     path,
@@ -341,11 +342,26 @@ function setOutsiderPathAcl(path: string, outsiderSid: string, ownerSid: string)
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"]
   });
-  execFileSync("icacls.exe", [path, "/remove:g", `*${ownerSid}`], {
-    encoding: "utf8",
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
+  try {
+    execFileSync("icacls.exe", [path, "/remove:g", `*${ownerSid}`], {
+      encoding: "utf8",
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  } catch (error) {
+    try {
+      execFileSync("icacls.exe", [path, "/grant:r", `*${ownerSid}:F`], {
+        encoding: "utf8",
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+    } catch (restoreError) {
+      restrictedPaths.push(path);
+      throw new AggregateError([error, restoreError], `Could not remove or restore the owner ACL for ${path}.`);
+    }
+    throw error;
+  }
+  restrictedPaths.push(path);
 }
 
 function runAsWindowsUser(
@@ -445,23 +461,41 @@ if ($deleteExitCode -ne 0) {
   }
 }
 
-async function takeFixtureOwnership(fixtureRoot: string, ownerSid: string): Promise<void> {
+async function takeFixtureOwnership(fixtureRoot: string, ownerSid: string, restrictedPaths: readonly string[]): Promise<void> {
   try {
     await lstat(fixtureRoot);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  execFileSync("takeown.exe", ["/F", fixtureRoot, "/R", "/D", "Y"], {
-    encoding: "utf8",
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-  execFileSync("icacls.exe", [fixtureRoot, "/grant", `*${ownerSid}:(OI)(CI)F`, "/T", "/C"], {
-    encoding: "utf8",
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
+  const restorationErrors: Error[] = [];
+  for (const path of [...restrictedPaths].reverse()) {
+    try {
+      try {
+        await lstat(path);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") continue;
+        if (code !== "EPERM" && code !== "EACCES") throw error;
+      }
+      execFileSync("takeown.exe", ["/F", path], {
+        encoding: "utf8",
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      execFileSync("icacls.exe", [path, "/grant:r", `*${ownerSid}:F`], {
+        encoding: "utf8",
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      restorationErrors.push(new Error(`Could not restore owner access to ${path}: ${detail}`));
+    }
+  }
+  if (restorationErrors.length > 0) {
+    throw new AggregateError(restorationErrors, `Could not restore access to ${restorationErrors.length} restricted fixture path(s).`);
+  }
 }
 
 function runPowerShell(script: string, env: Record<string, string>): void {
