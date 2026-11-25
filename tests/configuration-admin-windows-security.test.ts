@@ -105,6 +105,9 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
       runAsWindowsUser(userName, password, launcherPath, fixturePath, stdoutPath, stderrPath);
       const result = JSON.parse(await readFile(stdoutPath, "utf8")) as {
         sid: string;
+        discoveryStatus: number | null;
+        discoveryOutput: string;
+        discoveryError?: string;
         directStatus: number | null;
         directOutput: string;
         cliStatus: number | null;
@@ -112,6 +115,8 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
         cliOutput: string;
       };
       expect(result.sid).toBe(outsiderSid);
+      expect(result.discoveryStatus, `${result.discoveryError ?? "no spawn error"}: ${result.discoveryOutput}`).toBe(0);
+      expect(result.discoveryOutput).toContain(`"server_pid":${ownerRecord.server_pid}`);
       expect(result.directStatus).toBe(34);
       expect(result.directOutput).toContain("NOT_DISPATCHED\t5");
       expect(result.cliStatus).toBe(1);
@@ -202,6 +207,11 @@ const payload = Buffer.from(JSON.stringify({ protocol_version: 1, request_id: re
 const frame = Buffer.alloc(4 + payload.length);
 frame.writeUInt32BE(payload.length, 0);
 payload.copy(frame, 4);
+const discovery = spawnSync(fixture.helperPath, ["discover"], {
+  encoding: "utf8",
+  timeout: 7000,
+  windowsHide: true
+});
 const direct = spawnSync(fixture.helperPath, ["client", fixture.endpoint, "2000"], {
   input: frame,
   timeout: 7000,
@@ -216,6 +226,9 @@ const cli = spawnSync(process.execPath, [fixture.cliPath, "config", "reload", "-
 });
 process.stdout.write(JSON.stringify({
   sid,
+  discoveryStatus: discovery.status,
+  discoveryOutput: discovery.stdout ?? "",
+  discoveryError: discovery.error?.code,
   directStatus: direct.status,
   directOutput: direct.stdout?.toString("ascii") ?? "",
   directError: direct.error?.code,
@@ -304,22 +317,35 @@ async function writeOutsiderRecord(
   await writeFile(recordPath, contents, "utf8");
   const administrationRoot = join(localAppData, "GPTRepoMCP");
   const administrationDirectory = join(administrationRoot, "admin");
-  setOutsiderPathAcl(localAppData, outsiderSid, ownerSid, true);
-  setOutsiderPathAcl(administrationRoot, outsiderSid, ownerSid, true);
-  setOutsiderPathAcl(administrationDirectory, outsiderSid, ownerSid, true);
-  setOutsiderPathAcl(recordPath, outsiderSid, ownerSid, false);
+  setOutsiderPathAcl(recordPath, outsiderSid, ownerSid);
+  setOutsiderPathAcl(administrationDirectory, outsiderSid, ownerSid);
+  setOutsiderPathAcl(administrationRoot, outsiderSid, ownerSid);
+  setOutsiderPathAcl(localAppData, outsiderSid, ownerSid);
 }
 
-function setOutsiderPathAcl(path: string, outsiderSid: string, ownerSid: string, isDirectory: boolean): void {
-  const permission = isDirectory ? "(OI)(CI)F" : "F";
+function setOutsiderPathAcl(path: string, outsiderSid: string, ownerSid: string): void {
+  const permission = "F";
   execFileSync("icacls.exe", [
     path,
     "/inheritance:r",
     "/grant:r",
-    `*${ownerSid}:${permission}`,
-    "/grant",
-    `*${outsiderSid}:${permission}`
+    `*${ownerSid}:${permission}`
   ], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  execFileSync("icacls.exe", [path, "/grant", `*${outsiderSid}:${permission}`], {
+    encoding: "utf8",
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  execFileSync("icacls.exe", [path, "/setowner", `*${outsiderSid}`], {
+    encoding: "utf8",
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  execFileSync("icacls.exe", [path, "/remove:g", `*${ownerSid}`], {
+    encoding: "utf8",
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
 }
 
 function runAsWindowsUser(
