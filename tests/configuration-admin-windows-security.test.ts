@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
@@ -13,6 +13,8 @@ const builtCli = join(repoRoot, "dist", "cli", "connect-gpt.js");
 const productionHelper = join(repoRoot, "dist", "windows-configuration-admin-host.exe");
 const userProfileRoot = process.env.USERPROFILE;
 const publicRoot = process.env.PUBLIC ?? "C:\\Users\\Public";
+
+class WindowsSecurityFixtureUnavailableError extends Error {}
 
 describe.skipIf(process.platform !== "win32")("Windows configuration pipe identity enforcement", () => {
   test("a distinct SID is denied by the owner pipe while the owner production CLI reloads successfully", async ({ skip }) => {
@@ -46,14 +48,15 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
     try {
       await (async () => {
       try {
-        createOutsiderDiscoveryFixture(fixtureRoot, outsiderLocalAppData);
+        await createOutsiderDiscoveryFixture(fixtureRoot, outsiderLocalAppData);
         createTemporaryWindowsUser(userName, password, sidPath);
         ownerSid = currentWindowsSid();
       } catch (error) {
-        if (process.env.GPT_REPO_REQUIRE_SECURITY_FIXTURES === "1") {
+        if (process.env.GPT_REPO_REQUIRE_SECURITY_FIXTURES === "1" || error instanceof AggregateError) {
           throw new Error("Windows SID qualification requires local-account creation and alternate-credential process launch on the ephemeral CI runner.", { cause: error });
         }
-        fixtureSkipReason = "Windows SID qualification requires local-account creation and alternate-credential process launch.";
+        if (!(error instanceof WindowsSecurityFixtureUnavailableError)) throw error;
+        fixtureSkipReason = error.message;
         skip(fixtureSkipReason);
         return;
       }
@@ -134,7 +137,7 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
     }
     if (fixtureMayBeRestricted && ownerSid) {
       try {
-        takeFixtureOwnership(fixtureRoot, ownerSid);
+      await takeFixtureOwnership(fixtureRoot, ownerSid);
       } catch (error) {
         cleanupErrors.push(error);
         canRemoveFixture = false;
@@ -220,32 +223,64 @@ process.stdout.write(JSON.stringify({
 `;
 
 function createTemporaryWindowsUser(name: string, password: string, sidPath: string): void {
-  runPowerShell(String.raw`
+  try {
+    execFileSync("net.exe", ["user", name, password, "/add", "/expires:never", "/passwordchg:no"], {
+      encoding: "utf8",
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  } catch (error) {
+    const detail = safeCommandFailure(error, password);
+    if (/system error (5|1314|2245) has occurred|access is denied|required privilege is not held|password.*policy/i.test(detail)) {
+      throw new WindowsSecurityFixtureUnavailableError(`Windows local-account creation is unavailable on this host (${detail}).`);
+    }
+    throw new Error(`Unexpected failure creating the isolated Windows local account (${detail}).`);
+  }
+  try {
+    runPowerShell(String.raw`
 $ErrorActionPreference = 'Stop'
-$secure = ConvertTo-SecureString $env:GPT_REPO_SECURITY_PASSWORD -AsPlainText -Force
-$user = New-LocalUser -Name $env:GPT_REPO_SECURITY_USER -Password $secure -AccountNeverExpires -PasswordNeverExpires
-[System.IO.File]::WriteAllText($env:GPT_REPO_SECURITY_SID_PATH, $user.SID.Value)
+$accountName = '{0}\{1}' -f $env:COMPUTERNAME, $env:GPT_REPO_SECURITY_USER
+$sid = ([System.Security.Principal.NTAccount]::new($accountName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+[System.IO.File]::WriteAllText($env:GPT_REPO_SECURITY_SID_PATH, $sid)
 `, {
-    GPT_REPO_SECURITY_USER: name,
-    GPT_REPO_SECURITY_PASSWORD: password,
-    GPT_REPO_SECURITY_SID_PATH: sidPath
-  });
+      GPT_REPO_SECURITY_USER: name,
+      GPT_REPO_SECURITY_SID_PATH: sidPath
+    });
+  } catch (setupError) {
+    try {
+      execFileSync("net.exe", ["user", name, "/delete"], {
+        encoding: "utf8",
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+    } catch (cleanupError) {
+      throw new AggregateError([setupError, cleanupError], `Temporary Windows account ${name} was created but SID setup and rollback both failed.`);
+    }
+    throw setupError;
+  }
 }
 
-function createOutsiderDiscoveryFixture(fixtureRoot: string, localAppData: string): void {
-  runPowerShell(String.raw`
-$ErrorActionPreference = 'Stop'
-$root = $env:GPT_REPO_SECURITY_FIXTURE_ROOT
-$local = $env:GPT_REPO_SECURITY_LOCAL_APP_DATA
-[System.IO.Directory]::CreateDirectory($root) | Out-Null
-[System.IO.Directory]::CreateDirectory($local) | Out-Null
-$adminRoot = Join-Path $local 'GPTRepoMCP'
-$admin = Join-Path $adminRoot 'admin'
-[System.IO.Directory]::CreateDirectory($admin) | Out-Null
-`, {
-    GPT_REPO_SECURITY_FIXTURE_ROOT: fixtureRoot,
-    GPT_REPO_SECURITY_LOCAL_APP_DATA: localAppData
-  });
+async function createOutsiderDiscoveryFixture(fixtureRoot: string, localAppData: string): Promise<void> {
+  try {
+    await mkdir(fixtureRoot, { recursive: true });
+    await mkdir(join(localAppData, "GPTRepoMCP", "admin"), { recursive: true });
+  } catch (error) {
+    throw new WindowsSecurityFixtureUnavailableError("The Windows host does not allow creation of the isolated public fixture directory.", { cause: error });
+  }
+}
+
+function safeCommandFailure(error: unknown, secret: string): string {
+  if (typeof error !== "object" || error === null) return "the command failed without a diagnostic";
+  const result = error as { status?: number | null; stdout?: Buffer | string; stderr?: Buffer | string };
+  const output = [result.stdout, result.stderr]
+    .filter((value): value is Buffer | string => value !== undefined)
+    .map((value) => Buffer.isBuffer(value) ? value.toString("utf8") : value)
+    .join(" ")
+    .replaceAll(secret, "[redacted]")
+    .replace(/[\r\n\t]+/g, " ")
+    .trim();
+  const status = result.status === null || result.status === undefined ? "no exit status" : `exit ${result.status}`;
+  return output ? `${status}: ${output}` : status;
 }
 
 async function writeOutsiderRecord(
@@ -263,42 +298,24 @@ async function writeOutsiderRecord(
     ""
   ].join("\n");
   await writeFile(recordPath, contents, "utf8");
-  runPowerShell(String.raw`
-$ErrorActionPreference = 'Stop'
-$sid = [System.Security.Principal.SecurityIdentifier]::new($env:GPT_REPO_SECURITY_OUTSIDER_SID)
-function Set-PrivateOwnerAcl([string]$path) {
-  $acl = Get-Acl -LiteralPath $path
-  $acl.SetAccessRuleProtection($true, $false)
-  foreach ($entry in @($acl.Access)) { $acl.RemoveAccessRuleSpecific($entry) }
-  $acl.SetOwner($sid)
-  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-    $sid,
-    [System.Security.AccessControl.FileSystemRights]::FullControl,
-    [System.Security.AccessControl.AccessControlType]::Allow
-  )
-  $acl.SetAccessRule($rule)
-  Set-Acl -LiteralPath $path -AclObject $acl
+  const administrationRoot = join(localAppData, "GPTRepoMCP");
+  const administrationDirectory = join(administrationRoot, "admin");
+  setOutsiderPathAcl(localAppData, outsiderSid, true);
+  setOutsiderPathAcl(administrationRoot, outsiderSid, true);
+  setOutsiderPathAcl(administrationDirectory, outsiderSid, true);
+  setOutsiderPathAcl(recordPath, outsiderSid, false);
 }
-$local = $env:GPT_REPO_SECURITY_LOCAL_APP_DATA
-Set-PrivateOwnerAcl $local
-Set-PrivateOwnerAcl (Join-Path $local 'GPTRepoMCP')
-Set-PrivateOwnerAcl (Join-Path $local 'GPTRepoMCP\admin')
-$acl = Get-Acl -LiteralPath $env:GPT_REPO_SECURITY_RECORD_PATH
-$acl.SetAccessRuleProtection($true, $false)
-foreach ($entry in @($acl.Access)) { $acl.RemoveAccessRuleSpecific($entry) }
-$acl.SetOwner($sid)
-$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-  $sid,
-  [System.Security.AccessControl.FileSystemRights]::FullControl,
-  [System.Security.AccessControl.AccessControlType]::Allow
-)
-$acl.SetAccessRule($rule)
-Set-Acl -LiteralPath $env:GPT_REPO_SECURITY_RECORD_PATH -AclObject $acl
-`, {
-    GPT_REPO_SECURITY_OUTSIDER_SID: outsiderSid,
-    GPT_REPO_SECURITY_LOCAL_APP_DATA: localAppData,
-    GPT_REPO_SECURITY_RECORD_PATH: recordPath,
-  });
+
+function setOutsiderPathAcl(path: string, outsiderSid: string, isDirectory: boolean): void {
+  const permission = isDirectory ? "(OI)(CI)F" : "F";
+  execFileSync("icacls.exe", [
+    path,
+    "/inheritance:r",
+    "/grant:r",
+    `*${outsiderSid}:${permission}`,
+    "/setowner",
+    `*${outsiderSid}`
+  ], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 }
 
 function runAsWindowsUser(
@@ -311,17 +328,65 @@ function runAsWindowsUser(
 ): void {
   runPowerShell(String.raw`
 $ErrorActionPreference = 'Stop'
-$secure = ConvertTo-SecureString $env:GPT_REPO_SECURITY_PASSWORD -AsPlainText -Force
-$credential = [System.Management.Automation.PSCredential]::new(".\$env:GPT_REPO_SECURITY_USER", $secure)
-$arguments = '"{0}" "{1}"' -f $env:GPT_REPO_SECURITY_LAUNCHER, $env:GPT_REPO_SECURITY_FIXTURE_FILE
-$process = Start-Process -FilePath $env:GPT_REPO_SECURITY_NODE -ArgumentList $arguments -Credential $credential -LoadUserProfile -Wait -PassThru -RedirectStandardOutput $env:GPT_REPO_SECURITY_STDOUT -RedirectStandardError $env:GPT_REPO_SECURITY_STDERR
-if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+$secure = [System.Security.SecureString]::new()
+foreach ($character in $env:GPT_REPO_SECURITY_PASSWORD.ToCharArray()) { $secure.AppendChar($character) }
+$secure.MakeReadOnly()
+$startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+$startInfo.FileName = $env:GPT_REPO_SECURITY_NODE
+$startInfo.Arguments = '"{0}" "{1}"' -f $env:GPT_REPO_SECURITY_LAUNCHER, $env:GPT_REPO_SECURITY_FIXTURE_FILE
+$startInfo.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
+$startInfo.UserName = $env:GPT_REPO_SECURITY_USER
+$startInfo.Domain = $env:COMPUTERNAME
+$startInfo.Password = $secure
+$startInfo.LoadUserProfile = $true
+$startInfo.UseShellExecute = $false
+$startInfo.RedirectStandardOutput = $true
+$startInfo.RedirectStandardError = $true
+$process = $null
+$stdout = $null
+$stderr = $null
+$exitCode = $null
+try {
+  $process = [System.Diagnostics.Process]::Start($startInfo)
+  $stdout = $process.StandardOutput.ReadToEndAsync()
+  $stderr = $process.StandardError.ReadToEndAsync()
+  if (-not $process.WaitForExit(20000)) {
+    try { $process.Kill() } catch {
+      if (-not $process.HasExited) { throw }
+    }
+    if (-not $process.WaitForExit(5000)) {
+      throw 'The alternate-identity qualification process did not terminate after cancellation.'
+    }
+    $null = $stdout.GetAwaiter().GetResult()
+    $null = $stderr.GetAwaiter().GetResult()
+    throw 'The alternate-identity qualification process did not exit before its deadline.'
+  }
+  [System.IO.File]::WriteAllText($env:GPT_REPO_SECURITY_STDOUT, $stdout.GetAwaiter().GetResult())
+  [System.IO.File]::WriteAllText($env:GPT_REPO_SECURITY_STDERR, $stderr.GetAwaiter().GetResult())
+  $exitCode = $process.ExitCode
+} finally {
+  try {
+    if ($null -ne $process -and -not $process.HasExited) {
+      try { $process.Kill() } catch {
+        if (-not $process.HasExited) { throw }
+      }
+      if (-not $process.WaitForExit(5000)) {
+        throw 'The alternate-identity qualification process did not terminate during cleanup.'
+      }
+    }
+  } finally {
+    if ($null -ne $process) { $process.Dispose() }
+    $secure.Dispose()
+  }
+}
+if ($exitCode -ne 0) { exit $exitCode }
 `, {
     GPT_REPO_SECURITY_USER: name,
     GPT_REPO_SECURITY_PASSWORD: password,
     GPT_REPO_SECURITY_LAUNCHER: launcherPath,
     GPT_REPO_SECURITY_FIXTURE_FILE: fixturePath,
     GPT_REPO_SECURITY_NODE: process.execPath,
+    GPT_REPO_SECURITY_WORKING_DIRECTORY: repoRoot,
     GPT_REPO_SECURITY_STDOUT: stdoutPath,
     GPT_REPO_SECURITY_STDERR: stderrPath
   });
@@ -331,11 +396,20 @@ function removeTemporaryWindowsUser(name: string): void {
   try {
     runPowerShell(String.raw`
 $ErrorActionPreference = 'Stop'
-$name = $env:GPT_REPO_SECURITY_USER
-$user = Get-LocalUser -ErrorAction Stop | Where-Object { $_.Name -eq $name }
-if ($null -ne $user) { Remove-LocalUser -Name $name -ErrorAction Stop }
-$remaining = Get-LocalUser -ErrorAction Stop | Where-Object { $_.Name -eq $name }
-if ($null -ne $remaining) { throw "Temporary local account still exists: $name" }
+$accountName = '{0}\{1}' -f $env:COMPUTERNAME, $env:GPT_REPO_SECURITY_USER
+$account = [System.Security.Principal.NTAccount]::new($accountName)
+try {
+  $null = $account.Translate([System.Security.Principal.SecurityIdentifier])
+} catch [System.Security.Principal.IdentityNotMappedException] {
+  return
+}
+& net.exe user $env:GPT_REPO_SECURITY_USER /delete | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'The temporary local qualification account could not be removed.' }
+try {
+  $null = $account.Translate([System.Security.Principal.SecurityIdentifier])
+  throw 'The temporary local qualification account still exists.'
+} catch [System.Security.Principal.IdentityNotMappedException] {
+}
 `, { GPT_REPO_SECURITY_USER: name });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -343,19 +417,22 @@ if ($null -ne $remaining) { throw "Temporary local account still exists: $name" 
   }
 }
 
-function takeFixtureOwnership(fixtureRoot: string, ownerSid: string): void {
-  runPowerShell(String.raw`
-$ErrorActionPreference = 'Stop'
-$root = $env:GPT_REPO_SECURITY_FIXTURE_ROOT
-if (Test-Path -LiteralPath $root) {
-  & takeown.exe /F $root /R /D Y | Out-Null
-  $access = "*$($env:GPT_REPO_SECURITY_OWNER_SID):(OI)(CI)F"
-  & icacls.exe $root /grant $access /T /C | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw 'Could not restore access to the temporary security fixture.' }
-}
-`, {
-    GPT_REPO_SECURITY_FIXTURE_ROOT: fixtureRoot,
-    GPT_REPO_SECURITY_OWNER_SID: ownerSid
+async function takeFixtureOwnership(fixtureRoot: string, ownerSid: string): Promise<void> {
+  try {
+    await lstat(fixtureRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  execFileSync("takeown.exe", ["/F", fixtureRoot, "/R", "/D", "Y"], {
+    encoding: "utf8",
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  execFileSync("icacls.exe", [fixtureRoot, "/grant", `*${ownerSid}:(OI)(CI)F`, "/T", "/C"], {
+    encoding: "utf8",
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
   });
 }
 
@@ -363,7 +440,7 @@ function runPowerShell(script: string, env: Record<string, string>): void {
   execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
     encoding: "utf8",
     env: { ...process.env, ...env },
-    timeout: 15_000,
+    timeout: 30_000,
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"]
   });

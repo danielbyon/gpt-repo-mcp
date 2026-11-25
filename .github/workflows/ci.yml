@@ -145,7 +145,7 @@ jobs:
 
   macos-configuration-admin-ipc:
     name: "macOS configuration IPC / Node ${{ matrix.node-version }}"
-    runs-on: macos-latest
+    runs-on: macos-15-intel
 
     strategy:
       fail-fast: false
