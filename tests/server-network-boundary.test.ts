@@ -343,6 +343,8 @@ async function initializeSession(port: number): Promise<{ status: number; sessio
 async function startServer(extraEnv: Record<string, string> = {}): Promise<StartedServer> {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "gpt-repo-network-boundary-"));
   const configPath = join(fixtureRoot, "config.json");
+  const localAppData = join(fixtureRoot, "local-app-data");
+  await mkdir(localAppData, { recursive: true });
   const port = extraEnv.PORT === undefined ? await freePort() : Number(extraEnv.PORT);
   await writeFile(configPath, JSON.stringify({ repos: [], limits: {} }), "utf8");
   let output = "";
@@ -355,6 +357,9 @@ async function startServer(extraEnv: Record<string, string> = {}): Promise<Start
     cwd: process.cwd(),
     env: {
       ...process.env,
+      GPT_REPO_TEST_BUILT_SERVER: "1",
+      GPT_REPO_ADMIN_TEST_DIRECTORY: join(fixtureRoot, "admin-ipc"),
+      LOCALAPPDATA: localAppData,
       GPT_REPO_CONFIG: configPath,
       PORT: String(port),
       ...extraEnv

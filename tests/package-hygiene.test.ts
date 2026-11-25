@@ -93,7 +93,8 @@ describe("package boundary hygiene", () => {
       "LICENSE",
       "dist/server.js",
       "dist/cli/connect-gpt.js",
-      "dist/windows-process-host.exe"
+      "dist/windows-process-host.exe",
+      "dist/windows-configuration-admin-host.exe"
     ];
 
     expect(repositoryManifest.private).toBe(true);
@@ -108,20 +109,21 @@ describe("package boundary hygiene", () => {
     expect(inventory.entries).not.toContain("security/oss-security-policy.json");
   });
 
-  test("requires the Windows process host only for Windows package builds", async () => {
+  test("requires both Windows native hosts only for Windows package builds", async () => {
     const files = [
       "package.json",
       "README.md",
       "LICENSE",
       "dist/server.js",
       "dist/cli/connect-gpt.js",
-      "dist/windows-process-host.exe"
+      "dist/windows-process-host.exe",
+      "dist/windows-configuration-admin-host.exe"
     ];
     const root = await fixturePackage(
       { "README.md": "Setup guide.\n", "LICENSE": "License text.\n" },
       { files }
     );
-    const packedEntries = files.slice(0, -1).map((path) => ({ path }));
+    const packedEntries = files.slice(0, -2).map((path) => ({ path }));
     let packCalls = 0;
     const packPackage = async () => {
       packCalls += 1;
@@ -138,6 +140,9 @@ describe("package boundary hygiene", () => {
       expect(windows.blockers.some((blocker) =>
         blocker.startsWith("package preflight could not inspect dist/windows-process-host.exe: ")
       )).toBe(true);
+      expect(windows.blockers.some((blocker) =>
+        blocker.startsWith("package preflight could not inspect dist/windows-configuration-admin-host.exe: ")
+      )).toBe(true);
       expect(packCalls).toBe(1);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -147,11 +152,12 @@ describe("package boundary hygiene", () => {
   test("checks the parent route before treating an absent Windows host as optional", async () => {
     const externalRoot = await createTempDirectory("gpt-package-host-external-");
     const root = await fixturePackage({}, {
-      files: ["dist/windows-process-host.exe"],
+      files: ["dist/windows-process-host.exe", "dist/windows-configuration-admin-host.exe"],
       main: null,
       bin: null
     });
     const hostPath = join(root, "dist", "windows-process-host.exe");
+    const adminHostPath = join(root, "dist", "windows-configuration-admin-host.exe");
     const inspectedHostPaths: string[] = [];
     try {
       await rm(join(root, "dist"), { recursive: true, force: true });
@@ -163,7 +169,7 @@ describe("package boundary hygiene", () => {
         root,
         platform: "darwin",
         lstatPath: async (path: string) => {
-          if (path === hostPath) inspectedHostPaths.push(path);
+          if (path === hostPath || path === adminHostPath) inspectedHostPaths.push(path);
           return lstat(path);
         },
         packPackage: async () => {

@@ -76,6 +76,26 @@ and verify its `/health` endpoint.
 
 Run `cp config.example.json config.local.json`. This creates a valid empty local config with no approved repositories. `config.local.json` is ignored by git and should stay uncommitted.
 
+## Reload Configuration
+
+After the server starts, edit the selected config and run:
+
+```bash
+npm run config:reload
+```
+
+The command uses the existing source order: `--config`, `GPT_REPO_CONFIG`,
+`REPO_READER_CONFIG`, then `./config.local.json`. It reloads only a live server
+whose recorded config source matches the selected path. If more than one server
+matches, choose one with `npm run config:reload -- --instance <PID>`. The PID
+narrows the choice but does not skip the source check.
+
+`npm run mcp` starts the server with `GPT_REPO_CONFIG=./config.local.json`, which
+matches the CLI's implicit default. A server started without either config
+environment variable keeps its existing built-in default and does not read
+`config.local.json`; the reload command will fail the source check for that
+server. Start a file-backed server with the same selected path before reloading.
+
 ## Add A Repository
 
 ```bash

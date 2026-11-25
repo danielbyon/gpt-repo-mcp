@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -86,6 +86,7 @@ test("rejects file configs with canonical validation issues", async () => {
 
 async function createServerCwd(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), "gpt-repo-server-config-"));
+  await mkdir(join(cwd, "local-app-data"));
   await writeFile(join(cwd, "config.local.json"), JSON.stringify({
     repos: [{ repo_id: "neighbor", display_name: "Neighbor", root: ".", allow_non_git: true }],
     limits: {}
@@ -113,6 +114,9 @@ async function reservePort(): Promise<number> {
 function startServer(cwd: string, port: number, overrides: NodeJS.ProcessEnv) {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
+    GPT_REPO_TEST_BUILT_SERVER: "1",
+    GPT_REPO_ADMIN_TEST_DIRECTORY: join(cwd, "admin-ipc"),
+    LOCALAPPDATA: join(cwd, "local-app-data"),
     GPT_REPO_HOST: "127.0.0.1",
     PORT: String(port)
   };
