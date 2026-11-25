@@ -20,7 +20,8 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
   test("a distinct SID is denied by the owner pipe while the owner production CLI reloads successfully", async ({ skip }) => {
     const fixtureId = randomUUID().replaceAll("-", "");
     const userName = `CodexIpc${fixtureId.slice(0, 12)}`;
-    const password = `${randomBytes(30).toString("base64url")}Aa1!`;
+    const password = `Aa1!${randomBytes(8).toString("base64url").slice(0, 10)}`;
+    expect(password).toHaveLength(14);
     const ownerLocalAppData = await createOwnerLocalAppData();
     const fixtureRoot = join(publicRoot, `gpt-repo-admin-security-${fixtureId}`);
     const outsiderLocalAppData = join(fixtureRoot, "outsider-app-data");

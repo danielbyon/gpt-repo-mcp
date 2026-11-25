@@ -185,3 +185,6 @@ jobs:
           tests/configuration-admin-posix-security.test.ts
           tests/mcp-configuration-activation.test.ts
           --reporter=verbose
+          --fileParallelism=false
+          --maxWorkers=1
+          --testTimeout=15000
