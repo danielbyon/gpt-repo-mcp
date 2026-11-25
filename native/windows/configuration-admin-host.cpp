@@ -350,16 +350,30 @@ bool createOrVerifyDirectory(const std::wstring &path, SecurityContext &security
 }
 
 // Locates the per-user discovery directory and optionally creates its secured path.
+constexpr int kServeLocalAppDataRejected = 50;
+constexpr int kServeAdminRootSetupFailed = 51;
+constexpr int kServeAdminDirectorySetupFailed = 52;
+
 bool getAdminDirectory(SecurityContext &security, bool create,
-                       std::wstring &directory, bool &exists) {
+                       std::wstring &directory, bool &exists,
+                       int *createFailureCode = nullptr) {
   exists = false;
   std::wstring localAppData;
-  if (!getLocalAppData(localAppData)) return false;
+  if (!getLocalAppData(localAppData)) {
+    if (create && createFailureCode != nullptr) *createFailureCode = kServeLocalAppDataRejected;
+    return false;
+  }
   const std::wstring root = localAppData + L"\\GPTRepoMCP";
   directory = root + L"\\admin";
   if (create) {
-    if (!createOrVerifyDirectory(root, security) ||
-        !createOrVerifyDirectory(directory, security)) return false;
+    if (!createOrVerifyDirectory(root, security)) {
+      if (createFailureCode != nullptr) *createFailureCode = kServeAdminRootSetupFailed;
+      return false;
+    }
+    if (!createOrVerifyDirectory(directory, security)) {
+      if (createFailureCode != nullptr) *createFailureCode = kServeAdminDirectorySetupFailed;
+      return false;
+    }
     exists = true;
     return true;
   }
@@ -781,7 +795,9 @@ int serve(DWORD serverPid, const std::string &instanceId) {
 
   std::wstring directory;
   bool directoryExists = false;
-  if (!getAdminDirectory(security, true, directory, directoryExists) || !directoryExists) return 23;
+  int directorySetupFailure = 23;
+  if (!getAdminDirectory(security, true, directory, directoryExists, &directorySetupFailure) ||
+      !directoryExists) return directorySetupFailure;
   const std::wstring name = pipeName(serverPid, instanceId);
   HANDLE firstPipe = createServerPipe(name, security, true);
   if (firstPipe == INVALID_HANDLE_VALUE) return 24;
