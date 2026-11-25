@@ -93,11 +93,11 @@ describe("configuration source identity", () => {
       const originalPath = `${root}/link/../config.json`;
       const traversalTarget = process.platform === "win32" ? "lexical target" : "filesystem target";
       expect(await readFile(originalPath, "utf8")).toBe(traversalTarget);
-      expect(identity.createConfigurationSourceIdentity("link/../config.json", root, "linux").status).toBe("unavailable");
+      expect(identity.createConfigurationSourceIdentity("link/../config.json", root).status).toBe("unavailable");
 
-      const beforeReplacement = identity.createConfigurationSourceIdentity("config.json", root, "linux");
+      const beforeReplacement = identity.createConfigurationSourceIdentity("config.json", root);
       await writeFile(join(root, "config.json"), "replacement");
-      const afterReplacement = identity.createConfigurationSourceIdentity("config.json", root, "linux");
+      const afterReplacement = identity.createConfigurationSourceIdentity("config.json", root);
       expect(identity.configurationSourcesMatch(beforeReplacement, afterReplacement)).toBe(true);
       expect(await readFile(resolve(root, "config.json"), "utf8")).toBe("replacement");
     } finally {
