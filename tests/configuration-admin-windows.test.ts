@@ -1,6 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { ConfigurationSourceIdentity } from "../src/config/config-source-identity.js";
@@ -19,6 +18,7 @@ import {
 } from "../src/runtime/configuration-admin-protocol.js";
 
 const instanceId = "22222222-2222-4222-8222-222222222222";
+const userProfileRoot = process.env.USERPROFILE;
 
 describe("owner-local Windows configuration IPC", () => {
   test.skipIf(process.platform !== "win32")(
@@ -26,23 +26,27 @@ describe("owner-local Windows configuration IPC", () => {
     async () => {
       vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
 
-      await expect(startWindowsConfigurationAdminHost({
-        serverPid: 0,
-        instanceId,
-        handle: async () => {
-          throw new Error("An invalid server PID must stop the helper before dispatch.");
-        }
-      })).rejects.toMatchObject({
-        code: "WINDOWS_HELPER_EXITED",
-        message: expect.stringContaining("exit code 2")
-      });
+      try {
+        await expect(startWindowsConfigurationAdminHost({
+          serverPid: 0,
+          instanceId,
+          handle: async () => {
+            throw new Error("An invalid server PID must stop the helper before dispatch.");
+          }
+        })).rejects.toMatchObject({
+          code: "WINDOWS_HELPER_EXITED",
+          message: expect.stringContaining("exit code 2")
+        });
+      } finally {
+        vi.unstubAllEnvs();
+      }
     }
   );
 
   test.skipIf(process.platform !== "win32")(
     "discovers the private pipe and returns a correlated reload response",
     async () => {
-      const localAppData = await mkdtemp(join(tmpdir(), "gpt-repo-admin-windows-"));
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-");
       vi.stubEnv("LOCALAPPDATA", localAppData);
       vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
 
@@ -171,7 +175,7 @@ describe("owner-local Windows configuration IPC", () => {
   test.skipIf(process.platform !== "win32")(
     "fails closed when a helper exits unexpectedly and leaves a stale discovery record",
     async () => {
-      const localAppData = await mkdtemp(join(tmpdir(), "gpt-repo-admin-windows-stale-"));
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-stale-");
       vi.stubEnv("LOCALAPPDATA", localAppData);
       vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
 
@@ -239,7 +243,7 @@ describe("owner-local Windows configuration IPC", () => {
   test.skipIf(process.platform !== "win32")(
     "does not write a response after shutdown closes the helper control channel",
     async () => {
-      const localAppData = await mkdtemp(join(tmpdir(), "gpt-repo-admin-windows-shutdown-"));
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-shutdown-");
       vi.stubEnv("LOCALAPPDATA", localAppData);
       vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
 
@@ -299,7 +303,7 @@ describe("owner-local Windows configuration IPC", () => {
   test.skipIf(process.platform !== "win32")(
     "keeps the helper available after a reload response arrives after its deadline",
     async () => {
-      const localAppData = await mkdtemp(join(tmpdir(), "gpt-repo-admin-windows-late-response-"));
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-late-response-");
       vi.stubEnv("LOCALAPPDATA", localAppData);
       vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
 
@@ -399,4 +403,10 @@ async function cleanupWindowsHost(
       vi.unstubAllEnvs();
     }
   }
+}
+
+async function createIsolatedLocalAppData(prefix: string): Promise<string> {
+  if (!userProfileRoot) throw new Error("Windows tests require the current user's profile directory.");
+  // The helper rejects reparse-point ancestors. mkdtemp appends a random suffix under the profile root.
+  return mkdtemp(join(userProfileRoot, prefix));
 }
