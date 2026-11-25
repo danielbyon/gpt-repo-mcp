@@ -395,15 +395,7 @@ class WindowsHostProcess {
 
   private failWhenStreamCloses(code: string): void {
     if (this.closed || this.failed || this.child.exitCode !== null || this.child.signalCode !== null) return;
-    if (this.readyRecord) {
-      this.failHost(code);
-      return;
-    }
-    // Let the child exit event take precedence when process termination closes its stdio.
-    setImmediate(() => {
-      if (this.closed || this.failed || this.child.exitCode !== null || this.child.signalCode !== null) return;
-      this.failHost(code);
-    });
+    this.failHost(code);
   }
 
   private failHost(

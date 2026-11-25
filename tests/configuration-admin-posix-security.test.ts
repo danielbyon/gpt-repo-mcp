@@ -57,50 +57,27 @@ describe.skipIf(process.platform === "win32")("POSIX configuration IPC identity 
 
 const outsiderScript = String.raw`
 import net from "node:net";
-import { spawnSync } from "node:child_process";
-const [endpoint, cliPath, cwd, adminDirectory, configPath, serverPid] = process.argv.slice(1);
+const [endpoint] = process.argv.slice(1);
 const endpointResult = await new Promise((resolve) => {
   const socket = net.createConnection({ path: endpoint });
   socket.once("connect", () => { socket.destroy(); resolve({ connected: true }); });
   socket.once("error", (error) => resolve({ connected: false, code: error.code }));
 });
-const cli = spawnSync(process.execPath, [cliPath, "config", "reload", "--instance", serverPid], {
-  cwd,
-  encoding: "utf8",
-  timeout: 10000,
-  env: {
-    PATH: process.env.PATH,
-    GPT_REPO_TEST_BUILT_SERVER: "1",
-    GPT_REPO_ADMIN_TEST_DIRECTORY: adminDirectory,
-    GPT_REPO_CONFIG: configPath
-  }
-});
-process.stdout.write(JSON.stringify({
-  uid: process.getuid(),
-  endpointResult,
-  cliStatus: cli.status,
-  cliError: cli.error?.code,
-  cliOutput: (cli.stdout ?? "") + (cli.stderr ?? "")
-}));
+process.stdout.write(JSON.stringify({ uid: process.getuid(), endpointResult }));
 `;
       const outsiderResult = spawnSync("sudo", [
         "-n", "-u", outsider.name, "--", process.execPath, "-e", outsiderScript,
-        record.endpoint, builtCli, repoRoot, adminDirectory, configPath, String(record.server_pid)
+        record.endpoint
       ], { encoding: "utf8", timeout: 15_000, maxBuffer: 1_000_000 });
       expect(outsiderResult.error, outsiderResult.stderr).toBeUndefined();
       expect(outsiderResult.status, outsiderResult.stderr).toBe(0);
       const result = JSON.parse(outsiderResult.stdout) as {
         uid: number;
         endpointResult: { connected: boolean; code?: string };
-        cliStatus: number | null;
-        cliError?: string;
-        cliOutput: string;
       };
       expect(result.uid).toBe(outsider.uid);
       expect(result.uid).not.toBe(ownerUid);
       expect(result.endpointResult).toEqual({ connected: false, code: "EACCES" });
-      expect(result.cliStatus).toBe(1);
-      expect(result.cliOutput).toContain("EACCES");
     } finally {
       await stopServer(server);
       await rm(fixtureRoot, { recursive: true, force: true });

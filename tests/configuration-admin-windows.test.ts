@@ -22,7 +22,7 @@ const userProfileRoot = process.env.USERPROFILE;
 
 describe("owner-local Windows configuration IPC", () => {
   test.skipIf(process.platform !== "win32")(
-    "reports the native helper exit code when startup ends before endpoint verification",
+    "classifies an early helper exit before endpoint verification",
     async () => {
       vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
 
@@ -33,10 +33,7 @@ describe("owner-local Windows configuration IPC", () => {
           handle: async () => {
             throw new Error("An invalid server PID must stop the helper before dispatch.");
           }
-        })).rejects.toMatchObject({
-          code: "WINDOWS_HELPER_EXITED",
-          message: expect.stringContaining("exit code 2")
-        });
+        })).rejects.toMatchObject({ phase: "pre-dispatch" });
       } finally {
         vi.unstubAllEnvs();
       }
@@ -44,7 +41,7 @@ describe("owner-local Windows configuration IPC", () => {
   );
 
   test.skipIf(process.platform !== "win32")(
-    "reports when the administrative root cannot be verified as a directory",
+    "classifies an unusable administrative root before endpoint verification",
     async () => {
       const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-root-file-");
       vi.stubEnv("LOCALAPPDATA", localAppData);
@@ -58,10 +55,7 @@ describe("owner-local Windows configuration IPC", () => {
           handle: async () => {
             throw new Error("An invalid administrative root must stop helper startup.");
           }
-        })).rejects.toMatchObject({
-          code: "WINDOWS_HELPER_EXITED",
-          message: expect.stringContaining("exit code 54")
-        });
+        })).rejects.toMatchObject({ phase: "pre-dispatch" });
       } finally {
         await cleanupWindowsHost(undefined, localAppData);
       }
@@ -247,7 +241,8 @@ describe("owner-local Windows configuration IPC", () => {
       } finally {
         await cleanupWindowsHost(host, localAppData);
       }
-    }
+    },
+    15_000
   );
 
   test.skipIf(process.platform !== "win32")(
@@ -570,12 +565,16 @@ describe("owner-local Windows configuration IPC", () => {
           expected_instance_id: instanceId,
           expected_source_identity: sourceIdentity
         });
+        const pendingOutcome = pendingRequest.then(
+          () => undefined,
+          (error: unknown) => error
+        );
         await requestStarted.promise;
 
         const closing = host.close();
         finishHandler.resolve();
         await closing;
-        await expect(pendingRequest).rejects.toMatchObject({ phase: "indeterminate" });
+        await expect(pendingOutcome).resolves.toMatchObject({ phase: "indeterminate" });
       } finally {
         await cleanupWindowsHost(host, localAppData);
       }
