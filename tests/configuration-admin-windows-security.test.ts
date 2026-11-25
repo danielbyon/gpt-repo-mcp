@@ -88,7 +88,9 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
       const outsiderSid = (await readFile(sidPath, "utf8")).trim();
       expect(outsiderSid).not.toBe(ownerSid);
       fixtureMayBeRestricted = true;
-      await writeOutsiderRecord(outsiderLocalAppData, outsiderSid, ownerRecord);
+      const serverOwnerSid = ownerSid;
+      if (!serverOwnerSid) throw new Error("The production server owner SID was not established.");
+      await writeOutsiderRecord(outsiderLocalAppData, outsiderSid, serverOwnerSid, ownerRecord);
       await writeFile(launcherPath, outsiderLauncherSource, "utf8");
       await writeFile(fixturePath, JSON.stringify({
         expectedSid: outsiderSid,
@@ -287,6 +289,7 @@ function safeCommandFailure(error: unknown, secret: string): string {
 async function writeOutsiderRecord(
   localAppData: string,
   outsiderSid: string,
+  ownerSid: string,
   record: { server_pid: number; helper_pid: number; instance_id: string; endpoint: string }
 ): Promise<void> {
   const recordPath = join(localAppData, "GPTRepoMCP", "admin", `server-${record.server_pid}-${record.instance_id}.record`);
@@ -301,19 +304,21 @@ async function writeOutsiderRecord(
   await writeFile(recordPath, contents, "utf8");
   const administrationRoot = join(localAppData, "GPTRepoMCP");
   const administrationDirectory = join(administrationRoot, "admin");
-  setOutsiderPathAcl(localAppData, outsiderSid, true);
-  setOutsiderPathAcl(administrationRoot, outsiderSid, true);
-  setOutsiderPathAcl(administrationDirectory, outsiderSid, true);
-  setOutsiderPathAcl(recordPath, outsiderSid, false);
+  setOutsiderPathAcl(localAppData, outsiderSid, ownerSid, true);
+  setOutsiderPathAcl(administrationRoot, outsiderSid, ownerSid, true);
+  setOutsiderPathAcl(administrationDirectory, outsiderSid, ownerSid, true);
+  setOutsiderPathAcl(recordPath, outsiderSid, ownerSid, false);
 }
 
-function setOutsiderPathAcl(path: string, outsiderSid: string, isDirectory: boolean): void {
+function setOutsiderPathAcl(path: string, outsiderSid: string, ownerSid: string, isDirectory: boolean): void {
   const permission = isDirectory ? "(OI)(CI)F" : "F";
   execFileSync("icacls.exe", [
     path,
     "/inheritance:r",
     "/grant:r",
-      `*${outsiderSid}:${permission}`
+    `*${ownerSid}:${permission}`,
+    "/grant",
+    `*${outsiderSid}:${permission}`
   ], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 }
 
@@ -404,12 +409,9 @@ try {
 }
 & net.exe user $env:GPT_REPO_SECURITY_USER /delete | Out-Null
 $deleteExitCode = $LASTEXITCODE
-try {
-  $null = $account.Translate([System.Security.Principal.SecurityIdentifier])
-} catch [System.Security.Principal.IdentityNotMappedException] {
-  return
+if ($deleteExitCode -ne 0) {
+  throw "The temporary local qualification account could not be removed (net.exe exit code $deleteExitCode)."
 }
-throw "The temporary local qualification account still exists after deletion (net.exe exit code $deleteExitCode)."
 `, { GPT_REPO_SECURITY_USER: name });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
