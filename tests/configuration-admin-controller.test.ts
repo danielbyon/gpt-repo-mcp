@@ -69,6 +69,37 @@ describe("configuration admin controller", () => {
     });
   });
 
+  test("does not reject a reload when success response construction fails after publication", async () => {
+    const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
+    const publishedState = state("b".repeat(64), 3);
+    let currentState = state("a".repeat(64), 2);
+    let helperPidCalls = 0;
+    const reloadFromFile = vi.fn(async () => {
+      currentState = publishedState;
+      return publishedState;
+    });
+    const controller = controllerModule.createConfigurationAdminController({
+      serverPid: 51,
+      helperPid: () => {
+        helperPidCalls += 1;
+        if (helperPidCalls === 1) throw new Error("helper PID response unavailable");
+        return 52;
+      },
+      instanceId: "22222222-2222-4222-8222-222222222222",
+      sourceIdentity,
+      revisionStore: createStore(() => currentState, reloadFromFile)
+    });
+
+    await expect(controller.handle(reloadRequest())).rejects.toThrow("helper PID response unavailable");
+
+    expect(reloadFromFile).toHaveBeenCalledOnce();
+    expect(helperPidCalls).toBe(1);
+    expect(currentState).toMatchObject({
+      effectiveHotRevision: { generation: 3 },
+      acceptedCandidate: { sourceSha256: "b".repeat(64) }
+    });
+  });
+
   test("reports rejection against the state active when the response is built", async () => {
     const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
     let currentState = state("a".repeat(64), 2);

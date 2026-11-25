@@ -52,19 +52,21 @@ export function createConfigurationAdminController(options: {
       return rejection(request.request_id, "SHUTTING_DOWN", "The server is shutting down.");
     }
 
+    let completedState: AdminRevisionState;
     try {
-      const completedState = await options.revisionStore.reloadFromFile();
-      return parseAdminResponse({
-        ...responseIdentity(request.request_id),
-        operation: "reload_result",
-        outcome: "published",
-        effective_generation: completedState.effectiveHotRevision.generation,
-        accepted_source_sha256: completedState.acceptedCandidate.sourceSha256,
-        pending_restart: completedState.pendingRestart !== undefined
-      });
+      completedState = await options.revisionStore.reloadFromFile();
     } catch {
       return rejection(request.request_id, "CANDIDATE_REJECTED", "The configuration candidate was rejected.");
     }
+
+    return parseAdminResponse({
+      ...responseIdentity(request.request_id),
+      operation: "reload_result",
+      outcome: "published",
+      effective_generation: completedState.effectiveHotRevision.generation,
+      accepted_source_sha256: completedState.acceptedCandidate.sourceSha256,
+      pending_restart: completedState.pendingRestart !== undefined
+    });
   }
 
   function rejection(

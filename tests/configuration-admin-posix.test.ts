@@ -162,6 +162,62 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
     }
   });
 
+  test("keeps a post-publication controller failure indeterminate across POSIX IPC", async () => {
+    const ipc = await import("../src/runtime/configuration-admin-posix.js");
+    const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
+    const directory = await createPrivateDirectory();
+    const beforeState = {
+      acceptedCandidate: { sourceSha256: "a".repeat(64) },
+      effectiveHotRevision: { generation: 2 }
+    };
+    const publishedState = {
+      acceptedCandidate: { sourceSha256: "b".repeat(64) },
+      effectiveHotRevision: { generation: 3 }
+    };
+    let currentState = beforeState;
+    const reloadFromFile = vi.fn(async () => {
+      currentState = publishedState;
+      return publishedState;
+    });
+    const controller = controllerModule.createConfigurationAdminController({
+      serverPid: process.pid,
+      helperPid: () => { throw new Error("helper PID response unavailable"); },
+      instanceId,
+      sourceIdentity,
+      revisionStore: { getState: () => currentState, reloadFromFile }
+    });
+    let closeEndpoint: (() => Promise<void>) | undefined;
+
+    try {
+      const endpoint = await ipc.startPosixConfigurationAdminServer({
+        directory,
+        serverPid: process.pid,
+        instanceId,
+        handle: controller.handle
+      });
+      closeEndpoint = endpoint.close;
+      const [record] = await ipc.readPosixConfigurationAdminRecords(directory);
+
+      await expect(ipc.requestPosixConfigurationAdmin(record, {
+        protocol_version: 1,
+        request_id: "44444444-4444-4444-8444-444444444444",
+        operation: "reload",
+        expected_server_pid: process.pid,
+        expected_instance_id: instanceId,
+        expected_source_identity: sourceIdentity
+      })).rejects.toMatchObject({ phase: "indeterminate" });
+
+      expect(reloadFromFile).toHaveBeenCalledOnce();
+      expect(currentState).toMatchObject({
+        acceptedCandidate: { sourceSha256: "b".repeat(64) },
+        effectiveHotRevision: { generation: 3 }
+      });
+    } finally {
+      if (closeEndpoint) await closeEndpoint();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("expires a probe by elapsed time while the endpoint continues sending data", async () => {
     const ipc = await import("../src/runtime/configuration-admin-posix.js");
     const directory = await createPrivateDirectory();
@@ -306,6 +362,7 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
     let closeEndpoint: (() => Promise<void>) | undefined;
     let socket: ReturnType<typeof createConnection> | undefined;
     let progressInterval: ReturnType<typeof setInterval> | undefined;
+    let socketErrorCode: string | undefined;
     const partialFrame = Buffer.concat([Buffer.from([0, 0, 0, 100]), Buffer.alloc(100)]);
     let nextByte = 0;
 
@@ -318,7 +375,20 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
       });
       closeEndpoint = endpoint.close;
       socket = createConnection({ path: endpoint.record.endpoint });
-      const closed = new Promise<void>((resolve) => socket?.once("close", resolve));
+      const stopProgress = (): void => {
+        if (progressInterval) {
+          clearInterval(progressInterval);
+          progressInterval = undefined;
+        }
+      };
+      socket.on("error", (error: NodeJS.ErrnoException) => {
+        socketErrorCode = error.code;
+        stopProgress();
+      });
+      const closed = new Promise<void>((resolve) => socket?.once("close", () => {
+        stopProgress();
+        resolve();
+      }));
       progressInterval = setInterval(() => {
         const byte = partialFrame.subarray(nextByte, nextByte + 1);
         if (byte.byteLength > 0) {
@@ -339,6 +409,7 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
       expect(result).toBe("closed");
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_800);
       expect(Date.now() - startedAt).toBeLessThan(3_000);
+      expect([undefined, "EPIPE", "ECONNRESET"]).toContain(socketErrorCode);
       expect(handler).not.toHaveBeenCalled();
     } finally {
       if (progressInterval) clearInterval(progressInterval);

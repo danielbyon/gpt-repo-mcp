@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { ConfigurationSourceIdentity } from "../src/config/config-source-identity.js";
+import { createConfigurationAdminController } from "../src/runtime/configuration-admin-controller.js";
 import {
   readWindowsConfigurationAdminRecords,
   requestWindowsConfigurationAdmin,
@@ -21,6 +22,88 @@ const instanceId = "22222222-2222-4222-8222-222222222222";
 const userProfileRoot = process.env.USERPROFILE;
 
 describe("owner-local Windows configuration IPC", () => {
+  test.skipIf(process.platform !== "win32")(
+    "reports a post-publication response failure as indeterminate across the native helper",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-post-publication-error-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      const beforeState = {
+        acceptedCandidate: { sourceSha256: "a".repeat(64) },
+        effectiveHotRevision: { generation: 2 }
+      };
+      const publishedState = {
+        acceptedCandidate: { sourceSha256: "b".repeat(64) },
+        effectiveHotRevision: { generation: 3 }
+      };
+      let currentState = beforeState;
+      let helperPid: number | undefined;
+      let failHelperPidResolution = true;
+      const reloadFromFile = vi.fn(async () => {
+        currentState = publishedState;
+        return publishedState;
+      });
+      const controller = createConfigurationAdminController({
+        serverPid: process.pid,
+        helperPid: () => {
+          if (failHelperPidResolution) {
+            failHelperPidResolution = false;
+            throw new Error("helper PID response unavailable");
+          }
+          return helperPid;
+        },
+        instanceId,
+        sourceIdentity,
+        revisionStore: { getState: () => currentState, reloadFromFile }
+      });
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          onHelperPid: (pid) => { helperPid = pid; },
+          handle: controller.handle
+        });
+        const [record] = await readWindowsConfigurationAdminRecords();
+        expect(record).toBeDefined();
+
+        await expect(requestWindowsConfigurationAdmin(record!, {
+          protocol_version: 1,
+          request_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          operation: "reload",
+          expected_server_pid: process.pid,
+          expected_instance_id: instanceId,
+          expected_source_identity: sourceIdentity
+        })).rejects.toMatchObject({ phase: "indeterminate" });
+
+        expect(reloadFromFile).toHaveBeenCalledOnce();
+        expect(currentState).toMatchObject({
+          acceptedCandidate: { sourceSha256: "b".repeat(64) },
+          effectiveHotRevision: { generation: 3 }
+        });
+
+        const probe = await requestWindowsConfigurationAdmin(record!, {
+          protocol_version: 1,
+          request_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          operation: "probe"
+        });
+        expect(probe).toMatchObject({
+          operation: "probe_result",
+          effective_generation: 3,
+          accepted_source_sha256: "b".repeat(64)
+        });
+      } finally {
+        await cleanupWindowsHost(host, localAppData);
+      }
+    }
+  );
+
   test.skipIf(process.platform !== "win32")(
     "classifies an early helper exit before endpoint verification",
     async () => {

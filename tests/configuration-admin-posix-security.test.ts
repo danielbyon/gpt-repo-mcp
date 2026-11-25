@@ -42,6 +42,9 @@ describe.skipIf(process.platform === "win32")("POSIX configuration IPC identity 
     const fixtureRoot = await mkdtemp("/tmp/gpt-repo-admin-security-");
     const adminDirectory = join(fixtureRoot, "owner-admin");
     const configPath = join(fixtureRoot, "config.json");
+    const outsiderWorkingDirectory = join(fixtureRoot, "outsider-working-directory");
+    await mkdir(outsiderWorkingDirectory, { mode: 0o755 });
+    await chmod(outsiderWorkingDirectory, 0o755);
     await writeFile(configPath, JSON.stringify({ repos: [], limits: {} }), { mode: 0o600 });
     const serverEnv: NodeJS.ProcessEnv = {
       ...process.env,
@@ -88,7 +91,7 @@ process.stdout.write(JSON.stringify({ uid: process.getuid(), endpointResult }));
       const outsiderResult = spawnSync("sudo", [
         "-n", "-u", outsider.name, "--", outsiderNode, "-e", outsiderScript,
         record.endpoint
-      ], { encoding: "utf8", timeout: 15_000, maxBuffer: 1_000_000 });
+      ], { cwd: outsiderWorkingDirectory, encoding: "utf8", timeout: 15_000, maxBuffer: 1_000_000 });
       expect(outsiderResult.error, outsiderResult.stderr).toBeUndefined();
       expect(outsiderResult.status, outsiderResult.stderr).toBe(0);
       const result = JSON.parse(outsiderResult.stdout) as {

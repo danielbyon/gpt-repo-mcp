@@ -633,7 +633,9 @@ async function startProcessControl(): Promise<{
   const server = createServer((socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
-    socket.on("error", (error: Error) => socketErrors.set(socket, error));
+    socket.on("error", (error: Error) => {
+      if (!isConnectionReset(error)) socketErrors.set(socket, error);
+    });
     socket.once("end", () => socket.end());
     socket.setEncoding("utf8");
     let input = "";
@@ -692,6 +694,11 @@ async function startProcessControl(): Promise<{
                 resolve();
               };
               const onError = (error: Error): void => {
+                if (isConnectionReset(error)) {
+                  cleanup();
+                  resolve();
+                  return;
+                }
                 socketErrors.set(socket, error);
                 cleanup();
                 reject(error);
@@ -742,6 +749,10 @@ function isProcessRunning(pid: number): boolean {
     if (code === "EPERM") return true;
     throw error;
   }
+}
+
+function isConnectionReset(error: Error): boolean {
+  return "code" in error && error.code === "ECONNRESET";
 }
 
 async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
