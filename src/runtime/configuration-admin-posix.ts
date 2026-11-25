@@ -55,6 +55,7 @@ export async function startPosixConfigurationAdminServer(options: {
       return;
     }
     sockets.add(socket);
+    socket.on("error", () => socket.destroy());
     socket.setTimeout(IPC_TIMEOUT_MS, () => socket.destroy());
     void serveConnection(socket, options.handle).finally(() => sockets.delete(socket));
   });

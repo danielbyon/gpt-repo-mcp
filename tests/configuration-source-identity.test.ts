@@ -12,24 +12,36 @@ describe("configuration source identity", () => {
     expect(identity).toBeDefined();
     if (!identity || !store.resolveConfigPathSelection) return;
 
+    const pathFixture = process.platform === "win32"
+      ? {
+          cwd: "C:\\workspace\\cli",
+          chosen: "C:\\workspace\\cli\\chosen.json",
+          defaultConfig: "C:\\workspace\\cli\\config.local.json"
+        }
+      : {
+          cwd: "/workspace/cli",
+          chosen: "/workspace/cli/chosen.json",
+          defaultConfig: "/workspace/cli/config.local.json"
+        };
+
     const cli = store.resolveConfigPathSelection({
       cliConfigPath: "./chosen.json",
       env: { GPT_REPO_CONFIG: "gpt.json", REPO_READER_CONFIG: "reader.json" },
-      cwd: "/workspace/cli"
+      cwd: pathFixture.cwd
     });
-    expect(cli).toMatchObject({ selected_by: "cli", selected_value: "./chosen.json", path: "/workspace/cli/chosen.json" });
+    expect(cli).toMatchObject({ selected_by: "cli", selected_value: "./chosen.json", path: pathFixture.chosen });
 
     const emptyEnvironment = store.resolveConfigPathSelection({
       env: { GPT_REPO_CONFIG: "", REPO_READER_CONFIG: "reader.json" },
-      cwd: "/workspace/cli"
+      cwd: pathFixture.cwd
     });
-    expect(emptyEnvironment).toMatchObject({ selected_by: "GPT_REPO_CONFIG", selected_value: "", path: "/workspace/cli" });
+    expect(emptyEnvironment).toMatchObject({ selected_by: "GPT_REPO_CONFIG", selected_value: "", path: pathFixture.cwd });
 
-    const defaultSelection = store.resolveConfigPathSelection({ env: {}, cwd: "/workspace/cli" });
+    const defaultSelection = store.resolveConfigPathSelection({ env: {}, cwd: pathFixture.cwd });
     expect(defaultSelection).toMatchObject({
       selected_by: "default",
       selected_value: "./config.local.json",
-      path: "/workspace/cli/config.local.json"
+      path: pathFixture.defaultConfig
     });
     const serverWithoutFile = identity.createConfigurationSourceIdentity(undefined, "/workspace/cli", "linux");
     const cliDefault = identity.createConfigurationSourceIdentity(defaultSelection.path, "/workspace/cli", "linux");
@@ -65,7 +77,7 @@ describe("configuration source identity", () => {
   }
   });
 
-  test("keeps filesystem resolution for symlink traversal and keeps identity when a file is replaced in place", async () => {
+  test("rejects parent traversal without persisting file identity when a file is replaced", async () => {
     const identity = await import("../src/config/config-source-identity.js").catch(() => undefined);
     expect(identity).toBeDefined();
     if (!identity) return;
@@ -79,7 +91,8 @@ describe("configuration source identity", () => {
       await writeFile(join(root, "config.json"), "lexical target");
 
       const originalPath = `${root}/link/../config.json`;
-      expect(await readFile(originalPath, "utf8")).toBe("filesystem target");
+      const traversalTarget = process.platform === "win32" ? "lexical target" : "filesystem target";
+      expect(await readFile(originalPath, "utf8")).toBe(traversalTarget);
       expect(identity.createConfigurationSourceIdentity("link/../config.json", root, "linux").status).toBe("unavailable");
 
       const beforeReplacement = identity.createConfigurationSourceIdentity("config.json", root, "linux");
