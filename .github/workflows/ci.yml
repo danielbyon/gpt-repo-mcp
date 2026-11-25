@@ -51,6 +51,11 @@ jobs:
       - name: Distribution build and health smoke
         run: npm run verify:dist
 
+      - name: POSIX distinct UID enforcement
+        env:
+          GPT_REPO_REQUIRE_SECURITY_FIXTURES: '1'
+        run: node node_modules/vitest/vitest.mjs run tests/configuration-admin-posix-security.test.ts --reporter=verbose
+
   windows-test:
     name: "Windows local IPC and cancellation / Node ${{ matrix.node-version }}"
     runs-on: windows-2025
@@ -107,7 +112,7 @@ jobs:
           node node_modules/vitest/vitest.mjs run
           tests/package-archive-verification.test.ts
           tests/node-runtime-resolver.test.ts
-          tests/configuration-admin-windows.test.ts tests/configuration-admin-protocol.test.ts
+          tests/configuration-admin-windows.test.ts tests/configuration-admin-windows-spawn.test.ts tests/configuration-admin-protocol.test.ts
           tests/configuration-admin-client.test.ts tests/configuration-admin-controller.test.ts
           tests/configuration-admin-cli.test.ts
           tests/windows-process-host.test.ts tests/windows-process-host-protocol.test.ts tests/process-exec.test.ts
@@ -117,6 +122,11 @@ jobs:
           tests/configuration-revision-store.test.ts tests/root-registry-immutability.test.ts
           tests/configuration-background-work.test.ts
           --reporter=verbose
+
+      - name: Windows distinct SID enforcement
+        env:
+          GPT_REPO_REQUIRE_SECURITY_FIXTURES: '1'
+        run: node node_modules/vitest/vitest.mjs run tests/configuration-admin-windows-security.test.ts --reporter=verbose
 
       - name: Windows trusted dispatch, validation cancellation, and receipts
         run: >-
@@ -157,6 +167,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build production CLI and server
+        run: npm run build
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -164,4 +177,11 @@ jobs:
         run: npm run test:configuration-admin:coverage
 
       - name: POSIX local IPC lifecycle
-        run: node node_modules/vitest/vitest.mjs run tests/configuration-admin-posix.test.ts --reporter=verbose
+        env:
+          GPT_REPO_REQUIRE_SECURITY_FIXTURES: '1'
+        run: >-
+          node node_modules/vitest/vitest.mjs run
+          tests/configuration-admin-posix.test.ts
+          tests/configuration-admin-posix-security.test.ts
+          tests/mcp-configuration-activation.test.ts
+          --reporter=verbose

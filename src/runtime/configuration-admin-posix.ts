@@ -3,6 +3,7 @@ import { constants, type Stats } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, rename, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import process from "node:process";
 import type { ConfigurationAdminDiscoveryRecord } from "./configuration-admin-client.js";
 import { ConfigurationAdminIpcError } from "./configuration-admin-error.js";
@@ -17,7 +18,8 @@ import {
   type ConfigurationAdminResponse
 } from "./configuration-admin-protocol.js";
 
-const IPC_TIMEOUT_MS = 5_000;
+const CONNECTION_AND_PROBE_TIMEOUT_MS = 2_000;
+const RELOAD_ACK_TIMEOUT_MS = 30_000;
 const SOCKET_MODE = 0o600;
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const DIRECTORY_READ_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
@@ -56,8 +58,8 @@ export async function startPosixConfigurationAdminServer(options: {
     }
     sockets.add(socket);
     socket.on("error", () => socket.destroy());
-    socket.setTimeout(IPC_TIMEOUT_MS, () => socket.destroy());
-    void serveConnection(socket, options.handle).finally(() => sockets.delete(socket));
+    const frameDeadline = performance.now() + CONNECTION_AND_PROBE_TIMEOUT_MS;
+    void serveConnection(socket, options.handle, frameDeadline).finally(() => sockets.delete(socket));
   });
   server.maxConnections = 32;
   server.on("error", () => undefined);
@@ -137,11 +139,13 @@ export async function readPosixConfigurationAdminRecords(
   return records;
 }
 
-/** Sends one bounded request and never retries a reload after a write attempt. */
+/**
+ * The connection and probe share a two-second deadline. A dispatched reload gets 30 seconds for its acknowledgment.
+ * Reloads are never retried after a write attempt.
+ */
 export async function requestPosixConfigurationAdmin(
   record: ConfigurationAdminDiscoveryRecord,
-  value: ConfigurationAdminRequest,
-  timeoutMs = IPC_TIMEOUT_MS
+  value: ConfigurationAdminRequest
 ): Promise<ConfigurationAdminResponse> {
   let dispatched = false;
   let request: ConfigurationAdminRequest;
@@ -160,25 +164,49 @@ export async function requestPosixConfigurationAdmin(
     const socket = createConnection({ path: record.endpoint });
     let received = Buffer.alloc(0);
     let settled = false;
+    let deadlineAt = performance.now() + CONNECTION_AND_PROBE_TIMEOUT_MS;
+    let deadlineTimer: ReturnType<typeof setTimeout>;
     const phase = (): "pre-dispatch" | "indeterminate" => dispatched ? "indeterminate" : "pre-dispatch";
+
+    const clearDeadline = (): void => clearTimeout(deadlineTimer);
+
+    const armDeadline = (durationMs: number): void => {
+      clearDeadline();
+      deadlineAt = performance.now() + durationMs;
+      deadlineTimer = setTimeout(() => {
+        fail("IPC_TIMEOUT", "The administrative endpoint did not respond before the deadline.");
+      }, durationMs);
+    };
+
+    const deadlineExpired = (): boolean => {
+      if (performance.now() < deadlineAt) return false;
+      fail("IPC_TIMEOUT", "The administrative endpoint did not respond before the deadline.");
+      return true;
+    };
 
     const fail = (code: string, message: string): void => {
       if (settled) return;
       settled = true;
+      clearDeadline();
       socket.destroy();
       rejectResponse(new ConfigurationAdminIpcError(code, phase(), message));
     };
 
-    socket.setTimeout(timeoutMs, () => fail("IPC_TIMEOUT", "The administrative endpoint did not respond before the deadline."));
+    armDeadline(CONNECTION_AND_PROBE_TIMEOUT_MS);
     socket.on("connect", () => {
+      if (deadlineExpired()) return;
       try {
-        if (request.operation === "reload") dispatched = true;
+        if (request.operation === "reload") {
+          dispatched = true;
+          armDeadline(RELOAD_ACK_TIMEOUT_MS);
+        }
         socket.end(frame);
       } catch {
         fail("IPC_WRITE_FAILED", "The administrative request could not be sent.");
       }
     });
     socket.on("data", (chunk: Buffer) => {
+      if (deadlineExpired()) return;
       received = Buffer.concat([received, chunk]);
       if (received.byteLength > MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 4) {
         fail("IPC_FRAME_TOO_LARGE", "The administrative response exceeded the frame limit.");
@@ -186,6 +214,7 @@ export async function requestPosixConfigurationAdmin(
     });
     socket.on("end", () => {
       if (settled) return;
+      if (deadlineExpired()) return;
       try {
         const response = parseAdminResponse(decodeAdminFrame(received));
         if (response.request_id !== request.request_id
@@ -194,6 +223,7 @@ export async function requestPosixConfigurationAdmin(
           throw new Error("The administrative response does not match its request.");
         }
         settled = true;
+        clearDeadline();
         resolveResponse(response);
       } catch {
         fail("IPC_BAD_RESPONSE", "The administrative endpoint returned an invalid or uncorrelated response.");
@@ -238,29 +268,33 @@ export async function getPosixConfigurationAdminDirectory(): Promise<string> {
 
 async function serveConnection(
   socket: Socket,
-  handle: (value: unknown) => Promise<ConfigurationAdminResponse>
+  handle: (value: unknown) => Promise<ConfigurationAdminResponse>,
+  frameDeadline: number
 ): Promise<void> {
   try {
-    const requestValue = decodeAdminFrame(await readSocketFrame(socket));
+    const requestValue = decodeAdminFrame(await readSocketFrame(socket, frameDeadline));
     const request = parseAdminRequest(requestValue);
-    const response = parseAdminResponse(await handle(request));
+    const operationDeadline = request.operation === "probe"
+      ? frameDeadline
+      : performance.now() + RELOAD_ACK_TIMEOUT_MS;
+    const response = parseAdminResponse(await waitForDeadline(handle(request), operationDeadline, socket));
     if (response.request_id !== request.request_id) return;
-    socket.end(encodeAdminFrame(response));
+    await writeFrameBeforeDeadline(socket, encodeAdminFrame(response), operationDeadline);
   } catch {
     socket.destroy();
   }
 }
 
-async function readSocketFrame(socket: Socket): Promise<Buffer> {
+async function readSocketFrame(socket: Socket, deadlineAt: number): Promise<Buffer> {
   return await new Promise<Buffer>((resolveFrame, rejectFrame) => {
     let bytes = Buffer.alloc(0);
     let settled = false;
     const cleanup = (): void => {
+      clearTimeout(deadlineTimer);
       socket.off("data", onData);
       socket.off("end", onEnd);
       socket.off("error", onError);
       socket.off("close", onClose);
-      socket.off("timeout", onTimeout);
     };
     const fail = (): void => {
       if (settled) return;
@@ -268,7 +302,12 @@ async function readSocketFrame(socket: Socket): Promise<Buffer> {
       cleanup();
       rejectFrame(new Error("Invalid administrative request frame."));
     };
+    const deadlineTimer = scheduleDeadline(deadlineAt, fail);
     const onData = (chunk: Buffer): void => {
+      if (performance.now() >= deadlineAt) {
+        fail();
+        return;
+      }
       bytes = Buffer.concat([bytes, chunk]);
       if (bytes.byteLength > MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 4) {
         fail();
@@ -282,6 +321,10 @@ async function readSocketFrame(socket: Socket): Promise<Buffer> {
     };
     const onEnd = (): void => {
       if (settled) return;
+      if (performance.now() >= deadlineAt) {
+        fail();
+        return;
+      }
       try {
         decodeAdminFrame(bytes);
         settled = true;
@@ -293,13 +336,75 @@ async function readSocketFrame(socket: Socket): Promise<Buffer> {
     };
     const onError = (): void => fail();
     const onClose = (): void => fail();
-    const onTimeout = (): void => fail();
     socket.on("data", onData);
     socket.once("end", onEnd);
     socket.once("error", onError);
     socket.once("close", onClose);
-    socket.once("timeout", onTimeout);
   });
+}
+
+/** Waits against one monotonic deadline; socket activity never extends the limit. */
+function waitForDeadline<T>(operation: Promise<T>, deadlineAt: number, socket: Socket): Promise<T> {
+  return new Promise<T>((resolveOperation, rejectOperation) => {
+    if (socket.destroyed) {
+      rejectOperation(new Error("Administrative IPC connection closed."));
+      return;
+    }
+    let settled = false;
+    const finish = (rejected: boolean, value: unknown): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      socket.off("close", onSocketClose);
+      if (rejected) rejectOperation(value);
+      else resolveOperation(value as T);
+    };
+    const onSocketClose = (): void => finish(true, new Error("Administrative IPC connection closed."));
+    const deadlineTimer = scheduleDeadline(
+      deadlineAt,
+      () => finish(true, new Error("Administrative IPC operation timed out."))
+    );
+    socket.once("close", onSocketClose);
+
+    operation.then(
+      (value) => {
+        if (performance.now() >= deadlineAt) {
+          finish(true, new Error("Administrative IPC operation timed out."));
+        } else {
+          finish(false, value);
+        }
+      },
+      (error: unknown) => finish(true, error)
+    );
+  });
+}
+
+function writeFrameBeforeDeadline(socket: Socket, frame: Buffer, deadlineAt: number): Promise<void> {
+  return new Promise<void>((resolveWrite, rejectWrite) => {
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      socket.off("error", onError);
+      if (error) rejectWrite(error);
+      else if (performance.now() >= deadlineAt) rejectWrite(new Error("Administrative IPC response timed out."));
+      else resolveWrite();
+    };
+    const onError = (error: Error): void => finish(error);
+    const remainingMs = deadlineAt - performance.now();
+    if (remainingMs <= 0) {
+      rejectWrite(new Error("Administrative IPC response timed out."));
+      return;
+    }
+    const deadlineTimer = setTimeout(() => finish(new Error("Administrative IPC response timed out.")), remainingMs);
+    socket.once("error", onError);
+    socket.end(frame, () => finish());
+  });
+}
+
+function scheduleDeadline(deadlineAt: number, onDeadline: () => void): ReturnType<typeof setTimeout> {
+  return setTimeout(onDeadline, Math.max(0, deadlineAt - performance.now()));
 }
 
 async function publishDiscoveryRecord(

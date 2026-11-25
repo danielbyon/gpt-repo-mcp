@@ -240,11 +240,268 @@ describe("owner-local Windows configuration IPC", () => {
         const client = await import("../src/runtime/configuration-admin-client.js");
         await expect(client.reloadConfigurationAdmin({ selectedSourceIdentity: sourceIdentity }))
           .rejects.toMatchObject({ code: "NO_MATCHING_INSTANCE" });
+        await expect(client.reloadConfigurationAdmin({
+          selectedSourceIdentity: sourceIdentity,
+          instancePid: process.pid
+        })).rejects.toMatchObject({ code: "INSTANCE_UNAVAILABLE" });
       } finally {
         await cleanupWindowsHost(host, localAppData);
       }
     }
   );
+
+  test.skipIf(process.platform !== "win32")(
+    "correlates overlapping native connections while an earlier reload is outstanding",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-overlap-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      const reloadStarted = deferred<void>();
+      const finishReload = deferred<void>();
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          handle: async (value): Promise<ConfigurationAdminResponse> => {
+            const request = parseAdminRequest(value);
+            if (request.operation === "reload") {
+              reloadStarted.resolve();
+              await finishReload.promise;
+              return reloadResponse(request.request_id, sourceIdentity, "d");
+            }
+            return probeResponse(request.request_id, sourceIdentity);
+          }
+        });
+
+        const delayedReload = requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          operation: "reload",
+          expected_server_pid: process.pid,
+          expected_instance_id: instanceId,
+          expected_source_identity: sourceIdentity
+        });
+        await reloadStarted.promise;
+
+        const concurrentProbe = await requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          operation: "probe"
+        });
+        expect(concurrentProbe).toMatchObject({
+          request_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          operation: "probe_result"
+        });
+
+        finishReload.resolve();
+        await expect(delayedReload).resolves.toMatchObject({
+          request_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          operation: "reload_result",
+          outcome: "published"
+        });
+
+        const followupProbe = await requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+          operation: "probe"
+        });
+        expect(followupProbe).toMatchObject({
+          request_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+          operation: "probe_result"
+        });
+      } finally {
+        finishReload.resolve();
+        await cleanupWindowsHost(host, localAppData);
+      }
+    },
+    40_000
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "expires unmonitored probe waits at the two-second deadline",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-probe-deadline-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_FAULT", "unmonitored-client");
+
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      const bothRequestsStarted = deferred<void>();
+      const releaseHandlers = deferred<void>();
+      let startedCount = 0;
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          handle: async (value): Promise<ConfigurationAdminResponse> => {
+            const request = parseAdminRequest(value);
+            if (startedCount < 2) {
+              startedCount += 1;
+              if (startedCount === 2) bothRequestsStarted.resolve();
+              await releaseHandlers.promise;
+            }
+            return probeResponse(request.request_id, sourceIdentity);
+          }
+        });
+
+        const startedAt = Date.now();
+        const blockedRequests = [
+          "12121212-1212-4212-8212-121212121212",
+          "34343434-3434-4434-8434-343434343434"
+        ].map((requestId) => requestWindowsConfigurationAdmin(host!.record, {
+          protocol_version: 1,
+          request_id: requestId,
+          operation: "probe"
+        }));
+        await bothRequestsStarted.promise;
+        const outcomes = await Promise.all(blockedRequests.map((request) => request.then(
+          () => "resolved" as const,
+          () => "rejected" as const
+        )));
+
+        expect(outcomes).toEqual(["rejected", "rejected"]);
+        expect(Date.now() - startedAt).toBeLessThan(5_000);
+        await expect(requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "56565656-5656-4656-8656-565656565656",
+          operation: "probe"
+        })).resolves.toMatchObject({
+          request_id: "56565656-5656-4656-8656-565656565656",
+          operation: "probe_result"
+        });
+      } finally {
+        releaseHandlers.resolve();
+        await cleanupWindowsHost(host, localAppData);
+      }
+    },
+    12_000
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "drops a late control response after its client connection has ended",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-late-control-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      const firstStarted = deferred<void>();
+      const firstFinished = deferred<void>();
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          handle: async (value): Promise<ConfigurationAdminResponse> => {
+            const request = parseAdminRequest(value);
+            if (request.request_id === "11111111-1111-4111-8111-111111111111") {
+              firstStarted.resolve();
+              await new Promise((resolveDelay) => setTimeout(resolveDelay, 5_000));
+              firstFinished.resolve();
+            }
+            return probeResponse(request.request_id, sourceIdentity);
+          }
+        });
+
+        const timedOutProbe = requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "11111111-1111-4111-8111-111111111111",
+          operation: "probe"
+        });
+        await firstStarted.promise;
+        await expect(timedOutProbe).rejects.toMatchObject({ code: "WINDOWS_HELPER_TIMEOUT" });
+
+        const subsequentProbe = await requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "22222222-2222-4222-8222-222222222222",
+          operation: "probe"
+        });
+        expect(subsequentProbe).toMatchObject({
+          request_id: "22222222-2222-4222-8222-222222222222",
+          operation: "probe_result"
+        });
+
+        await firstFinished.promise;
+        const finalProbe = await requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "33333333-3333-4333-8333-333333333333",
+          operation: "probe"
+        });
+        expect(finalProbe).toMatchObject({
+          request_id: "33333333-3333-4333-8333-333333333333",
+          operation: "probe_result"
+        });
+      } finally {
+        await cleanupWindowsHost(host, localAppData);
+      }
+    },
+    15_000
+  );
+
+  test.skipIf(process.platform !== "win32").each([
+    "break-control-input",
+    "break-control-output"
+  ])("keeps helper channel failures from becoming successful dispatches (%s)", async (fault) => {
+    const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-control-fault-");
+    vi.stubEnv("LOCALAPPDATA", localAppData);
+    vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+    vi.stubEnv("GPT_REPO_ADMIN_TEST_FAULT", fault);
+    let dispatched = 0;
+    let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+    try {
+      host = await startWindowsConfigurationAdminHost({
+        serverPid: process.pid,
+        instanceId,
+        handle: async () => {
+          dispatched += 1;
+          throw new Error("A broken private control channel must not dispatch a request.");
+        }
+      });
+      const record = host.record;
+      await vi.waitFor(async () => {
+        const records = await readWindowsConfigurationAdminRecords();
+        if (fault === "break-control-input") expect(records).not.toContainEqual(record);
+        else expect(records).toContainEqual(record);
+      }, { timeout: 4_000, interval: 25 });
+
+      await expect(requestWindowsConfigurationAdmin(record, {
+        protocol_version: 1,
+        request_id: "44444444-4444-4444-8444-444444444444",
+        operation: "probe"
+      })).rejects.toMatchObject({ phase: "pre-dispatch" });
+      expect(dispatched).toBe(0);
+    } finally {
+      try {
+        await host?.close().catch(() => undefined);
+      } finally {
+        try {
+          await rm(localAppData, { recursive: true, force: true });
+        } finally {
+          vi.unstubAllEnvs();
+        }
+      }
+    }
+  });
 
   test.skipIf(process.platform !== "win32")(
     "rejects a UNC endpoint before starting the native client",
@@ -367,7 +624,7 @@ describe("owner-local Windows configuration IPC", () => {
               };
             }
             requestStarted.resolve();
-            await new Promise((resolveDelay) => setTimeout(resolveDelay, 6_000));
+            await new Promise((resolveDelay) => setTimeout(resolveDelay, 31_000));
             handlerFinished.resolve();
             return {
               ...identity,
@@ -406,7 +663,7 @@ describe("owner-local Windows configuration IPC", () => {
         await cleanupWindowsHost(host, localAppData);
       }
     },
-    15_000
+    45_000
   );
 });
 
@@ -414,6 +671,39 @@ function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((complete) => { resolve = complete; });
   return { promise, resolve };
+}
+
+function probeResponse(requestId: string, sourceIdentity: ConfigurationSourceIdentity): ConfigurationAdminResponse {
+  return {
+    protocol_version: 1,
+    request_id: requestId,
+    server_pid: process.pid,
+    instance_id: instanceId,
+    source_identity: sourceIdentity,
+    operation: "probe_result",
+    effective_generation: 7,
+    accepted_source_sha256: "a".repeat(64),
+    pending_restart: false
+  };
+}
+
+function reloadResponse(
+  requestId: string,
+  sourceIdentity: ConfigurationSourceIdentity,
+  digestCharacter: string
+): ConfigurationAdminResponse {
+  return {
+    protocol_version: 1,
+    request_id: requestId,
+    server_pid: process.pid,
+    instance_id: instanceId,
+    source_identity: sourceIdentity,
+    operation: "reload_result",
+    outcome: "published",
+    effective_generation: 8,
+    accepted_source_sha256: digestCharacter.repeat(64),
+    pending_restart: false
+  };
 }
 
 async function cleanupWindowsHost(

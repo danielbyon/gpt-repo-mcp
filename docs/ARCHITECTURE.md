@@ -43,6 +43,17 @@ definition unique, preserves a stable public order, and rejects missing or
 duplicate definitions. Package and tier metadata organize implementation code;
 they are not additional user-facing tools or permissions.
 
+Configuration reload uses private IPC for the current user. POSIX stores
+discovery records in a `0700` directory and creates `0600` sockets. Windows
+protects discovery files and named pipes with the helper owner's SID, and the
+native pipe rejects remote clients. The CLI probes each candidate and checks
+its normalized configuration path before dispatch. Windows control messages
+carry a connection ID, keeping concurrent responses and aborts attached to
+the pipe that sent each request. Connections and probes have a two-second
+absolute deadline. Reload acknowledgments have a 30-second absolute deadline.
+`ConfigurationRevisionStore` serializes configuration reads, validation, and
+publication.
+
 ## Data Flow
 
 ChatGPT calls a tool with `repo_id` and repo-relative POSIX paths or globs. The handler resolves `repo_id` through `RootRegistry`, creates the required services, and returns a result envelope.

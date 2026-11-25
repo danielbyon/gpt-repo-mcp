@@ -18,8 +18,11 @@ import {
   type ConfigurationAdminResponse
 } from "./configuration-admin-protocol.js";
 
-const STARTUP_TIMEOUT_MS = 3_000;
-const HELPER_TIMEOUT_MS = 7_000;
+const CONNECTION_TIMEOUT_MS = 2_000;
+const PROBE_TIMEOUT_MS = 2_000;
+const CONTROL_WRITE_TIMEOUT_MS = 2_000;
+const RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS = 30_000;
+const SHUTDOWN_TIMEOUT_MS = 7_000;
 const MAX_DISCOVERY_BYTES = 1_048_576;
 const MAX_CONTROL_LINE_BYTES = Math.ceil((MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 4) * 4 / 3) + 16;
 
@@ -43,14 +46,13 @@ export async function startWindowsConfigurationAdminHost(options: {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true
   });
+  const host = new WindowsHostProcess(child, options.handle, options.serverPid, options.instanceId);
   child.stderr.resume();
   if (!child.pid) {
-    child.kill();
-    throw ipcError("WINDOWS_HELPER_START_FAILED", "pre-dispatch", "The local administrative helper could not be started.");
+    host.reportMissingPid();
+  } else {
+    options.onHelperPid?.(child.pid);
   }
-  options.onHelperPid?.(child.pid);
-
-  const host = new WindowsHostProcess(child, options.handle, options.serverPid, options.instanceId);
   try {
     const record = await host.waitUntilReady();
     return Object.freeze({ record, close: () => host.close() });
@@ -63,7 +65,7 @@ export async function startWindowsConfigurationAdminHost(options: {
 /** Reads Windows discovery records through the helper that validates their ACLs. */
 export async function readWindowsConfigurationAdminRecords(): Promise<ConfigurationAdminDiscoveryRecord[]> {
   const helperPath = await resolveWindowsConfigurationAdminHostPath();
-  const output = await runHelper(helperPath, ["discover"], undefined, 3_000, MAX_DISCOVERY_BYTES);
+  const output = await runHelper(helperPath, ["discover"], undefined, CONNECTION_TIMEOUT_MS, MAX_DISCOVERY_BYTES);
   let parsed: unknown;
   try {
     parsed = JSON.parse(output.toString("utf8"));
@@ -89,7 +91,8 @@ export async function requestWindowsConfigurationAdmin(
   }
 
   const frame = encodeAdminFrame(request);
-  const output = await runHelper(helperPath, ["client", target.endpoint], frame, HELPER_TIMEOUT_MS,
+  const timeoutMs = request.operation === "probe" ? PROBE_TIMEOUT_MS : RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS;
+  const output = await runHelper(helperPath, ["client", target.endpoint, String(timeoutMs)], frame, timeoutMs,
     MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 64, request.operation === "reload");
   const markerEnd = output.indexOf(0x0a);
   if (markerEnd < 0) {
@@ -103,8 +106,15 @@ export async function requestWindowsConfigurationAdmin(
   }
 
   const marker = output.subarray(0, markerEnd).toString("ascii");
-  if (marker === "NOT_DISPATCHED") {
-    throw ipcError("WINDOWS_PIPE_UNAVAILABLE", "pre-dispatch", "The native helper confirmed that it could not write the request.");
+  if (marker.startsWith("NOT_DISPATCHED\t")) {
+    const errorCode = marker.slice("NOT_DISPATCHED\t".length);
+    throw ipcError(
+      errorCode === "5" ? "WINDOWS_PIPE_ACCESS_DENIED" : "WINDOWS_PIPE_UNAVAILABLE",
+      "pre-dispatch",
+      errorCode === "5"
+        ? "Windows denied access to the owner-local administrative pipe."
+        : "The native helper confirmed that it could not write the request."
+    );
   }
   if (marker === "INDETERMINATE") {
     throw ipcError("WINDOWS_PIPE_INDETERMINATE", "indeterminate", "The reload may have run, but the native helper could not confirm the response.");
@@ -167,8 +177,9 @@ class WindowsHostProcess {
   private readyRecord: ConfigurationAdminDiscoveryRecord | undefined;
   private readyResolve: ((record: ConfigurationAdminDiscoveryRecord) => void) | undefined;
   private readyReject: ((error: Error) => void) | undefined;
-  private requestInFlight = false;
+  private readonly pendingConnections = new Map<string, object>();
   private closed = false;
+  private failed = false;
   private readonly readyPromise: Promise<ConfigurationAdminDiscoveryRecord>;
 
   constructor(
@@ -182,14 +193,24 @@ class WindowsHostProcess {
       this.readyReject = rejectReady;
     });
     child.stdout.on("data", (chunk: Buffer) => this.onOutput(chunk));
-    child.once("error", () => this.failBeforeReady("WINDOWS_HELPER_START_FAILED"));
+    child.stdout.on("error", () => this.failHost("WINDOWS_HELPER_CONTROL_READ_FAILED"));
+    child.stdout.on("close", () => this.failWhenStreamCloses("WINDOWS_HELPER_CONTROL_READ_CLOSED"));
+    child.stdin.on("error", () => this.failHost("WINDOWS_HELPER_CONTROL_WRITE_FAILED"));
+    child.stdin.on("close", () => this.failWhenStreamCloses("WINDOWS_HELPER_CONTROL_WRITE_CLOSED"));
+    child.stderr.on("error", () => this.failHost("WINDOWS_HELPER_STDERR_FAILED"));
+    child.stderr.on("close", () => this.failWhenStreamCloses("WINDOWS_HELPER_STDERR_CLOSED"));
+    child.on("error", () => this.failHost("WINDOWS_HELPER_START_FAILED"));
     child.once("exit", (code, signal) => {
       const exitDetail = code === null ? `signal ${signal ?? "unknown"}` : `exit code ${code}`;
-      this.failBeforeReady(
-        "WINDOWS_HELPER_EXITED",
-        `The local administrative helper exited before establishing a verified endpoint (${exitDetail}).`
-      );
+      const message = `The local administrative helper exited before establishing a verified endpoint (${exitDetail}).`;
+      this.failBeforeReady("WINDOWS_HELPER_EXITED", message);
+      this.failHost("WINDOWS_HELPER_EXITED", message, false);
     });
+    child.once("close", () => this.failWhenStreamCloses("WINDOWS_HELPER_CLOSED"));
+  }
+
+  reportMissingPid(): void {
+    this.failHost("WINDOWS_HELPER_START_FAILED");
   }
 
   async waitUntilReady(): Promise<ConfigurationAdminDiscoveryRecord> {
@@ -202,7 +223,7 @@ class WindowsHostProcess {
             "WINDOWS_HELPER_START_TIMEOUT",
             "pre-dispatch",
             "The local administrative helper did not start before the deadline."
-          )), STARTUP_TIMEOUT_MS);
+          )), CONNECTION_TIMEOUT_MS);
         })
       ]);
     } finally {
@@ -212,12 +233,15 @@ class WindowsHostProcess {
 
   async abortStartup(): Promise<void> {
     this.closed = true;
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+    if (this.child.exitCode !== null || this.child.signalCode !== null || this.failed) {
+      this.child.kill();
+      return;
+    }
     const shutdownWritten = await this.writeControlLine("SHUTDOWN\n");
     this.child.stdin.end();
     if (!shutdownWritten) this.child.kill();
     try {
-      await waitForExit(this.child, HELPER_TIMEOUT_MS);
+      await waitForExit(this.child, SHUTDOWN_TIMEOUT_MS);
     } catch {
       this.child.kill();
       await waitForExit(this.child, 1_000).catch(() => undefined);
@@ -232,7 +256,7 @@ class WindowsHostProcess {
     this.child.stdin.end();
     if (!shutdownWritten) this.child.kill();
     try {
-      await waitForExit(this.child, HELPER_TIMEOUT_MS);
+      await waitForExit(this.child, SHUTDOWN_TIMEOUT_MS);
     } catch {
       this.child.kill();
       await waitForExit(this.child, 1_000).catch(() => undefined);
@@ -245,16 +269,24 @@ class WindowsHostProcess {
 
   private writeControlLine(line: string): Promise<boolean> {
     return new Promise((resolveWrite) => {
+      let settled = false;
+      const finish = (written: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolveWrite(written);
+      };
+      const timer = setTimeout(() => finish(false), CONTROL_WRITE_TIMEOUT_MS);
       try {
-        this.child.stdin.write(line, (error) => resolveWrite(error === null));
+        this.child.stdin.write(line, (error) => finish(error == null));
       } catch {
-        resolveWrite(false);
+        finish(false);
       }
     });
   }
 
   private onOutput(chunk: Buffer): void {
-    if (this.closed) return;
+    if (this.closed || this.failed) return;
     this.bufferedOutput = Buffer.concat([this.bufferedOutput, chunk]);
     if (this.bufferedOutput.byteLength > MAX_CONTROL_LINE_BYTES * 2) {
       this.child.kill();
@@ -273,9 +305,41 @@ class WindowsHostProcess {
       const line = this.bufferedOutput.subarray(0, newline).toString("utf8");
       this.bufferedOutput = this.bufferedOutput.subarray(newline + 1);
       if (!this.readyRecord) this.acceptReadyLine(line);
-      else if (line.startsWith("REQUEST\t")) void this.forwardRequest(line.slice("REQUEST\t".length));
-      else void this.writeControlLine("ABORT\n");
+      else this.acceptControlLine(line);
     }
+  }
+
+  private acceptControlLine(line: string): void {
+    const requestPrefix = "REQUEST\t";
+    if (line.startsWith(requestPrefix)) {
+      const separator = line.indexOf("\t", requestPrefix.length);
+      if (separator < 0) {
+        this.failHost("WINDOWS_HELPER_BAD_CONTROL_MESSAGE");
+        return;
+      }
+      const connectionId = line.slice(requestPrefix.length, separator);
+      const encodedFrame = line.slice(separator + 1);
+      if (!isCanonicalConnectionId(connectionId) || !isCanonicalBase64(encodedFrame)
+        || this.pendingConnections.has(connectionId)) {
+        this.failHost("WINDOWS_HELPER_BAD_CONTROL_MESSAGE");
+        return;
+      }
+      void this.forwardRequest(connectionId, encodedFrame);
+      return;
+    }
+
+    const abortPrefix = "ABORT\t";
+    if (line.startsWith(abortPrefix)) {
+      const connectionId = line.slice(abortPrefix.length);
+      if (!isCanonicalConnectionId(connectionId)) {
+        this.failHost("WINDOWS_HELPER_BAD_CONTROL_MESSAGE");
+        return;
+      }
+      this.pendingConnections.delete(connectionId);
+      return;
+    }
+
+    this.failHost("WINDOWS_HELPER_BAD_CONTROL_MESSAGE");
   }
 
   private acceptReadyLine(line: string): void {
@@ -296,27 +360,48 @@ class WindowsHostProcess {
     }
   }
 
-  private async forwardRequest(encodedFrame: string): Promise<void> {
-    if (this.closed) return;
-    if (this.requestInFlight || !isCanonicalBase64(encodedFrame)) {
-      await this.writeControlLine("ABORT\n");
-      return;
-    }
-    this.requestInFlight = true;
+  private async forwardRequest(connectionId: string, encodedFrame: string): Promise<void> {
+    if (this.closed || this.failed) return;
+    const pendingToken = {};
+    this.pendingConnections.set(connectionId, pendingToken);
     try {
       const frame = Buffer.from(encodedFrame, "base64");
       if (frame.byteLength > MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 4) throw new Error("Oversized request.");
       const request = parseAdminRequest(decodeAdminFrame(frame));
       const response = parseAdminResponse(await this.handle(request));
       if (response.request_id !== request.request_id) throw new Error("Request correlation failed.");
-      if (this.closed) return;
-      const line = `RESPONSE\t${encodeAdminFrame(response).toString("base64")}\n`;
+      if (this.closed || this.failed || this.pendingConnections.get(connectionId) !== pendingToken) return;
+      this.pendingConnections.delete(connectionId);
+      const line = `RESPONSE\t${connectionId}\t${encodeAdminFrame(response).toString("base64")}\n`;
       const responseWritten = await this.writeControlLine(line);
-      if (!responseWritten && !this.closed) await this.writeControlLine("ABORT\n");
+      if (!responseWritten && !this.closed && !this.failed) {
+        this.failHost("WINDOWS_HELPER_CONTROL_WRITE_FAILED");
+      }
     } catch {
-      if (!this.closed) await this.writeControlLine("ABORT\n");
-    } finally {
-      this.requestInFlight = false;
+      if (!this.closed && !this.failed
+        && this.pendingConnections.get(connectionId) === pendingToken) {
+        this.pendingConnections.delete(connectionId);
+        await this.writeControlLine(`ABORT\t${connectionId}\n`);
+      }
+    }
+  }
+
+  private failWhenStreamCloses(code: string): void {
+    if (this.closed || this.failed || this.child.exitCode !== null || this.child.signalCode !== null) return;
+    this.failHost(code);
+  }
+
+  private failHost(
+    code: string,
+    message = "The local administrative helper control channel failed.",
+    terminate = true
+  ): void {
+    if (this.failed) return;
+    this.failed = true;
+    this.pendingConnections.clear();
+    this.failBeforeReady(code, message);
+    if (terminate && this.child.exitCode === null && this.child.signalCode === null) {
+      this.child.kill();
     }
   }
 
@@ -340,45 +425,68 @@ async function runHelper(
   maximumOutputBytes: number,
   mutation = false
 ): Promise<Buffer> {
+  const deadline = performance.now() + timeoutMs;
   const child = spawn(helperPath, args, { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
   const chunks: Buffer[] = [];
   let outputLength = 0;
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    child.kill();
-  }, timeoutMs);
-  const outputPromise = new Promise<Buffer>((resolveOutput, rejectOutput) => {
+  return await new Promise<Buffer>((resolveOutput, rejectOutput) => {
+    let settled = false;
+    const fail = (error: Error, terminate = true): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (terminate && child.exitCode === null && child.signalCode === null) child.kill();
+      rejectOutput(error);
+    };
+    const finish = (value: Buffer): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveOutput(value);
+    };
+    // Without a native NOT_DISPATCHED marker, a stream error cannot prove the request was not sent.
+    const processErrorPhase = child.pid !== undefined && mutation ? "indeterminate" : "pre-dispatch";
+
     child.stdout.on("data", (chunk: Buffer) => {
+      if (settled) return;
       outputLength += chunk.byteLength;
       if (outputLength > maximumOutputBytes) {
-        child.kill();
-        rejectOutput(ipcError("WINDOWS_HELPER_OUTPUT_TOO_LARGE", mutation ? "indeterminate" : "pre-dispatch", "The native helper output exceeded its limit."));
+        fail(ipcError("WINDOWS_HELPER_OUTPUT_TOO_LARGE", processErrorPhase, "The native helper output exceeded its limit."));
         return;
       }
       chunks.push(Buffer.from(chunk));
     });
-    child.once("error", () => rejectOutput(ipcError("WINDOWS_HELPER_START_FAILED", "pre-dispatch", "The native helper could not be started.")));
+    child.stdout.on("error", () => {
+      fail(ipcError("WINDOWS_HELPER_CONTROL_READ_FAILED", processErrorPhase, "The native helper control channel could not be read."));
+    });
+    child.stdin.on("error", () => {
+      fail(ipcError("WINDOWS_HELPER_CONTROL_WRITE_FAILED", processErrorPhase, "The native helper control channel could not be written."));
+    });
+    child.on("error", () => {
+      fail(ipcError("WINDOWS_HELPER_START_FAILED", "pre-dispatch", "The native helper could not be started."), false);
+    });
     child.once("close", (code) => {
-      if (timedOut) {
-        rejectOutput(ipcError(
-          "WINDOWS_HELPER_TIMEOUT",
-          mutation ? "indeterminate" : "pre-dispatch",
-          mutation ? "The reload may have run, but the native helper timed out." : "The native probe timed out."
-        ));
-      } else if (code !== 0 && args[0] !== "client") {
-        rejectOutput(ipcError("WINDOWS_HELPER_FAILED", "pre-dispatch", "The local administrative helper failed."));
+      if (settled) return;
+      if (code !== 0 && args[0] !== "client") {
+        fail(ipcError("WINDOWS_HELPER_FAILED", "pre-dispatch", "The local administrative helper failed."), false);
       } else {
-        resolveOutput(Buffer.concat(chunks));
+        finish(Buffer.concat(chunks));
       }
     });
+    const remaining = Math.max(0, deadline - performance.now());
+    const timer = setTimeout(() => {
+      fail(ipcError(
+        "WINDOWS_HELPER_TIMEOUT",
+        processErrorPhase,
+        mutation ? "The reload may have run, but the native helper timed out." : "The native probe timed out."
+      ));
+    }, remaining);
+    try {
+      child.stdin.end(input);
+    } catch {
+      fail(ipcError("WINDOWS_HELPER_CONTROL_WRITE_FAILED", processErrorPhase, "The native helper control channel could not be written."));
+    }
   });
-  child.stdin.end(input);
-  try {
-    return await outputPromise;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 function validateWindowsRecord(value: unknown): ConfigurationAdminDiscoveryRecord {
@@ -394,6 +502,10 @@ function isCanonicalBase64(value: string): boolean {
   return value.length > 0 && value.length <= MAX_CONTROL_LINE_BYTES
     && /^[A-Za-z0-9+/]+={0,2}$/.test(value)
     && Buffer.from(value, "base64").toString("base64") === value;
+}
+
+function isCanonicalConnectionId(value: string): boolean {
+  return /^[1-9][0-9]*-[1-9][0-9]*$/.test(value);
 }
 
 function ipcError(code: string, phase: "pre-dispatch" | "indeterminate", message: string): ConfigurationAdminIpcError {

@@ -90,6 +90,10 @@ whose recorded config source matches the selected path. If more than one server
 matches, choose one with `npm run config:reload -- --instance <PID>`. The PID
 narrows the choice but does not skip the source check.
 
+Each connection and probe has a two-second absolute deadline. A reload
+acknowledgment has a 30-second absolute deadline. If the acknowledgment is lost
+after dispatch, the CLI reports that the reload outcome is indeterminate.
+
 `npm run mcp` starts the server with `GPT_REPO_CONFIG=./config.local.json`, which
 matches the CLI's implicit default. A server started without either config
 environment variable keeps its existing built-in default and does not read

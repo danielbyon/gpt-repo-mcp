@@ -6,11 +6,19 @@
 #include <sddl.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cwchar>
+#include <functional>
 #include <iterator>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -29,7 +37,16 @@ namespace {
 constexpr DWORD kMaximumFrameBytes = 16'384;
 constexpr DWORD kMaximumInputBytes = kMaximumFrameBytes + 4;
 constexpr DWORD kMaximumControlLineBytes = 32'768;
-constexpr DWORD kIoTimeoutMs = 5'000;
+constexpr DWORD kConnectionTimeoutMs = 2'000;
+constexpr DWORD kProbeTimeoutMs = 2'000;
+constexpr DWORD kReloadAcknowledgmentTimeoutMs = 30'000;
+constexpr DWORD kControlLineTimeoutMs = 2'000;
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+constexpr size_t kMaximumConnections = 2;
+#else
+constexpr size_t kMaximumConnections = 32;
+#endif
+constexpr DWORD kMaximumPipeInstances = 64;
 constexpr DWORD kPipeBufferBytes = kMaximumInputBytes;
 constexpr char kBase64Alphabet[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -79,6 +96,13 @@ struct InstanceRecord {
 };
 
 enum class IoWaitResult { kCompleted, kParentExited, kTimedOut, kFailed };
+
+std::mutex g_stdoutMutex;
+std::atomic<ULONGLONG> g_connectionSequence{1};
+
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+const wchar_t *testFault();
+#endif
 
 bool isValidUuid(const std::string &value) {
   if (value.size() != 36) return false;
@@ -190,12 +214,14 @@ bool writeHandle(HANDLE handle, const BYTE *bytes, DWORD size) {
 }
 
 bool writeStdout(const std::string &value) {
+  std::lock_guard<std::mutex> lock(g_stdoutMutex);
   return writeHandle(GetStdHandle(STD_OUTPUT_HANDLE),
                      reinterpret_cast<const BYTE *>(value.data()),
                      static_cast<DWORD>(value.size()));
 }
 
 bool writeStdoutBytes(const BYTE *bytes, DWORD size) {
+  std::lock_guard<std::mutex> lock(g_stdoutMutex);
   return writeHandle(GetStdHandle(STD_OUTPUT_HANDLE), bytes, size);
 }
 
@@ -606,7 +632,7 @@ bool removeRecordIfSame(const std::wstring &path, const SecurityContext &securit
 
 bool readAllControlLine(HANDLE input, HANDLE parentProcess, std::string &line) {
   line.clear();
-  const ULONGLONG deadline = GetTickCount64() + kIoTimeoutMs;
+  const ULONGLONG deadline = GetTickCount64() + kControlLineTimeoutMs;
   while (GetTickCount64() < deadline) {
     if (WaitForSingleObject(parentProcess, 0) == WAIT_OBJECT_0) return false;
     DWORD available = 0;
@@ -635,9 +661,17 @@ IoWaitResult waitForIo(HANDLE event, HANDLE parentProcess, DWORD timeoutMs) {
   return IoWaitResult::kFailed;
 }
 
+DWORD remainingMilliseconds(ULONGLONG deadline) {
+  const ULONGLONG now = GetTickCount64();
+  if (now >= deadline) return 0;
+  return static_cast<DWORD>(std::min<ULONGLONG>(deadline - now, MAXDWORD));
+}
+
 bool finishOverlapped(HANDLE pipe, OVERLAPPED &operation, HANDLE parentProcess,
-                      DWORD &transferred) {
-  const IoWaitResult wait = waitForIo(operation.hEvent, parentProcess, kIoTimeoutMs);
+                      DWORD &transferred, ULONGLONG deadline) {
+  const DWORD remaining = remainingMilliseconds(deadline);
+  const IoWaitResult wait = remaining == 0 ? IoWaitResult::kTimedOut
+      : waitForIo(operation.hEvent, parentProcess, remaining);
   if (wait != IoWaitResult::kCompleted) {
     CancelIoEx(pipe, &operation);
     WaitForSingleObject(operation.hEvent, INFINITE);
@@ -648,7 +682,8 @@ bool finishOverlapped(HANDLE pipe, OVERLAPPED &operation, HANDLE parentProcess,
   return GetOverlappedResult(pipe, &operation, &transferred, FALSE) != FALSE;
 }
 
-bool readPipeMessage(HANDLE pipe, HANDLE parentProcess, std::vector<BYTE> &message) {
+bool readPipeMessage(HANDLE pipe, HANDLE parentProcess, std::vector<BYTE> &message,
+                     ULONGLONG deadline) {
   BYTE buffer[kMaximumInputBytes + 1];
   DWORD read = 0;
   OVERLAPPED operation{};
@@ -657,7 +692,7 @@ bool readPipeMessage(HANDLE pipe, HANDLE parentProcess, std::vector<BYTE> &messa
   operation.hEvent = event.get();
   BOOL succeeded = ReadFile(pipe, buffer, sizeof(buffer), &read, &operation);
   if (!succeeded && GetLastError() == ERROR_IO_PENDING) {
-    if (!finishOverlapped(pipe, operation, parentProcess, read)) return false;
+    if (!finishOverlapped(pipe, operation, parentProcess, read, deadline)) return false;
     succeeded = TRUE;
   }
   if (!succeeded || read > kMaximumInputBytes) return false;
@@ -666,7 +701,7 @@ bool readPipeMessage(HANDLE pipe, HANDLE parentProcess, std::vector<BYTE> &messa
 }
 
 bool writePipeMessage(HANDLE pipe, const std::vector<BYTE> &message,
-                      HANDLE parentProcess) {
+                      HANDLE parentProcess, ULONGLONG deadline) {
   if (!hasValidFrame(message)) return false;
   DWORD written = 0;
   OVERLAPPED operation{};
@@ -676,16 +711,16 @@ bool writePipeMessage(HANDLE pipe, const std::vector<BYTE> &message,
   BOOL succeeded = WriteFile(pipe, message.data(), static_cast<DWORD>(message.size()),
                              &written, &operation);
   if (!succeeded && GetLastError() == ERROR_IO_PENDING) {
-    if (!finishOverlapped(pipe, operation, parentProcess, written)) return false;
+    if (!finishOverlapped(pipe, operation, parentProcess, written, deadline)) return false;
   } else if (!succeeded) {
     return false;
   }
   return written == message.size();
 }
 
-enum class ConnectResult { kConnected, kLateControl, kShutdown, kParentGone, kFailed };
+enum class ConnectResult { kConnected, kShutdown, kParentGone, kFailed };
 
-ConnectResult connectPipe(HANDLE pipe, HANDLE parentProcess, HANDLE controlInput) {
+ConnectResult connectPipe(HANDLE pipe, HANDLE parentProcess, HANDLE shutdownEvent) {
   OVERLAPPED operation{};
   UniqueHandle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
   if (!event) return ConnectResult::kFailed;
@@ -696,9 +731,9 @@ ConnectResult connectPipe(HANDLE pipe, HANDLE parentProcess, HANDLE controlInput
   if (error == ERROR_PIPE_CONNECTED) return ConnectResult::kConnected;
   if (error != ERROR_IO_PENDING) return ConnectResult::kFailed;
 
-  HANDLE handles[2] = {operation.hEvent, parentProcess};
+  HANDLE handles[3] = {operation.hEvent, parentProcess, shutdownEvent};
   for (;;) {
-    const DWORD result = WaitForMultipleObjects(2, handles, FALSE, 50);
+    const DWORD result = WaitForMultipleObjects(3, handles, FALSE, 50);
     if (result == WAIT_OBJECT_0) {
       DWORD transferred = 0;
       return GetOverlappedResult(pipe, &operation, &transferred, FALSE) != FALSE
@@ -709,39 +744,14 @@ ConnectResult connectPipe(HANDLE pipe, HANDLE parentProcess, HANDLE controlInput
       WaitForSingleObject(operation.hEvent, INFINITE);
       return ConnectResult::kParentGone;
     }
+    if (result == WAIT_OBJECT_0 + 2) {
+      CancelIoEx(pipe, &operation);
+      WaitForSingleObject(operation.hEvent, INFINITE);
+      return ConnectResult::kShutdown;
+    }
     if (result != WAIT_TIMEOUT) {
       CancelIoEx(pipe, &operation);
       WaitForSingleObject(operation.hEvent, INFINITE);
-      return ConnectResult::kFailed;
-    }
-
-    DWORD available = 0;
-    if (!PeekNamedPipe(controlInput, nullptr, 0, nullptr, &available, nullptr)) {
-      CancelIoEx(pipe, &operation);
-      WaitForSingleObject(operation.hEvent, INFINITE);
-      return ConnectResult::kParentGone;
-    }
-    if (available > 0) {
-      std::string line;
-      if (!readAllControlLine(controlInput, parentProcess, line)) {
-        CancelIoEx(pipe, &operation);
-        WaitForSingleObject(operation.hEvent, INFINITE);
-        return ConnectResult::kParentGone;
-      }
-      if (line == "SHUTDOWN") {
-        CancelIoEx(pipe, &operation);
-        WaitForSingleObject(operation.hEvent, INFINITE);
-        return ConnectResult::kShutdown;
-      }
-      // Late control output belongs to a client that already timed out.
-      if (line == "ABORT" || line.rfind("RESPONSE\t", 0) == 0) {
-        CancelIoEx(pipe, &operation);
-        WaitForSingleObject(operation.hEvent, INFINITE);
-        return ConnectResult::kLateControl;
-      }
-      CancelIoEx(pipe, &operation);
-      WaitForSingleObject(operation.hEvent, INFINITE);
-      SetLastError(ERROR_INVALID_DATA);
       return ConnectResult::kFailed;
     }
   }
@@ -754,48 +764,254 @@ HANDLE createServerPipe(const std::wstring &name, SecurityContext &security,
   if (firstInstance) flags |= FILE_FLAG_FIRST_PIPE_INSTANCE;
   return CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | flags,
       PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-      1, kPipeBufferBytes, kPipeBufferBytes, kIoTimeoutMs,
+      kMaximumPipeInstances, kPipeBufferBytes, kPipeBufferBytes, kConnectionTimeoutMs,
       &security.attributes);
 }
 
 enum class ControlResult { kResponse, kAbort, kShutdown, kParentGone };
 
-ControlResult waitForControlResponse(HANDLE pipe, HANDLE parentProcess,
-                                     std::vector<BYTE> &response) {
+struct PendingConnection {
+  std::condition_variable changed;
+  bool ready = false;
+  bool aborted = false;
+  std::vector<BYTE> response;
+};
+
+struct ControlHub {
+  std::mutex mutex;
+  std::condition_variable workersChanged;
+  std::unordered_map<std::string, std::shared_ptr<PendingConnection>> pending;
+  size_t activeWorkers = 0;
+  std::atomic<bool> shuttingDown{false};
+  HANDLE shutdownEvent = nullptr;
+};
+
+bool isValidConnectionId(const std::string &value) {
+  const size_t separator = value.find('-');
+  if (separator == std::string::npos || separator == 0 || separator + 1 >= value.size() ||
+      value.find('-', separator + 1) != std::string::npos) return false;
+  for (size_t index = 0; index < value.size(); ++index) {
+    if (index == separator) continue;
+    if (value[index] < '0' || value[index] > '9') return false;
+  }
+  return value[0] != '0' && value[separator + 1] != '0';
+}
+
+bool hasJsonStringField(const std::string &json, const char *name, const char *expected) {
+  const std::string key = std::string("\"") + name + "\"";
+  const size_t keyPosition = json.find(key);
+  if (keyPosition == std::string::npos) return false;
+  size_t cursor = keyPosition + key.size();
+  const auto skipWhitespace = [&json](size_t &position) {
+    while (position < json.size() &&
+           (json[position] == ' ' || json[position] == '\t' ||
+            json[position] == '\r' || json[position] == '\n')) ++position;
+  };
+  skipWhitespace(cursor);
+  if (cursor >= json.size() || json[cursor++] != ':') return false;
+  skipWhitespace(cursor);
+  const std::string value = std::string("\"") + expected + "\"";
+  if (json.compare(cursor, value.size(), value) != 0) return false;
+  cursor += value.size();
+  skipWhitespace(cursor);
+  return cursor == json.size() || json[cursor] == ',' || json[cursor] == '}';
+}
+
+bool isReloadRequest(const std::vector<BYTE> &request) {
+  if (request.size() < 4) return false;
+  const std::string json(reinterpret_cast<const char *>(request.data() + 4), request.size() - 4);
+  return hasJsonStringField(json, "operation", "reload");
+}
+
+std::string nextConnectionId() {
+  const ULONGLONG sequence = g_connectionSequence.fetch_add(1);
+  return std::to_string(GetCurrentProcessId()) + "-" + std::to_string(sequence);
+}
+
+void signalShutdown(ControlHub &hub) {
+  hub.shuttingDown.store(true);
+  if (hub.shutdownEvent != nullptr) SetEvent(hub.shutdownEvent);
+  std::lock_guard<std::mutex> lock(hub.mutex);
+  for (auto &entry : hub.pending) {
+    entry.second->aborted = true;
+    entry.second->changed.notify_all();
+  }
+  hub.pending.clear();
+}
+
+void dispatchControlLine(const std::string &line, ControlHub &hub) {
+  if (line == "SHUTDOWN") {
+    signalShutdown(hub);
+    return;
+  }
+
+  constexpr char abortPrefix[] = "ABORT\t";
+  if (line.rfind(abortPrefix, 0) == 0) {
+    const std::string connectionId = line.substr(sizeof(abortPrefix) - 1);
+    if (!isValidConnectionId(connectionId)) {
+      signalShutdown(hub);
+      return;
+    }
+    std::lock_guard<std::mutex> lock(hub.mutex);
+    const auto found = hub.pending.find(connectionId);
+    if (found != hub.pending.end()) {
+      found->second->aborted = true;
+      found->second->changed.notify_all();
+      hub.pending.erase(found);
+    }
+    return;
+  }
+
+  constexpr char responsePrefix[] = "RESPONSE\t";
+  if (line.rfind(responsePrefix, 0) == 0) {
+    const size_t separator = line.find('\t', sizeof(responsePrefix) - 1);
+    if (separator == std::string::npos) {
+      signalShutdown(hub);
+      return;
+    }
+    const std::string connectionId = line.substr(sizeof(responsePrefix) - 1,
+                                                  separator - (sizeof(responsePrefix) - 1));
+    std::vector<BYTE> response;
+    if (!isValidConnectionId(connectionId) ||
+        !decodeBase64(line.substr(separator + 1), response) || !hasValidFrame(response)) {
+      signalShutdown(hub);
+      return;
+    }
+    std::lock_guard<std::mutex> lock(hub.mutex);
+    const auto found = hub.pending.find(connectionId);
+    if (found != hub.pending.end()) {
+      found->second->response = std::move(response);
+      found->second->ready = true;
+      found->second->changed.notify_all();
+      hub.pending.erase(found);
+    }
+    // Unknown IDs are late responses for connections that already ended.
+    return;
+  }
+
+  signalShutdown(hub);
+}
+
+void readControlMessages(HANDLE parentProcess, ControlHub &hub) {
   const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
-  const ULONGLONG deadline = GetTickCount64() + kIoTimeoutMs;
-  while (GetTickCount64() < deadline) {
-    if (WaitForSingleObject(parentProcess, 0) == WAIT_OBJECT_0) return ControlResult::kParentGone;
+  while (!hub.shuttingDown.load()) {
+    if (WaitForSingleObject(parentProcess, 0) == WAIT_OBJECT_0) break;
     DWORD available = 0;
-    if (!PeekNamedPipe(input, nullptr, 0, nullptr, &available, nullptr)) return ControlResult::kParentGone;
+    if (!PeekNamedPipe(input, nullptr, 0, nullptr, &available, nullptr)) break;
     if (available == 0) {
       Sleep(20);
       continue;
     }
     std::string line;
-    if (!readAllControlLine(input, parentProcess, line)) return ControlResult::kParentGone;
-    if (line == "SHUTDOWN") return ControlResult::kShutdown;
-    if (line == "ABORT") return ControlResult::kAbort;
-    constexpr char responsePrefix[] = "RESPONSE\t";
-    if (line.rfind(responsePrefix, 0) != 0) return ControlResult::kAbort;
-    if (!decodeBase64(line.substr(sizeof(responsePrefix) - 1), response) ||
-        !hasValidFrame(response)) return ControlResult::kAbort;
-    if (!writePipeMessage(pipe, response, parentProcess)) return ControlResult::kAbort;
-    return ControlResult::kResponse;
+    if (!readAllControlLine(input, parentProcess, line)) break;
+    dispatchControlLine(line, hub);
   }
-  return ControlResult::kAbort;
+  signalShutdown(hub);
 }
 
-ControlResult handleServerConnection(HANDLE pipe, HANDLE parentProcess) {
+void removePending(ControlHub &hub, const std::string &connectionId,
+                   const std::shared_ptr<PendingConnection> &pending) {
+  std::lock_guard<std::mutex> lock(hub.mutex);
+  const auto found = hub.pending.find(connectionId);
+  if (found != hub.pending.end() && found->second == pending) hub.pending.erase(found);
+}
+
+ControlResult waitForControlResponse(
+    HANDLE parentProcess, HANDLE clientProcess, ControlHub &hub,
+    const std::string &connectionId,
+    const std::shared_ptr<PendingConnection> &pending,
+    std::vector<BYTE> &response, ULONGLONG deadline) {
+  std::unique_lock<std::mutex> lock(hub.mutex);
+  for (;;) {
+    if (hub.shuttingDown.load()) return ControlResult::kShutdown;
+    if (pending->ready) {
+      response = std::move(pending->response);
+      return ControlResult::kResponse;
+    }
+    if (pending->aborted) return ControlResult::kAbort;
+    lock.unlock();
+
+    if (WaitForSingleObject(parentProcess, 0) == WAIT_OBJECT_0) {
+      signalShutdown(hub);
+      return ControlResult::kParentGone;
+    }
+    if (hub.shuttingDown.load()) return ControlResult::kShutdown;
+    if (clientProcess != nullptr && WaitForSingleObject(clientProcess, 0) == WAIT_OBJECT_0) {
+      writeStdout("ABORT\t" + connectionId + "\n");
+      removePending(hub, connectionId, pending);
+      return ControlResult::kAbort;
+    }
+    if (remainingMilliseconds(deadline) == 0) {
+      writeStdout("ABORT\t" + connectionId + "\n");
+      removePending(hub, connectionId, pending);
+      return ControlResult::kAbort;
+    }
+
+    lock.lock();
+    pending->changed.wait_for(lock, std::chrono::milliseconds(20));
+  }
+}
+
+ControlResult handleServerConnection(HANDLE pipe, HANDLE parentProcess, ControlHub &hub) {
   std::vector<BYTE> request;
-  if (!readPipeMessage(pipe, parentProcess, request)) {
+  const ULONGLONG requestDeadline = GetTickCount64() + kConnectionTimeoutMs;
+  if (!readPipeMessage(pipe, parentProcess, request, requestDeadline)) {
     return WaitForSingleObject(parentProcess, 0) == WAIT_OBJECT_0
         ? ControlResult::kParentGone : ControlResult::kAbort;
   }
-  const std::string line = "REQUEST\t" + encodeBase64(request.data(), request.size()) + "\n";
-  if (!writeStdout(line)) return ControlResult::kParentGone;
+
+  DWORD clientPid = 0;
+  UniqueHandle clientProcess;
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+  const bool monitorClient = wcscmp(testFault(), L"unmonitored-client") != 0;
+#else
+  constexpr bool monitorClient = true;
+#endif
+  if (monitorClient && GetNamedPipeClientProcessId(pipe, &clientPid) && clientPid != 0) {
+    HANDLE rawClient = OpenProcess(SYNCHRONIZE, FALSE, clientPid);
+    if (rawClient != nullptr) clientProcess.reset(rawClient);
+  }
+
+  const std::string connectionId = nextConnectionId();
+  auto pending = std::make_shared<PendingConnection>();
+  {
+    std::lock_guard<std::mutex> lock(hub.mutex);
+    if (hub.shuttingDown.load() || !hub.pending.emplace(connectionId, pending).second) {
+      return ControlResult::kShutdown;
+    }
+  }
+
+  const std::string line = "REQUEST\t" + connectionId + "\t" +
+      encodeBase64(request.data(), request.size()) + "\n";
+  if (!writeStdout(line)) {
+    removePending(hub, connectionId, pending);
+    return ControlResult::kParentGone;
+  }
+
   std::vector<BYTE> response;
-  return waitForControlResponse(pipe, parentProcess, response);
+  const DWORD acknowledgmentTimeout = isReloadRequest(request)
+      ? kReloadAcknowledgmentTimeoutMs : kProbeTimeoutMs;
+  const ULONGLONG acknowledgmentDeadline = GetTickCount64() + acknowledgmentTimeout;
+  const ControlResult result = waitForControlResponse(
+      parentProcess, clientProcess.get(), hub, connectionId, pending,
+      response, acknowledgmentDeadline);
+  if (result != ControlResult::kResponse) return result;
+  if (!writePipeMessage(pipe, response, parentProcess, acknowledgmentDeadline)) {
+    writeStdout("ABORT\t" + connectionId + "\n");
+    return ControlResult::kAbort;
+  }
+  return ControlResult::kResponse;
+}
+
+void workerFinished(ControlHub &hub) {
+  std::lock_guard<std::mutex> lock(hub.mutex);
+  if (hub.activeWorkers > 0) --hub.activeWorkers;
+  hub.workersChanged.notify_all();
+}
+
+void waitForWorkers(ControlHub &hub) {
+  std::unique_lock<std::mutex> lock(hub.mutex);
+  hub.workersChanged.wait(lock, [&hub] { return hub.activeWorkers == 0; });
 }
 
 bool writeReady(const InstanceRecord &record) {
@@ -829,34 +1045,47 @@ int serve(DWORD serverPid, const std::string &instanceId) {
   record.endpoint = narrowAscii(name);
   std::wstring recordPath;
   if (record.endpoint.empty() || !publishRecord(directory, security, record, recordPath)) return 25;
-  if (!writeReady(record)) {
+  UniqueHandle shutdownEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+  if (!shutdownEvent) {
     removeRecordIfSame(recordPath, security, record);
-    return 26;
+    return 27;
   }
 
+  ControlHub hub;
+  hub.shutdownEvent = shutdownEvent.get();
+  std::thread controlReader;
+  try {
+    controlReader = std::thread(readControlMessages, parentProcess.get(), std::ref(hub));
+  } catch (...) {
+    removeRecordIfSame(recordPath, security, record);
+    return 27;
+  }
   int exitCode = 0;
-  for (;;) {
-    if (WaitForSingleObject(parentProcess.get(), 0) == WAIT_OBJECT_0) break;
-    const ConnectResult connection = connectPipe(pipe.get(), parentProcess.get(), GetStdHandle(STD_INPUT_HANDLE));
-    if (connection == ConnectResult::kShutdown || connection == ConnectResult::kParentGone) break;
-    if (connection == ConnectResult::kLateControl) {
-      pipe.reset();
-      pipe.reset(createServerPipe(name, security, false));
-      if (!pipe) {
-        exitCode = 29;
-        break;
-      }
+  if (!writeReady(record)) {
+    exitCode = 26;
+    signalShutdown(hub);
+  }
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+  if (wcscmp(testFault(), L"break-control-output") == 0) {
+    Sleep(100);
+    CloseHandle(GetStdHandle(STD_OUTPUT_HANDLE));
+  }
+  if (wcscmp(testFault(), L"break-control-input") == 0) {
+    Sleep(100);
+    CloseHandle(GetStdHandle(STD_INPUT_HANDLE));
+  }
+#endif
+
+  while (!hub.shuttingDown.load()) {
+    size_t activeWorkers = 0;
+    {
+      std::lock_guard<std::mutex> lock(hub.mutex);
+      activeWorkers = hub.activeWorkers;
+    }
+    if (activeWorkers >= kMaximumConnections) {
+      Sleep(20);
       continue;
     }
-    if (connection == ConnectResult::kConnected) {
-      const ControlResult result = handleServerConnection(pipe.get(), parentProcess.get());
-      DisconnectNamedPipe(pipe.get());
-      if (result == ControlResult::kShutdown || result == ControlResult::kParentGone) break;
-    } else {
-      exitCode = 28;
-      break;
-    }
-    pipe.reset();
     if (!pipe) {
       pipe.reset(createServerPipe(name, security, false));
       if (!pipe) {
@@ -864,8 +1093,38 @@ int serve(DWORD serverPid, const std::string &instanceId) {
         break;
       }
     }
+
+    const ConnectResult connection = connectPipe(
+        pipe.get(), parentProcess.get(), shutdownEvent.get());
+    if (connection == ConnectResult::kShutdown || connection == ConnectResult::kParentGone) break;
+    if (connection != ConnectResult::kConnected) {
+      exitCode = 28;
+      break;
+    }
+
+    UniqueHandle connectedPipe = std::move(pipe);
+    {
+      std::lock_guard<std::mutex> lock(hub.mutex);
+      ++hub.activeWorkers;
+    }
+    try {
+      std::thread([connectedPipe = std::move(connectedPipe), parent = parentProcess.get(),
+                   &hub]() mutable {
+        const ControlResult result = handleServerConnection(connectedPipe.get(), parent, hub);
+        if (connectedPipe) DisconnectNamedPipe(connectedPipe.get());
+        if (result == ControlResult::kParentGone) signalShutdown(hub);
+        workerFinished(hub);
+      }).detach();
+    } catch (...) {
+      if (connectedPipe) DisconnectNamedPipe(connectedPipe.get());
+      workerFinished(hub);
+    }
   }
+
   pipe.reset();
+  signalShutdown(hub);
+  waitForWorkers(hub);
+  if (controlReader.joinable()) controlReader.join();
   if (!removeRecordIfSame(recordPath, security, record) && exitCode == 0) exitCode = 30;
   return exitCode;
 }
@@ -882,7 +1141,8 @@ bool validLocalPipeName(const std::wstring &endpoint) {
   return isValidUuid(uuid) && endpoint == pipeName(pid, uuid);
 }
 
-bool openClientPipe(const std::wstring &endpoint, HANDLE &pipe) {
+bool openClientPipe(const std::wstring &endpoint, HANDLE &pipe,
+                    ULONGLONG deadline, DWORD &errorCode) {
   const DWORD access = FILE_READ_DATA | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
   for (int attempt = 0; attempt < 2; ++attempt) {
     HANDLE raw = CreateFileW(endpoint.c_str(), access, 0, nullptr, OPEN_EXISTING,
@@ -891,6 +1151,7 @@ bool openClientPipe(const std::wstring &endpoint, HANDLE &pipe) {
       pipe = raw;
       DWORD mode = PIPE_READMODE_MESSAGE;
       if (!SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr)) {
+        errorCode = GetLastError();
         CloseHandle(pipe);
         pipe = INVALID_HANDLE_VALUE;
         return false;
@@ -898,12 +1159,19 @@ bool openClientPipe(const std::wstring &endpoint, HANDLE &pipe) {
       return true;
     }
     const DWORD error = GetLastError();
-    if (error != ERROR_PIPE_BUSY || !WaitNamedPipeW(endpoint.c_str(), kIoTimeoutMs)) return false;
+    errorCode = error;
+    const DWORD remaining = remainingMilliseconds(deadline);
+    if (error != ERROR_PIPE_BUSY || remaining == 0 ||
+        !WaitNamedPipeW(endpoint.c_str(), remaining)) {
+      if (error == ERROR_PIPE_BUSY) errorCode = GetLastError();
+      return false;
+    }
   }
   return false;
 }
 
-bool clientWrite(HANDLE pipe, const std::vector<BYTE> &request, DWORD &written) {
+bool clientWrite(HANDLE pipe, const std::vector<BYTE> &request, DWORD &written,
+                 ULONGLONG deadline) {
   OVERLAPPED operation{};
   UniqueHandle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
   if (!event) return false;
@@ -911,7 +1179,7 @@ bool clientWrite(HANDLE pipe, const std::vector<BYTE> &request, DWORD &written) 
   BOOL succeeded = WriteFile(pipe, request.data(), static_cast<DWORD>(request.size()),
                              &written, &operation);
   if (!succeeded && GetLastError() == ERROR_IO_PENDING) {
-    if (!finishOverlapped(pipe, operation, nullptr, written)) return false;
+    if (!finishOverlapped(pipe, operation, nullptr, written, deadline)) return false;
   } else if (!succeeded) {
     return false;
   }
@@ -928,32 +1196,36 @@ const wchar_t *testFault() {
 }
 #endif
 
-int client(const std::wstring &endpoint) {
+int client(const std::wstring &endpoint, DWORD timeoutMs) {
+  const ULONGLONG operationDeadline = GetTickCount64() + timeoutMs;
   std::vector<BYTE> request;
   if (!validLocalPipeName(endpoint) ||
       !readAllInput(GetStdHandle(STD_INPUT_HANDLE), kMaximumInputBytes, request) ||
       !hasValidFrame(request)) {
-    writeStdout("NOT_DISPATCHED\n");
+    writeStdout("NOT_DISPATCHED\t0\n");
     return 31;
   }
 
   HANDLE rawPipe = INVALID_HANDLE_VALUE;
-  if (!openClientPipe(endpoint, rawPipe)) {
-    writeStdout("NOT_DISPATCHED\n");
+  DWORD openError = ERROR_SUCCESS;
+  const ULONGLONG connectionDeadline = std::min<ULONGLONG>(
+      operationDeadline, GetTickCount64() + kConnectionTimeoutMs);
+  if (!openClientPipe(endpoint, rawPipe, connectionDeadline, openError)) {
+    writeStdout("NOT_DISPATCHED\t" + std::to_string(openError) + "\n");
     return 34;
   }
   UniqueHandle pipe(rawPipe);
 
 #ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
   if (wcscmp(testFault(), L"before-write") == 0) {
-    writeStdout("NOT_DISPATCHED\n");
+    writeStdout("NOT_DISPATCHED\t0\n");
     return 32;
   }
   if (wcscmp(testFault(), L"silent-before-write") == 0) return 33;
 #endif
 
   DWORD written = 0;
-  const bool writeSucceeded = clientWrite(pipe.get(), request, written);
+  const bool writeSucceeded = clientWrite(pipe.get(), request, written, operationDeadline);
   if (!writeSucceeded) {
     writeStdout("INDETERMINATE\n");
     return 35;
@@ -965,7 +1237,7 @@ int client(const std::wstring &endpoint) {
 #endif
 
   std::vector<BYTE> response;
-  if (!readPipeMessage(pipe.get(), nullptr, response)) {
+  if (!readPipeMessage(pipe.get(), nullptr, response, operationDeadline)) {
     writeStdout("INDETERMINATE\n");
     return 37;
   }
@@ -1003,6 +1275,12 @@ int wmain(int argc, wchar_t *argv[]) {
     if (!isValidUuid(instanceId)) return 3;
     return serve(serverPid, instanceId);
   }
-  if (wcscmp(argv[1], L"client") == 0 && argc == 3) return client(argv[2]);
+  if (wcscmp(argv[1], L"client") == 0 && argc == 4) {
+    wchar_t *end = nullptr;
+    const unsigned long timeout = wcstoul(argv[3], &end, 10);
+    if (end == argv[3] || *end != L'\0' ||
+        (timeout != kProbeTimeoutMs && timeout != kReloadAcknowledgmentTimeoutMs)) return 5;
+    return client(argv[2], static_cast<DWORD>(timeout));
+  }
   return 4;
 }

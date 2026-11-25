@@ -8,7 +8,7 @@ Count the remote-rejection check as a pass only when all of these conditions hol
 
 1. The client and server are separate existing Windows hosts. The client can resolve the server name and reach TCP port 445.
 2. The positive control connects over the network, exchanges a nonce, and reports the authenticated client SID. That SID must match the server helper's owner SID.
-3. The positive-control DACL grants read/write access to that SID. The control and production attempts use the same `NamedPipeClientStream` constructor and `PipeDirection.InOut` access.
+3. The positive-control DACL grants read/write access to that SID. The control and production attempts use the same `NamedPipeClientStream` constructor, `PipeDirection.InOut`, and client-side options, so both request equivalent access.
 4. The negative attempt targets the pipe created by the production native helper. The connection fails with `ERROR_PIPE_LOCAL` (`0xE5`). A different error is inconclusive; a successful connection fails the gate.
 5. A second positive control succeeds after the negative attempt. The isolated server remains healthy and accepts a local administrative reload.
 
@@ -70,10 +70,20 @@ if (-not $health) { throw "The isolated server did not become healthy." }
 
 node dist/cli/connect-gpt.js config reload --instance $serverPid
 $adminDir = Join-Path $env:LOCALAPPDATA "GPTRepoMCP\admin"
-$recordFile = Get-ChildItem -LiteralPath $adminDir -Filter "server-$serverPid-*.json" |
+$recordFile = Get-ChildItem -LiteralPath $adminDir -Filter "server-$serverPid-*.record" |
   Select-Object -First 1
 if (-not $recordFile) { throw "The isolated server did not publish a discovery record." }
-$record = Get-Content -LiteralPath $recordFile.FullName -Raw | ConvertFrom-Json
+$fields = @{}
+Get-Content -LiteralPath $recordFile.FullName | ForEach-Object {
+  $separator = $_.IndexOf('=')
+  if ($separator -gt 0) { $fields[$_.Substring(0, $separator)] = $_.Substring($separator + 1) }
+}
+$record = [pscustomobject]@{
+  server_pid = [int]$fields.server_pid
+  helper_pid = [int]$fields.helper_pid
+  instance_id = $fields.instance_id
+  endpoint = $fields.endpoint
+}
 if ($record.server_pid -ne $serverPid) { throw "The record belongs to another server." }
 $helper = Get-CimInstance Win32_Process -Filter "ProcessId = $($record.helper_pid)"
 if ($helper.ExecutablePath -ine $productionHelper) {
