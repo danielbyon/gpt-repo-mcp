@@ -183,7 +183,13 @@ class WindowsHostProcess {
     });
     child.stdout.on("data", (chunk: Buffer) => this.onOutput(chunk));
     child.once("error", () => this.failBeforeReady("WINDOWS_HELPER_START_FAILED"));
-    child.once("exit", () => this.failBeforeReady("WINDOWS_HELPER_EXITED"));
+    child.once("exit", (code, signal) => {
+      const exitDetail = code === null ? `signal ${signal ?? "unknown"}` : `exit code ${code}`;
+      this.failBeforeReady(
+        "WINDOWS_HELPER_EXITED",
+        `The local administrative helper exited before establishing a verified endpoint (${exitDetail}).`
+      );
+    });
   }
 
   async waitUntilReady(): Promise<ConfigurationAdminDiscoveryRecord> {
@@ -314,12 +320,15 @@ class WindowsHostProcess {
     }
   }
 
-  private failBeforeReady(code: string): void {
+  private failBeforeReady(
+    code: string,
+    message = "The local administrative helper did not establish a verified endpoint."
+  ): void {
     if (!this.readyReject) return;
     const reject = this.readyReject;
     this.readyReject = undefined;
     this.readyResolve = undefined;
-    reject(ipcError(code, "pre-dispatch", "The local administrative helper did not establish a verified endpoint."));
+    reject(ipcError(code, "pre-dispatch", message));
   }
 }
 

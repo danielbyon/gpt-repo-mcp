@@ -22,6 +22,24 @@ const instanceId = "22222222-2222-4222-8222-222222222222";
 
 describe("owner-local Windows configuration IPC", () => {
   test.skipIf(process.platform !== "win32")(
+    "reports the native helper exit code when startup ends before endpoint verification",
+    async () => {
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+
+      await expect(startWindowsConfigurationAdminHost({
+        serverPid: 0,
+        instanceId,
+        handle: async () => {
+          throw new Error("An invalid server PID must stop the helper before dispatch.");
+        }
+      })).rejects.toMatchObject({
+        code: "WINDOWS_HELPER_EXITED",
+        message: expect.stringContaining("exit code 2")
+      });
+    }
+  );
+
+  test.skipIf(process.platform !== "win32")(
     "discovers the private pipe and returns a correlated reload response",
     async () => {
       const localAppData = await mkdtemp(join(tmpdir(), "gpt-repo-admin-windows-"));
