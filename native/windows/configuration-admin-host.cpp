@@ -277,7 +277,9 @@ bool hasOwnerOnlyDacl(HANDLE handle, const SecurityContext &security) {
       if (valid) {
         const auto *ace = static_cast<ACCESS_ALLOWED_ACE *>(rawAce);
         PSID aceSid = const_cast<DWORD *>(&ace->SidStart);
-        valid = ace->Mask == GENERIC_ALL && EqualSid(aceSid, security.userSid) != FALSE;
+        // Windows may return GENERIC_ALL or its FILE_ALL_ACCESS file-object mapping.
+        const bool grantsFullAccess = ace->Mask == GENERIC_ALL || ace->Mask == FILE_ALL_ACCESS;
+        valid = grantsFullAccess && EqualSid(aceSid, security.userSid) != FALSE;
       }
     }
   }
@@ -334,17 +336,29 @@ bool openVerifiedDirectory(const std::wstring &path, const SecurityContext &secu
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
   if (raw == INVALID_HANDLE_VALUE) return false;
+  if (!verifyFileHandle(raw, security, true)) {
+    CloseHandle(raw);
+    return false;
+  }
   output = raw;
-  return verifyFileHandle(output, security, true);
+  return true;
 }
 
-bool createOrVerifyDirectory(const std::wstring &path, SecurityContext &security) {
+bool createOrVerifyDirectory(const std::wstring &path, SecurityContext &security,
+                            int *failureCode = nullptr, int createFailureCode = 0,
+                            int verifyFailureCode = 0) {
   if (CreateDirectoryW(path.c_str(), &security.attributes) == FALSE) {
     const DWORD error = GetLastError();
-    if (error != ERROR_ALREADY_EXISTS) return false;
+    if (error != ERROR_ALREADY_EXISTS) {
+      if (failureCode != nullptr) *failureCode = createFailureCode;
+      return false;
+    }
   }
   HANDLE directory = nullptr;
-  if (!openVerifiedDirectory(path, security, directory)) return false;
+  if (!openVerifiedDirectory(path, security, directory)) {
+    if (failureCode != nullptr) *failureCode = verifyFailureCode;
+    return false;
+  }
   CloseHandle(directory);
   return true;
 }
@@ -353,6 +367,8 @@ bool createOrVerifyDirectory(const std::wstring &path, SecurityContext &security
 constexpr int kServeLocalAppDataRejected = 50;
 constexpr int kServeAdminRootSetupFailed = 51;
 constexpr int kServeAdminDirectorySetupFailed = 52;
+constexpr int kServeAdminRootCreateFailed = 53;
+constexpr int kServeAdminRootVerifyFailed = 54;
 
 bool getAdminDirectory(SecurityContext &security, bool create,
                        std::wstring &directory, bool &exists,
@@ -366,8 +382,11 @@ bool getAdminDirectory(SecurityContext &security, bool create,
   const std::wstring root = localAppData + L"\\GPTRepoMCP";
   directory = root + L"\\admin";
   if (create) {
-    if (!createOrVerifyDirectory(root, security)) {
-      if (createFailureCode != nullptr) *createFailureCode = kServeAdminRootSetupFailed;
+    int rootFailureCode = kServeAdminRootSetupFailed;
+    if (!createOrVerifyDirectory(root, security, &rootFailureCode,
+                                 kServeAdminRootCreateFailed,
+                                 kServeAdminRootVerifyFailed)) {
+      if (createFailureCode != nullptr) *createFailureCode = rootFailureCode;
       return false;
     }
     if (!createOrVerifyDirectory(directory, security)) {

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -39,6 +39,31 @@ describe("owner-local Windows configuration IPC", () => {
         });
       } finally {
         vi.unstubAllEnvs();
+      }
+    }
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "reports when the administrative root cannot be verified as a directory",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-root-file-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+
+      try {
+        await writeFile(join(localAppData, "GPTRepoMCP"), "not a directory");
+        await expect(startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          handle: async () => {
+            throw new Error("An invalid administrative root must stop helper startup.");
+          }
+        })).rejects.toMatchObject({
+          code: "WINDOWS_HELPER_EXITED",
+          message: expect.stringContaining("exit code 54")
+        });
+      } finally {
+        await cleanupWindowsHost(undefined, localAppData);
       }
     }
   );
