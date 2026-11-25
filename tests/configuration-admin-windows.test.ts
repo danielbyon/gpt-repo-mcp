@@ -320,7 +320,7 @@ describe("owner-local Windows configuration IPC", () => {
         await expect(client.reloadConfigurationAdmin({
           selectedSourceIdentity: sourceIdentity,
           instancePid: process.pid
-        })).rejects.toMatchObject({ code: "INSTANCE_UNAVAILABLE" });
+        })).rejects.toMatchObject({ code: "WINDOWS_HELPER_TIMEOUT", phase: "pre-dispatch" });
       } finally {
         await cleanupWindowsHost(host, localAppData);
       }
