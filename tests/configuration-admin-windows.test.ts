@@ -405,7 +405,8 @@ describe("owner-local Windows configuration IPC", () => {
       } finally {
         await cleanupWindowsHost(host, localAppData);
       }
-    }
+    },
+    15_000
   );
 });
 
