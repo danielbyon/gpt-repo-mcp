@@ -586,7 +586,7 @@ async function writeValidationFixture(
     releaseWaiter,
     "const released = waitForRelease(releasePath);",
     reportProcess("child"),
-    "released.then(() => process.exit(0));",
+    "released.then(() => socket.end());",
     "} else if (readFileSync(modePath, 'utf8').trim() === 'hold') {",
     releaseWaiter,
     "const released = waitForRelease(releasePath);",
@@ -597,7 +597,10 @@ async function writeValidationFixture(
     "child.once('error', error => { childSpawnFailed = true; process.stderr.write('validation fixture child spawn failed: ' + error.message + '\\n'); });",
     "child.once('close', (code, signal) => resolve(!childSpawnFailed && code === 0 && signal === null));",
     "});",
-    "Promise.all([released, childExit]).then(([, childSucceeded]) => process.exit(childSucceeded ? 0 : 1));",
+    "Promise.all([released, childExit]).then(([, childSucceeded]) => {",
+    "if (!childSucceeded) process.exitCode = 1;",
+    "socket.end();",
+    "});",
     "} else {",
     "console.log('validation fixture passed');",
     "}"
@@ -615,7 +618,7 @@ async function writeValidationFixture(
   await writeFile(runnerPath, runner, "utf8");
 }
 
-/** Tracks fixture-process sockets so tests can observe process exit without PID polling. */
+/** Tracks fixture-process sockets and confirms each process exits before its files are removed. */
 async function startProcessControl(): Promise<{
   port: number;
   waitForConnections(count: number, timeoutMs?: number): Promise<ProcessConnection[]>;
@@ -625,10 +628,12 @@ async function startProcessControl(): Promise<{
 }> {
   const connections: ProcessConnection[] = [];
   const sockets = new Set<Socket>();
+  const socketErrors = new Map<Socket, Error>();
   const changes = new EventEmitter();
   const server = createServer((socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
+    socket.on("error", (error: Error) => socketErrors.set(socket, error));
     socket.once("end", () => socket.end());
     socket.setEncoding("utf8");
     let input = "";
@@ -668,40 +673,45 @@ async function startProcessControl(): Promise<{
       }
       return connections.slice(0, count);
     },
-    async waitForClosed(closedConnections, timeoutMs = 3_000) {
+    async waitForClosed(closedConnections, timeoutMs = 5_000) {
       await Promise.all(closedConnections.map(async ({ pid, socket }) => {
-        if (socket.closed) return;
-        const signal = AbortSignal.timeout(timeoutMs);
-        try {
-          await new Promise<void>((resolve, reject) => {
-            const cleanup = (): void => {
-              socket.removeListener("close", onClose);
-              socket.removeListener("error", onError);
-              signal.removeEventListener("abort", onAbort);
-            };
-            const onClose = (): void => {
-              cleanup();
-              resolve();
-            };
-            const onError = (error: Error): void => {
-              if ("code" in error && error.code === "ECONNRESET") return;
-              cleanup();
-              reject(error);
-            };
-            const onAbort = (): void => {
-              cleanup();
-              reject(signal.reason);
-            };
+        const deadline = Date.now() + timeoutMs;
+        const previousError = socketErrors.get(socket);
+        if (previousError) throw new Error(`Validation process ${pid} control socket failed.`, { cause: previousError });
+        if (!socket.closed) {
+          const signal = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+          try {
+            await new Promise<void>((resolve, reject) => {
+              const cleanup = (): void => {
+                socket.removeListener("close", onClose);
+                socket.removeListener("error", onError);
+                signal.removeEventListener("abort", onAbort);
+              };
+              const onClose = (): void => {
+                cleanup();
+                resolve();
+              };
+              const onError = (error: Error): void => {
+                socketErrors.set(socket, error);
+                cleanup();
+                reject(error);
+              };
+              const onAbort = (): void => {
+                cleanup();
+                reject(signal.reason);
+              };
 
-            socket.once("close", onClose);
-            socket.on("error", onError);
-            signal.addEventListener("abort", onAbort, { once: true });
-            if (socket.closed) onClose();
-          });
-        } catch (error) {
-          if (!signal.aborted) throw error;
-          throw new Error(`Validation process ${pid} kept its control socket open.`, { cause: error });
+              socket.once("close", onClose);
+              socket.once("error", onError);
+              signal.addEventListener("abort", onAbort, { once: true });
+              if (socket.closed) onClose();
+            });
+          } catch (error) {
+            if (!signal.aborted) throw error;
+            throw new Error(`Validation process ${pid} kept its control socket open.`, { cause: error });
+          }
         }
+        await waitForProcessExit(pid, deadline);
       }));
     },
     connections: () => [...connections],
@@ -712,6 +722,26 @@ async function startProcessControl(): Promise<{
       });
     }
   };
+}
+
+async function waitForProcessExit(pid: number, deadline: number): Promise<void> {
+  while (isProcessRunning(pid)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`Validation process ${pid} remained alive after its control socket closed.`);
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, remaining)));
+  }
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    throw error;
+  }
 }
 
 async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {

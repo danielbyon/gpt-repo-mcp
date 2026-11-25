@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { chmod, copyFile, cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
 import { describe, expect, test } from "vitest";
@@ -11,6 +11,24 @@ const builtServer = join(repoRoot, "dist", "server.js");
 const builtCli = join(repoRoot, "dist", "cli", "connect-gpt.js");
 
 describe.skipIf(process.platform === "win32")("POSIX configuration IPC identity enforcement", () => {
+  test.skipIf(process.platform !== "darwin")("copies a Node runtime that remains launchable from the fixture", async () => {
+    const fixtureRoot = await mkdtemp("/tmp/gpt-repo-node-runtime-");
+
+    try {
+      const executable = await makeNodeExecutableAccessibleToOtherUsers(fixtureRoot);
+      const result = spawnSync(executable, ["-e", "process.stdout.write(process.version)"], {
+        encoding: "utf8",
+        timeout: 5_000
+      });
+
+      expect(result.error, result.stderr).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe(process.version);
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
   test("a distinct UID cannot connect to the owner endpoint while the owner CLI reloads successfully", async ({ skip }) => {
     const ownerUid = process.getuid?.();
     const outsider = ownerUid === undefined ? undefined : findPasswordlessDistinctUid(ownerUid);
@@ -34,8 +52,10 @@ describe.skipIf(process.platform === "win32")("POSIX configuration IPC identity 
       PORT: "0"
     };
     let server: ChildProcess | undefined;
+    let outsiderNode = process.execPath;
 
     try {
+      if (process.platform === "darwin") outsiderNode = await makeNodeExecutableAccessibleToOtherUsers(fixtureRoot);
       server = spawn(process.execPath, [builtServer], {
         cwd: repoRoot,
         env: serverEnv,
@@ -66,7 +86,7 @@ const endpointResult = await new Promise((resolve) => {
 process.stdout.write(JSON.stringify({ uid: process.getuid(), endpointResult }));
 `;
       const outsiderResult = spawnSync("sudo", [
-        "-n", "-u", outsider.name, "--", process.execPath, "-e", outsiderScript,
+        "-n", "-u", outsider.name, "--", outsiderNode, "-e", outsiderScript,
         record.endpoint
       ], { encoding: "utf8", timeout: 15_000, maxBuffer: 1_000_000 });
       expect(outsiderResult.error, outsiderResult.stderr).toBeUndefined();
@@ -98,6 +118,25 @@ function findPasswordlessDistinctUid(ownerUid: number): { name: string; uid: num
     if (credentialCheck.status === 0 && Number(credentialCheck.stdout.trim()) === uid) return { name, uid };
   }
   return undefined;
+}
+
+async function makeNodeExecutableAccessibleToOtherUsers(fixtureRoot: string): Promise<string> {
+  const sourceRuntimeRoot = dirname(dirname(process.execPath));
+  const runtimeDirectory = join(fixtureRoot, "outsider-runtime");
+  const executableDirectory = join(runtimeDirectory, "bin");
+  await mkdir(executableDirectory, { recursive: true, mode: 0o755 });
+  await chmod(executableDirectory, 0o755);
+  const executable = join(executableDirectory, basename(process.execPath));
+  await copyFile(process.execPath, executable);
+  await chmod(executable, 0o755);
+  if ((await readdir(sourceRuntimeRoot)).includes("lib")) {
+    await cp(join(sourceRuntimeRoot, "lib"), join(runtimeDirectory, "lib"), {
+      recursive: true,
+      dereference: true
+    });
+  }
+  await chmod(fixtureRoot, 0o711);
+  return executable;
 }
 
 function runCli(cliPath: string, cwd: string, env: NodeJS.ProcessEnv, serverPid: number) {
