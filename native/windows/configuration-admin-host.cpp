@@ -1144,7 +1144,12 @@ bool validLocalPipeName(const std::wstring &endpoint) {
 bool openClientPipe(const std::wstring &endpoint, HANDLE &pipe,
                     ULONGLONG deadline, DWORD &errorCode) {
   const DWORD access = FILE_READ_DATA | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
-  for (int attempt = 0; attempt < 2; ++attempt) {
+  for (;;) {
+    const DWORD remaining = remainingMilliseconds(deadline);
+    if (remaining == 0) {
+      errorCode = ERROR_SEM_TIMEOUT;
+      return false;
+    }
     HANDLE raw = CreateFileW(endpoint.c_str(), access, 0, nullptr, OPEN_EXISTING,
                              FILE_FLAG_OVERLAPPED, nullptr);
     if (raw != INVALID_HANDLE_VALUE) {
@@ -1160,14 +1165,20 @@ bool openClientPipe(const std::wstring &endpoint, HANDLE &pipe,
     }
     const DWORD error = GetLastError();
     errorCode = error;
-    const DWORD remaining = remainingMilliseconds(deadline);
-    if (error != ERROR_PIPE_BUSY || remaining == 0 ||
-        !WaitNamedPipeW(endpoint.c_str(), remaining)) {
-      if (error == ERROR_PIPE_BUSY) errorCode = GetLastError();
+    if (error == ERROR_PIPE_BUSY) {
+      if (WaitNamedPipeW(endpoint.c_str(), remaining)) continue;
+      errorCode = GetLastError();
+      if (errorCode != ERROR_FILE_NOT_FOUND) return false;
+    } else if (error != ERROR_FILE_NOT_FOUND) {
       return false;
     }
+    const DWORD retryDelay = remainingMilliseconds(deadline);
+    if (retryDelay == 0) {
+      errorCode = ERROR_SEM_TIMEOUT;
+      return false;
+    }
+    Sleep(std::min<DWORD>(10, retryDelay));
   }
-  return false;
 }
 
 bool clientWrite(HANDLE pipe, const std::vector<BYTE> &request, DWORD &written,

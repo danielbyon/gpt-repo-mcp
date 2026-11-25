@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstat } from "node:fs/promises";
 import { once } from "node:events";
 import { dirname, join, resolve } from "node:path";
@@ -117,7 +117,14 @@ export async function requestWindowsConfigurationAdmin(
     );
   }
   if (marker === "INDETERMINATE") {
-    throw ipcError("WINDOWS_PIPE_INDETERMINATE", "indeterminate", "The reload may have run, but the native helper could not confirm the response.");
+    const phase = request.operation === "reload" ? "indeterminate" : "pre-dispatch";
+    throw ipcError(
+      "WINDOWS_PIPE_INDETERMINATE",
+      phase,
+      request.operation === "reload"
+        ? "The reload may have run, but the native helper could not confirm the response."
+        : "The native helper could not confirm the probe response."
+    );
   }
   if (marker !== "RESPONSE") {
     throw ipcError(
@@ -234,16 +241,16 @@ class WindowsHostProcess {
   async abortStartup(): Promise<void> {
     this.closed = true;
     if (this.child.exitCode !== null || this.child.signalCode !== null || this.failed) {
-      this.child.kill();
+      terminateChild(this.child);
       return;
     }
     const shutdownWritten = await this.writeControlLine("SHUTDOWN\n");
     this.child.stdin.end();
-    if (!shutdownWritten) this.child.kill();
+    if (!shutdownWritten) terminateChild(this.child);
     try {
       await waitForExit(this.child, SHUTDOWN_TIMEOUT_MS);
     } catch {
-      this.child.kill();
+      terminateChild(this.child);
       await waitForExit(this.child, 1_000).catch(() => undefined);
     }
   }
@@ -254,11 +261,11 @@ class WindowsHostProcess {
     if (this.child.exitCode !== null || this.child.signalCode !== null) return;
     const shutdownWritten = await this.writeControlLine("SHUTDOWN\n");
     this.child.stdin.end();
-    if (!shutdownWritten) this.child.kill();
+    if (!shutdownWritten) terminateChild(this.child);
     try {
       await waitForExit(this.child, SHUTDOWN_TIMEOUT_MS);
     } catch {
-      this.child.kill();
+      terminateChild(this.child);
       await waitForExit(this.child, 1_000).catch(() => undefined);
       throw ipcError("WINDOWS_HELPER_SHUTDOWN_TIMEOUT", "pre-dispatch", "The local administrative helper did not stop before the deadline.");
     }
@@ -388,7 +395,15 @@ class WindowsHostProcess {
 
   private failWhenStreamCloses(code: string): void {
     if (this.closed || this.failed || this.child.exitCode !== null || this.child.signalCode !== null) return;
-    this.failHost(code);
+    if (this.readyRecord) {
+      this.failHost(code);
+      return;
+    }
+    // Let the child exit event take precedence when process termination closes its stdio.
+    setImmediate(() => {
+      if (this.closed || this.failed || this.child.exitCode !== null || this.child.signalCode !== null) return;
+      this.failHost(code);
+    });
   }
 
   private failHost(
@@ -401,7 +416,7 @@ class WindowsHostProcess {
     this.pendingConnections.clear();
     this.failBeforeReady(code, message);
     if (terminate && this.child.exitCode === null && this.child.signalCode === null) {
-      this.child.kill();
+      terminateChild(this.child);
     }
   }
 
@@ -435,7 +450,7 @@ async function runHelper(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (terminate && child.exitCode === null && child.signalCode === null) child.kill();
+      if (terminate) terminateChild(child);
       rejectOutput(error);
     };
     const finish = (value: Buffer): void => {
@@ -528,5 +543,14 @@ async function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: num
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+function terminateChild(child: ChildProcess): void {
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    child.kill();
+  } catch {
+    // A spawn error or exit race can leave no process handle to terminate.
   }
 }

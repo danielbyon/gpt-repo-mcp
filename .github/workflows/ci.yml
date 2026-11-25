@@ -39,6 +39,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Distribution build and health smoke
+        run: npm run verify:dist
+
       - name: Test
         run: npm test
 
@@ -47,9 +50,6 @@ jobs:
 
       - name: Public hygiene
         run: npm run check:public
-
-      - name: Distribution build and health smoke
-        run: npm run verify:dist
 
       - name: POSIX distinct UID enforcement
         env:
