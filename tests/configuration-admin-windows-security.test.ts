@@ -40,7 +40,11 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
     let serverOutput = "";
     let fixtureMayBeRestricted = false;
     let ownerSid: string | undefined;
+    let fixtureSkipReason: string | undefined;
+    let testFailed = false;
+    let testError: unknown;
     try {
+      await (async () => {
       try {
         createOutsiderDiscoveryFixture(fixtureRoot, outsiderLocalAppData);
         createTemporaryWindowsUser(userName, password, sidPath);
@@ -49,7 +53,8 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
         if (process.env.GPT_REPO_REQUIRE_SECURITY_FIXTURES === "1") {
           throw new Error("Windows SID qualification requires local-account creation and alternate-credential process launch on the ephemeral CI runner.", { cause: error });
         }
-        skip("Windows SID qualification requires local-account creation and alternate-credential process launch.");
+        fixtureSkipReason = "Windows SID qualification requires local-account creation and alternate-credential process launch.";
+        skip(fixtureSkipReason);
         return;
       }
       await writeFile(configPath, JSON.stringify({ repos: [], limits: {} }), { mode: 0o600 });
@@ -64,9 +69,12 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
       server.stderr?.on("data", (chunk: string) => {
         serverOutput = (serverOutput + chunk).slice(-8_000);
       });
-      server.once("error", () => undefined);
+      let serverSpawnError: Error | undefined;
+      server.once("error", (error: Error) => {
+        serverSpawnError = error;
+      });
 
-      const serverPort = await waitForServer(server, () => serverOutput);
+      const serverPort = await waitForServer(server, () => serverOutput, () => serverSpawnError);
       const ownerRecord = await waitForOwnerRecord(ownerLocalAppData, () => serverOutput);
       const ownerReload = runCli(builtCli, repoRoot, serverEnv, ownerRecord.server_pid);
       expect(ownerReload.status, ownerReload.stderr).toBe(0);
@@ -103,18 +111,72 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
       expect(result.cliStatus).toBe(1);
       expect(result.cliOutput).toContain("Windows denied access to the owner-local administrative pipe.");
       expect(result.cliOutput).toContain("Configuration reload was not dispatched.");
-    } finally {
+      })();
+    } catch (error) {
+      testFailed = true;
+      testError = error;
+    }
+
+    const cleanupErrors: unknown[] = [];
+    let canRemoveFixture = true;
+    let canRemoveOwnerData = true;
+    let canRemoveTemporaryUser = true;
+    try {
       await stopServer(server);
-      try {
-        if (fixtureMayBeRestricted && ownerSid) takeFixtureOwnership(fixtureRoot, ownerSid);
-      } finally {
-        try {
-          removeTemporaryWindowsUser(userName);
-        } finally {
-          await rm(fixtureRoot, { recursive: true, force: true });
-          await rm(ownerLocalAppData, { recursive: true, force: true });
-        }
+    } catch (error) {
+      cleanupErrors.push(error);
+      canRemoveFixture = false;
+      canRemoveOwnerData = false;
+      if (fixtureMayBeRestricted) {
+        canRemoveTemporaryUser = false;
+        cleanupErrors.push(new Error(`Preserved temporary account ${userName} because the server did not stop and its fixture may remain in use or restricted.`));
       }
+    }
+    if (fixtureMayBeRestricted && ownerSid) {
+      try {
+        takeFixtureOwnership(fixtureRoot, ownerSid);
+      } catch (error) {
+        cleanupErrors.push(error);
+        canRemoveFixture = false;
+        canRemoveOwnerData = false;
+        canRemoveTemporaryUser = false;
+        cleanupErrors.push(new Error(`Preserved temporary account ${userName} because fixture ownership could not be restored.`));
+        cleanupErrors.push(new Error(`Preserved owner data at ${ownerLocalAppData} because fixture ownership could not be restored.`));
+      }
+    }
+    if (canRemoveTemporaryUser) {
+      try {
+        removeTemporaryWindowsUser(userName);
+      } catch (error) {
+        cleanupErrors.push(error);
+        canRemoveFixture = false;
+        canRemoveOwnerData = false;
+        cleanupErrors.push(new Error(`Preserved fixture at ${fixtureRoot} and owner data at ${ownerLocalAppData} because temporary account ${userName} could not be removed.`));
+      }
+    }
+    if (canRemoveFixture) {
+      try {
+        await rm(fixtureRoot, { recursive: true, force: true });
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (canRemoveOwnerData) {
+      try {
+        await rm(ownerLocalAppData, { recursive: true, force: true });
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    const details = cleanupErrors.map((error) => error instanceof Error ? error.message : String(error));
+    if (testFailed && cleanupErrors.length > 0) {
+      const skipDetail = fixtureSkipReason ? ` Fixture prerequisite: ${fixtureSkipReason}` : "";
+      throw new AggregateError([testError, ...cleanupErrors], `Windows SID test and cleanup failed.${skipDetail} ${details.join("; ")}`);
+    }
+    if (testFailed) throw testError;
+    if (cleanupErrors.length > 0) {
+      const skipDetail = fixtureSkipReason ? ` after fixture skip: ${fixtureSkipReason}` : "";
+      throw new AggregateError(cleanupErrors, `Windows SID fixture cleanup failed${skipDetail}: ${details.join("; ")}`);
     }
   }, 60_000);
 });
@@ -268,11 +330,16 @@ if ($process.ExitCode -ne 0) { exit $process.ExitCode }
 function removeTemporaryWindowsUser(name: string): void {
   try {
     runPowerShell(String.raw`
-$ErrorActionPreference = 'SilentlyContinue'
-Remove-LocalUser -Name $env:GPT_REPO_SECURITY_USER -ErrorAction SilentlyContinue
+$ErrorActionPreference = 'Stop'
+$name = $env:GPT_REPO_SECURITY_USER
+$user = Get-LocalUser -ErrorAction Stop | Where-Object { $_.Name -eq $name }
+if ($null -ne $user) { Remove-LocalUser -Name $name -ErrorAction Stop }
+$remaining = Get-LocalUser -ErrorAction Stop | Where-Object { $_.Name -eq $name }
+if ($null -ne $remaining) { throw "Temporary local account still exists: $name" }
 `, { GPT_REPO_SECURITY_USER: name });
-  } catch {
-    throw new Error("The temporary Windows SID qualification account could not be removed.");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`The temporary Windows SID qualification account could not be removed: ${detail}`, { cause: error });
   }
 }
 
@@ -282,7 +349,7 @@ $ErrorActionPreference = 'Stop'
 $root = $env:GPT_REPO_SECURITY_FIXTURE_ROOT
 if (Test-Path -LiteralPath $root) {
   & takeown.exe /F $root /R /D Y | Out-Null
-  $access = "$($env:GPT_REPO_SECURITY_OWNER_SID):(OI)(CI)F"
+  $access = "*$($env:GPT_REPO_SECURITY_OWNER_SID):(OI)(CI)F"
   & icacls.exe $root /grant $access /T /C | Out-Null
   if ($LASTEXITCODE -ne 0) { throw 'Could not restore access to the temporary security fixture.' }
 }
@@ -314,9 +381,17 @@ async function createOwnerLocalAppData(): Promise<string> {
   return mkdtemp(join(userProfileRoot, "gpt-repo-admin-security-owner-"));
 }
 
-async function waitForServer(child: ChildProcess, readOutput: () => string): Promise<number> {
+async function waitForServer(
+  child: ChildProcess,
+  readOutput: () => string,
+  readSpawnError: () => Error | undefined
+): Promise<number> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
+    const spawnError = readSpawnError();
+    if (spawnError) {
+      throw new Error(`Built Windows server could not be spawned: ${spawnError.message}`, { cause: spawnError });
+    }
     if (child.exitCode !== null || child.signalCode !== null) {
       throw new Error(`Built Windows server exited before binding. ${readOutput()}`);
     }
@@ -377,14 +452,23 @@ function runCli(cliPath: string, cwd: string, env: NodeJS.ProcessEnv, serverPid:
 }
 
 async function stopServer(child: ChildProcess | undefined): Promise<void> {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  if (!child || child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
-  const stopped = await Promise.race([
-    once(child, "exit").then(() => true),
-    new Promise<false>((resolveDelay) => setTimeout(() => resolveDelay(false), 5_000))
-  ]);
-  if (!stopped && child.exitCode === null && child.signalCode === null) {
-    child.kill();
-    await once(child, "exit");
+  if (await waitForChildExit(child, 5_000)) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill();
+  if (!await waitForChildExit(child, 5_000) && child.exitCode === null && child.signalCode === null) {
+    throw new Error(`Windows security server process ${child.pid} did not exit after termination.`);
+  }
+}
+
+async function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  try {
+    await once(child, "exit", { signal: AbortSignal.timeout(timeoutMs) });
+    return true;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") return false;
+    throw error;
   }
 }
