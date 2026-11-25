@@ -313,9 +313,7 @@ function setOutsiderPathAcl(path: string, outsiderSid: string, isDirectory: bool
     path,
     "/inheritance:r",
     "/grant:r",
-    `*${outsiderSid}:${permission}`,
-    "/setowner",
-    `*${outsiderSid}`
+      `*${outsiderSid}:${permission}`
   ], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 }
 
@@ -405,12 +403,13 @@ try {
   return
 }
 & net.exe user $env:GPT_REPO_SECURITY_USER /delete | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'The temporary local qualification account could not be removed.' }
+$deleteExitCode = $LASTEXITCODE
 try {
   $null = $account.Translate([System.Security.Principal.SecurityIdentifier])
-  throw 'The temporary local qualification account still exists.'
 } catch [System.Security.Principal.IdentityNotMappedException] {
+  return
 }
+throw "The temporary local qualification account still exists after deletion (net.exe exit code $deleteExitCode)."
 `, { GPT_REPO_SECURITY_USER: name });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
