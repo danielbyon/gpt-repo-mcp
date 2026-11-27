@@ -7,13 +7,17 @@ import { fileURLToPath } from "node:url";
 import { DEFAULT_OPERATIONS_POLICY, SHIP_VALIDATION_TEST_PATH_GLOBS } from "../policies/operations-defaults.js";
 import { DEFAULT_WRITE_POLICY } from "../policies/write-defaults.js";
 import { isNotFoundError } from "../runtime/fs-helpers.js";
+import { ConfigurationAdminIpcError } from "../runtime/configuration-admin-error.js";
+import { createConfigurationSourceIdentity, type ConfigurationSourceIdentity } from "../config/config-source-identity.js";
 import {
   loadConfig,
   readConfigDocument,
-  resolveConfigPath,
+  resolveConfigPathSelection,
   writeConfigAtomic
 } from "../config/store.js";
 import { validateConfigDocument } from "../config/validation.js";
+import { reloadConfigurationAdmin } from "../runtime/configuration-admin-client.js";
+import type { ConfigurationAdminReloadResponse } from "../runtime/configuration-admin-protocol.js";
 import { runDoctor, type DoctorChecks } from "./connect-gpt-doctor.js";
 
 type CliIo = {
@@ -23,6 +27,10 @@ type CliIo = {
   stderr: (line: string) => void;
   stdin?: NodeJS.ReadStream;
   doctorChecks?: Partial<DoctorChecks>;
+  configurationAdminReload?: (options: {
+    selectedSourceIdentity: ConfigurationSourceIdentity;
+    instancePid?: number;
+  }) => Promise<ConfigurationAdminReloadResponse>;
 };
 
 type AddOptions = {
@@ -41,20 +49,22 @@ const usage = [
   "  gpt-repo list [--config <path>]",
   "  gpt-repo add <path> [--mode read|write|ship] [--id <repo_id>] [--name <display_name>] [--allow-non-git] [--config <path>]",
   "  gpt-repo remove <repo_id> [--config <path>]",
+  "  gpt-repo config reload [--instance <PID>] [--config <path>]",
   "  gpt-repo check [--config <path>]",
   "",
   "Compatibility:",
-  "  connect-gpt config list|add|remove|check"
+  "  connect-gpt config list|add|remove|check|reload"
 ].join("\n");
 
 export async function runConnectGptCli(argv: string[], io: CliIo = defaultIo()): Promise<number> {
   try {
     const { args, configOverride } = parseGlobalArgs(argv);
-    const configPath = resolveConfigPath({
+    const configSelection = resolveConfigPathSelection({
       cliConfigPath: configOverride,
       env: io.env,
       cwd: io.cwd
     });
+    const configPath = configSelection.path;
 
     const command = normalizeCommand(args);
 
@@ -101,13 +111,19 @@ export async function runConnectGptCli(argv: string[], io: CliIo = defaultIo()):
       return await handleCheck(configPath, io);
     }
 
+    if (args[1] === "reload") {
+      return await handleReload(args.slice(2), configSelection.selected_value, io);
+    }
+
     throw new CliError(`Unknown config command "${args[1] ?? ""}".\n${usage}`);
   } catch (error) {
-    const message = error instanceof CliError
-      ? error.message
-      : error instanceof Error
+    const message = error instanceof ConfigurationAdminIpcError
+      ? formatConfigurationAdminError(error)
+      : error instanceof CliError
         ? error.message
-        : String(error);
+        : error instanceof Error
+          ? error.message
+          : String(error);
     io.stderr(`Error: ${message}`);
     return 1;
   }
@@ -237,6 +253,46 @@ async function handleCheck(configPath: string, io: CliIo): Promise<number> {
   return 0;
 }
 
+async function handleReload(args: string[], selectedPath: string, io: CliIo): Promise<number> {
+  let instancePid: number | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg !== "--instance" || instancePid !== undefined) {
+      throw new CliError("Usage: gpt-repo config reload [--instance <PID>]");
+    }
+    const rawPid = args[index + 1];
+    if (!rawPid || !/^[1-9][0-9]*$/.test(rawPid)) {
+      throw new CliError("--instance requires a positive server PID.");
+    }
+    instancePid = Number(rawPid);
+    if (!Number.isSafeInteger(instancePid)) {
+      throw new CliError("--instance requires a positive server PID.");
+    }
+    index += 1;
+  }
+
+  const selectedSourceIdentity = createConfigurationSourceIdentity(selectedPath, io.cwd);
+  if (selectedSourceIdentity.status !== "available") {
+    throw new CliError("The selected configuration path cannot be compared safely; reload was not dispatched.");
+  }
+  const reload = io.configurationAdminReload ?? reloadConfigurationAdmin;
+  const response = await reload({ selectedSourceIdentity, ...(instancePid === undefined ? {} : { instancePid }) });
+  if (response.outcome === "rejected") {
+    io.stderr(
+      `Configuration reload rejected [${response.rejection_code}]: ${response.rejection_message} ` +
+      `(active generation=${response.active_effective_generation}, source_sha256=${response.active_source_sha256}).`
+    );
+    return 1;
+  }
+
+  io.stdout(
+    `Reloaded configuration in server PID ${response.server_pid} ` +
+    `(generation=${response.effective_generation}, source_sha256=${response.accepted_source_sha256}` +
+    `${response.pending_restart ? ", restart settings pending" : ""}).`
+  );
+  return 0;
+}
+
 function normalizeCommand(args: string[]): { name?: string; args: string[] } {
   if (args[0] === "config") {
     return { name: args[1], args: args.slice(2) };
@@ -245,6 +301,13 @@ function normalizeCommand(args: string[]): { name?: string; args: string[] } {
     return { name: args[0], args: args.slice(1) };
   }
   return { name: args[0], args: args.slice(1) };
+}
+
+function formatConfigurationAdminError(error: ConfigurationAdminIpcError): string {
+  if (error.phase === "indeterminate") {
+    return `Configuration reload outcome is indeterminate. The server may have applied it. ${error.message}`;
+  }
+  return `Configuration reload was not dispatched. ${error.message}`;
 }
 
 function parseGlobalArgs(argv: string[]): { args: string[]; configOverride?: string } {

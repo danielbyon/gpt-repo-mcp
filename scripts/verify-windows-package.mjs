@@ -19,10 +19,13 @@ const COMMON_ENTRIES = [
   "package/package.json"
 ];
 const WINDOWS_HELPER_ENTRY = "package/dist/windows-process-host.exe";
+const WINDOWS_ADMIN_HELPER_ENTRY = "package/dist/windows-configuration-admin-host.exe";
 const projectRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 
 export function verifyPackageArchiveInventory(entries, platform = process.platform) {
-  const expected = [...COMMON_ENTRIES, ...(platform === "win32" ? [WINDOWS_HELPER_ENTRY] : [])].sort();
+  const expected = [...COMMON_ENTRIES, ...(platform === "win32"
+    ? [WINDOWS_HELPER_ENTRY, WINDOWS_ADMIN_HELPER_ENTRY]
+    : [])].sort();
   const expectedSet = new Set(expected);
   const actual = [...entries].sort();
   const seen = new Set();
@@ -103,25 +106,30 @@ async function verifyPackageArchive() {
     const entries = readTarGzip(archive);
     verifyPackageArchiveInventory(entries.map(({ path }) => path));
 
-    let helperDigest;
+    const helperDigests = [];
     if (process.platform === "win32") {
-      const buildHostPath = join(projectRoot, "dist", "windows-process-host.exe");
-      const buildHost = await readFile(buildHostPath);
-      if (buildHost.byteLength === 0) {
-        throw new Error("The built Windows process host is empty.");
-      }
+      for (const [entry, filename, label] of [
+        [WINDOWS_HELPER_ENTRY, "windows-process-host.exe", "Windows process host"],
+        [WINDOWS_ADMIN_HELPER_ENTRY, "windows-configuration-admin-host.exe", "Windows administrative host"]
+      ]) {
+        const buildHost = await readFile(join(projectRoot, "dist", filename));
+        if (buildHost.byteLength === 0) {
+          throw new Error(`The built ${label} is empty.`);
+        }
 
-      const packedHost = entries.find(({ path }) => path === WINDOWS_HELPER_ENTRY)?.contents;
-      if (!packedHost || packedHost.byteLength === 0) {
-        throw new Error(`${WINDOWS_HELPER_ENTRY} is missing or empty in the npm archive.`);
-      }
+        const packedHost = entries.find(({ path }) => path === entry)?.contents;
+        if (!packedHost || packedHost.byteLength === 0) {
+          throw new Error(`${entry} is missing or empty in the npm archive.`);
+        }
 
-      const buildHostSha256 = sha256(buildHost);
-      helperDigest = sha256(packedHost);
-      if (helperDigest !== buildHostSha256) {
-        throw new Error(
-          `Packaged Windows process host hash mismatch: built=${buildHostSha256}, packed=${helperDigest}.`
-        );
+        const buildHostSha256 = sha256(buildHost);
+        const packedHostSha256 = sha256(packedHost);
+        if (packedHostSha256 !== buildHostSha256) {
+          throw new Error(
+            `Packaged ${label} hash mismatch: built=${buildHostSha256}, packed=${packedHostSha256}.`
+          );
+        }
+        helperDigests.push(`${label}: SHA-256 ${packedHostSha256}`);
       }
     }
 
@@ -129,7 +137,7 @@ async function verifyPackageArchive() {
     process.stdout.write([
       `Verified ${packageMetadata.name}@${packageMetadata.version}:`,
       `  files: ${packageFiles.join(", ")}`,
-      ...(helperDigest ? [`  Windows process host: SHA-256 ${helperDigest}`] : [])
+      ...helperDigests.map((digest) => `  ${digest}`)
     ].join("\n") + "\n");
   } catch (error) {
     verificationError = error;

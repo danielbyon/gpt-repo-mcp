@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
@@ -12,14 +12,20 @@ const POLL_INTERVAL_MS = 100;
 const tempRoot = await mkdtemp(join(tmpdir(), "gpt-repo-dist-smoke-"));
 const configPath = join(tempRoot, "config.json");
 let child;
+let output = "";
 
 try {
+  const localAppData = join(tempRoot, "local-app-data");
+  await mkdir(localAppData);
   await writeFile(configPath, JSON.stringify({ repos: [], limits: {} }), "utf8");
   const deadline = Date.now() + START_TIMEOUT_MS;
   child = spawn(process.execPath, ["dist/server.js"], {
     cwd: process.cwd(),
     env: {
       ...process.env,
+      GPT_REPO_TEST_BUILT_SERVER: "1",
+      GPT_REPO_ADMIN_TEST_DIRECTORY: join(tempRoot, "admin-ipc"),
+      LOCALAPPDATA: localAppData,
       GPT_REPO_CONFIG: configPath,
       GPT_REPO_HOST: "127.0.0.1",
       PORT: "0"
@@ -27,7 +33,6 @@ try {
     stdio: ["ignore", "pipe", "pipe"]
   });
 
-  let output = "";
   child.stdout.on("data", (chunk) => {
     output = appendBounded(output, chunk.toString());
   });
@@ -44,6 +49,56 @@ try {
   });
   await waitForHealth(child, boundPort, deadline, () => output);
   process.stdout.write("Built server passed the /health runtime smoke test.\n");
+
+  await stopChild(child);
+  child = undefined;
+
+  const blockedPath = join(tempRoot, "not-a-directory");
+  await writeFile(blockedPath, "file used to force isolated IPC setup failure");
+  const failedAdminDirectory = process.platform === "win32"
+    ? join(tempRoot, "unused-admin-ipc")
+    : join(blockedPath, "child");
+  const failedLocalAppData = process.platform === "win32" ? blockedPath : localAppData;
+  output = "";
+  const failureDeadline = Date.now() + START_TIMEOUT_MS;
+  child = spawn(process.execPath, ["dist/server.js"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      GPT_REPO_TEST_BUILT_SERVER: "1",
+      GPT_REPO_ADMIN_TEST_DIRECTORY: failedAdminDirectory,
+      LOCALAPPDATA: failedLocalAppData,
+      GPT_REPO_CONFIG: configPath,
+      GPT_REPO_HOST: "127.0.0.1",
+      PORT: "0"
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  child.stdout.on("data", (chunk) => {
+    output = appendBounded(output, chunk.toString());
+  });
+  child.stderr.on("data", (chunk) => {
+    output = appendBounded(output, chunk.toString());
+  });
+
+  const failurePort = await waitForMcpListener({
+    child,
+    port: 0,
+    timeoutMs: failureDeadline - Date.now()
+  }).catch((error) => {
+    throw new Error(`${error.message}\n${output}`.trim(), { cause: error });
+  });
+  await waitForHealth(child, failurePort.boundPort, failureDeadline, () => output);
+  while (!output.includes("administrative IPC unavailable") && Date.now() < failureDeadline) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`Built server exited after administrative IPC startup failed.\n${output}`.trim());
+    }
+    await new Promise((resolve) => globalThis.setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+  if (!output.includes("administrative IPC unavailable")) {
+    throw new Error(`Administrative IPC startup did not fail as expected.\n${output}`.trim());
+  }
+  process.stdout.write("Built server remained healthy when administrative IPC startup failed.\n");
 } finally {
   await stopChild(child);
   await rm(tempRoot, { recursive: true, force: true });

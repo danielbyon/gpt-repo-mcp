@@ -71,9 +71,12 @@ cp config.example.json config.local.json
 
 On Windows, run the build from a Visual Studio Developer PowerShell or
 Developer Command Prompt with C++ tools that match the installed Node
-architecture. The build creates the process host used by validation. Build on
-Windows before running the service there; builds made on other platforms do not
-include the Windows host.
+architecture. The build creates the native helpers used for validation and
+local configuration reload. Build on Windows before running the service there;
+builds made on other platforms do not include these helpers.
+
+The two-host remote named-pipe qualification requirements and commands are in
+[the Windows qualification guide](docs/WINDOWS_REMOTE_PIPE_QUALIFICATION.md).
 
 The copied starter config is valid and empty.
 
@@ -204,6 +207,7 @@ For the full boundary, threat model, and approval behavior, read
 | `npm run connect` | Start the server and built-in ngrok connection flow |
 | `npm run connect:secure` | Start the server with the OpenAI Secure MCP Tunnel |
 | `npm run check:config` | Validate local configuration |
+| `npm run config:reload -- [--instance <PID>]` | Reload the selected configuration in its matching local server |
 
 ## Documentation
 

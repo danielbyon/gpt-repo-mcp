@@ -29,6 +29,11 @@ const FORBIDDEN_PREFIXES = new Set([
 const FORBIDDEN_PATTERNS = [/(?:^|\/)[^/]*\.local\.[^/]*$/i];
 const ENVIRONMENT_TEMPLATE = ".env.example";
 const WINDOWS_PROCESS_HOST_PATH = "dist/windows-process-host.exe";
+const WINDOWS_CONFIGURATION_ADMIN_HOST_PATH = "dist/windows-configuration-admin-host.exe";
+const OPTIONAL_NON_WINDOWS_HOST_PATHS = new Set([
+  WINDOWS_PROCESS_HOST_PATH,
+  WINDOWS_CONFIGURATION_ADMIN_HOST_PATH
+]);
 const WINDOWS_DRIVE_PATH = /^[A-Za-z]:/;
 const WINDOWS_UNC_PATH = /^\/\//;
 // Account roots are assembled from parts because the public hygiene gate
@@ -455,7 +460,7 @@ async function preflightPackagePaths(root, files, {
     }
     // A non-Windows build cannot produce this native runtime artifact.
     const optionalWindowsHost = platform !== "win32" &&
-      relativePath === WINDOWS_PROCESS_HOST_PATH;
+      OPTIONAL_NON_WINDOWS_HOST_PATHS.has(relativePath);
     let info;
     try {
       info = await lstatPath(join(root, relativePath));

@@ -43,6 +43,92 @@ definition unique, preserves a stable public order, and rejects missing or
 duplicate definitions. Package and tier metadata organize implementation code;
 they are not additional user-facing tools or permissions.
 
+Configuration reload uses private IPC for the current user. POSIX stores
+discovery records in a `0700` directory and creates `0600` sockets. Windows
+protects discovery files and named pipes with the helper owner's SID, and the
+native pipe rejects remote clients. Before sending a request, the native
+client opens the endpoint with `READ_CONTROL` and calls
+[`GetSecurityInfo`](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo)
+on that exact connected handle. The owner must match the client's token user
+SID, and the protected DACL must contain exactly one non-inherited
+full-control allow ACE for that SID. The check runs again on the same handle
+immediately before the client writes the request. A failed or unavailable
+security query stops the request.
+
+On Windows startup, the native helper sends a `READY` record to its parent.
+The parent checks the server PID, helper PID and creation time, instance ID,
+and endpoint, then replies with `READY_ACCEPTED`. Only then does the helper
+publish the protected discovery record and send `PUBLISHED`. The parent makes
+IPC available after it receives that confirmation. A startup failure leaves
+public MCP serving available. Helper shutdown has a two-second absolute
+deadline covering the control write and exit wait. If the helper remains
+alive at that deadline, the parent terminates it; the child-process lifecycle
+handlers observe its exit.
+
+The Windows qualification uses single-host CI. Microsoft documents
+that CreateNamedPipeW with PIPE_REJECT_REMOTE_CLIENTS automatically rejects
+remote clients ([CreateNamedPipeW](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew)), and
+the production factory supplies the mode for both the first instance and each
+successor. The Windows test helper calls that shared factory to create both
+instances, alongside otherwise equivalent accept-remote and reject-remote
+control pipes. CI compares the controls' GetNamedPipeInfo results and records
+the results from the production-factory handles. The public
+GetNamedPipeInfo reference lists endpoint and pipe-type flags but does not
+list the remote-rejection bit ([GetNamedPipeInfo](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-getnamedpipeinfo)); Microsoft's
+[HLK test](https://learn.microsoft.com/en-us/windows-hardware/test/hlk/testref/e3bcbd3f-3e9c-484a-a587-3c081cb28f7a)
+says it checks that option. If the controls do not expose a reliable
+difference on the runner, CI reports that observation as unqualified and
+still checks the exact mode passed to CreateNamedPipeW. The query and its
+instrumentation exist only in the test build. Production security does not
+depend on GetNamedPipeInfo.
+End-to-end remote SMB testing remains optional supplementary evidence and is
+recorded as NOT RUN unless it is performed.
+
+The protected discovery record carries the helper PID and process creation
+time. The client checks those values against a live process handle to detect
+stale records and PID reuse. They identify the helper named by the record;
+they do not authenticate the process serving the connected endpoint. Microsoft
+documents [`GetNamedPipeServerProcessId`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeserverprocessid)
+for a handle created by `CreateNamedPipe`, while this client opens its handle
+with `CreateFileW`. This design trusts processes running under the same owner
+SID and privileged principals that can override object ownership or access
+controls. It excludes hostile same-SID processes and those privileged
+principals.
+An older running instance can continue serving MCP requests, but the new CLI
+refuses to administer a discovery record without the helper creation time; the
+instance must restart and publish a current record first.
+
+Security authentication and instance identification have separate jobs. The
+owner SID and protected DACL on the connected handle establish the endpoint's
+security identity within the approved same-SID boundary. PID, process creation
+time, instance UUID, and configuration-source identity select the intended
+instance and detect stale discovery records; they do not authenticate the
+process serving the connection. We do not use
+`GetNamedPipeServerProcessId` because Microsoft documents it for a handle
+created by `CreateNamedPipe`, while this client opens its handle with
+`CreateFileW`. A name-based check would not verify the exact connected handle,
+and protocol identity fields arrive only after data has been sent. The threat
+model excludes hostile same-SID processes and principals that can override
+object security, so bearer credentials and a separate authentication service
+would add authority outside the approved boundary. The existing
+`ConfigurationRevisionStore` continues to serialize configuration
+publication; no second transaction store is needed.
+
+The client keeps
+`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION | SECURITY_EFFECTIVE_ONLY`;
+the server can identify the client but cannot impersonate it. The first pipe
+instance must claim the name before the helper publishes its endpoint. While
+serving, the helper opens each successor before releasing the current instance
+and exits if it cannot create that successor.
+
+The CLI probes each candidate and checks its normalized configuration path
+before dispatch. Windows control messages carry a connection ID, keeping
+concurrent responses and aborts attached to the pipe that sent each request.
+Connections and probes have a two-second absolute deadline. Reload
+acknowledgments have a 30-second absolute deadline.
+`ConfigurationRevisionStore` serializes configuration reads, validation, and
+publication.
+
 ## Data Flow
 
 ChatGPT calls a tool with `repo_id` and repo-relative POSIX paths or globs. The handler resolves `repo_id` through `RootRegistry`, creates the required services, and returns a result envelope.

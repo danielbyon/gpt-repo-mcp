@@ -1,12 +1,17 @@
 import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createConnection, type AddressInfo } from "node:net";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { expect, test, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { createConfigurationSourceIdentity } from "../src/config/config-source-identity.js";
+import { createConfigurationAdminController } from "../src/runtime/configuration-admin-controller.js";
+import { startPosixConfigurationAdminServer } from "../src/runtime/configuration-admin-posix.js";
+import { encodeAdminFrame, type ConfigurationAdminResponse } from "../src/runtime/configuration-admin-protocol.js";
 import { createMcpHttpApp } from "../src/runtime/mcp-http-app.js";
 import { ConfigurationRevisionStore, prepareConfigurationCandidate } from "../src/services/configuration-revision-store.js";
 import type { EffectiveHotRevision } from "../src/services/configuration-revision-store.js";
@@ -198,30 +203,194 @@ test("keeps one HTTP session while connection setup skips context lookup and req
   }
 });
 
+test("serves the published snapshot after an administrative reload acknowledgement", async () => {
+  const fixture = await createFixture();
+  const sourceIdentity = createConfigurationSourceIdentity(fixture.configPath, process.cwd());
+  const instanceId = "88888888-8888-4888-8888-888888888888";
+  const httpApp = createMcpHttpApp({ revisionStore: fixture.store, maxSessions: 4, sessionIdleTtlMs: 60_000 });
+  const controller = createConfigurationAdminController({
+    serverPid: process.pid,
+    instanceId,
+    sourceIdentity,
+    revisionStore: fixture.store
+  });
+  const server = createServer(httpApp.app);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`));
+  const client = new Client({ name: "configuration-admin-revision-test", version: "1" });
+
+  try {
+    await client.connect(transport);
+    await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)]);
+    const acceptedBytes = await readFile(fixture.configPath);
+    const response = await controller.handle({
+      protocol_version: 1,
+      request_id: "99999999-9999-4999-8999-999999999999",
+      operation: "reload",
+      expected_server_pid: process.pid,
+      expected_instance_id: instanceId,
+      expected_source_identity: sourceIdentity
+    });
+
+    expect(response).toMatchObject({
+      outcome: "published",
+      effective_generation: 2,
+      accepted_source_sha256: createHash("sha256").update(acceptedBytes).digest("hex")
+    });
+
+    const rootsResult = await callRawTool(client, "repo_list_roots", {});
+    const roots = rootsResult.structuredContent as { repos: Array<{ root: string }> };
+    const rootPaths = roots.repos.map(({ root }) => root);
+    expect(rootPaths).toContain(await realpath(fixture.newRoot));
+    expect(rootPaths).not.toContain(await realpath(fixture.oldRoot));
+  } finally {
+    await client.close().catch(() => undefined);
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await httpApp.dispose();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test.skipIf(process.platform === "win32")(
+  "serves a published snapshot after its administrative reload acknowledgement is lost",
+  async () => {
+  const fixture = await createFixture();
+  const publication = deferred<ConfigurationAdminResponse>();
+  const releaseAcknowledgement = deferred<void>();
+  let ipcDirectory: string | undefined;
+  let httpApp: ReturnType<typeof createMcpHttpApp> | undefined;
+  let server: ReturnType<typeof createServer> | undefined;
+  let client: Client | undefined;
+  let adminHost: Awaited<ReturnType<typeof startPosixConfigurationAdminServer>> | undefined;
+  let socket: ReturnType<typeof createConnection> | undefined;
+
+  try {
+    ipcDirectory = await mkdtemp(join("/tmp", "gpt-admin-"));
+    const sourceIdentity = createConfigurationSourceIdentity(fixture.configPath, process.cwd());
+    const instanceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    httpApp = createMcpHttpApp({ revisionStore: fixture.store, maxSessions: 4, sessionIdleTtlMs: 60_000 });
+    const controller = createConfigurationAdminController({
+      serverPid: process.pid,
+      instanceId,
+      sourceIdentity,
+      revisionStore: fixture.store
+    });
+    const httpServer = createServer(httpApp.app);
+    server = httpServer;
+    const mcpClient = new Client({ name: "configuration-admin-lost-ack-test", version: "1" });
+    client = mcpClient;
+
+    await chmod(ipcDirectory, 0o700);
+    adminHost = await startPosixConfigurationAdminServer({
+      directory: ipcDirectory,
+      serverPid: process.pid,
+      instanceId,
+      handle: async (request) => {
+        const response = await controller.handle(request);
+        if (response.operation === "reload_result" && response.outcome === "published") {
+          publication.resolve(response);
+          await releaseAcknowledgement.promise;
+        }
+        return response;
+      }
+    });
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+    const address = httpServer.address() as AddressInfo;
+    await mcpClient.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`)));
+
+    await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)]);
+    const acceptedBytes = await readFile(fixture.configPath);
+    const request = {
+      protocol_version: 1 as const,
+      request_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      operation: "reload" as const,
+      expected_server_pid: process.pid,
+      expected_instance_id: instanceId,
+      expected_source_identity: sourceIdentity
+    };
+
+    socket = createConnection(adminHost.record.endpoint);
+    await new Promise<void>((resolve, reject) => {
+      socket!.once("connect", resolve);
+      socket!.once("error", reject);
+    });
+    socket.end(encodeAdminFrame(request));
+    const response = await publication.promise;
+
+    // Closing before the handler returns prevents the published response from reaching this client.
+    socket.destroy();
+    releaseAcknowledgement.resolve();
+    expect(response).toMatchObject({
+      outcome: "published",
+      effective_generation: 2,
+      accepted_source_sha256: createHash("sha256").update(acceptedBytes).digest("hex")
+    });
+
+    const rootsResult = await callRawTool(mcpClient, "repo_list_roots", {});
+    const roots = rootsResult.structuredContent as { repos: Array<{ root: string }> };
+    const rootPaths = roots.repos.map(({ root }) => root);
+    expect(rootPaths).toContain(await realpath(fixture.newRoot));
+    expect(rootPaths).not.toContain(await realpath(fixture.oldRoot));
+  } finally {
+    releaseAcknowledgement.resolve();
+    socket?.destroy();
+    await client?.close().catch(() => undefined);
+    server?.closeAllConnections();
+    try {
+      const httpServer = server;
+      if (httpServer) await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    } finally {
+      try {
+        if (adminHost) await adminHost.close();
+      } finally {
+        try {
+            if (httpApp) await httpApp.dispose();
+        } finally {
+          try {
+            if (ipcDirectory) await rm(ipcDirectory, { recursive: true, force: true });
+          } finally {
+            await rm(fixture.directory, { recursive: true, force: true });
+          }
+        }
+      }
+    }
+  }
+  },
+  15_000
+);
+
 async function createFixture() {
   const directory = await mkdtemp(join(tmpdir(), "mcp-config-activation-"));
   const oldRoot = join(directory, "old-root");
   const newRoot = join(directory, "new-root");
   const addedRoot = join(directory, "added-root");
   const configPath = join(directory, "config.json");
-  await Promise.all([mkdir(oldRoot), mkdir(newRoot), mkdir(addedRoot)]);
-  await writeFile(join(oldRoot, "marker.txt"), "marker from old root");
-  await writeFile(join(newRoot, "marker.txt"), "marker from new root");
-  await mkdir(join(oldRoot, ".chatgpt", "runs", "past"), { recursive: true });
-  await writeFile(join(oldRoot, ".chatgpt", "runs", "past", "prompt.md"), "historical delegation artifact");
-  await writeFile(configPath, JSON.stringify({ repos: [repository("fixture", oldRoot, true)], limits: {} }));
-  const initial = await prepareConfigurationCandidate(await readFile(configPath), configPath);
-  const store = new ConfigurationRevisionStore({ configPath, initial });
-  return {
-    directory,
-    oldRoot,
-    newRoot,
-    addedRoot,
-    store,
-    async writeCandidate(repos: ReturnType<typeof repository>[]) {
-      await writeFile(configPath, JSON.stringify({ repos, limits: {} }));
-    }
-  };
+  try {
+    await Promise.all([mkdir(oldRoot), mkdir(newRoot), mkdir(addedRoot)]);
+    await writeFile(join(oldRoot, "marker.txt"), "marker from old root");
+    await writeFile(join(newRoot, "marker.txt"), "marker from new root");
+    await mkdir(join(oldRoot, ".chatgpt", "runs", "past"), { recursive: true });
+    await writeFile(join(oldRoot, ".chatgpt", "runs", "past", "prompt.md"), "historical delegation artifact");
+    await writeFile(configPath, JSON.stringify({ repos: [repository("fixture", oldRoot, true)], limits: {} }));
+    const initial = await prepareConfigurationCandidate(await readFile(configPath), configPath);
+    const store = new ConfigurationRevisionStore({ configPath, initial });
+    return {
+      directory,
+      oldRoot,
+      newRoot,
+      addedRoot,
+      configPath,
+      store,
+      async writeCandidate(repos: ReturnType<typeof repository>[]) {
+        await writeFile(configPath, JSON.stringify({ repos, limits: {} }));
+      }
+    };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function repository(repoId: string, root: string, writesEnabled: boolean, cleanupEnabled = true) {
