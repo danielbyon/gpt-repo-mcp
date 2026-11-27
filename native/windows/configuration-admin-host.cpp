@@ -573,6 +573,23 @@ bool publishRecord(const std::wstring &directory, SecurityContext &security,
   return valid;
 }
 
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+// Replaces a protected discovery record from the helper's own security context.
+bool replaceRecordForTest(const std::wstring &path, SecurityContext &security,
+                          const InstanceRecord &record) {
+  const std::wstring replacement = path + L".pending-" +
+      std::to_wstring(GetCurrentProcessId()) + L"-" +
+      std::to_wstring(GetTickCount64());
+  if (!createSecureRecordFile(replacement, security, recordContents(record))) return false;
+  if (!MoveFileExW(replacement.c_str(), path.c_str(),
+                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileW(replacement.c_str());
+    return false;
+  }
+  return true;
+}
+#endif
+
 bool readSecureRecordFile(const std::wstring &path, const SecurityContext &security,
                           std::string &contents) {
   HANDLE raw = CreateFileW(path.c_str(), GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES,
@@ -1239,6 +1256,13 @@ int serve(DWORD serverPid, const std::string &instanceId) {
   signalShutdown(hub);
   waitForWorkers(hub);
   if (controlReader.joinable()) controlReader.join();
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+  if (wcscmp(testFault(), L"replace-record-before-cleanup") == 0) {
+    InstanceRecord replacement = record;
+    ++replacement.helperCreationTime;
+    if (!replaceRecordForTest(recordPath, security, replacement)) exitCode = 31;
+  }
+#endif
   if (!removeRecordIfSame(recordPath, security, record) && exitCode == 0) exitCode = 30;
   return exitCode;
 }
@@ -1491,9 +1515,16 @@ int client(const std::wstring &endpoint, DWORD timeoutMs,
   if (wcscmp(testFault(), L"expire-before-write") == 0) Sleep(timeoutMs + 50);
 #endif
 
+  if (remainingMilliseconds(operationDeadline) == 0) {
+    writeStdout("NOT_DISPATCHED\t" + std::to_string(ERROR_SEM_TIMEOUT) + "\n");
+    return 34;
+  }
   if (!verifyPipeOwnerAndHelperBeforeDispatch(
           pipe.get(), security, expectedHelperPid, expectedCreationTime,
           verifiedHelperProcess.get(), verificationError)) {
+    if (remainingMilliseconds(operationDeadline) == 0) {
+      verificationError = ERROR_SEM_TIMEOUT;
+    }
     if (verificationError == ERROR_SUCCESS) verificationError = ERROR_ACCESS_DENIED;
     writeStdout("NOT_DISPATCHED\t" + std::to_string(verificationError) + "\n");
     return 34;

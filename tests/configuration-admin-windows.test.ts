@@ -75,6 +75,8 @@ describe("owner-local Windows configuration IPC", () => {
     async () => {
       const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-record-identity-");
       vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_FAULT", "replace-record-before-cleanup");
       let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
 
       try {
@@ -93,14 +95,7 @@ describe("owner-local Windows configuration IPC", () => {
           "admin",
           `server-${record!.server_pid}-${record!.instance_id}.record`
         );
-        const original = await readFile(recordPath, "utf8");
         const replacementCreationTime = (BigInt(record!.helper_creation_time!) + 1n).toString();
-        const updated = original.replace(
-          `helper_creation_time=${record!.helper_creation_time}`,
-          `helper_creation_time=${replacementCreationTime}`
-        );
-        expect(updated).not.toBe(original);
-        await writeFile(recordPath, updated, "utf8");
 
         await host.close();
         expect(await readFile(recordPath, "utf8")).toContain(
