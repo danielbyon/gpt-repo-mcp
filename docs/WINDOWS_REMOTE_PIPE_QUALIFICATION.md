@@ -12,6 +12,12 @@ Microsoft documents that CreateNamedPipeW automatically rejects remote clients w
 
 The owner approved single-host CI as the required gate because it checks the documented local pipe-creation contract on the Windows kernel used by CI. A two-host attempt adds a second Windows machine, SID and account coordination, DNS, SMB services, and port 445 availability. Those requirements qualify the end-to-end network path. They add infrastructure cost beyond the approved local creation-mode check, so the two-host procedure remains supplementary.
 
+## Single-host CI result
+
+On the Windows 2025 runners, Node 20 and 22 both reported accept-control flags `5` (`0x05`) and reject-control flags `13` (`0x0D`), differing by `PIPE_REJECT_REMOTE_CLIENTS` (`0x08`). The production factory passed mode `14` (`0x0E`) for both first and successor instances. `GetNamedPipeInfo` returned `13` (`0x0D`) for both production handles, matching the reject control. The cleared-bit mutation check passed on both versions.
+
+See the [Node 20 job](https://github.com/danielbyon/gpt-repo-mcp/actions/runs/45970602004/job/140409810502) and [Node 22 job](https://github.com/danielbyon/gpt-repo-mcp/actions/runs/45970602004/job/140409810271). This qualifies the runtime observation on the Windows 2025 CI image. The public API reference still does not enumerate the remote-rejection bit, so the result is recorded for this runner rather than treated as a portable API guarantee. The documented `CreateNamedPipeW` behavior and the exact mode passed by the production factory remain the enforcement basis. The result does not exercise remote SMB access; that optional procedure remains **NOT RUN**.
+
 ## 1. Optional two-host pass criteria
 
 When running the supplementary check, count it as a pass only when all of these conditions hold:
