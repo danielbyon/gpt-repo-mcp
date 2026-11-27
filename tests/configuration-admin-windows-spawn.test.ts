@@ -10,7 +10,7 @@ vi.mock("node:child_process", async (importOriginal) => {
     spawn: (command: string, args: readonly string[] = [], options: SpawnOptions = {}) => {
       if (spawnFault.failNext) {
         spawnFault.failNext = false;
-        return actual.spawn("Z:\\missing-issue-6-admin-helper.exe", args, options);
+        return actual.spawn("Z:\\missing-configuration-admin-helper.exe", args, options);
       }
       return actual.spawn(command, args, options);
     }

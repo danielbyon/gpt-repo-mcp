@@ -1,30 +1,684 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import { requestWindowsConfigurationAdmin, startWindowsConfigurationAdminHost } from "../src/runtime/configuration-admin-windows.js";
+import { parseAdminRequest, type ConfigurationAdminResponse } from "../src/runtime/configuration-admin-protocol.js";
 
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const builtServer = join(repoRoot, "dist", "server.js");
 const builtCli = join(repoRoot, "dist", "cli", "connect-gpt.js");
 const productionHelper = join(repoRoot, "dist", "windows-configuration-admin-host.exe");
+const testHelper = join(repoRoot, "dist", "windows-configuration-admin-host.test.exe");
 const userProfileRoot = process.env.USERPROFILE;
 const publicRoot = process.env.PUBLIC ?? "C:\\Users\\Public";
 
+const replacementPipeServerSource = String.raw`
+$ErrorActionPreference = 'Stop'
+$pipeName = $env:GPT_REPO_SECURITY_PIPE_NAME
+$ownerSid = [System.Security.Principal.SecurityIdentifier]::new($env:GPT_REPO_SECURITY_OWNER_SID)
+$serverSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$processInfo = Get-Process -Id $PID
+$creationTime = $processInfo.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+$pipeSecurity = [System.IO.Pipes.PipeSecurity]::new()
+$pipeSecurity.SetOwner($serverSid)
+$pipeSecurity.SetAccessRuleProtection($true, $false)
+$accessSids = @($ownerSid)
+if ($serverSid.Value -ne $ownerSid.Value -and
+    $env:GPT_REPO_SECURITY_OWNER_ONLY_DACL -ne '1') { $accessSids += $serverSid }
+foreach ($sid in $accessSids) {
+  $rule = [System.IO.Pipes.PipeAccessRule]::new(
+    $sid,
+    [System.IO.Pipes.PipeAccessRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow
+  )
+  $pipeSecurity.AddAccessRule($rule)
+}
+if ($env:GPT_REPO_SECURITY_UNEXPECTED_DACL -eq '1') {
+  $everyoneSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+  $unexpectedRule = [System.IO.Pipes.PipeAccessRule]::new(
+    $everyoneSid,
+    [System.IO.Pipes.PipeAccessRights]::ReadData,
+    [System.Security.AccessControl.AccessControlType]::Allow
+  )
+  $pipeSecurity.AddAccessRule($unexpectedRule)
+}
+$pipe = [System.IO.Pipes.NamedPipeServerStream]::new(
+  $pipeName,
+  [System.IO.Pipes.PipeDirection]::InOut,
+  1,
+  [System.IO.Pipes.PipeTransmissionMode]::Message,
+  [System.IO.Pipes.PipeOptions]::Asynchronous,
+  4096,
+  4096,
+  $pipeSecurity
+)
+Write-Output ('READY|{0}|{1}|{2}' -f $PID, $serverSid.Value, $creationTime)
+[Console]::Out.Flush()
+if (-not $pipe.WaitForConnectionAsync().Wait(10000)) {
+  Write-Output 'NO_CONNECTION'
+  exit 2
+}
+if ($env:GPT_REPO_SECURITY_CHANGE_DACL -eq '1') {
+  if ([Console]::In.ReadLine() -ne 'CHANGE_DACL') {
+    throw 'The DACL mutation command was missing.'
+  }
+  $everyoneSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+  $mutationRule = [System.IO.Pipes.PipeAccessRule]::new(
+    $everyoneSid,
+    [System.IO.Pipes.PipeAccessRights]::ReadData,
+    [System.Security.AccessControl.AccessControlType]::Allow
+  )
+  $pipeSecurity.AddAccessRule($mutationRule)
+  $pipe.SetAccessControl($pipeSecurity)
+  Write-Output 'DACL_CHANGED'
+  [Console]::Out.Flush()
+}
+$buffer = [byte[]]::new(65536)
+$received = $pipe.Read($buffer, 0, $buffer.Length)
+Write-Output ('CONNECTED|{0}' -f $received)
+$pipe.Dispose()
+`;
+
+const pipeNamespaceClaimLauncherSource = String.raw`
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+
+const fixture = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const identity = spawnSync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], {
+  encoding: 'utf8',
+  windowsHide: true
+});
+const sid = identity.stdout?.match(/S-1-[0-9-]+/)?.[0];
+if (identity.status !== 0 || !sid) {
+  process.stderr.write(identity.stderr || 'The pipe claimant SID could not be read.');
+  process.exit(2);
+}
+const claim = spawnSync(fixture.helperPath, ['claim', fixture.endpoint], {
+  encoding: 'utf8',
+  timeout: 5000,
+  windowsHide: true
+});
+if (claim.error) {
+  process.stderr.write(claim.error.message);
+  process.exit(3);
+}
+process.stdout.write(JSON.stringify({ sid, status: claim.status, stdout: claim.stdout, stderr: claim.stderr }));
+if (claim.status !== 0) process.exit(claim.status ?? 4);
+`;
+
+const replacementPipeProbeScript = String.raw`
+$ErrorActionPreference = 'Stop'
+$pipeServer = $null
+$serveProcess = $null
+$clientProcess = $null
+$securePassword = $null
+try {
+  $serverStart = [System.Diagnostics.ProcessStartInfo]::new()
+  $serverStart.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $serverStart.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $env:GPT_REPO_SECURITY_REPLACEMENT_SCRIPT
+  $serverStart.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
+  $serverStart.UseShellExecute = $false
+  $serverStart.RedirectStandardOutput = $true
+  $serverStart.RedirectStandardError = $true
+  $serverStart.CreateNoWindow = $true
+  $serverStart.EnvironmentVariables['GPT_REPO_SECURITY_PIPE_NAME'] = $env:GPT_REPO_SECURITY_PIPE_NAME
+  $serverStart.EnvironmentVariables['GPT_REPO_SECURITY_OWNER_SID'] = $env:GPT_REPO_SECURITY_OWNER_SID
+  $serverStart.EnvironmentVariables['GPT_REPO_SECURITY_UNEXPECTED_DACL'] = $env:GPT_REPO_SECURITY_UNEXPECTED_DACL
+  $serverStart.EnvironmentVariables['GPT_REPO_SECURITY_OWNER_ONLY_DACL'] = $env:GPT_REPO_SECURITY_OWNER_ONLY_DACL
+  if ($env:GPT_REPO_SECURITY_RUN_AS_OUTSIDER -eq '1') {
+    $securePassword = [System.Security.SecureString]::new()
+    foreach ($character in $env:GPT_REPO_SECURITY_PASSWORD.ToCharArray()) { $securePassword.AppendChar($character) }
+    $securePassword.MakeReadOnly()
+    $serverStart.UserName = $env:GPT_REPO_SECURITY_USER
+    $serverStart.Domain = $env:COMPUTERNAME
+    $serverStart.Password = $securePassword
+    $serverStart.LoadUserProfile = $true
+  }
+
+  $pipeServer = [System.Diagnostics.Process]::Start($serverStart)
+  $serverErrorTask = $pipeServer.StandardError.ReadToEndAsync()
+  $readyTask = $pipeServer.StandardOutput.ReadLineAsync()
+  if (-not $readyTask.Wait(10000)) { throw 'The replacement pipe server did not become ready.' }
+  $readyLine = $readyTask.GetAwaiter().GetResult()
+  $readyParts = $readyLine.Split('|')
+  if ($readyParts.Length -ne 4 -or $readyParts[0] -ne 'READY') {
+    throw "The replacement pipe server returned an invalid ready line: $readyLine"
+  }
+  $replacementPid = [uint32]$readyParts[1]
+  $replacementSid = $readyParts[2]
+  $replacementCreationTime = $readyParts[3]
+  $expectedPid = [uint32]$env:GPT_REPO_SECURITY_HELPER_PID
+  $expectedCreationTime = $env:GPT_REPO_SECURITY_HELPER_CREATION_TIME
+  if ($env:GPT_REPO_SECURITY_EXPECTED_IDENTITY_MODE -eq 'replacement-pid' -or
+      $env:GPT_REPO_SECURITY_EXPECTED_IDENTITY_MODE -eq 'replacement-process') {
+    $expectedPid = $replacementPid
+  }
+  if ($env:GPT_REPO_SECURITY_EXPECTED_IDENTITY_MODE -eq 'replacement-process') {
+    $expectedCreationTime = $replacementCreationTime
+  }
+
+  $recreateExitCode = $null
+  if ($env:GPT_REPO_SECURITY_TRY_SERVER_RECREATION -eq '1') {
+    $serveStart = [System.Diagnostics.ProcessStartInfo]::new()
+    $serveStart.FileName = $env:GPT_REPO_SECURITY_HELPER_PATH
+    $serveStart.Arguments = 'serve {0} "{1}"' -f $env:GPT_REPO_SECURITY_SERVER_PID, $env:GPT_REPO_SECURITY_INSTANCE_ID
+    $serveStart.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
+    $serveStart.UseShellExecute = $false
+    $serveStart.RedirectStandardOutput = $true
+    $serveStart.RedirectStandardError = $true
+    $serveStart.CreateNoWindow = $true
+    $serveStart.EnvironmentVariables['LOCALAPPDATA'] = $env:GPT_REPO_SECURITY_OWNER_LOCALAPPDATA
+    $serveProcess = [System.Diagnostics.Process]::Start($serveStart)
+    $serveStdoutTask = $serveProcess.StandardOutput.ReadToEndAsync()
+    $serveStderrTask = $serveProcess.StandardError.ReadToEndAsync()
+    if ($serveProcess.WaitForExit(5000)) {
+      $recreateExitCode = $serveProcess.ExitCode
+    } else {
+      $serveProcess.Kill()
+      $null = $serveProcess.WaitForExit(5000)
+      $recreateExitCode = -1
+    }
+  }
+
+  $clientStart = [System.Diagnostics.ProcessStartInfo]::new()
+  $clientStart.FileName = $env:GPT_REPO_SECURITY_HELPER_PATH
+  $clientStart.Arguments = 'client "{0}" 2000 {1} {2}' -f $env:GPT_REPO_SECURITY_ENDPOINT, $expectedPid, $expectedCreationTime
+  $clientStart.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
+  $clientStart.UseShellExecute = $false
+  $clientStart.RedirectStandardInput = $true
+  $clientStart.RedirectStandardOutput = $true
+  $clientStart.RedirectStandardError = $true
+  $clientStart.CreateNoWindow = $true
+  $clientProcess = [System.Diagnostics.Process]::Start($clientStart)
+  $clientStdoutTask = $clientProcess.StandardOutput.ReadToEndAsync()
+  $clientStderrTask = $clientProcess.StandardError.ReadToEndAsync()
+  $frame = [Convert]::FromBase64String($env:GPT_REPO_SECURITY_FRAME)
+  $clientProcess.StandardInput.BaseStream.Write($frame, 0, $frame.Length)
+  $clientProcess.StandardInput.BaseStream.Flush()
+  $clientProcess.StandardInput.Close()
+  if (-not $clientProcess.WaitForExit(10000)) {
+    $clientProcess.Kill()
+    $null = $clientProcess.WaitForExit(5000)
+    throw 'The native client did not exit before its deadline.'
+  }
+  $clientStdout = $clientStdoutTask.GetAwaiter().GetResult()
+  $clientStderr = $clientStderrTask.GetAwaiter().GetResult()
+
+  $serverResultTask = $pipeServer.StandardOutput.ReadLineAsync()
+  if (-not $serverResultTask.Wait(5000)) { throw 'The replacement pipe server did not finish the connection.' }
+  $serverLine = $serverResultTask.GetAwaiter().GetResult()
+  if (-not $pipeServer.WaitForExit(5000)) {
+    $pipeServer.Kill()
+    $null = $pipeServer.WaitForExit(5000)
+    throw 'The replacement pipe server did not exit after the connection.'
+  }
+  $serverError = $serverErrorTask.GetAwaiter().GetResult()
+  [pscustomobject]@{
+    serverPid = $replacementPid
+    serverSid = $replacementSid
+    serverCreationTime = $replacementCreationTime
+    expectedHelperPid = $expectedPid
+    expectedCreationTime = $expectedCreationTime
+    serverLine = $serverLine
+    serverError = $serverError
+    clientExitCode = $clientProcess.ExitCode
+    clientStdout = $clientStdout
+    clientStderr = $clientStderr
+    serverRecreationExitCode = $recreateExitCode
+  } | ConvertTo-Json -Compress
+} finally {
+  foreach ($child in @($clientProcess, $serveProcess, $pipeServer)) {
+    if ($null -ne $child) {
+      try {
+        if (-not $child.HasExited) {
+          $child.Kill()
+          $null = $child.WaitForExit(5000)
+        }
+      } catch {
+        if (-not $child.HasExited) { throw }
+      }
+      $child.Dispose()
+    }
+  }
+  if ($null -ne $securePassword) { $securePassword.Dispose() }
+}
+`;
+
+const pipeConnectionRaceProbeScript = String.raw`
+$ErrorActionPreference = 'Stop'
+$serverA = $null
+$serverB = $null
+$clientProcess = $null
+try {
+  $serverAStart = [System.Diagnostics.ProcessStartInfo]::new()
+  $serverAStart.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $serverAStart.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $env:GPT_REPO_SECURITY_REPLACEMENT_SCRIPT
+  $serverAStart.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
+  $serverAStart.UseShellExecute = $false
+  $serverAStart.RedirectStandardInput = $true
+  $serverAStart.RedirectStandardOutput = $true
+  $serverAStart.RedirectStandardError = $true
+  $serverAStart.CreateNoWindow = $true
+  $serverAStart.EnvironmentVariables['GPT_REPO_SECURITY_PIPE_NAME'] = $env:GPT_REPO_SECURITY_PIPE_NAME
+  $serverAStart.EnvironmentVariables['GPT_REPO_SECURITY_OWNER_SID'] = $env:GPT_REPO_SECURITY_OWNER_SID
+  $serverAStart.EnvironmentVariables['GPT_REPO_SECURITY_CHANGE_DACL'] = $env:GPT_REPO_SECURITY_CHANGE_DACL
+  $serverA = [System.Diagnostics.Process]::Start($serverAStart)
+  $serverAErrorTask = $serverA.StandardError.ReadToEndAsync()
+  $serverAReadyTask = $serverA.StandardOutput.ReadLineAsync()
+  if (-not $serverAReadyTask.Wait(10000)) { throw 'The initial pipe server did not become ready.' }
+  $serverAReadyLine = $serverAReadyTask.GetAwaiter().GetResult()
+  $serverAReady = $serverAReadyLine.Split('|')
+  if ($serverAReady.Length -ne 4 -or $serverAReady[0] -ne 'READY') {
+    throw "The initial pipe server returned an invalid ready line: $serverAReadyLine"
+  }
+
+  $clientStart = [System.Diagnostics.ProcessStartInfo]::new()
+  $clientStart.FileName = $env:GPT_REPO_SECURITY_TEST_HELPER_PATH
+  $clientStart.Arguments = 'client "{0}" 2000 {1} {2}' -f $env:GPT_REPO_SECURITY_ENDPOINT, $serverAReady[1], $serverAReady[3]
+  $clientStart.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
+  $clientStart.UseShellExecute = $false
+  $clientStart.RedirectStandardInput = $true
+  $clientStart.RedirectStandardOutput = $true
+  $clientStart.RedirectStandardError = $true
+  $clientStart.CreateNoWindow = $true
+  $clientStart.EnvironmentVariables['GPT_REPO_ADMIN_TEST_FAULT'] = 'pause-after-pipe-security-check'
+  $clientStart.EnvironmentVariables['GPT_REPO_ADMIN_TEST_RELEASE_MARKER'] = $env:GPT_REPO_SECURITY_CLIENT_RELEASE_MARKER
+  $clientProcess = [System.Diagnostics.Process]::Start($clientStart)
+  $clientVerificationTask = $clientProcess.StandardOutput.ReadLineAsync()
+  $clientErrorTask = $clientProcess.StandardError.ReadToEndAsync()
+  $frame = [Convert]::FromBase64String($env:GPT_REPO_SECURITY_FRAME)
+  $clientProcess.StandardInput.BaseStream.Write($frame, 0, $frame.Length)
+  $clientProcess.StandardInput.BaseStream.Flush()
+  $clientProcess.StandardInput.Close()
+  if (-not $clientVerificationTask.Wait(10000)) { throw 'The native client did not finish peer verification.' }
+  $clientVerificationLine = $clientVerificationTask.GetAwaiter().GetResult()
+  if ($clientVerificationLine -ne 'VERIFIED') {
+    throw "The native client returned no verification marker: $clientVerificationLine"
+  }
+
+  $serverBReady = $false
+  $serverBReadyLine = $null
+  $serverBLine = $null
+  $serverBPid = 0
+  $serverBSid = ''
+  $serverBExitCode = $null
+  $serverBError = ''
+  $serverALine = $null
+  $serverAExitCode = $null
+  if ($env:GPT_REPO_SECURITY_CHANGE_DACL -eq '1') {
+    $serverA.StandardInput.WriteLine('CHANGE_DACL')
+    $serverA.StandardInput.Flush()
+    $daclChangedTask = $serverA.StandardOutput.ReadLineAsync()
+    if (-not $daclChangedTask.Wait(5000)) { throw 'The pipe DACL change did not complete.' }
+    $daclChangedLine = $daclChangedTask.GetAwaiter().GetResult()
+    if ($daclChangedLine -ne 'DACL_CHANGED') { throw "Unexpected DACL update result: $daclChangedLine" }
+  } else {
+    $serverA.Kill()
+    if (-not $serverA.WaitForExit(5000)) { throw 'The verified pipe server did not terminate.' }
+    $serverAError = $serverAErrorTask.GetAwaiter().GetResult()
+    $serverA.Dispose()
+    $serverA = $null
+
+  $serverBStart = [System.Diagnostics.ProcessStartInfo]::new()
+  $serverBStart.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $serverBStart.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $env:GPT_REPO_SECURITY_REPLACEMENT_SCRIPT
+  $serverBStart.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
+  $serverBStart.UseShellExecute = $false
+  $serverBStart.RedirectStandardOutput = $true
+  $serverBStart.RedirectStandardError = $true
+  $serverBStart.CreateNoWindow = $true
+  $serverBStart.EnvironmentVariables['GPT_REPO_SECURITY_PIPE_NAME'] = $env:GPT_REPO_SECURITY_PIPE_NAME
+  $serverBStart.EnvironmentVariables['GPT_REPO_SECURITY_OWNER_SID'] = $env:GPT_REPO_SECURITY_OWNER_SID
+  $serverB = [System.Diagnostics.Process]::Start($serverBStart)
+  $serverBErrorTask = $serverB.StandardError.ReadToEndAsync()
+  $serverBReadyTask = $serverB.StandardOutput.ReadLineAsync()
+  $serverBReadyLine = $null
+  $serverBReady = $false
+  if ($serverBReadyTask.Wait(10000)) {
+    $serverBReadyLine = $serverBReadyTask.GetAwaiter().GetResult()
+    $serverBReady = $serverBReadyLine -like 'READY|*'
+  }
+  if (-not $serverBReady) {
+    if (-not $serverB.HasExited) {
+      $serverB.Kill()
+      $null = $serverB.WaitForExit(5000)
+    }
+    throw "The replacement pipe server did not become ready: $serverBReadyLine"
+  }
+  }
+
+  [System.IO.File]::WriteAllText($env:GPT_REPO_SECURITY_CLIENT_RELEASE_MARKER, 'release')
+
+  $clientStdoutTask = $clientProcess.StandardOutput.ReadToEndAsync()
+  if (-not $clientProcess.WaitForExit(10000)) {
+    $clientProcess.Kill()
+    $null = $clientProcess.WaitForExit(5000)
+    throw 'The native client did not exit before its deadline.'
+  }
+  $clientStdout = $clientStdoutTask.GetAwaiter().GetResult()
+  $clientError = $clientErrorTask.GetAwaiter().GetResult()
+  if ($env:GPT_REPO_SECURITY_CHANGE_DACL -eq '1') {
+    $serverAResultTask = $serverA.StandardOutput.ReadLineAsync()
+    if (-not $serverAResultTask.Wait(10000)) { throw 'The original pipe server did not report received bytes.' }
+    $serverALine = $serverAResultTask.GetAwaiter().GetResult()
+    if (-not $serverA.WaitForExit(5000)) {
+      $serverA.Kill()
+      $null = $serverA.WaitForExit(5000)
+      throw 'The original pipe server did not exit after reporting received bytes.'
+    }
+    $serverAExitCode = $serverA.ExitCode
+    $serverAError = $serverAErrorTask.GetAwaiter().GetResult()
+  }
+  $serverBLine = $null
+  $serverBPid = 0
+  $serverBSid = ''
+  $serverBExitCode = $null
+  if ($serverBReady) {
+    $serverBParts = $serverBReadyLine.Split('|')
+    if ($serverBParts.Length -ne 4) { throw "The replacement server returned an invalid ready line: $serverBReadyLine" }
+    $serverBPid = [int]$serverBParts[1]
+    $serverBSid = $serverBParts[2]
+    $serverBResultTask = $serverB.StandardOutput.ReadLineAsync()
+    if (-not $serverBResultTask.Wait(11000)) {
+      throw 'The replacement server did not report whether it received a connection.'
+    }
+    $serverBLine = $serverBResultTask.GetAwaiter().GetResult()
+    if (-not $serverB.WaitForExit(5000)) {
+      $serverB.Kill()
+      $null = $serverB.WaitForExit(5000)
+      throw 'The replacement server did not exit after reporting its connection result.'
+    }
+    $serverBExitCode = $serverB.ExitCode
+    $serverBError = $serverBErrorTask.GetAwaiter().GetResult()
+  }
+  if (-not $clientProcess.HasExited) { throw 'The client process did not exit.' }
+  [pscustomobject]@{
+    clientVerificationLine = $clientVerificationLine
+    clientExitCode = $clientProcess.ExitCode
+    clientStdout = $clientStdout
+    clientError = $clientError
+    serverASid = $serverAReady[2]
+    serverALine = $serverALine
+    serverAExitCode = $serverAExitCode
+    serverBReady = $serverBReady
+    serverBPid = $serverBPid
+    serverBSid = $serverBSid
+    serverBLine = $serverBLine
+    serverBExitCode = $serverBExitCode
+    serverBError = $serverBError
+    serverAError = $serverAError
+  } | ConvertTo-Json -Compress
+} finally {
+  foreach ($child in @($clientProcess, $serverB, $serverA)) {
+    if ($null -ne $child) {
+      try {
+        if (-not $child.HasExited) {
+          $child.Kill()
+          $null = $child.WaitForExit(5000)
+        }
+      } catch {
+        if (-not $child.HasExited) { throw }
+      }
+      $child.Dispose()
+    }
+  }
+}
+`;
+
 class WindowsSecurityFixtureUnavailableError extends Error {}
 
+function skipUnavailableSecurityFixture(
+  error: unknown,
+  skip: (reason: string) => void,
+  required = process.env.GPT_REPO_REQUIRE_SECURITY_FIXTURES === "1"
+): boolean {
+  if (!(error instanceof WindowsSecurityFixtureUnavailableError)) return false;
+  if (required) {
+    throw new Error(`Required Windows security fixture is unavailable: ${error.message}`, { cause: error });
+  }
+  skip(error.message);
+  return true;
+}
+
+test("required Windows security fixtures fail instead of being skipped", () => {
+  const skip = vi.fn();
+  expect(() => skipUnavailableSecurityFixture(
+    new WindowsSecurityFixtureUnavailableError("alternate-account launch is unavailable"),
+    skip,
+    true
+  )).toThrow("Required Windows security fixture is unavailable");
+  expect(skip).not.toHaveBeenCalled();
+});
+
 describe.skipIf(process.platform !== "win32")("Windows configuration pipe identity enforcement", () => {
-  test("a distinct SID is denied by the owner pipe while the owner production CLI reloads successfully", async ({ skip }) => {
+  test("keeps the production pipe namespace owner-controlled while admitted clients drain", async ({ skip }) => {
+    const fixtureRoot = await mkdtemp(join(publicRoot, "pipe-namespace-"));
     const fixtureId = randomUUID().replaceAll("-", "");
-    const userName = `CodexIpc${fixtureId.slice(0, 12)}`;
+    const userName = `PipeTest${fixtureId.slice(0, 12)}`;
+    const password = `Aa1!${randomBytes(8).toString("base64url").slice(0, 10)}`;
+    const sidPath = join(fixtureRoot, "claimant.sid");
+    const launcherPath = join(fixtureRoot, "pipe-namespace-claim.mjs");
+    const claimFixturePath = join(fixtureRoot, "pipe-namespace-claim.json");
+    const stdoutPath = join(fixtureRoot, "claimant.stdout");
+    const stderrPath = join(fixtureRoot, "claimant.stderr");
+    const capacityPath = join(fixtureRoot, "capacity-reached");
+    const workersClosedPath = join(fixtureRoot, "workers-closed");
+    const releasePath = join(fixtureRoot, "release-capacity");
+    const instanceId = randomUUID();
+    const ownerSid = currentWindowsSid();
+    let outsiderSid: string | undefined;
+    let accountCreated = false;
+    let localAppData: string | undefined;
+    let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+    let releaseHandlers = (): void => {};
+    let requestBatch: Promise<ConfigurationAdminResponse[]> | undefined;
+    let continuityProbe: Promise<ConfigurationAdminResponse> | undefined;
+
+    try {
+      try {
+        createTemporaryWindowsUser(userName, password, sidPath);
+        accountCreated = true;
+      } catch (error) {
+        if (skipUnavailableSecurityFixture(error, skip)) return;
+        throw error;
+      }
+
+      outsiderSid = (await readFile(sidPath, "utf8")).trim();
+      expect(outsiderSid).not.toBe(ownerSid);
+      localAppData = await createOwnerLocalAppData();
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_FAULT", "hold-at-connection-capacity");
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_CAPACITY_REACHED", capacityPath);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_WORKERS_CLOSED", workersClosedPath);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_RELEASE_CAPACITY", releasePath);
+
+      let helperPid: number | undefined;
+      let startedCount = 0;
+      let signalHandlersStarted = (): void => {};
+      const handlersStarted = new Promise<void>((resolveStarted) => {
+        signalHandlersStarted = resolveStarted;
+      });
+      let signalHandlersReleased = (): void => {};
+      const handlersReleased = new Promise<void>((resolveReleased) => {
+        signalHandlersReleased = resolveReleased;
+      });
+      releaseHandlers = signalHandlersReleased;
+      const sourceIdentity = {
+        status: "available" as const,
+        platform: "win32" as const,
+        path: join(localAppData, "configuration.json")
+      };
+
+      host = await startWindowsConfigurationAdminHost({
+        serverPid: process.pid,
+        instanceId,
+        onHelperPid: (pid) => { helperPid = pid; },
+        handle: async (value): Promise<ConfigurationAdminResponse> => {
+          const request = parseAdminRequest(value);
+          if (request.operation !== "probe") throw new Error("The namespace fixture accepts probe requests only.");
+          startedCount += 1;
+          if (startedCount === 2) signalHandlersStarted();
+          await handlersReleased;
+          return {
+            protocol_version: 1,
+            request_id: request.request_id,
+            server_pid: process.pid,
+            helper_pid: helperPid,
+            instance_id: instanceId,
+            source_identity: sourceIdentity,
+            operation: "probe_result",
+            effective_generation: 1,
+            accepted_source_sha256: "a".repeat(64),
+            pending_restart: false
+          };
+        }
+      });
+
+      const makeProbe = (): Promise<ConfigurationAdminResponse> => requestWindowsConfigurationAdmin(host!.record, {
+        protocol_version: 1,
+        request_id: randomUUID(),
+        operation: "probe"
+      });
+      requestBatch = Promise.all([makeProbe(), makeProbe()]);
+      await waitForSignal(handlersStarted, 5000, "Both owner probe requests did not reach the isolated helper.");
+      await waitForTestFile(capacityPath, 5000, "The test helper did not reach its connection limit.");
+
+      releaseHandlers();
+      await requestBatch;
+      await waitForTestFile(workersClosedPath, 5000, "The admitted pipe workers did not close.");
+
+      const ownerClaim = spawnSync(testHelper, ["claim", host.record.endpoint], {
+        encoding: "utf8",
+        timeout: 5000,
+        windowsHide: true
+      });
+      expect(ownerClaim.status, ownerClaim.stderr).toBe(0);
+      expect(ownerClaim.stdout).toBe("CREATED\n");
+
+      await writeFile(launcherPath, pipeNamespaceClaimLauncherSource, "utf8");
+      await writeFile(claimFixturePath, JSON.stringify({ helperPath: testHelper, endpoint: host.record.endpoint }), "utf8");
+      runAsWindowsUser(userName, password, launcherPath, claimFixturePath, stdoutPath, stderrPath);
+      const outsiderClaim = JSON.parse(await readFile(stdoutPath, "utf8")) as {
+        sid: string;
+        status: number | null;
+        stdout: string;
+        stderr: string;
+      };
+      expect(outsiderClaim.sid).toBe(outsiderSid);
+      expect(outsiderClaim.status, outsiderClaim.stderr).toBe(0);
+      expect(outsiderClaim.stdout).toBe("NOT_CREATED\t5\n");
+
+      await writeFile(releasePath, "continue");
+      continuityProbe = makeProbe();
+      await expect(continuityProbe).resolves.toMatchObject({ operation: "probe_result" });
+    } finally {
+      releaseHandlers();
+      await writeFile(releasePath, "continue").catch(() => undefined);
+      if (host) await host.close();
+      if (requestBatch) await Promise.allSettled([requestBatch]);
+      if (continuityProbe) await Promise.allSettled([continuityProbe]);
+      vi.unstubAllEnvs();
+      if (localAppData) await rm(localAppData, { recursive: true, force: true });
+      await rm(fixtureRoot, { recursive: true, force: true });
+      if (accountCreated) removeTemporaryWindowsUser(userName);
+    }
+  }, 45_000);
+
+  test("does not dispatch through an open connection after its verified server exits", async () => {
+    const fixtureRoot = await mkdtemp(join(userProfileRoot ?? publicRoot, "pipe-connection-race-"));
+    const ownerSid = currentWindowsSid();
+    const instanceId = randomUUID();
+    const endpoint = `\\\\.\\pipe\\gpt-repo-mcp-${process.pid}-${instanceId}`;
+    try {
+      const result = await runPipeConnectionRaceProbe({
+        endpoint,
+        helperPath: testHelper,
+        ownerSid,
+        fixtureRoot
+      });
+      expect(result.clientVerificationLine).toBe("VERIFIED");
+      expect(result.clientExitCode).toBe(34);
+      expect(result.clientStdout).toMatch(/^NOT_DISPATCHED\t\d+\s*$/);
+      expect(result.clientStdout).not.toContain("RESPONSE\n");
+      expect(result.serverAError).toBe("");
+      expect(result.serverBReady).toBe(true);
+      expect(result.serverBSid).toBe(ownerSid);
+      expect(result.serverBLine).toBe("NO_CONNECTION");
+      expect(result.serverBExitCode).toBe(2);
+      expect(result.serverBError).toBe("");
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("rechecks the connected pipe DACL immediately before dispatch", async () => {
+    const fixtureRoot = await mkdtemp(join(userProfileRoot ?? publicRoot, "pipe-dacl-race-"));
+    const ownerSid = currentWindowsSid();
+    const instanceId = randomUUID();
+    const endpoint = `\\\\.\\pipe\\gpt-repo-mcp-${process.pid}-${instanceId}`;
+    try {
+      const result = await runPipeConnectionRaceProbe({
+        endpoint,
+        helperPath: testHelper,
+        ownerSid,
+        fixtureRoot,
+        changeDacl: true
+      });
+      expect(result.clientVerificationLine).toBe("VERIFIED");
+      expect(result.clientExitCode).toBe(34);
+      expect(result.clientStdout).toMatch(/^NOT_DISPATCHED\t\d+\s*$/);
+      expect(result.serverASid).toBe(ownerSid);
+      expect(result.serverALine).toBe("CONNECTED|0");
+      expect(result.serverAExitCode).toBe(0);
+      expect(result.serverAError).toBe("");
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("validates helper creation time arguments before reading a request", () => {
+    const endpoint = "\\\\.\\pipe\\gpt-repo-mcp-1-22222222-2222-4222-8222-222222222222";
+    for (const creationTime of ["01", "00000000000000000001", "100000000000000000000"]) {
+      const result = spawnSync(productionHelper, ["client", endpoint, "2000", "1", creationTime], {
+        input: Buffer.alloc(0),
+        encoding: "utf8",
+        timeout: 2_000,
+        windowsHide: true
+      });
+      expect(result.status, result.stderr).toBe(5);
+      expect(result.stdout).toBe("");
+    }
+
+    const maximum = spawnSync(productionHelper, [
+      "client",
+      endpoint,
+      "2000",
+      "1",
+      "18446744073709551615"
+    ], {
+      input: Buffer.alloc(0),
+      encoding: "utf8",
+      timeout: 2_000,
+      windowsHide: true
+    });
+    expect(maximum.status, maximum.stderr).toBe(31);
+    expect(maximum.stdout).toBe("NOT_DISPATCHED\t0\n");
+  });
+
+  test("rejects a replacement pipe after helper exit while the owner production CLI reloads successfully", async ({ skip }) => {
+    const fixtureId = randomUUID().replaceAll("-", "");
+    const userName = `PipeTest${fixtureId.slice(0, 12)}`;
     const password = `Aa1!${randomBytes(8).toString("base64url").slice(0, 10)}`;
     const restrictedPaths: string[] = [];
     expect(password).toHaveLength(14);
     const ownerLocalAppData = await createOwnerLocalAppData();
-    const fixtureRoot = join(publicRoot, `gpt-repo-admin-security-${fixtureId}`);
+    const fixtureRoot = join(publicRoot, `configuration-admin-security-${fixtureId}`);
     const outsiderLocalAppData = join(fixtureRoot, "outsider-app-data");
     const configPath = join(fixtureRoot, "configuration.json");
     const launcherPath = join(fixtureRoot, "run-as-outsider.mjs");
@@ -54,12 +708,11 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
         createTemporaryWindowsUser(userName, password, sidPath);
         ownerSid = currentWindowsSid();
       } catch (error) {
-        if (process.env.GPT_REPO_REQUIRE_SECURITY_FIXTURES === "1" || error instanceof AggregateError) {
+        if (error instanceof AggregateError) {
           throw new Error("Windows SID qualification requires local-account creation and alternate-credential process launch on the ephemeral CI runner.", { cause: error });
         }
-        if (!(error instanceof WindowsSecurityFixtureUnavailableError)) throw error;
-        fixtureSkipReason = error.message;
-        skip(fixtureSkipReason);
+        if (error instanceof WindowsSecurityFixtureUnavailableError) fixtureSkipReason = error.message;
+        if (!skipUnavailableSecurityFixture(error, skip)) throw error;
         return;
       }
       await writeFile(configPath, JSON.stringify({ repos: [], limits: {} }), { mode: 0o600 });
@@ -81,6 +734,7 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
 
       const serverPort = await waitForServer(server, () => serverOutput, () => serverSpawnError);
       const ownerRecord = await waitForOwnerRecord(ownerLocalAppData, () => serverOutput);
+      const helperCreationTime = ownerRecord.helper_creation_time;
       const ownerReload = runCli(builtCli, repoRoot, serverEnv, ownerRecord.server_pid);
       expect(ownerReload.status, ownerReload.stderr).toBe(0);
       expect(ownerReload.stdout).toContain("Reloaded configuration");
@@ -100,6 +754,8 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
         cliPath: builtCli,
         helperPath: productionHelper,
         endpoint: ownerRecord.endpoint,
+        helperPid: ownerRecord.helper_pid,
+        helperCreationTime,
         serverPid: ownerRecord.server_pid
       }), "utf8");
 
@@ -123,6 +779,136 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
       expect(result.cliStatus).toBe(1);
       expect(result.cliOutput).toContain("Windows denied access to the owner-local administrative pipe.");
       expect(result.cliOutput).toContain("Configuration reload was not dispatched.");
+
+      terminateHelperProcess(ownerRecord.helper_pid, helperCreationTime, productionHelper);
+      expect(await fetch(`http://127.0.0.1:${serverPort}/health`).then((response) => response.ok)).toBe(true);
+      const staleRecordPath = join(
+        ownerLocalAppData,
+        "GPTRepoMCP",
+        "admin",
+        `server-${ownerRecord.server_pid}-${ownerRecord.instance_id}.record`
+      );
+      const staleRecord = await readFile(staleRecordPath, "utf8");
+      expect(staleRecord).toContain(`helper_pid=${ownerRecord.helper_pid}`);
+      expect(staleRecord).toContain(`helper_creation_time=${helperCreationTime}`);
+
+      const replacement = await runReplacementPipeProbe({
+        endpoint: ownerRecord.endpoint,
+        helperPath: productionHelper,
+        helperPid: ownerRecord.helper_pid,
+        helperCreationTime,
+        instanceId: ownerRecord.instance_id,
+        ownerLocalAppData,
+        ownerSid,
+        outsiderName: userName,
+        outsiderPassword: password,
+        serverPid: ownerRecord.server_pid,
+        runAsOutsider: true,
+        tryServerRecreation: true,
+        fixtureRoot,
+        expectedIdentityMode: "discovery"
+      });
+      expect(replacement.serverSid).toBe(outsiderSid);
+      expect(replacement.serverPid).not.toBe(ownerRecord.helper_pid);
+      expect(replacement.clientExitCode).toBe(34);
+      expect(replacement.clientOutput).toContain("NOT_DISPATCHED\t5");
+      expect(replacement.serverLine).toBe("CONNECTED|0");
+      expect(replacement.serverRecreationExitCode).toBe(24);
+
+      const staleHelper = await runReplacementPipeProbe({
+        endpoint: ownerRecord.endpoint,
+        helperPath: productionHelper,
+        helperPid: ownerRecord.helper_pid,
+        helperCreationTime,
+        instanceId: ownerRecord.instance_id,
+        ownerLocalAppData,
+        ownerSid,
+        outsiderName: userName,
+        outsiderPassword: password,
+        serverPid: ownerRecord.server_pid,
+        runAsOutsider: false,
+        tryServerRecreation: false,
+        fixtureRoot,
+        expectedIdentityMode: "discovery"
+      });
+      expect(staleHelper.serverSid).toBe(ownerSid);
+      expect(staleHelper.serverPid).not.toBe(ownerRecord.helper_pid);
+      expect(staleHelper.serverCreationTime).not.toBe(helperCreationTime);
+      expect(staleHelper.clientExitCode).toBe(34);
+      expect(staleHelper.clientOutput).toMatch(/NOT_DISPATCHED\t\d+/);
+      expect(staleHelper.serverLine).toBe("CONNECTED|0");
+
+      const wrongOwner = await runReplacementPipeProbe({
+        endpoint: ownerRecord.endpoint,
+        helperPath: productionHelper,
+        helperPid: ownerRecord.helper_pid,
+        helperCreationTime,
+        instanceId: ownerRecord.instance_id,
+        ownerLocalAppData,
+        ownerSid,
+        outsiderName: userName,
+        outsiderPassword: password,
+        serverPid: ownerRecord.server_pid,
+        runAsOutsider: true,
+        tryServerRecreation: false,
+        ownerOnlyDacl: true,
+        fixtureRoot,
+        expectedIdentityMode: "replacement-process"
+      });
+      expect(wrongOwner.serverPid).toBe(wrongOwner.expectedHelperPid);
+      expect(wrongOwner.serverCreationTime).toBe(wrongOwner.expectedCreationTime);
+      expect(wrongOwner.serverSid).toBe(outsiderSid);
+      expect(wrongOwner.clientExitCode).toBe(34);
+      expect(wrongOwner.clientOutput).toContain("NOT_DISPATCHED\t5");
+      expect(wrongOwner.serverLine).toBe("CONNECTED|0");
+
+      const wrongDacl = await runReplacementPipeProbe({
+        endpoint: ownerRecord.endpoint,
+        helperPath: productionHelper,
+        helperPid: ownerRecord.helper_pid,
+        helperCreationTime,
+        instanceId: ownerRecord.instance_id,
+        ownerLocalAppData,
+        ownerSid,
+        outsiderName: userName,
+        outsiderPassword: password,
+        serverPid: ownerRecord.server_pid,
+        runAsOutsider: false,
+        tryServerRecreation: false,
+        unexpectedDacl: true,
+        fixtureRoot,
+        expectedIdentityMode: "replacement-process"
+      });
+      expect(wrongDacl.serverSid).toBe(ownerSid);
+      expect(wrongDacl.serverPid).toBe(wrongDacl.expectedHelperPid);
+      expect(wrongDacl.serverCreationTime).toBe(wrongDacl.expectedCreationTime);
+      expect(wrongDacl.clientExitCode).toBe(34);
+      expect(wrongDacl.clientOutput).toContain("NOT_DISPATCHED\t5");
+      expect(wrongDacl.serverLine).toBe("CONNECTED|0");
+
+      // Matching PID but retaining the old creation time models a reused PID.
+      const reusedPid = await runReplacementPipeProbe({
+        endpoint: ownerRecord.endpoint,
+        helperPath: productionHelper,
+        helperPid: ownerRecord.helper_pid,
+        helperCreationTime,
+        instanceId: ownerRecord.instance_id,
+        ownerLocalAppData,
+        ownerSid,
+        outsiderName: userName,
+        outsiderPassword: password,
+        serverPid: ownerRecord.server_pid,
+        runAsOutsider: false,
+        tryServerRecreation: false,
+        fixtureRoot,
+        expectedIdentityMode: "replacement-pid"
+      });
+      expect(reusedPid.serverSid).toBe(ownerSid);
+      expect(reusedPid.expectedHelperPid).toBe(reusedPid.serverPid);
+      expect(reusedPid.serverCreationTime).not.toBe(reusedPid.expectedCreationTime);
+      expect(reusedPid.clientExitCode).toBe(34);
+      expect(reusedPid.clientOutput).toContain("NOT_DISPATCHED\t5");
+      expect(reusedPid.serverLine).toBe("CONNECTED|0");
       })();
     } catch (error) {
       testFailed = true;
@@ -213,7 +999,13 @@ const discovery = spawnSync(fixture.helperPath, ["discover"], {
   timeout: 7000,
   windowsHide: true
 });
-const direct = spawnSync(fixture.helperPath, ["client", fixture.endpoint, "2000"], {
+const direct = spawnSync(fixture.helperPath, [
+  "client",
+  fixture.endpoint,
+  "2000",
+  String(fixture.helperPid),
+  fixture.helperCreationTime
+], {
   input: frame,
   timeout: 7000,
   windowsHide: true
@@ -304,7 +1096,7 @@ async function writeOutsiderRecord(
   localAppData: string,
   outsiderSid: string,
   ownerSid: string,
-  record: { server_pid: number; helper_pid: number; instance_id: string; endpoint: string },
+  record: { server_pid: number; helper_pid: number; helper_creation_time: string; instance_id: string; endpoint: string },
   restrictedPaths: string[]
 ): Promise<void> {
   const recordPath = join(localAppData, "GPTRepoMCP", "admin", `server-${record.server_pid}-${record.instance_id}.record`);
@@ -312,6 +1104,7 @@ async function writeOutsiderRecord(
     "protocol_version=1",
     `server_pid=${record.server_pid}`,
     `helper_pid=${record.helper_pid}`,
+    `helper_creation_time=${record.helper_creation_time}`,
     `instance_id=${record.instance_id}`,
     `endpoint=${record.endpoint}`,
     ""
@@ -508,6 +1301,205 @@ function runPowerShell(script: string, env: Record<string, string>): void {
   });
 }
 
+function runPowerShellOutput(script: string, env: Record<string, string>): string {
+  return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+    timeout: 30_000,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+}
+
+async function waitForSignal(signal: Promise<void>, timeoutMs: number, message: string): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      signal,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function waitForTestFile(path: string, timeoutMs: number, message: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await access(path);
+      return;
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+    }
+  }
+  throw new Error(message);
+}
+
+function terminateHelperProcess(helperPid: number, creationTime: string, helperPath: string): void {
+  runPowerShell(String.raw`
+$ErrorActionPreference = 'Stop'
+$processInfo = [System.Diagnostics.Process]::GetProcessById([int]$env:GPT_REPO_SECURITY_HELPER_PID)
+$actualCreationTime = $processInfo.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+if ($actualCreationTime -ne $env:GPT_REPO_SECURITY_HELPER_CREATION_TIME) {
+  throw 'The helper PID now belongs to a different process.'
+}
+$actualPath = [System.IO.Path]::GetFullPath($processInfo.Path)
+$expectedPath = [System.IO.Path]::GetFullPath($env:GPT_REPO_SECURITY_HELPER_PATH)
+if (-not [string]::Equals($actualPath, $expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw 'The helper PID now belongs to a different executable.'
+}
+$processInfo.Kill()
+if (-not $processInfo.WaitForExit(5000)) { throw 'The native helper did not exit after termination.' }
+`, {
+    GPT_REPO_SECURITY_HELPER_PID: String(helperPid),
+    GPT_REPO_SECURITY_HELPER_CREATION_TIME: creationTime,
+    GPT_REPO_SECURITY_HELPER_PATH: helperPath
+  });
+}
+
+async function runPipeConnectionRaceProbe(options: {
+  endpoint: string;
+  helperPath: string;
+  ownerSid: string;
+  fixtureRoot: string;
+  changeDacl?: boolean;
+}): Promise<{
+  clientVerificationLine: string;
+  clientExitCode: number;
+  clientStdout: string;
+  serverAError: string;
+  serverASid: string;
+  serverALine: string | null;
+  serverAExitCode: number | null;
+  serverBReady: boolean;
+  serverBLine: string;
+  serverBExitCode: number;
+  serverBSid: string;
+  serverBError: string;
+}> {
+  const scriptPath = join(options.fixtureRoot, "replacement-pipe-server.ps1");
+  await writeFile(scriptPath, replacementPipeServerSource, "utf8");
+  const payload = Buffer.from(JSON.stringify({
+    protocol_version: 1,
+    request_id: "11111111-1111-4111-8111-111111111111",
+    operation: "probe"
+  }));
+  const frame = Buffer.alloc(4 + payload.length);
+  frame.writeUInt32BE(payload.length, 0);
+  payload.copy(frame, 4);
+  const result = JSON.parse(runPowerShellOutput(pipeConnectionRaceProbeScript, {
+    GPT_REPO_SECURITY_PIPE_NAME: options.endpoint.slice("\\\\.\\pipe\\".length),
+    GPT_REPO_SECURITY_OWNER_SID: options.ownerSid,
+    GPT_REPO_SECURITY_CHANGE_DACL: options.changeDacl ? "1" : "0",
+    GPT_REPO_SECURITY_REPLACEMENT_SCRIPT: scriptPath,
+    GPT_REPO_SECURITY_TEST_HELPER_PATH: options.helperPath,
+    GPT_REPO_SECURITY_ENDPOINT: options.endpoint,
+    GPT_REPO_SECURITY_FRAME: frame.toString("base64"),
+    GPT_REPO_SECURITY_CLIENT_RELEASE_MARKER: join(options.fixtureRoot, "client-release"),
+    GPT_REPO_SECURITY_WORKING_DIRECTORY: repoRoot
+  })) as {
+    clientVerificationLine: string;
+    clientExitCode: number;
+    clientStdout: string;
+    serverAError: string;
+    serverASid: string;
+    serverALine: string | null;
+    serverAExitCode: number | null;
+    serverBReady: boolean;
+    serverBLine: string;
+    serverBExitCode: number;
+    serverBSid: string;
+    serverBError: string;
+  };
+  return result;
+}
+
+async function runReplacementPipeProbe(options: {
+  endpoint: string;
+  helperPath: string;
+  helperPid: number;
+  helperCreationTime: string;
+  instanceId: string;
+  ownerLocalAppData: string;
+  ownerSid: string;
+  outsiderName: string;
+  outsiderPassword: string;
+  serverPid: number;
+  runAsOutsider: boolean;
+  tryServerRecreation: boolean;
+  unexpectedDacl?: boolean;
+  ownerOnlyDacl?: boolean;
+  expectedIdentityMode: "discovery" | "replacement-pid" | "replacement-process";
+  fixtureRoot: string;
+}): Promise<{
+  serverPid: number;
+  serverSid: string;
+  serverCreationTime: string;
+  expectedHelperPid: number;
+  expectedCreationTime: string;
+  serverLine: string;
+  clientExitCode: number;
+  clientOutput: string;
+  serverRecreationExitCode: number | null;
+}> {
+  const scriptPath = join(options.fixtureRoot, "replacement-pipe-server.ps1");
+  await writeFile(scriptPath, replacementPipeServerSource, "utf8");
+  const payload = Buffer.from(JSON.stringify({
+    protocol_version: 1,
+    request_id: "11111111-1111-4111-8111-111111111111",
+    operation: "probe"
+  }));
+  const frame = Buffer.alloc(4 + payload.length);
+  frame.writeUInt32BE(payload.length, 0);
+  payload.copy(frame, 4);
+  const probe = JSON.parse(runPowerShellOutput(replacementPipeProbeScript, {
+    GPT_REPO_SECURITY_PIPE_NAME: options.endpoint.slice("\\\\.\\pipe\\".length),
+    GPT_REPO_SECURITY_OWNER_SID: options.ownerSid,
+    GPT_REPO_SECURITY_REPLACEMENT_SCRIPT: scriptPath,
+    GPT_REPO_SECURITY_RUN_AS_OUTSIDER: options.runAsOutsider ? "1" : "0",
+    GPT_REPO_SECURITY_OWNER_LOCALAPPDATA: options.ownerLocalAppData,
+    GPT_REPO_SECURITY_PASSWORD: options.outsiderPassword,
+    GPT_REPO_SECURITY_USER: options.outsiderName,
+    GPT_REPO_SECURITY_HELPER_PID: String(options.helperPid),
+    GPT_REPO_SECURITY_HELPER_CREATION_TIME: options.helperCreationTime,
+    GPT_REPO_SECURITY_EXPECTED_IDENTITY_MODE: options.expectedIdentityMode,
+    GPT_REPO_SECURITY_TRY_SERVER_RECREATION: options.tryServerRecreation ? "1" : "0",
+    GPT_REPO_SECURITY_UNEXPECTED_DACL: options.unexpectedDacl ? "1" : "0",
+    GPT_REPO_SECURITY_OWNER_ONLY_DACL: options.ownerOnlyDacl ? "1" : "0",
+    GPT_REPO_SECURITY_SERVER_PID: String(options.serverPid),
+    GPT_REPO_SECURITY_INSTANCE_ID: options.instanceId,
+    GPT_REPO_SECURITY_HELPER_PATH: options.helperPath,
+    GPT_REPO_SECURITY_ENDPOINT: options.endpoint,
+    GPT_REPO_SECURITY_FRAME: frame.toString("base64"),
+    GPT_REPO_SECURITY_WORKING_DIRECTORY: repoRoot
+  })) as {
+    serverPid: number;
+    serverSid: string;
+    serverCreationTime: string;
+    expectedHelperPid: number;
+    expectedCreationTime: string;
+    serverLine: string;
+    clientExitCode: number;
+    clientStdout: string;
+    serverRecreationExitCode: number | null;
+  };
+  return {
+    serverPid: probe.serverPid,
+    serverSid: probe.serverSid,
+    serverCreationTime: probe.serverCreationTime,
+    expectedHelperPid: probe.expectedHelperPid,
+    expectedCreationTime: probe.expectedCreationTime,
+    serverLine: probe.serverLine,
+    clientExitCode: probe.clientExitCode,
+    clientOutput: probe.clientStdout,
+    serverRecreationExitCode: probe.serverRecreationExitCode
+  };
+}
+
 function currentWindowsSid(): string {
   const identity = execFileSync("whoami.exe", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8", windowsHide: true });
   const sid = identity.match(/S-1-[0-9-]+/)?.[0];
@@ -551,7 +1543,7 @@ async function waitForServer(
 async function waitForOwnerRecord(
   localAppData: string,
   readOutput: () => string
-): Promise<{ server_pid: number; helper_pid: number; instance_id: string; endpoint: string }> {
+): Promise<{ server_pid: number; helper_pid: number; helper_creation_time: string; instance_id: string; endpoint: string }> {
   const recordPath = join(localAppData, "GPTRepoMCP", "admin");
   const deadline = Date.now() + 8_000;
   while (Date.now() < deadline) {
@@ -567,6 +1559,7 @@ async function waitForOwnerRecord(
         return {
           server_pid: Number(fields.server_pid),
           helper_pid: Number(fields.helper_pid),
+          helper_creation_time: fields.helper_creation_time!,
           instance_id: fields.instance_id!,
           endpoint: fields.endpoint!
         };

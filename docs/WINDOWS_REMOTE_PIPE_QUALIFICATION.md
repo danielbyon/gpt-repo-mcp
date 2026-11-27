@@ -8,7 +8,7 @@ Count the remote-rejection check as a pass only when all of these conditions hol
 
 1. The client and server are separate existing Windows hosts. The client can resolve the server name and reach TCP port 445.
 2. The positive control connects over the network, exchanges a nonce, and reports the authenticated client SID. That SID must match the server helper's owner SID.
-3. The positive-control DACL grants read/write access to that SID. The control and production attempts use the same `NamedPipeClientStream` constructor, `PipeDirection.InOut`, and client-side options, so both request equivalent access.
+3. The positive-control DACL grants `ReadWrite | CreateNewInstance` to that SID. The control and production attempts use the same `NamedPipeClientStream` constructor, `PipeDirection.InOut`, and client-side options, so both request equivalent access.
 4. The negative attempt targets the pipe created by the production native helper. The connection fails with `ERROR_PIPE_LOCAL` (`0xE5`). A different error is inconclusive; a successful connection fails the gate.
 5. A second positive control succeeds after the negative attempt. The isolated server remains healthy and accepts a local administrative reload.
 
@@ -81,10 +81,14 @@ Get-Content -LiteralPath $recordFile.FullName | ForEach-Object {
 $record = [pscustomobject]@{
   server_pid = [int]$fields.server_pid
   helper_pid = [int]$fields.helper_pid
+  helper_creation_time = [string]$fields.helper_creation_time
   instance_id = $fields.instance_id
   endpoint = $fields.endpoint
 }
 if ($record.server_pid -ne $serverPid) { throw "The record belongs to another server." }
+if ($record.helper_creation_time -notmatch '^[1-9][0-9]{0,19}$') {
+  throw "The discovery record has no valid helper creation time."
+}
 $helper = Get-CimInstance Win32_Process -Filter "ProcessId = $($record.helper_pid)"
 if ($helper.ExecutablePath -ine $productionHelper) {
   throw "The isolated server is not using the production native helper."
@@ -94,6 +98,7 @@ $pipeName = $record.endpoint.Substring($record.endpoint.LastIndexOf('\') + 1)
 "SERVER_HOST=$serverHost"
 "SERVER_PID=$serverPid"
 "HELPER_PID=$($record.helper_pid)"
+"HELPER_CREATION_TIME=$($record.helper_creation_time)"
 "PRODUCTION_PIPE=$pipeName"
 "POSITIVE_CONTROL_OWNER_SID=$serverOwnerSid"
 ```
@@ -102,7 +107,7 @@ Keep this server window open. Record its host name and the printed values. Do no
 
 ## 4. Run the authenticated positive control
 
-In another PowerShell window on the server, start a new control server for each run. It creates a one-use pipe with a protected DACL granting `ReadWrite` only to the server's current user SID.
+In another PowerShell window on the server, start a new control server for each run. It creates a one-use pipe with a protected DACL granting `ReadWrite | CreateNewInstance` only to the server's current user SID.
 
 ```powershell
 Add-Type -AssemblyName System.IO.Pipes.AccessControl
@@ -112,7 +117,7 @@ $security = [System.IO.Pipes.PipeSecurity]::new()
 $security.SetAccessRuleProtection($true, $false)
 $rule = [System.IO.Pipes.PipeAccessRule]::new(
   $serverOwnerSid,
-  [System.IO.Pipes.PipeAccessRights]::ReadWrite,
+  ([System.IO.Pipes.PipeAccessRights]::ReadWrite -bor [System.IO.Pipes.PipeAccessRights]::CreateNewInstance),
   [System.Security.AccessControl.AccessControlType]::Allow
 )
 $security.AddAccessRule($rule)
@@ -218,6 +223,8 @@ if ($win32Error -ne 0xE5) {
 }
 "PRODUCTION_REMOTE_REJECTED=ERROR_PIPE_LOCAL (0xE5)"
 ```
+
+The script extracts the Win32 code from the `IOException.HResult` low 16 bits. .NET documents this conversion for native I/O errors in its [IOException guidance](https://learn.microsoft.com/en-us/dotnet/standard/io/handling-io-errors).
 
 After the second positive control passes, check the isolated server's `/health` endpoint and run the same local reload command again. The production helper must remain healthy and the discovery record must still refer to the same server and helper.
 

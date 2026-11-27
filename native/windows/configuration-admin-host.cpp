@@ -91,6 +91,7 @@ struct SecurityContext {
 struct InstanceRecord {
   DWORD serverPid = 0;
   DWORD helperPid = 0;
+  ULONGLONG helperCreationTime = 0;
   std::string instanceId;
   std::string endpoint;
 };
@@ -102,6 +103,8 @@ std::atomic<ULONGLONG> g_connectionSequence{1};
 
 #ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
 const wchar_t *testFault();
+bool writeTestMarker(const wchar_t *environmentName);
+bool testMarkerExists(const wchar_t *environmentName);
 #endif
 
 bool isValidUuid(const std::string &value) {
@@ -127,6 +130,38 @@ bool parsePositivePid(const wchar_t *value, DWORD &pid) {
   }
   pid = static_cast<DWORD>(parsed);
   return true;
+}
+
+bool parsePositiveUint64(const wchar_t *value, ULONGLONG &parsed) {
+  if (value == nullptr || *value == L'\0' || *value == L'0') return false;
+  ULONGLONG result = 0;
+  constexpr ULONGLONG maximum = ~static_cast<ULONGLONG>(0);
+  size_t digits = 0;
+  for (const wchar_t *cursor = value; *cursor != L'\0'; ++cursor) {
+    if (*cursor < L'0' || *cursor > L'9') return false;
+    if (++digits > 20) return false;
+    const ULONGLONG digit = static_cast<ULONGLONG>(*cursor - L'0');
+    if (result > (maximum - digit) / 10) return false;
+    result = result * 10 + digit;
+  }
+  if (result == 0) return false;
+  parsed = result;
+  return true;
+}
+
+bool getProcessCreationTime(HANDLE process, ULONGLONG &creationTime) {
+  FILETIME creation{};
+  FILETIME exit{};
+  FILETIME kernel{};
+  FILETIME user{};
+  if (!GetProcessTimes(process, &creation, &exit, &kernel, &user)) return false;
+  ULARGE_INTEGER value{};
+  value.LowPart = creation.dwLowDateTime;
+  value.HighPart = creation.dwHighDateTime;
+  creationTime = value.QuadPart;
+  if (creationTime != 0) return true;
+  SetLastError(ERROR_INVALID_DATA);
+  return false;
 }
 
 std::string narrowAscii(const std::wstring &value) {
@@ -275,11 +310,12 @@ bool createSecurityContext(SecurityContext &security) {
 }
 
 // Accepts only objects owned by this user with one non-inherited full-control ACE.
-bool hasOwnerOnlyDacl(HANDLE handle, const SecurityContext &security) {
+bool hasOwnerOnlyDacl(HANDLE handle, const SecurityContext &security,
+                      SE_OBJECT_TYPE objectType) {
   PSID owner = nullptr;
   PACL dacl = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
-  const DWORD error = GetSecurityInfo(handle, SE_FILE_OBJECT,
+  const DWORD error = GetSecurityInfo(handle, objectType,
       OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr,
       &dacl, nullptr, &descriptor);
   if (error != ERROR_SUCCESS) return false;
@@ -319,7 +355,7 @@ bool verifyFileHandle(HANDLE handle, const SecurityContext &security, bool direc
   const bool isDirectory = (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
   const bool isReparse = (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
   return isDirectory == directory && !isReparse && information.nNumberOfLinks == 1 &&
-         hasOwnerOnlyDacl(handle, security);
+         hasOwnerOnlyDacl(handle, security, SE_FILE_OBJECT);
 }
 
 bool pathHasUnsafeComponent(const std::wstring &path) {
@@ -461,11 +497,20 @@ std::string jsonEscape(const std::string &value) {
 }
 
 std::string recordJson(const InstanceRecord &record) {
-  return "{\"protocol_version\":1,\"server_pid\":" +
-         std::to_string(record.serverPid) + ",\"helper_pid\":" +
-         std::to_string(record.helperPid) + ",\"instance_id\":\"" +
-         record.instanceId + "\",\"endpoint\":\"" +
-         jsonEscape(record.endpoint) + "\"}";
+  std::string json = "{\"protocol_version\":1,\"server_pid\":" +
+      std::to_string(record.serverPid) + ",\"helper_pid\":" +
+      std::to_string(record.helperPid);
+  if (record.helperCreationTime != 0) {
+    json.append(",\"helper_creation_time\":\"");
+    json.append(std::to_string(record.helperCreationTime));
+    json.push_back('"');
+  }
+  json.append(",\"instance_id\":\"");
+  json.append(record.instanceId);
+  json.append("\",\"endpoint\":\"");
+  json.append(jsonEscape(record.endpoint));
+  json.append("\"}");
+  return json;
 }
 
 std::wstring recordFileName(const InstanceRecord &record) {
@@ -474,9 +519,18 @@ std::wstring recordFileName(const InstanceRecord &record) {
 }
 
 std::string recordContents(const InstanceRecord &record) {
-  return "protocol_version=1\nserver_pid=" + std::to_string(record.serverPid) +
-         "\nhelper_pid=" + std::to_string(record.helperPid) +
-         "\ninstance_id=" + record.instanceId + "\nendpoint=" + record.endpoint + "\n";
+  std::string contents = "protocol_version=1\nserver_pid=" + std::to_string(record.serverPid) +
+      "\nhelper_pid=" + std::to_string(record.helperPid);
+  if (record.helperCreationTime != 0) {
+    contents.append("\nhelper_creation_time=");
+    contents.append(std::to_string(record.helperCreationTime));
+  }
+  contents.append("\ninstance_id=");
+  contents.append(record.instanceId);
+  contents.append("\nendpoint=");
+  contents.append(record.endpoint);
+  contents.push_back('\n');
+  return contents;
 }
 
 bool createSecureRecordFile(const std::wstring &path, SecurityContext &security,
@@ -548,13 +602,29 @@ bool parseRecordContents(const std::string &contents, InstanceRecord &record) {
   };
   std::string serverPid;
   std::string helperPid;
+  std::string helperCreationTime;
   std::string instanceId;
   std::string endpoint;
   if (!readLine(serverPid) || serverPid.empty() ||
       contents.compare(cursor, 11, "helper_pid=") != 0) return false;
   cursor += 11;
-  if (!readLine(helperPid) || helperPid.empty() ||
-      contents.compare(cursor, 12, "instance_id=") != 0) return false;
+  if (!readLine(helperPid) || helperPid.empty()) return false;
+  if (contents.compare(cursor, 21, "helper_creation_time=") == 0) {
+    cursor += 21;
+    if (!readLine(helperCreationTime) || helperCreationTime.empty() ||
+        helperCreationTime.size() > 20 || helperCreationTime[0] == '0') return false;
+    ULONGLONG parsedCreation = 0;
+    constexpr ULONGLONG maximumCreationTime = ~static_cast<ULONGLONG>(0);
+    for (const char character : helperCreationTime) {
+      if (character < '0' || character > '9') return false;
+      const ULONGLONG digit = static_cast<ULONGLONG>(character - '0');
+      if (parsedCreation > (maximumCreationTime - digit) / 10) return false;
+      parsedCreation = parsedCreation * 10 + digit;
+    }
+    if (parsedCreation == 0) return false;
+    record.helperCreationTime = parsedCreation;
+  }
+  if (contents.compare(cursor, 12, "instance_id=") != 0) return false;
   cursor += 12;
   if (!readLine(instanceId) || !isValidUuid(instanceId) ||
       contents.compare(cursor, 9, "endpoint=") != 0) return false;
@@ -626,6 +696,7 @@ bool removeRecordIfSame(const std::wstring &path, const SecurityContext &securit
   InstanceRecord current{};
   if (!readRecord(path, security, current)) return false;
   if (current.serverPid != expected.serverPid || current.helperPid != expected.helperPid ||
+      current.helperCreationTime != expected.helperCreationTime ||
       current.instanceId != expected.instanceId || current.endpoint != expected.endpoint) return true;
   return DeleteFileW(path.c_str()) != FALSE || GetLastError() == ERROR_FILE_NOT_FOUND;
 }
@@ -757,7 +828,10 @@ ConnectResult connectPipe(HANDLE pipe, HANDLE parentProcess, HANDLE shutdownEven
   }
 }
 
-// Creates one local-only pipe instance with the process user's protected ACL.
+// Creates one local-only pipe instance with the helper user's protected ACL.
+// The serve loop opens each replacement while another helper-owned instance
+// remains open, so an unprivileged process outside that SID cannot claim the
+// name between instances.
 HANDLE createServerPipe(const std::wstring &name, SecurityContext &security,
                         bool firstInstance) {
   DWORD flags = FILE_FLAG_OVERLAPPED;
@@ -1004,9 +1078,22 @@ ControlResult handleServerConnection(HANDLE pipe, HANDLE parentProcess, ControlH
 }
 
 void workerFinished(ControlHub &hub) {
-  std::lock_guard<std::mutex> lock(hub.mutex);
-  if (hub.activeWorkers > 0) --hub.activeWorkers;
-  hub.workersChanged.notify_all();
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+  bool workersClosed = false;
+#endif
+  {
+    std::lock_guard<std::mutex> lock(hub.mutex);
+    if (hub.activeWorkers > 0) --hub.activeWorkers;
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+    workersClosed = hub.activeWorkers == 0;
+#endif
+    hub.workersChanged.notify_all();
+  }
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+  if (workersClosed && wcscmp(testFault(), L"hold-at-connection-capacity") == 0) {
+    writeTestMarker(L"GPT_REPO_ADMIN_TEST_WORKERS_CLOSED");
+  }
+#endif
 }
 
 void waitForWorkers(ControlHub &hub) {
@@ -1041,6 +1128,7 @@ int serve(DWORD serverPid, const std::string &instanceId) {
   InstanceRecord record{};
   record.serverPid = serverPid;
   record.helperPid = GetCurrentProcessId();
+  if (!getProcessCreationTime(GetCurrentProcess(), record.helperCreationTime)) return 20;
   record.instanceId = instanceId;
   record.endpoint = narrowAscii(name);
   std::wstring recordPath;
@@ -1061,6 +1149,9 @@ int serve(DWORD serverPid, const std::string &instanceId) {
     return 27;
   }
   int exitCode = 0;
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+  bool capacityPauseUsed = false;
+#endif
   if (!writeReady(record)) {
     exitCode = 26;
     signalShutdown(hub);
@@ -1082,16 +1173,30 @@ int serve(DWORD serverPid, const std::string &instanceId) {
       std::lock_guard<std::mutex> lock(hub.mutex);
       activeWorkers = hub.activeWorkers;
     }
-    if (activeWorkers >= kMaximumConnections) {
-      Sleep(20);
-      continue;
-    }
     if (!pipe) {
       pipe.reset(createServerPipe(name, security, false));
       if (!pipe) {
         exitCode = 29;
         break;
       }
+    }
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+    if (activeWorkers >= kMaximumConnections && !capacityPauseUsed &&
+        wcscmp(testFault(), L"hold-at-connection-capacity") == 0) {
+      capacityPauseUsed = true;
+      if (!writeTestMarker(L"GPT_REPO_ADMIN_TEST_CAPACITY_REACHED")) {
+        exitCode = 29;
+        break;
+      }
+      while (!hub.shuttingDown.load() &&
+             !testMarkerExists(L"GPT_REPO_ADMIN_TEST_RELEASE_CAPACITY")) {
+        Sleep(10);
+      }
+    }
+#endif
+    if (activeWorkers >= kMaximumConnections) {
+      Sleep(20);
+      continue;
     }
 
     const ConnectResult connection = connectPipe(
@@ -1103,6 +1208,13 @@ int serve(DWORD serverPid, const std::string &instanceId) {
     }
 
     UniqueHandle connectedPipe = std::move(pipe);
+    pipe.reset(createServerPipe(name, security, false));
+    if (!pipe) {
+      exitCode = 29;
+      if (connectedPipe) DisconnectNamedPipe(connectedPipe.get());
+      pipe = std::move(connectedPipe);
+      break;
+    }
     {
       std::lock_guard<std::mutex> lock(hub.mutex);
       ++hub.activeWorkers;
@@ -1112,11 +1224,13 @@ int serve(DWORD serverPid, const std::string &instanceId) {
                    &hub]() mutable {
         const ControlResult result = handleServerConnection(connectedPipe.get(), parent, hub);
         if (connectedPipe) DisconnectNamedPipe(connectedPipe.get());
+        connectedPipe.reset();
         if (result == ControlResult::kParentGone) signalShutdown(hub);
         workerFinished(hub);
       }).detach();
     } catch (...) {
       if (connectedPipe) DisconnectNamedPipe(connectedPipe.get());
+      connectedPipe.reset();
       workerFinished(hub);
     }
   }
@@ -1143,7 +1257,8 @@ bool validLocalPipeName(const std::wstring &endpoint) {
 
 bool openClientPipe(const std::wstring &endpoint, HANDLE &pipe,
                     ULONGLONG deadline, DWORD &errorCode) {
-  const DWORD access = FILE_READ_DATA | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
+  const DWORD access = READ_CONTROL | FILE_READ_DATA | FILE_WRITE_DATA |
+                       FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
   for (;;) {
     const DWORD remaining = remainingMilliseconds(deadline);
     if (remaining == 0) {
@@ -1151,7 +1266,9 @@ bool openClientPipe(const std::wstring &endpoint, HANDLE &pipe,
       return false;
     }
     HANDLE raw = CreateFileW(endpoint.c_str(), access, 0, nullptr, OPEN_EXISTING,
-                             FILE_FLAG_OVERLAPPED, nullptr);
+                             FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT |
+                                 SECURITY_IDENTIFICATION | SECURITY_EFFECTIVE_ONLY,
+                             nullptr);
     if (raw != INVALID_HANDLE_VALUE) {
       pipe = raw;
       DWORD mode = PIPE_READMODE_MESSAGE;
@@ -1181,20 +1298,34 @@ bool openClientPipe(const std::wstring &endpoint, HANDLE &pipe,
   }
 }
 
-bool clientWrite(HANDLE pipe, const std::vector<BYTE> &request, DWORD &written,
-                 ULONGLONG deadline) {
+enum class ClientWriteResult { kWritten, kNotDispatched, kIndeterminate };
+
+ClientWriteResult clientWrite(HANDLE pipe, const std::vector<BYTE> &request,
+                              DWORD &written, DWORD &errorCode,
+                              ULONGLONG deadline) {
   OVERLAPPED operation{};
   UniqueHandle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-  if (!event) return false;
+  if (!event) {
+    errorCode = GetLastError();
+    return ClientWriteResult::kNotDispatched;
+  }
   operation.hEvent = event.get();
+  if (remainingMilliseconds(deadline) == 0) {
+    errorCode = ERROR_SEM_TIMEOUT;
+    return ClientWriteResult::kNotDispatched;
+  }
   BOOL succeeded = WriteFile(pipe, request.data(), static_cast<DWORD>(request.size()),
                              &written, &operation);
   if (!succeeded && GetLastError() == ERROR_IO_PENDING) {
-    if (!finishOverlapped(pipe, operation, nullptr, written, deadline)) return false;
+    if (!finishOverlapped(pipe, operation, nullptr, written, deadline)) {
+      return ClientWriteResult::kIndeterminate;
+    }
   } else if (!succeeded) {
-    return false;
+    return ClientWriteResult::kIndeterminate;
   }
-  return written == request.size();
+  if (written != request.size()) return ClientWriteResult::kIndeterminate;
+  errorCode = ERROR_SUCCESS;
+  return ClientWriteResult::kWritten;
 }
 
 #ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
@@ -1205,9 +1336,109 @@ const wchar_t *testFault() {
   if (length == 0 || length >= std::size(value)) return L"";
   return value;
 }
+
+bool testPathFromEnvironment(const wchar_t *name, std::wstring &path) {
+  wchar_t value[MAX_PATH]{};
+  const DWORD length = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+  if (length == 0 || length >= std::size(value)) return false;
+  path.assign(value, length);
+  return true;
+}
+
+bool writeTestMarker(const wchar_t *environmentName) {
+  std::wstring path;
+  if (!testPathFromEnvironment(environmentName, path)) return false;
+  UniqueHandle marker(CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                  nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (!marker) return false;
+  constexpr char contents[] = "ready\n";
+  DWORD written = 0;
+  return WriteFile(marker.get(), contents, static_cast<DWORD>(sizeof(contents) - 1),
+                   &written, nullptr) != FALSE && written == sizeof(contents) - 1 &&
+      FlushFileBuffers(marker.get()) != FALSE;
+}
+
+bool testMarkerExists(const wchar_t *environmentName) {
+  std::wstring path;
+  if (!testPathFromEnvironment(environmentName, path)) return false;
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
 #endif
 
-int client(const std::wstring &endpoint, DWORD timeoutMs) {
+// Checks the connected pipe descriptor, then confirms the discovered helper is live.
+bool verifyPipeOwnerAndHelperMetadata(HANDLE pipe, const SecurityContext &security,
+                                     DWORD expectedHelperPid,
+                                     ULONGLONG expectedCreationTime,
+                                     UniqueHandle &verifiedHelperProcess,
+                                     DWORD &errorCode) {
+  if (!hasOwnerOnlyDacl(pipe, security, SE_KERNEL_OBJECT)) {
+    errorCode = ERROR_ACCESS_DENIED;
+    return false;
+  }
+  HANDLE rawProcess = OpenProcess(
+      PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, expectedHelperPid);
+  if (rawProcess == nullptr) {
+    errorCode = GetLastError();
+    return false;
+  }
+  verifiedHelperProcess.reset(rawProcess);
+  ULONGLONG actualCreationTime = 0;
+  if (!getProcessCreationTime(verifiedHelperProcess.get(), actualCreationTime)) {
+    errorCode = GetLastError();
+    return false;
+  }
+  if (actualCreationTime != expectedCreationTime) {
+    errorCode = ERROR_ACCESS_DENIED;
+    return false;
+  }
+  const DWORD processState = WaitForSingleObject(verifiedHelperProcess.get(), 0);
+  if (processState != WAIT_TIMEOUT) {
+    errorCode = processState == WAIT_FAILED ? GetLastError() : ERROR_ACCESS_DENIED;
+    return false;
+  }
+  errorCode = ERROR_SUCCESS;
+  return true;
+}
+
+// Rechecks the pipe descriptor and pinned helper process immediately before dispatch.
+bool verifyPipeOwnerAndHelperBeforeDispatch(
+    HANDLE pipe, const SecurityContext &security, DWORD expectedHelperPid,
+    ULONGLONG expectedCreationTime, HANDLE verifiedHelperProcess,
+    DWORD &errorCode) {
+  if (!hasOwnerOnlyDacl(pipe, security, SE_KERNEL_OBJECT)) {
+    errorCode = ERROR_ACCESS_DENIED;
+    return false;
+  }
+  const DWORD actualHelperPid = GetProcessId(verifiedHelperProcess);
+  if (actualHelperPid == 0) {
+    errorCode = GetLastError();
+    return false;
+  }
+  if (actualHelperPid != expectedHelperPid) {
+    errorCode = ERROR_ACCESS_DENIED;
+    return false;
+  }
+  ULONGLONG actualCreationTime = 0;
+  if (!getProcessCreationTime(verifiedHelperProcess, actualCreationTime)) {
+    errorCode = GetLastError();
+    return false;
+  }
+  if (actualCreationTime != expectedCreationTime) {
+    errorCode = ERROR_ACCESS_DENIED;
+    return false;
+  }
+  const DWORD processState = WaitForSingleObject(verifiedHelperProcess, 0);
+  if (processState != WAIT_TIMEOUT) {
+    errorCode = processState == WAIT_FAILED ? GetLastError() : ERROR_ACCESS_DENIED;
+    return false;
+  }
+  errorCode = ERROR_SUCCESS;
+  return true;
+}
+
+int client(const std::wstring &endpoint, DWORD timeoutMs,
+           DWORD expectedHelperPid, ULONGLONG expectedCreationTime) {
   const ULONGLONG operationDeadline = GetTickCount64() + timeoutMs;
   std::vector<BYTE> request;
   if (!validLocalPipeName(endpoint) ||
@@ -1217,6 +1448,13 @@ int client(const std::wstring &endpoint, DWORD timeoutMs) {
     return 31;
   }
 
+  SecurityContext security;
+  if (!createSecurityContext(security)) {
+    DWORD error = GetLastError();
+    if (error == ERROR_SUCCESS) error = ERROR_ACCESS_DENIED;
+    writeStdout("NOT_DISPATCHED\t" + std::to_string(error) + "\n");
+    return 34;
+  }
   HANDLE rawPipe = INVALID_HANDLE_VALUE;
   DWORD openError = ERROR_SUCCESS;
   const ULONGLONG connectionDeadline = std::min<ULONGLONG>(
@@ -1226,6 +1464,15 @@ int client(const std::wstring &endpoint, DWORD timeoutMs) {
     return 34;
   }
   UniqueHandle pipe(rawPipe);
+  UniqueHandle verifiedHelperProcess;
+  DWORD verificationError = ERROR_SUCCESS;
+  if (!verifyPipeOwnerAndHelperMetadata(
+          pipe.get(), security, expectedHelperPid, expectedCreationTime,
+          verifiedHelperProcess, verificationError)) {
+    if (verificationError == ERROR_SUCCESS) verificationError = ERROR_ACCESS_DENIED;
+    writeStdout("NOT_DISPATCHED\t" + std::to_string(verificationError) + "\n");
+    return 34;
+  }
 
 #ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
   if (wcscmp(testFault(), L"before-write") == 0) {
@@ -1233,11 +1480,34 @@ int client(const std::wstring &endpoint, DWORD timeoutMs) {
     return 32;
   }
   if (wcscmp(testFault(), L"silent-before-write") == 0) return 33;
+  if (wcscmp(testFault(), L"pause-after-pipe-security-check") == 0) {
+    if (!writeStdout("VERIFIED\n")) return 32;
+    const ULONGLONG pauseDeadline = GetTickCount64() + 10'000;
+    while (GetTickCount64() < pauseDeadline &&
+           !testMarkerExists(L"GPT_REPO_ADMIN_TEST_RELEASE_MARKER")) {
+      Sleep(10);
+    }
+  }
+  if (wcscmp(testFault(), L"expire-before-write") == 0) Sleep(timeoutMs + 50);
 #endif
 
+  if (!verifyPipeOwnerAndHelperBeforeDispatch(
+          pipe.get(), security, expectedHelperPid, expectedCreationTime,
+          verifiedHelperProcess.get(), verificationError)) {
+    if (verificationError == ERROR_SUCCESS) verificationError = ERROR_ACCESS_DENIED;
+    writeStdout("NOT_DISPATCHED\t" + std::to_string(verificationError) + "\n");
+    return 34;
+  }
+
   DWORD written = 0;
-  const bool writeSucceeded = clientWrite(pipe.get(), request, written, operationDeadline);
-  if (!writeSucceeded) {
+  DWORD writeError = ERROR_SUCCESS;
+  const ClientWriteResult writeResult = clientWrite(
+      pipe.get(), request, written, writeError, operationDeadline);
+  if (writeResult == ClientWriteResult::kNotDispatched) {
+    writeStdout("NOT_DISPATCHED\t" + std::to_string(writeError) + "\n");
+    return 34;
+  }
+  if (writeResult == ClientWriteResult::kIndeterminate) {
     writeStdout("INDETERMINATE\n");
     return 35;
   }
@@ -1256,6 +1526,26 @@ int client(const std::wstring &endpoint, DWORD timeoutMs) {
       !writeStdoutBytes(response.data(), static_cast<DWORD>(response.size()))) return 38;
   return 0;
 }
+
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+int claimPipeInstance(const std::wstring &endpoint) {
+  if (!validLocalPipeName(endpoint)) return 4;
+  constexpr wchar_t prefix[] = L"\\\\.\\pipe\\";
+  const std::wstring name = endpoint.substr(std::size(prefix) - 1);
+  SecurityContext security;
+  if (!createSecurityContext(security)) {
+    writeStdout("SECURITY_FAILED\n");
+    return 5;
+  }
+  HANDLE raw = createServerPipe(name, security, false);
+  if (raw == INVALID_HANDLE_VALUE) {
+    const DWORD error = GetLastError();
+    return writeStdout("NOT_CREATED\t" + std::to_string(error) + "\n") ? 0 : 6;
+  }
+  UniqueHandle pipe(raw);
+  return writeStdout("CREATED\n") ? 0 : 6;
+}
+#endif
 
 int discover() {
   SecurityContext security;
@@ -1278,6 +1568,9 @@ int discover() {
 
 int wmain(int argc, wchar_t *argv[]) {
   if (argc < 2) return 1;
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+  if (wcscmp(argv[1], L"claim") == 0 && argc == 3) return claimPipeInstance(argv[2]);
+#endif
   if (wcscmp(argv[1], L"discover") == 0 && argc == 2) return discover();
   if (wcscmp(argv[1], L"serve") == 0 && argc == 4) {
     DWORD serverPid = 0;
@@ -1286,12 +1579,17 @@ int wmain(int argc, wchar_t *argv[]) {
     if (!isValidUuid(instanceId)) return 3;
     return serve(serverPid, instanceId);
   }
-  if (wcscmp(argv[1], L"client") == 0 && argc == 4) {
+  if (wcscmp(argv[1], L"client") == 0 && argc == 6) {
     wchar_t *end = nullptr;
     const unsigned long timeout = wcstoul(argv[3], &end, 10);
     if (end == argv[3] || *end != L'\0' ||
         (timeout != kProbeTimeoutMs && timeout != kReloadAcknowledgmentTimeoutMs)) return 5;
-    return client(argv[2], static_cast<DWORD>(timeout));
+    DWORD expectedHelperPid = 0;
+    ULONGLONG expectedCreationTime = 0;
+    if (!parsePositivePid(argv[4], expectedHelperPid) ||
+        !parsePositiveUint64(argv[5], expectedCreationTime)) return 5;
+    return client(argv[2], static_cast<DWORD>(timeout), expectedHelperPid,
+                  expectedCreationTime);
   }
   return 4;
 }

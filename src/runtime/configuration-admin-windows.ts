@@ -25,11 +25,17 @@ const RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS = 30_000;
 const SHUTDOWN_TIMEOUT_MS = 7_000;
 const MAX_DISCOVERY_BYTES = 1_048_576;
 const MAX_CONTROL_LINE_BYTES = Math.ceil((MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 4) * 4 / 3) + 16;
+const MAX_HELPER_CREATION_TIME = "18446744073709551615";
+
+const HelperCreationTimeSchema = z.string().max(20).regex(/^[1-9][0-9]*$/)
+  .refine((value) => value.length < MAX_HELPER_CREATION_TIME.length
+    || (value.length === MAX_HELPER_CREATION_TIME.length && value <= MAX_HELPER_CREATION_TIME));
 
 const DiscoveryRecordSchema = z.object({
   protocol_version: z.literal(1),
   server_pid: z.number().int().positive(),
   helper_pid: z.number().int().positive(),
+  helper_creation_time: HelperCreationTimeSchema.optional(),
   instance_id: z.string().uuid(),
   endpoint: z.string().min(1)
 }).strict();
@@ -83,6 +89,13 @@ export async function requestWindowsConfigurationAdmin(
 ): Promise<ConfigurationAdminResponse> {
   const request = parseAdminRequest(value);
   const target = validateWindowsRecord(record);
+  if (!target.helper_creation_time) {
+    throw ipcError(
+      "WINDOWS_HELPER_IDENTITY_UNAVAILABLE",
+      "pre-dispatch",
+      "The discovered endpoint does not include a verifiable helper process identity."
+    );
+  }
   let helperPath: string;
   try {
     helperPath = await resolveWindowsConfigurationAdminHostPath();
@@ -92,7 +105,13 @@ export async function requestWindowsConfigurationAdmin(
 
   const frame = encodeAdminFrame(request);
   const timeoutMs = request.operation === "probe" ? PROBE_TIMEOUT_MS : RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS;
-  const output = await runHelper(helperPath, ["client", target.endpoint, String(timeoutMs)], frame, timeoutMs,
+  const output = await runHelper(helperPath, [
+    "client",
+    target.endpoint,
+    String(timeoutMs),
+    String(target.helper_pid),
+    target.helper_creation_time
+  ], frame, timeoutMs,
     MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 64, request.operation === "reload");
   const markerEnd = output.indexOf(0x0a);
   if (markerEnd < 0) {
@@ -357,7 +376,9 @@ class WindowsHostProcess {
     try {
       const record = validateWindowsRecord(JSON.parse(line.slice("READY\t".length)));
       if (record.server_pid !== this.serverPid || record.helper_pid !== this.child.pid
-        || record.instance_id !== this.instanceId) throw new Error("Instance mismatch.");
+        || !record.helper_creation_time || record.instance_id !== this.instanceId) {
+        throw new Error("Instance identity mismatch.");
+      }
       this.readyRecord = record;
       this.readyResolve?.(record);
       this.readyResolve = undefined;

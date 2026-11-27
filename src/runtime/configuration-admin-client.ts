@@ -17,6 +17,7 @@ export type ConfigurationAdminDiscoveryRecord = Readonly<{
   protocol_version: 1;
   server_pid: number;
   helper_pid?: number;
+  helper_creation_time?: string;
   instance_id: string;
   endpoint: string;
 }>;

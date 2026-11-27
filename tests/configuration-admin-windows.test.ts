@@ -1,5 +1,6 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { ConfigurationSourceIdentity } from "../src/config/config-source-identity.js";
@@ -7,12 +8,14 @@ import { createConfigurationAdminController } from "../src/runtime/configuration
 import {
   readWindowsConfigurationAdminRecords,
   requestWindowsConfigurationAdmin,
+  resolveWindowsConfigurationAdminHostPath,
   startWindowsConfigurationAdminHost
 } from "../src/runtime/configuration-admin-windows.js";
 import type {
   ConfigurationAdminDiscoveryRecord
 } from "../src/runtime/configuration-admin-client.js";
 import {
+  encodeAdminFrame,
   parseAdminRequest,
   type ConfigurationAdminRequest,
   type ConfigurationAdminResponse
@@ -22,6 +25,93 @@ const instanceId = "22222222-2222-4222-8222-222222222222";
 const userProfileRoot = process.env.USERPROFILE;
 
 describe("owner-local Windows configuration IPC", () => {
+  test("refuses a legacy discovery record without helper process creation time before dispatch", async () => {
+    const serverPid = process.pid;
+    const legacyRecord: ConfigurationAdminDiscoveryRecord = {
+      protocol_version: 1,
+      server_pid: serverPid,
+      helper_pid: serverPid + 1,
+      instance_id: instanceId,
+      endpoint: `\\\\.\\pipe\\gpt-repo-mcp-${serverPid}-${instanceId}`
+    };
+
+    await expect(requestWindowsConfigurationAdmin(legacyRecord, {
+      protocol_version: 1,
+      request_id: "11111111-1111-4111-8111-111111111111",
+      operation: "probe"
+    })).rejects.toMatchObject({
+      code: "WINDOWS_HELPER_IDENTITY_UNAVAILABLE",
+      phase: "pre-dispatch"
+    });
+  });
+
+  test("rejects a helper creation time outside the native uint64 range before dispatch", async () => {
+    const serverPid = process.pid;
+    const invalidRecord: ConfigurationAdminDiscoveryRecord = {
+      protocol_version: 1,
+      server_pid: serverPid,
+      helper_pid: serverPid + 1,
+      helper_creation_time: "18446744073709551616",
+      instance_id: instanceId,
+      endpoint: `\\\\.\\pipe\\gpt-repo-mcp-${serverPid}-${instanceId}`
+    };
+
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!platformDescriptor) throw new Error("The process platform property is unavailable.");
+    Object.defineProperty(process, "platform", { ...platformDescriptor, value: "win32" });
+    try {
+      await expect(requestWindowsConfigurationAdmin(invalidRecord, {
+        protocol_version: 1,
+        request_id: "11111111-1111-4111-8111-111111111111",
+        operation: "probe"
+      })).rejects.toMatchObject({ name: "ZodError" });
+    } finally {
+      Object.defineProperty(process, "platform", platformDescriptor);
+    }
+  });
+
+  test.skipIf(process.platform !== "win32")(
+    "preserves a discovery record whose helper creation identity changed before shutdown",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-record-identity-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          handle: async () => {
+            throw new Error("A discovery cleanup test must not dispatch requests.");
+          }
+        });
+        const [record] = await readWindowsConfigurationAdminRecords();
+        expect(record?.helper_creation_time).toMatch(/^[1-9][0-9]*$/);
+        const recordPath = join(
+          localAppData,
+          "GPTRepoMCP",
+          "admin",
+          `server-${record!.server_pid}-${record!.instance_id}.record`
+        );
+        const original = await readFile(recordPath, "utf8");
+        const replacementCreationTime = (BigInt(record!.helper_creation_time!) + 1n).toString();
+        const updated = original.replace(
+          `helper_creation_time=${record!.helper_creation_time}`,
+          `helper_creation_time=${replacementCreationTime}`
+        );
+        expect(updated).not.toBe(original);
+        await writeFile(recordPath, updated, "utf8");
+
+        await host.close();
+        expect(await readFile(recordPath, "utf8")).toContain(
+          `helper_creation_time=${replacementCreationTime}`
+        );
+      } finally {
+        await cleanupWindowsHost(host, localAppData);
+      }
+    }
+  );
+
   test.skipIf(process.platform !== "win32")(
     "reports a post-publication response failure as indeterminate across the native helper",
     async () => {
@@ -121,6 +211,74 @@ describe("owner-local Windows configuration IPC", () => {
         vi.unstubAllEnvs();
       }
     }
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "does not write an administrative frame after the absolute connection deadline",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-expired-write-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      let helperPid: number | undefined;
+      let requestCount = 0;
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: join(localAppData, "configuration.json")
+      };
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          onHelperPid: (pid) => { helperPid = pid; },
+          handle: async (value): Promise<ConfigurationAdminResponse> => {
+            const request = parseAdminRequest(value);
+            requestCount += 1;
+            return {
+              protocol_version: 1,
+              request_id: request.request_id,
+              server_pid: process.pid,
+              helper_pid: helperPid,
+              instance_id: instanceId,
+              source_identity: sourceIdentity,
+              operation: "probe_result",
+              effective_generation: 1,
+              accepted_source_sha256: "a".repeat(64),
+              pending_restart: false
+            };
+          }
+        });
+        const helperPath = await resolveWindowsConfigurationAdminHostPath();
+        const request: ConfigurationAdminRequest = {
+          protocol_version: 1,
+          request_id: randomUUID(),
+          operation: "probe"
+        };
+        const result = spawnSync(helperPath, [
+          "client",
+          host.record.endpoint,
+          "2000",
+          String(host.record.helper_pid),
+          host.record.helper_creation_time!
+        ], {
+          input: encodeAdminFrame(request),
+          encoding: "utf8",
+          env: { ...process.env, GPT_REPO_ADMIN_TEST_FAULT: "expire-before-write" },
+          timeout: 5000,
+          windowsHide: true
+        });
+
+        expect(result.error).toBeUndefined();
+        expect(result.status, result.stderr).toBe(34);
+        expect(result.stdout).toBe("NOT_DISPATCHED\t121\n");
+        expect(requestCount).toBe(0);
+      } finally {
+        await cleanupWindowsHost(host, localAppData);
+      }
+    },
+    15_000
   );
 
   test.skipIf(process.platform !== "win32")(
