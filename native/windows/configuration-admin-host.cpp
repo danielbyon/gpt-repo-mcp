@@ -1283,10 +1283,18 @@ bool validLocalPipeName(const std::wstring &endpoint) {
   return isValidUuid(uuid) && endpoint == pipeName(pid, uuid);
 }
 
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+const wchar_t *testFault();
+#endif
+
 bool openClientPipe(const std::wstring &endpoint, HANDLE &pipe,
                     ULONGLONG deadline, DWORD &errorCode) {
-  const DWORD access = READ_CONTROL | FILE_READ_DATA | FILE_WRITE_DATA |
-                       FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
+  DWORD access = READ_CONTROL | FILE_READ_DATA | FILE_WRITE_DATA |
+                 FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+  // This fault changes the ACL after verification; production clients never request WRITE_DAC.
+  if (wcscmp(testFault(), L"pause-and-change-pipe-dacl") == 0) access |= WRITE_DAC;
+#endif
   for (;;) {
     const DWORD remaining = remainingMilliseconds(deadline);
     if (remaining == 0) {
@@ -1391,6 +1399,41 @@ bool testMarkerExists(const wchar_t *environmentName) {
   if (!testPathFromEnvironment(environmentName, path)) return false;
   const DWORD attributes = GetFileAttributesW(path.c_str());
   return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+// Adds a test ACE through the connected handle to make the dispatch-time ACL check reject it.
+bool addTestWorldReadAceToPipe(HANDLE pipe, const SecurityContext &security) {
+  BYTE worldSidBuffer[SECURITY_MAX_SID_SIZE]{};
+  DWORD worldSidSize = sizeof(worldSidBuffer);
+  if (!CreateWellKnownSid(WinWorldSid, nullptr, worldSidBuffer, &worldSidSize)) return false;
+
+  PACL currentDacl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  const DWORD queryError = GetSecurityInfo(pipe, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                                           nullptr, nullptr, &currentDacl, nullptr, &descriptor);
+  if (queryError != ERROR_SUCCESS) {
+    if (descriptor != nullptr) LocalFree(descriptor);
+    return false;
+  }
+
+  EXPLICIT_ACCESSW entry{};
+  entry.grfAccessPermissions = FILE_READ_DATA;
+  entry.grfAccessMode = GRANT_ACCESS;
+  entry.grfInheritance = NO_INHERITANCE;
+  entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+  entry.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+  entry.Trustee.ptstrName = reinterpret_cast<LPWSTR>(worldSidBuffer);
+  PACL changedDacl = nullptr;
+  const DWORD aclError = SetEntriesInAclW(1, &entry, currentDacl, &changedDacl);
+  DWORD setError = aclError;
+  if (aclError == ERROR_SUCCESS) {
+    setError = SetSecurityInfo(pipe, SE_KERNEL_OBJECT,
+                               DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                               nullptr, nullptr, changedDacl, nullptr);
+  }
+  if (changedDacl != nullptr) LocalFree(changedDacl);
+  if (descriptor != nullptr) LocalFree(descriptor);
+  return setError == ERROR_SUCCESS && !hasOwnerOnlyDacl(pipe, security, SE_KERNEL_OBJECT);
 }
 #endif
 
@@ -1508,12 +1551,26 @@ int client(const std::wstring &endpoint, DWORD timeoutMs,
     return 32;
   }
   if (wcscmp(testFault(), L"silent-before-write") == 0) return 33;
-  if (wcscmp(testFault(), L"pause-after-pipe-security-check") == 0) {
-    if (!writeStdout("VERIFIED\n")) return 32;
-    const ULONGLONG pauseDeadline = GetTickCount64() + 10'000;
+  const bool pauseForDaclMutation =
+      wcscmp(testFault(), L"pause-and-change-pipe-dacl") == 0;
+  if (wcscmp(testFault(), L"pause-after-pipe-security-check") == 0 ||
+      pauseForDaclMutation) {
+    if (!writeStdout("VERIFIED\t" + std::to_string(operationDeadline) + "\n")) return 32;
+    const ULONGLONG pauseDeadline = operationDeadline;
     while (GetTickCount64() < pauseDeadline &&
            !testMarkerExists(L"GPT_REPO_ADMIN_TEST_RELEASE_MARKER")) {
       Sleep(10);
+    }
+    if (!testMarkerExists(L"GPT_REPO_ADMIN_TEST_RELEASE_MARKER")) {
+      writeStdout("NOT_DISPATCHED\t" + std::to_string(ERROR_SEM_TIMEOUT) + "\n");
+      return 34;
+    }
+    if (pauseForDaclMutation) {
+      if (!addTestWorldReadAceToPipe(pipe.get(), security)) {
+        writeStdout("TEST_DACL_MUTATION_FAILED\n");
+        return 32;
+      }
+      if (!writeStdout("DACL_CHANGED\n")) return 32;
     }
   }
   if (wcscmp(testFault(), L"expire-before-write") == 0) Sleep(timeoutMs + 50);

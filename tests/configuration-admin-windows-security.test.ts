@@ -47,6 +47,18 @@ if ($env:GPT_REPO_SECURITY_UNEXPECTED_DACL -eq '1') {
   )
   $pipeSecurity.AddAccessRule($unexpectedRule)
 }
+if ($env:GPT_REPO_SECURITY_DELAY_PIPE_CREATION -eq '1') {
+  Write-Output 'PIPE_PREPARED'
+  [Console]::Out.Flush()
+  $createPipeDeadline = [DateTime]::UtcNow.AddSeconds(10)
+  while (-not [System.IO.File]::Exists($env:GPT_REPO_SECURITY_CREATE_PIPE_MARKER) -and
+         [DateTime]::UtcNow -lt $createPipeDeadline) {
+    Start-Sleep -Milliseconds 10
+  }
+  if (-not [System.IO.File]::Exists($env:GPT_REPO_SECURITY_CREATE_PIPE_MARKER)) {
+    throw 'The delayed pipe creation signal was not received.'
+  }
+}
 $pipe = [System.IO.Pipes.NamedPipeServerStream]::new(
   $pipeName,
   [System.IO.Pipes.PipeDirection]::InOut,
@@ -62,21 +74,6 @@ Write-Output ('READY|{0}|{1}|{2}' -f $PID, $serverSid.Value, $creationTime)
 if (-not $pipe.WaitForConnectionAsync().Wait(10000)) {
   Write-Output 'NO_CONNECTION'
   exit 2
-}
-if ($env:GPT_REPO_SECURITY_CHANGE_DACL -eq '1') {
-  if ([Console]::In.ReadLine() -ne 'CHANGE_DACL') {
-    throw 'The DACL mutation command was missing.'
-  }
-  $everyoneSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
-  $mutationRule = [System.IO.Pipes.PipeAccessRule]::new(
-    $everyoneSid,
-    [System.IO.Pipes.PipeAccessRights]::ReadData,
-    [System.Security.AccessControl.AccessControlType]::Allow
-  )
-  $pipeSecurity.AddAccessRule($mutationRule)
-  $pipe.SetAccessControl($pipeSecurity)
-  Write-Output 'DACL_CHANGED'
-  [Console]::Out.Flush()
 }
 $buffer = [byte[]]::new(65536)
 $received = $pipe.Read($buffer, 0, $buffer.Length)
@@ -254,6 +251,13 @@ $ErrorActionPreference = 'Stop'
 $serverA = $null
 $serverB = $null
 $clientProcess = $null
+Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+public static class PipeDeadlineClock {
+  [DllImport("kernel32.dll", ExactSpelling = true)]
+  public static extern ulong GetTickCount64();
+}
+'@
 try {
   $serverAStart = [System.Diagnostics.ProcessStartInfo]::new()
   $serverAStart.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -266,7 +270,6 @@ try {
   $serverAStart.CreateNoWindow = $true
   $serverAStart.EnvironmentVariables['GPT_REPO_SECURITY_PIPE_NAME'] = $env:GPT_REPO_SECURITY_PIPE_NAME
   $serverAStart.EnvironmentVariables['GPT_REPO_SECURITY_OWNER_SID'] = $env:GPT_REPO_SECURITY_OWNER_SID
-  $serverAStart.EnvironmentVariables['GPT_REPO_SECURITY_CHANGE_DACL'] = $env:GPT_REPO_SECURITY_CHANGE_DACL
   $serverA = [System.Diagnostics.Process]::Start($serverAStart)
   $serverAErrorTask = $serverA.StandardError.ReadToEndAsync()
   $serverAReadyTask = $serverA.StandardOutput.ReadLineAsync()
@@ -275,30 +278,6 @@ try {
   $serverAReady = $serverAReadyLine.Split('|')
   if ($serverAReady.Length -ne 4 -or $serverAReady[0] -ne 'READY') {
     throw "The initial pipe server returned an invalid ready line: $serverAReadyLine"
-  }
-
-  $clientStart = [System.Diagnostics.ProcessStartInfo]::new()
-  $clientStart.FileName = $env:GPT_REPO_SECURITY_TEST_HELPER_PATH
-  $clientStart.Arguments = 'client "{0}" 2000 {1} {2}' -f $env:GPT_REPO_SECURITY_ENDPOINT, $serverAReady[1], $serverAReady[3]
-  $clientStart.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
-  $clientStart.UseShellExecute = $false
-  $clientStart.RedirectStandardInput = $true
-  $clientStart.RedirectStandardOutput = $true
-  $clientStart.RedirectStandardError = $true
-  $clientStart.CreateNoWindow = $true
-  $clientStart.EnvironmentVariables['GPT_REPO_ADMIN_TEST_FAULT'] = 'pause-after-pipe-security-check'
-  $clientStart.EnvironmentVariables['GPT_REPO_ADMIN_TEST_RELEASE_MARKER'] = $env:GPT_REPO_SECURITY_CLIENT_RELEASE_MARKER
-  $clientProcess = [System.Diagnostics.Process]::Start($clientStart)
-  $clientVerificationTask = $clientProcess.StandardOutput.ReadLineAsync()
-  $clientErrorTask = $clientProcess.StandardError.ReadToEndAsync()
-  $frame = [Convert]::FromBase64String($env:GPT_REPO_SECURITY_FRAME)
-  $clientProcess.StandardInput.BaseStream.Write($frame, 0, $frame.Length)
-  $clientProcess.StandardInput.BaseStream.Flush()
-  $clientProcess.StandardInput.Close()
-  if (-not $clientVerificationTask.Wait(10000)) { throw 'The native client did not finish peer verification.' }
-  $clientVerificationLine = $clientVerificationTask.GetAwaiter().GetResult()
-  if ($clientVerificationLine -ne 'VERIFIED') {
-    throw "The native client returned no verification marker: $clientVerificationLine"
   }
 
   $serverBReady = $false
@@ -310,49 +289,111 @@ try {
   $serverBError = ''
   $serverALine = $null
   $serverAExitCode = $null
+  $clientDaclChangedLine = $null
+  if ($env:GPT_REPO_SECURITY_CHANGE_DACL -ne '1') {
+    $serverBStart = [System.Diagnostics.ProcessStartInfo]::new()
+    $serverBStart.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $serverBStart.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $env:GPT_REPO_SECURITY_REPLACEMENT_SCRIPT
+    $serverBStart.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
+    $serverBStart.UseShellExecute = $false
+    $serverBStart.RedirectStandardOutput = $true
+    $serverBStart.RedirectStandardError = $true
+    $serverBStart.CreateNoWindow = $true
+    $serverBStart.EnvironmentVariables['GPT_REPO_SECURITY_PIPE_NAME'] = $env:GPT_REPO_SECURITY_PIPE_NAME
+    $serverBStart.EnvironmentVariables['GPT_REPO_SECURITY_OWNER_SID'] = $env:GPT_REPO_SECURITY_OWNER_SID
+    $serverBStart.EnvironmentVariables['GPT_REPO_SECURITY_DELAY_PIPE_CREATION'] = '1'
+    $serverBStart.EnvironmentVariables['GPT_REPO_SECURITY_CREATE_PIPE_MARKER'] = $env:GPT_REPO_SECURITY_CREATE_PIPE_MARKER
+    $serverB = [System.Diagnostics.Process]::Start($serverBStart)
+    $serverBErrorTask = $serverB.StandardError.ReadToEndAsync()
+    $serverBPreparedTask = $serverB.StandardOutput.ReadLineAsync()
+    if (-not $serverBPreparedTask.Wait(5000) -or
+        $serverBPreparedTask.GetAwaiter().GetResult() -ne 'PIPE_PREPARED') {
+      throw 'The replacement server did not finish preparation before the client started.'
+    }
+    $serverBReadyTask = $serverB.StandardOutput.ReadLineAsync()
+  }
+
+  $clientStart = [System.Diagnostics.ProcessStartInfo]::new()
+  $clientStart.FileName = $env:GPT_REPO_SECURITY_TEST_HELPER_PATH
+  $clientStart.Arguments = 'client "{0}" 2000 {1} {2}' -f $env:GPT_REPO_SECURITY_ENDPOINT, $serverAReady[1], $serverAReady[3]
+  $clientStart.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
+  $clientStart.UseShellExecute = $false
+  $clientStart.RedirectStandardInput = $true
+  $clientStart.RedirectStandardOutput = $true
+  $clientStart.RedirectStandardError = $true
+  $clientStart.CreateNoWindow = $true
+  $clientFault = 'pause-after-pipe-security-check'
   if ($env:GPT_REPO_SECURITY_CHANGE_DACL -eq '1') {
-    $serverA.StandardInput.WriteLine('CHANGE_DACL')
-    $serverA.StandardInput.Flush()
-    $daclChangedTask = $serverA.StandardOutput.ReadLineAsync()
-    if (-not $daclChangedTask.Wait(5000)) { throw 'The pipe DACL change did not complete.' }
-    $daclChangedLine = $daclChangedTask.GetAwaiter().GetResult()
-    if ($daclChangedLine -ne 'DACL_CHANGED') { throw "Unexpected DACL update result: $daclChangedLine" }
+    $clientFault = 'pause-and-change-pipe-dacl'
+  }
+  $clientStart.EnvironmentVariables['GPT_REPO_ADMIN_TEST_FAULT'] = $clientFault
+  $clientStart.EnvironmentVariables['GPT_REPO_ADMIN_TEST_RELEASE_MARKER'] = $env:GPT_REPO_SECURITY_CLIENT_RELEASE_MARKER
+  $clientProcess = [System.Diagnostics.Process]::Start($clientStart)
+  $clientVerificationTask = $clientProcess.StandardOutput.ReadLineAsync()
+  $clientErrorTask = $clientProcess.StandardError.ReadToEndAsync()
+  $frame = [Convert]::FromBase64String($env:GPT_REPO_SECURITY_FRAME)
+  $clientProcess.StandardInput.BaseStream.Write($frame, 0, $frame.Length)
+  $clientProcess.StandardInput.BaseStream.Flush()
+  $clientProcess.StandardInput.Close()
+  if (-not $clientVerificationTask.Wait(10000)) { throw 'The native client did not finish peer verification.' }
+  $clientVerificationLine = $clientVerificationTask.GetAwaiter().GetResult()
+  $clientVerificationParts = $clientVerificationLine.Split([char]9, 2)
+  [UInt64]$clientOperationDeadlineTick = 0
+  if ($clientVerificationParts.Length -ne 2 -or
+      $clientVerificationParts[0] -ne 'VERIFIED' -or
+      -not [UInt64]::TryParse($clientVerificationParts[1], [ref]$clientOperationDeadlineTick) -or
+      $clientOperationDeadlineTick -le [PipeDeadlineClock]::GetTickCount64()) {
+    throw "The native client returned no verification marker: $clientVerificationLine"
+  }
+
+  if ($env:GPT_REPO_SECURITY_CHANGE_DACL -eq '1') {
+    $daclChangedTask = $clientProcess.StandardOutput.ReadLineAsync()
+    [System.IO.File]::WriteAllText($env:GPT_REPO_SECURITY_CLIENT_RELEASE_MARKER, 'release')
+    $daclDeadlineTick = $clientOperationDeadlineTick
+    while (-not $daclChangedTask.IsCompleted -and
+           [PipeDeadlineClock]::GetTickCount64() -lt $daclDeadlineTick) {
+      Start-Sleep -Milliseconds 10
+    }
+    if (-not $daclChangedTask.IsCompleted) {
+      throw 'The connected pipe DACL change did not complete within the client deadline.'
+    }
+    $clientDaclChangedLine = $daclChangedTask.GetAwaiter().GetResult()
+    if ($clientDaclChangedLine -ne 'DACL_CHANGED') {
+      throw "Unexpected connected pipe DACL update result: $clientDaclChangedLine"
+    }
   } else {
     $serverA.Kill()
-    if (-not $serverA.WaitForExit(5000)) { throw 'The verified pipe server did not terminate.' }
+    $pipeReadyDeadlineTick = $clientOperationDeadlineTick
+    while (-not $serverA.HasExited -and
+           [PipeDeadlineClock]::GetTickCount64() -lt $pipeReadyDeadlineTick) {
+      Start-Sleep -Milliseconds 10
+    }
+    if (-not $serverA.HasExited) {
+      throw 'The verified pipe server did not exit within the client deadline.'
+    }
+    [System.IO.File]::WriteAllText($env:GPT_REPO_SECURITY_CREATE_PIPE_MARKER, 'create')
+    while (-not $serverBReadyTask.IsCompleted -and
+           [PipeDeadlineClock]::GetTickCount64() -lt $pipeReadyDeadlineTick) {
+      Start-Sleep -Milliseconds 10
+    }
+    if (-not $serverBReadyTask.IsCompleted) {
+      throw 'The replacement endpoint did not become ready within the client deadline.'
+    }
     $serverAError = $serverAErrorTask.GetAwaiter().GetResult()
     $serverA.Dispose()
     $serverA = $null
 
-  $serverBStart = [System.Diagnostics.ProcessStartInfo]::new()
-  $serverBStart.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-  $serverBStart.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $env:GPT_REPO_SECURITY_REPLACEMENT_SCRIPT
-  $serverBStart.WorkingDirectory = $env:GPT_REPO_SECURITY_WORKING_DIRECTORY
-  $serverBStart.UseShellExecute = $false
-  $serverBStart.RedirectStandardOutput = $true
-  $serverBStart.RedirectStandardError = $true
-  $serverBStart.CreateNoWindow = $true
-  $serverBStart.EnvironmentVariables['GPT_REPO_SECURITY_PIPE_NAME'] = $env:GPT_REPO_SECURITY_PIPE_NAME
-  $serverBStart.EnvironmentVariables['GPT_REPO_SECURITY_OWNER_SID'] = $env:GPT_REPO_SECURITY_OWNER_SID
-  $serverB = [System.Diagnostics.Process]::Start($serverBStart)
-  $serverBErrorTask = $serverB.StandardError.ReadToEndAsync()
-  $serverBReadyTask = $serverB.StandardOutput.ReadLineAsync()
-  $serverBReadyLine = $null
-  $serverBReady = $false
-  if ($serverBReadyTask.Wait(10000)) {
     $serverBReadyLine = $serverBReadyTask.GetAwaiter().GetResult()
     $serverBReady = $serverBReadyLine -like 'READY|*'
-  }
-  if (-not $serverBReady) {
-    if (-not $serverB.HasExited) {
-      $serverB.Kill()
-      $null = $serverB.WaitForExit(5000)
+    if (-not $serverBReady) {
+      if (-not $serverB.HasExited) {
+        $serverB.Kill()
+        $null = $serverB.WaitForExit(5000)
+      }
+      throw "The replacement pipe server did not become ready within the client deadline: $serverBReadyLine"
     }
-    throw "The replacement pipe server did not become ready: $serverBReadyLine"
+    [System.IO.File]::WriteAllText($env:GPT_REPO_SECURITY_CLIENT_RELEASE_MARKER, 'release')
   }
-  }
-
-  [System.IO.File]::WriteAllText($env:GPT_REPO_SECURITY_CLIENT_RELEASE_MARKER, 'release')
 
   $clientStdoutTask = $clientProcess.StandardOutput.ReadToEndAsync()
   if (-not $clientProcess.WaitForExit(10000)) {
@@ -399,6 +440,8 @@ try {
   if (-not $clientProcess.HasExited) { throw 'The client process did not exit.' }
   [pscustomobject]@{
     clientVerificationLine = $clientVerificationLine
+    clientOperationDeadlineTick = $clientOperationDeadlineTick
+    clientDaclChangedLine = $clientDaclChangedLine
     clientExitCode = $clientProcess.ExitCode
     clientStdout = $clientStdout
     clientError = $clientError
@@ -602,10 +645,12 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
         ownerSid,
         fixtureRoot
       });
-      expect(result.clientVerificationLine).toBe("VERIFIED");
+      expect(result.clientVerificationLine).toMatch(/^VERIFIED\t\d+$/);
+      expect(result.clientOperationDeadlineTick).toBeGreaterThan(0);
       expect(result.clientExitCode).toBe(34);
-      expect(result.clientStdout).toMatch(/^NOT_DISPATCHED\t\d+\s*$/);
+      expect(result.clientStdout).toBe("NOT_DISPATCHED\t5\n");
       expect(result.clientStdout).not.toContain("RESPONSE\n");
+      expect(result.serverASid).toBe(ownerSid);
       expect(result.serverAError).toBe("");
       expect(result.serverBReady).toBe(true);
       expect(result.serverBSid).toBe(ownerSid);
@@ -630,9 +675,11 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
         fixtureRoot,
         changeDacl: true
       });
-      expect(result.clientVerificationLine).toBe("VERIFIED");
+      expect(result.clientVerificationLine).toMatch(/^VERIFIED\t\d+$/);
+      expect(result.clientOperationDeadlineTick).toBeGreaterThan(0);
+      expect(result.clientDaclChangedLine).toBe("DACL_CHANGED");
       expect(result.clientExitCode).toBe(34);
-      expect(result.clientStdout).toMatch(/^NOT_DISPATCHED\t\d+\s*$/);
+      expect(result.clientStdout).toBe("NOT_DISPATCHED\t5\n");
       expect(result.serverASid).toBe(ownerSid);
       expect(result.serverALine).toBe("CONNECTED|0");
       expect(result.serverAExitCode).toBe(0);
@@ -1369,6 +1416,8 @@ async function runPipeConnectionRaceProbe(options: {
   changeDacl?: boolean;
 }): Promise<{
   clientVerificationLine: string;
+  clientOperationDeadlineTick: number;
+  clientDaclChangedLine: string | null;
   clientExitCode: number;
   clientStdout: string;
   serverAError: string;
@@ -1395,6 +1444,7 @@ async function runPipeConnectionRaceProbe(options: {
     GPT_REPO_SECURITY_PIPE_NAME: options.endpoint.slice("\\\\.\\pipe\\".length),
     GPT_REPO_SECURITY_OWNER_SID: options.ownerSid,
     GPT_REPO_SECURITY_CHANGE_DACL: options.changeDacl ? "1" : "0",
+    GPT_REPO_SECURITY_CREATE_PIPE_MARKER: join(options.fixtureRoot, "create-replacement-pipe"),
     GPT_REPO_SECURITY_REPLACEMENT_SCRIPT: scriptPath,
     GPT_REPO_SECURITY_TEST_HELPER_PATH: options.helperPath,
     GPT_REPO_SECURITY_ENDPOINT: options.endpoint,
@@ -1403,6 +1453,8 @@ async function runPipeConnectionRaceProbe(options: {
     GPT_REPO_SECURITY_WORKING_DIRECTORY: repoRoot
   })) as {
     clientVerificationLine: string;
+    clientOperationDeadlineTick: number;
+    clientDaclChangedLine: string | null;
     clientExitCode: number;
     clientStdout: string;
     serverAError: string;
