@@ -772,7 +772,8 @@ async function stopChild(server: StartedServer): Promise<void> {
     return;
   }
   child.kill("SIGTERM");
-  if (!await waitForExit(child, 1_000)) {
+  // Allow the two-second IPC startup and shutdown bounds to finish before force-stopping the fixture server.
+  if (!await waitForExit(child, 5_000)) {
     child.kill("SIGKILL");
     if (child.exitCode === null && child.signalCode === null) await once(child, "exit");
   }
