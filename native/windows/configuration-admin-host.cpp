@@ -339,8 +339,12 @@ bool hasOwnerOnlyDacl(HANDLE handle, const SecurityContext &security,
       if (valid) {
         const auto *ace = static_cast<ACCESS_ALLOWED_ACE *>(rawAce);
         PSID aceSid = const_cast<DWORD *>(&ace->SidStart);
-        // Windows may return GENERIC_ALL or its FILE_ALL_ACCESS file-object mapping.
-        const bool grantsFullAccess = ace->Mask == GENERIC_ALL || ace->Mask == FILE_ALL_ACCESS;
+        // The .NET pipe API's FullControl mask omits file rights that pipes do not use.
+        constexpr DWORD kPipeAccessRightsFullControl = 0x001F019F;
+        const bool grantsFullAccess = ace->Mask == GENERIC_ALL ||
+                                      ace->Mask == FILE_ALL_ACCESS ||
+                                      (objectType == SE_KERNEL_OBJECT &&
+                                       ace->Mask == kPipeAccessRightsFullControl);
         valid = grantsFullAccess && EqualSid(aceSid, security.userSid) != FALSE;
       }
     }
@@ -1561,14 +1565,12 @@ int client(const std::wstring &endpoint, DWORD timeoutMs,
 #ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
 int claimPipeInstance(const std::wstring &endpoint) {
   if (!validLocalPipeName(endpoint)) return 4;
-  constexpr wchar_t prefix[] = L"\\\\.\\pipe\\";
-  const std::wstring name = endpoint.substr(std::size(prefix) - 1);
   SecurityContext security;
   if (!createSecurityContext(security)) {
     writeStdout("SECURITY_FAILED\n");
     return 5;
   }
-  HANDLE raw = createServerPipe(name, security, false);
+  HANDLE raw = createServerPipe(endpoint, security, false);
   if (raw == INVALID_HANDLE_VALUE) {
     const DWORD error = GetLastError();
     return writeStdout("NOT_CREATED\t" + std::to_string(error) + "\n") ? 0 : 6;
