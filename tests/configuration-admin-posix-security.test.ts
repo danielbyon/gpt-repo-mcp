@@ -73,12 +73,7 @@ describe.skipIf(process.platform === "win32")("POSIX configuration IPC identity 
 
       const port = await waitForServer(server, () => serverOutput);
       const record = await waitForDiscoveryRecord(adminDirectory, () => serverOutput);
-      const ownerReload = runCli(builtCli, repoRoot, serverEnv, record.server_pid);
-      expect(ownerReload.status, ownerReload.stderr).toBe(0);
-      expect(ownerReload.stdout).toContain("Reloaded configuration");
-      expect(await fetch(`http://127.0.0.1:${port}/health`).then((response) => response.ok)).toBe(true);
-
-const outsiderScript = String.raw`
+      const outsiderScript = String.raw`
 import net from "node:net";
 const [endpoint] = process.argv.slice(1);
 const endpointResult = await new Promise((resolve) => {
@@ -101,6 +96,11 @@ process.stdout.write(JSON.stringify({ uid: process.getuid(), endpointResult }));
       expect(result.uid).toBe(outsider.uid);
       expect(result.uid).not.toBe(ownerUid);
       expect(result.endpointResult).toEqual({ connected: false, code: "EACCES" });
+
+      const ownerReload = runCli(builtCli, repoRoot, serverEnv, record.server_pid);
+      expect(ownerReload.status, ownerReload.stderr).toBe(0);
+      expect(ownerReload.stdout).toContain("Reloaded configuration");
+      expect(await fetch(`http://127.0.0.1:${port}/health`).then((response) => response.ok)).toBe(true);
     } finally {
       await stopServer(server);
       await rm(fixtureRoot, { recursive: true, force: true });

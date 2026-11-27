@@ -1130,12 +1130,13 @@ void waitForWorkers(ControlHub &hub) {
   hub.workersChanged.wait(lock, [&hub] { return hub.activeWorkers == 0; });
 }
 
+// The parent must accept this endpoint identity before discovery is published.
 bool writeReady(const InstanceRecord &record) {
   const std::string line = "READY\t" + recordJson(record) + "\n";
   return writeStdout(line);
 }
 
-// Publishes this instance's local endpoint and relays requests until shutdown.
+// Confirms the endpoint with its parent before publishing discovery or relaying requests.
 int serve(DWORD serverPid, const std::string &instanceId) {
   SecurityContext security;
   if (!createSecurityContext(security)) return 20;
@@ -1161,12 +1162,16 @@ int serve(DWORD serverPid, const std::string &instanceId) {
   record.instanceId = instanceId;
   record.endpoint = narrowAscii(name);
   std::wstring recordPath;
-  if (record.endpoint.empty() || !publishRecord(directory, security, record, recordPath)) return 25;
+  if (record.endpoint.empty()) return 25;
   UniqueHandle shutdownEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-  if (!shutdownEvent) {
-    removeRecordIfSame(recordPath, security, record);
-    return 27;
-  }
+  if (!shutdownEvent) return 27;
+
+  if (!writeReady(record)) return 26;
+  std::string startupAcknowledgment;
+  const std::string expectedAcknowledgment = "READY_ACCEPTED\t" + instanceId;
+  if (!readAllControlLine(GetStdHandle(STD_INPUT_HANDLE), parentProcess.get(), startupAcknowledgment) ||
+      startupAcknowledgment != expectedAcknowledgment) return 27;
+  if (!publishRecord(directory, security, record, recordPath)) return 25;
 
   ControlHub hub;
   hub.shutdownEvent = shutdownEvent.get();
@@ -1181,7 +1186,7 @@ int serve(DWORD serverPid, const std::string &instanceId) {
 #ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
   bool capacityPauseUsed = false;
 #endif
-  if (!writeReady(record)) {
+  if (!writeStdout("PUBLISHED\t" + instanceId + "\n")) {
     exitCode = 26;
     signalShutdown(hub);
   }

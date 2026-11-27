@@ -21,10 +21,114 @@ import {
   type ConfigurationAdminResponse
 } from "../src/runtime/configuration-admin-protocol.js";
 
+const delayedStartupAcknowledgment = vi.hoisted(() => ({ delayMs: 0 }));
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const spawnWithDelayedAcknowledgment: typeof actual.spawn = ((...args: Parameters<typeof actual.spawn>) => {
+    const child = actual.spawn(...args);
+    const stdin = child.stdin;
+    if (!stdin) return child;
+
+    const originalWrite = stdin.write.bind(stdin);
+    stdin.write = ((
+      chunk: string | Uint8Array,
+      encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
+      callback?: (error?: Error | null) => void
+    ) => {
+      const writeCallback = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+      const isStartupAcknowledgment = typeof chunk === "string" && chunk.startsWith("READY_ACCEPTED\t");
+      const delayedCallback = writeCallback && isStartupAcknowledgment && delayedStartupAcknowledgment.delayMs > 0
+        ? (error?: Error | null) => {
+          setTimeout(() => writeCallback(error), delayedStartupAcknowledgment.delayMs);
+        }
+        : writeCallback;
+
+      return typeof encodingOrCallback === "string"
+        ? originalWrite(chunk, encodingOrCallback, delayedCallback)
+        : originalWrite(chunk, delayedCallback);
+    }) as typeof stdin.write;
+    return child;
+  }) as typeof actual.spawn;
+
+  return { ...actual, spawn: spawnWithDelayedAcknowledgment };
+});
+
 const instanceId = "22222222-2222-4222-8222-222222222222";
 const userProfileRoot = process.env.USERPROFILE;
 
+type ReloadAttemptState = {
+  outcome: "published" | "rejected";
+  generation: number;
+  digest: string;
+};
+
+const overlappingReloadScenarios: Array<{
+  label: string;
+  first: ReloadAttemptState;
+  second: ReloadAttemptState;
+}> = [
+  {
+    label: "success/success",
+    first: { outcome: "published", generation: 8, digest: "b" },
+    second: { outcome: "published", generation: 9, digest: "c" }
+  },
+  {
+    label: "success/rejection",
+    first: { outcome: "published", generation: 8, digest: "b" },
+    second: { outcome: "rejected", generation: 8, digest: "b" }
+  },
+  {
+    label: "rejection/success",
+    first: { outcome: "rejected", generation: 7, digest: "a" },
+    second: { outcome: "published", generation: 8, digest: "c" }
+  }
+];
+
 describe("owner-local Windows configuration IPC", () => {
+  test.skipIf(process.platform !== "win32")(
+    "keeps a confirmed startup publication when the acknowledgment write callback stalls",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-start-ack-delay-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      delayedStartupAcknowledgment.delayMs = 2_500;
+
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          handle: async (value): Promise<ConfigurationAdminResponse> => {
+            const request = parseAdminRequest(value);
+            return probeResponse(request.request_id, sourceIdentity);
+          }
+        });
+
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_100));
+        const response = await requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "56565656-5656-4656-8656-565656565656",
+          operation: "probe"
+        });
+        expect(response).toMatchObject({
+          request_id: "56565656-5656-4656-8656-565656565656",
+          operation: "probe_result"
+        });
+      } finally {
+        delayedStartupAcknowledgment.delayMs = 0;
+        await cleanupWindowsHost(host, localAppData);
+      }
+    },
+    10_000
+  );
+
   test("refuses a legacy discovery record without helper process creation time before dispatch", async () => {
     const serverPid = process.pid;
     const legacyRecord: ConfigurationAdminDiscoveryRecord = {
@@ -554,6 +658,195 @@ describe("owner-local Windows configuration IPC", () => {
       }
     },
     40_000
+  );
+
+  test.skipIf(process.platform !== "win32").each(overlappingReloadScenarios)(
+    "correlates overlapping reload outcomes and per-attempt state ($label)",
+    async (scenario) => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-outcome-overlap-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      const firstRequestId = "12121212-1212-4212-8212-121212121212";
+      const secondRequestId = "34343434-3434-4434-8434-343434343434";
+      const bothReloadsStarted = deferred<void>();
+      const releaseFirstResponse = deferred<void>();
+      const releaseSecondResponse = deferred<void>();
+      let reloadCount = 0;
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+      const requests: Promise<ConfigurationAdminResponse>[] = [];
+
+      const responseFor = (requestId: string, attempt: ReloadAttemptState): ConfigurationAdminResponse => {
+        const identity = {
+          protocol_version: 1 as const,
+          request_id: requestId,
+          server_pid: process.pid,
+          instance_id: instanceId,
+          source_identity: sourceIdentity,
+          operation: "reload_result" as const,
+          pending_restart: false
+        };
+        if (attempt.outcome === "published") {
+          return {
+            ...identity,
+            outcome: "published",
+            effective_generation: attempt.generation,
+            accepted_source_sha256: attempt.digest.repeat(64)
+          };
+        }
+        return {
+          ...identity,
+          outcome: "rejected",
+          rejection_code: "CANDIDATE_REJECTED",
+          rejection_message: "The candidate was rejected.",
+          active_effective_generation: attempt.generation,
+          active_source_sha256: attempt.digest.repeat(64)
+        };
+      };
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          handle: async (value): Promise<ConfigurationAdminResponse> => {
+            const request = parseAdminRequest(value);
+            if (request.operation !== "reload") return probeResponse(request.request_id, sourceIdentity);
+            reloadCount += 1;
+            if (reloadCount === 2) bothReloadsStarted.resolve();
+            await (request.request_id === firstRequestId
+              ? releaseFirstResponse.promise
+              : releaseSecondResponse.promise);
+            return responseFor(request.request_id, request.request_id === firstRequestId ? scenario.first : scenario.second);
+          }
+        });
+
+        const makeReloadRequest = (requestId: string): Promise<ConfigurationAdminResponse> =>
+          requestWindowsConfigurationAdmin(host!.record, {
+            protocol_version: 1,
+            request_id: requestId,
+            operation: "reload",
+            expected_server_pid: process.pid,
+            expected_instance_id: instanceId,
+            expected_source_identity: sourceIdentity
+          });
+        requests.push(makeReloadRequest(firstRequestId), makeReloadRequest(secondRequestId));
+        await bothReloadsStarted.promise;
+
+        releaseSecondResponse.resolve();
+        const secondResponse = await requests[1]!;
+        releaseFirstResponse.resolve();
+        const firstResponse = await requests[0]!;
+
+        expect(firstResponse).toMatchObject({
+          request_id: firstRequestId,
+          operation: "reload_result",
+          outcome: scenario.first.outcome,
+          ...(scenario.first.outcome === "published"
+            ? {
+              effective_generation: scenario.first.generation,
+              accepted_source_sha256: scenario.first.digest.repeat(64)
+            }
+            : {
+              active_effective_generation: scenario.first.generation,
+              active_source_sha256: scenario.first.digest.repeat(64)
+            })
+        });
+        expect(secondResponse).toMatchObject({
+          request_id: secondRequestId,
+          operation: "reload_result",
+          outcome: scenario.second.outcome,
+          ...(scenario.second.outcome === "published"
+            ? {
+              effective_generation: scenario.second.generation,
+              accepted_source_sha256: scenario.second.digest.repeat(64)
+            }
+            : {
+              active_effective_generation: scenario.second.generation,
+              active_source_sha256: scenario.second.digest.repeat(64)
+            })
+        });
+      } finally {
+        releaseFirstResponse.resolve();
+        releaseSecondResponse.resolve();
+        await Promise.allSettled(requests);
+        await cleanupWindowsHost(host, localAppData);
+      }
+    },
+    40_000
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bounds shutdown when a native helper cannot drain an outstanding reload",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-shutdown-bound-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      const requestStarted = deferred<void>();
+      const releaseRequest = deferred<void>();
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+      let pendingReload: Promise<ConfigurationAdminResponse> | undefined;
+      let observedReload: Promise<
+        | { ok: true; response: ConfigurationAdminResponse }
+        | { ok: false; error: unknown }
+      > | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          handle: async (value): Promise<ConfigurationAdminResponse> => {
+            const request = parseAdminRequest(value);
+            if (request.operation === "reload") {
+              requestStarted.resolve();
+              await releaseRequest.promise;
+              return reloadResponse(request.request_id, sourceIdentity, "d");
+            }
+            return probeResponse(request.request_id, sourceIdentity);
+          }
+        });
+
+        pendingReload = requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "abababab-abab-4bab-8bab-abababababab",
+          operation: "reload",
+          expected_server_pid: process.pid,
+          expected_instance_id: instanceId,
+          expected_source_identity: sourceIdentity
+        });
+        observedReload = pendingReload.then(
+          (response) => ({ ok: true as const, response }),
+          (error: unknown) => ({ ok: false as const, error })
+        );
+        await requestStarted.promise;
+
+        const shutdownStartedAt = Date.now();
+        await expect(host.close()).rejects.toMatchObject({
+          code: "WINDOWS_HELPER_SHUTDOWN_TIMEOUT",
+          phase: "pre-dispatch"
+        });
+        expect(Date.now() - shutdownStartedAt).toBeLessThan(2_750);
+
+        const reloadOutcome = await observedReload;
+        if (reloadOutcome?.ok) throw new Error("The interrupted reload unexpectedly received a response.");
+        expect(reloadOutcome?.error).toMatchObject({ phase: "indeterminate" });
+      } finally {
+        releaseRequest.resolve();
+        if (pendingReload) await Promise.allSettled([pendingReload]);
+        await cleanupWindowsHost(host, localAppData);
+      }
+    },
+    10_000
   );
 
   test.skipIf(process.platform !== "win32")(

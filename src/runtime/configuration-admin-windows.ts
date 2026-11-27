@@ -22,7 +22,7 @@ const CONNECTION_TIMEOUT_MS = 2_000;
 const PROBE_TIMEOUT_MS = 2_000;
 const CONTROL_WRITE_TIMEOUT_MS = 2_000;
 const RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS = 30_000;
-const SHUTDOWN_TIMEOUT_MS = 7_000;
+const SHUTDOWN_TIMEOUT_MS = 2_000;
 const MAX_DISCOVERY_BYTES = 1_048_576;
 const MAX_CONTROL_LINE_BYTES = Math.ceil((MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 4) * 4 / 3) + 16;
 const MAX_HELPER_CREATION_TIME = "18446744073709551615";
@@ -203,6 +203,7 @@ class WindowsHostProcess {
   private readyRecord: ConfigurationAdminDiscoveryRecord | undefined;
   private readyResolve: ((record: ConfigurationAdminDiscoveryRecord) => void) | undefined;
   private readyReject: ((error: Error) => void) | undefined;
+  private startupHandshakeState: "awaiting_ready" | "awaiting_publication" | "published" = "awaiting_ready";
   private readonly pendingConnections = new Map<string, object>();
   private closed = false;
   private failed = false;
@@ -263,14 +264,14 @@ class WindowsHostProcess {
       terminateChild(this.child);
       return;
     }
-    const shutdownWritten = await this.writeControlLine("SHUTDOWN\n");
+    const deadline = performance.now() + SHUTDOWN_TIMEOUT_MS;
+    const shutdownWritten = await this.writeControlLine("SHUTDOWN\n", remainingDuration(deadline));
     this.child.stdin.end();
     if (!shutdownWritten) terminateChild(this.child);
     try {
-      await waitForExit(this.child, SHUTDOWN_TIMEOUT_MS);
+      await waitForExit(this.child, remainingDuration(deadline));
     } catch {
       terminateChild(this.child);
-      await waitForExit(this.child, 1_000).catch(() => undefined);
     }
   }
 
@@ -278,14 +279,14 @@ class WindowsHostProcess {
     if (this.closed) return;
     this.closed = true;
     if (this.child.exitCode !== null || this.child.signalCode !== null) return;
-    const shutdownWritten = await this.writeControlLine("SHUTDOWN\n");
+    const deadline = performance.now() + SHUTDOWN_TIMEOUT_MS;
+    const shutdownWritten = await this.writeControlLine("SHUTDOWN\n", remainingDuration(deadline));
     this.child.stdin.end();
     if (!shutdownWritten) terminateChild(this.child);
     try {
-      await waitForExit(this.child, SHUTDOWN_TIMEOUT_MS);
+      await waitForExit(this.child, remainingDuration(deadline));
     } catch {
       terminateChild(this.child);
-      await waitForExit(this.child, 1_000).catch(() => undefined);
       throw ipcError("WINDOWS_HELPER_SHUTDOWN_TIMEOUT", "pre-dispatch", "The local administrative helper did not stop before the deadline.");
     }
     if (this.child.exitCode !== 0) {
@@ -293,7 +294,7 @@ class WindowsHostProcess {
     }
   }
 
-  private writeControlLine(line: string): Promise<boolean> {
+  private writeControlLine(line: string, timeoutMs = CONTROL_WRITE_TIMEOUT_MS): Promise<boolean> {
     return new Promise((resolveWrite) => {
       let settled = false;
       const finish = (written: boolean): void => {
@@ -302,9 +303,12 @@ class WindowsHostProcess {
         clearTimeout(timer);
         resolveWrite(written);
       };
-      const timer = setTimeout(() => finish(false), CONTROL_WRITE_TIMEOUT_MS);
+      const timer = setTimeout(() => finish(false), timeoutMs);
       try {
-        this.child.stdin.write(line, (error) => finish(error == null));
+        this.child.stdin.write(line, (error) => {
+          if (settled) return;
+          finish(error == null);
+        });
       } catch {
         finish(false);
       }
@@ -336,6 +340,18 @@ class WindowsHostProcess {
   }
 
   private acceptControlLine(line: string): void {
+    if (this.startupHandshakeState !== "published") {
+      if (!this.readyRecord || this.startupHandshakeState !== "awaiting_publication"
+        || line !== `PUBLISHED\t${this.instanceId}`) {
+        this.failHost("WINDOWS_HELPER_BAD_PUBLICATION");
+        return;
+      }
+      this.startupHandshakeState = "published";
+      // PUBLISHED confirms that the helper received the parent's acknowledgment.
+      this.resolveReadyIfComplete();
+      return;
+    }
+
     const requestPrefix = "REQUEST\t";
     if (line.startsWith(requestPrefix)) {
       const separator = line.indexOf("\t", requestPrefix.length);
@@ -380,12 +396,25 @@ class WindowsHostProcess {
         throw new Error("Instance identity mismatch.");
       }
       this.readyRecord = record;
-      this.readyResolve?.(record);
-      this.readyResolve = undefined;
-      this.readyReject = undefined;
+      this.startupHandshakeState = "awaiting_publication";
+      void this.writeControlLine(`READY_ACCEPTED\t${record.instance_id}\n`).then((written) => {
+        if (!written) {
+          if (this.startupHandshakeState !== "published") this.failHost("WINDOWS_HELPER_START_ACK_FAILED");
+          return;
+        }
+        this.resolveReadyIfComplete();
+      });
     } catch {
       this.failBeforeReady("WINDOWS_HELPER_BAD_READY");
     }
+  }
+
+  private resolveReadyIfComplete(): void {
+    const record = this.readyRecord;
+    if (!record || this.startupHandshakeState !== "published") return;
+    this.readyResolve?.(record);
+    this.readyResolve = undefined;
+    this.readyReject = undefined;
   }
 
   private async forwardRequest(connectionId: string, encodedFrame: string): Promise<void> {
@@ -542,6 +571,10 @@ function ipcError(code: string, phase: "pre-dispatch" | "indeterminate", message
 
 function asIpcError(error: unknown, code: string, phase: "pre-dispatch" | "indeterminate", message: string): ConfigurationAdminIpcError {
   return error instanceof ConfigurationAdminIpcError ? error : ipcError(code, phase, message);
+}
+
+function remainingDuration(deadline: number): number {
+  return Math.max(0, Math.ceil(deadline - performance.now()));
 }
 
 async function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<void> {

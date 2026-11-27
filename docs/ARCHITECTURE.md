@@ -55,6 +55,16 @@ full-control allow ACE for that SID. The check runs again on the same handle
 immediately before the client writes the request. A failed or unavailable
 security query stops the request.
 
+On Windows startup, the native helper sends a `READY` record to its parent.
+The parent checks the server PID, helper PID and creation time, instance ID,
+and endpoint, then replies with `READY_ACCEPTED`. Only then does the helper
+publish the protected discovery record and send `PUBLISHED`. The parent makes
+IPC available after it receives that confirmation. A startup failure leaves
+public MCP serving available. Helper shutdown has a two-second absolute
+deadline covering the control write and exit wait. If the helper remains
+alive at that deadline, the parent terminates it; the child-process lifecycle
+handlers observe its exit.
+
 The Windows qualification uses single-host CI. Microsoft documents
 that CreateNamedPipeW with PIPE_REJECT_REMOTE_CLIENTS automatically rejects
 remote clients ([CreateNamedPipeW](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew)), and

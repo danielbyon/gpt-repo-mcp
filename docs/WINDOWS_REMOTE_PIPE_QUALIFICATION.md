@@ -246,7 +246,7 @@ After the second positive control passes, check the isolated server's `/health` 
 
 ## 6. Evidence and cleanup
 
-Preserve the host names, server and client SIDs, positive-control DACL and nonce results, DNS and TCP 445 output, production executable path and SHA-256, discovery record, production error code, health response, and local reload result. Any missing or mismatched evidence leaves remote rejection **BLOCKED**.
+Preserve the host names, server and client SIDs, positive-control DACL and nonce results, DNS and TCP 445 output, production executable path and SHA-256, discovery record, production error code, health response, and local reload result. Missing or mismatched evidence makes this optional two-host result **INCONCLUSIVE**. The required single-host status remains based on Windows CI.
 
 Stop only the isolated server and its helper, then remove only the temporary fixture directory:
 

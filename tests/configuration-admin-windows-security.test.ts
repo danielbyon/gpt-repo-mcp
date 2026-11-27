@@ -912,10 +912,6 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
       const serverPort = await waitForServer(server, () => serverOutput, () => serverSpawnError);
       const ownerRecord = await waitForOwnerRecord(ownerLocalAppData, () => serverOutput);
       const helperCreationTime = ownerRecord.helper_creation_time;
-      const ownerReload = runCli(builtCli, repoRoot, serverEnv, ownerRecord.server_pid);
-      expect(ownerReload.status, ownerReload.stderr).toBe(0);
-      expect(ownerReload.stdout).toContain("Reloaded configuration");
-      expect(await fetch(`http://127.0.0.1:${serverPort}/health`).then((response) => response.ok)).toBe(true);
 
       const outsiderSid = (await readFile(sidPath, "utf8")).trim();
       expect(outsiderSid).not.toBe(ownerSid);
@@ -956,6 +952,11 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
       expect(result.cliStatus).toBe(1);
       expect(result.cliOutput).toContain("Windows denied access to the owner-local administrative pipe.");
       expect(result.cliOutput).toContain("Configuration reload was not dispatched.");
+
+      const ownerReload = runCli(builtCli, repoRoot, serverEnv, ownerRecord.server_pid);
+      expect(ownerReload.status, ownerReload.stderr).toBe(0);
+      expect(ownerReload.stdout).toContain("Reloaded configuration");
+      expect(await fetch(`http://127.0.0.1:${serverPort}/health`).then((response) => response.ok)).toBe(true);
 
       terminateHelperProcess(ownerRecord.helper_pid, helperCreationTime, productionHelper);
       expect(await fetch(`http://127.0.0.1:${serverPort}/health`).then((response) => response.ok)).toBe(true);
