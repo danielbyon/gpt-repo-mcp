@@ -651,17 +651,20 @@ function startWindowsLeaderExitTree(
   testHost = false
 ): Invocation {
   const controller = new AbortController();
+  const pidTemporaryPath = `${pidPath}.tmp`;
+  const exitPath = exitPathFor(readyPath);
+  const exitTemporaryPath = `${exitPath}.tmp`;
   const readyTemporaryPath = `${readyPath}.tmp`;
   const descendantScript = [
     "const { existsSync, renameSync, writeFileSync } = require('node:fs');",
     "process.on('SIGTERM', () => {});",
-    `setInterval(() => { if (existsSync(${JSON.stringify(cleanupPathFor(readyPath))})) { writeFileSync(${JSON.stringify(exitPathFor(readyPath))}, String(process.pid)); process.exit(0); } }, 20);`,
+    `setInterval(() => { if (existsSync(${JSON.stringify(cleanupPathFor(readyPath))})) { writeFileSync(${JSON.stringify(exitTemporaryPath)}, String(process.pid)); renameSync(${JSON.stringify(exitTemporaryPath)}, ${JSON.stringify(exitPath)}); process.exit(0); } }, 20);`,
     `writeFileSync(${JSON.stringify(readyTemporaryPath)}, String(process.pid));`,
     `renameSync(${JSON.stringify(readyTemporaryPath)}, ${JSON.stringify(readyPath)});`
   ].join(" ");
   const leaderScript = [
     "const { spawn } = require('node:child_process');",
-    "const { existsSync, writeFileSync } = require('node:fs');",
+    "const { existsSync, renameSync, writeFileSync } = require('node:fs');",
     "let readinessPoll;",
     // Node's non-detached Windows children normally join libuv's
     // kill-on-close job.
@@ -669,7 +672,7 @@ function startWindowsLeaderExitTree(
     // breakaway from the process-host Job Object.
     `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: ${JSON.stringify(stdio)}, detached: true });`,
     "descendant.once('error', (error) => { if (readinessPoll) clearInterval(readinessPoll); console.error('Descendant spawn failed:', error); process.exitCode = 1; });",
-    `descendant.once('spawn', () => { writeFileSync(${JSON.stringify(pidPath)}, JSON.stringify({ leader: process.pid, descendant: descendant.pid })); readinessPoll = setInterval(() => { if (existsSync(${JSON.stringify(readyPath)}) || existsSync(${JSON.stringify(cleanupPathFor(readyPath))})) { clearInterval(readinessPoll); descendant.unref(); } }, 10); });`,
+    `descendant.once('spawn', () => { writeFileSync(${JSON.stringify(pidTemporaryPath)}, JSON.stringify({ leader: process.pid, descendant: descendant.pid })); renameSync(${JSON.stringify(pidTemporaryPath)}, ${JSON.stringify(pidPath)}); readinessPoll = setInterval(() => { if (existsSync(${JSON.stringify(readyPath)}) || existsSync(${JSON.stringify(cleanupPathFor(readyPath))})) { clearInterval(readinessPoll); descendant.unref(); } }, 10); });`,
     `descendant.once('exit', (code, signal) => { if (!existsSync(${JSON.stringify(readyPath)})) { if (readinessPoll) clearInterval(readinessPoll); console.error('Descendant exited before readiness:', code, signal); process.exitCode = 1; } });`
   ].join(" ");
   const processInput = {
