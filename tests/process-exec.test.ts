@@ -651,11 +651,13 @@ function startWindowsLeaderExitTree(
   testHost = false
 ): Invocation {
   const controller = new AbortController();
+  const readyTemporaryPath = `${readyPath}.tmp`;
   const descendantScript = [
-    "const { existsSync, writeFileSync } = require('node:fs');",
+    "const { existsSync, renameSync, writeFileSync } = require('node:fs');",
     "process.on('SIGTERM', () => {});",
     `setInterval(() => { if (existsSync(${JSON.stringify(cleanupPathFor(readyPath))})) { writeFileSync(${JSON.stringify(exitPathFor(readyPath))}, String(process.pid)); process.exit(0); } }, 20);`,
-    `writeFileSync(${JSON.stringify(readyPath)}, String(process.pid));`
+    `writeFileSync(${JSON.stringify(readyTemporaryPath)}, String(process.pid));`,
+    `renameSync(${JSON.stringify(readyTemporaryPath)}, ${JSON.stringify(readyPath)});`
   ].join(" ");
   const leaderScript = [
     "const { spawn } = require('node:child_process');",
