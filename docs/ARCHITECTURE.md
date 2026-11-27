@@ -55,6 +55,25 @@ full-control allow ACE for that SID. The check runs again on the same handle
 immediately before the client writes the request. A failed or unavailable
 security query stops the request.
 
+The Windows qualification uses single-host CI. Microsoft documents
+that CreateNamedPipeW with PIPE_REJECT_REMOTE_CLIENTS automatically rejects
+remote clients ([CreateNamedPipeW](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew)), and
+the production factory supplies the mode for both the first instance and each
+successor. The Windows test helper calls that shared factory to create both
+instances, alongside otherwise equivalent accept-remote and reject-remote
+control pipes. CI compares the controls' GetNamedPipeInfo results and records
+the results from the production-factory handles. The public
+GetNamedPipeInfo reference lists endpoint and pipe-type flags but does not
+list the remote-rejection bit ([GetNamedPipeInfo](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-getnamedpipeinfo)); Microsoft's
+[HLK test](https://learn.microsoft.com/en-us/windows-hardware/test/hlk/testref/e3bcbd3f-3e9c-484a-a587-3c081cb28f7a)
+says it checks that option. If the controls do not expose a reliable
+difference on the runner, CI reports that observation as unqualified and
+still checks the exact mode passed to CreateNamedPipeW. The query and its
+instrumentation exist only in the test build. Production security does not
+depend on GetNamedPipeInfo.
+End-to-end remote SMB testing remains optional supplementary evidence and is
+recorded as NOT RUN unless it is performed.
+
 The protected discovery record carries the helper PID and process creation
 time. The client checks those values against a live process handle to detect
 stale records and PID reuse. They identify the helper named by the record;

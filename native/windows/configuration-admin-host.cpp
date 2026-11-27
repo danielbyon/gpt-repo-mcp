@@ -854,11 +854,19 @@ ConnectResult connectPipe(HANDLE pipe, HANDLE parentProcess, HANDLE shutdownEven
 // remains open, so an unprivileged process outside that SID cannot claim the
 // name between instances.
 HANDLE createServerPipe(const std::wstring &name, SecurityContext &security,
-                        bool firstInstance) {
+                        bool firstInstance
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+                        , DWORD *createdModeForTest = nullptr
+#endif
+                        ) {
   DWORD flags = FILE_FLAG_OVERLAPPED;
   if (firstInstance) flags |= FILE_FLAG_FIRST_PIPE_INSTANCE;
-  return CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | flags,
-      PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+  const DWORD pipeMode =
+      PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+  if (createdModeForTest) *createdModeForTest = pipeMode;
+#endif
+  return CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | flags, pipeMode,
       kMaximumPipeInstances, kPipeBufferBytes, kPipeBufferBytes, kConnectionTimeoutMs,
       &security.attributes);
 }
@@ -1620,6 +1628,96 @@ int client(const std::wstring &endpoint, DWORD timeoutMs,
 }
 
 #ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+// Compare matched remote-client controls with first and successor handles from
+// the shared production factory. Keep the CreateNamedPipeW mode as the
+// regression oracle because the public GetNamedPipeInfo reference omits this bit.
+struct PipeModeObservation {
+  bool succeeded = false;
+  DWORD flags = 0;
+  DWORD error = ERROR_SUCCESS;
+};
+
+void observePipeMode(HANDLE pipe, PipeModeObservation &observation) {
+  observation.succeeded = GetNamedPipeInfo(
+      pipe, &observation.flags, nullptr, nullptr, nullptr) != FALSE;
+  observation.error = observation.succeeded ? ERROR_SUCCESS : GetLastError();
+}
+
+bool inspectPipeModeControl(const std::wstring &name, DWORD remoteMode,
+                            SecurityContext &security,
+                            PipeModeObservation &observation) {
+  const DWORD openMode =
+      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE;
+  const DWORD pipeMode = PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | remoteMode;
+  UniqueHandle pipe(CreateNamedPipeW(
+      name.c_str(), openMode, pipeMode, kMaximumPipeInstances,
+      kPipeBufferBytes, kPipeBufferBytes, kConnectionTimeoutMs,
+      &security.attributes));
+  if (!pipe) return false;
+  observePipeMode(pipe.get(), observation);
+  return true;
+}
+
+int reportPipeModeControls() {
+  SecurityContext security;
+  if (!createSecurityContext(security)) return 1;
+  const std::wstring prefix =
+      L"\\\\.\\pipe\\gpt-repo-pipe-mode-" +
+      std::to_wstring(GetCurrentProcessId()) + L"-" +
+      std::to_wstring(GetTickCount64());
+  PipeModeObservation acceptObservation;
+  PipeModeObservation rejectObservation;
+  PipeModeObservation productionFirstObservation;
+  PipeModeObservation productionSuccessorObservation;
+  if (!inspectPipeModeControl(prefix + L"-accept", PIPE_ACCEPT_REMOTE_CLIENTS,
+                              security, acceptObservation) ||
+      !inspectPipeModeControl(prefix + L"-reject", PIPE_REJECT_REMOTE_CLIENTS,
+                              security, rejectObservation)) {
+    const DWORD error = GetLastError();
+    writeStdout("PIPE_MODE_CONTROL_CREATE_FAILED\t" + std::to_string(error) + "\n");
+    return 2;
+  }
+  const std::wstring productionName = prefix + L"-production";
+  DWORD productionFirstMode = 0;
+  UniqueHandle productionFirst(createServerPipe(
+      productionName, security, true, &productionFirstMode));
+  if (!productionFirst) {
+    const DWORD error = GetLastError();
+    writeStdout("PRODUCTION_PIPE_CREATE_FAILED\tfirst\t" +
+                std::to_string(error) + "\n");
+    return 2;
+  }
+  observePipeMode(productionFirst.get(), productionFirstObservation);
+
+  DWORD productionSuccessorMode = 0;
+  UniqueHandle productionSuccessor(createServerPipe(
+      productionName, security, false, &productionSuccessorMode));
+  if (!productionSuccessor) {
+    const DWORD error = GetLastError();
+    writeStdout("PRODUCTION_PIPE_CREATE_FAILED\tsuccessor\t" +
+                std::to_string(error) + "\n");
+    return 2;
+  }
+  observePipeMode(productionSuccessor.get(), productionSuccessorObservation);
+
+  const std::string output =
+      std::string("accept\t") + (acceptObservation.succeeded ? "ok" : "error") +
+      "\t" + std::to_string(acceptObservation.flags) +
+      "\t" + std::to_string(acceptObservation.error) + "\n" +
+      "reject\t" + (rejectObservation.succeeded ? "ok" : "error") +
+      "\t" + std::to_string(rejectObservation.flags) +
+      "\t" + std::to_string(rejectObservation.error) + "\n" +
+      "production-first\t" + std::to_string(productionFirstMode) +
+      "\t" + (productionFirstObservation.succeeded ? "ok" : "error") +
+      "\t" + std::to_string(productionFirstObservation.flags) +
+      "\t" + std::to_string(productionFirstObservation.error) + "\n" +
+      "production-successor\t" + std::to_string(productionSuccessorMode) +
+      "\t" + (productionSuccessorObservation.succeeded ? "ok" : "error") +
+      "\t" + std::to_string(productionSuccessorObservation.flags) +
+      "\t" + std::to_string(productionSuccessorObservation.error) + "\n";
+  return writeStdout(output) ? 0 : 3;
+}
+
 int claimPipeInstance(const std::wstring &endpoint) {
   if (!validLocalPipeName(endpoint)) return 4;
   SecurityContext security;
@@ -1659,6 +1757,9 @@ int discover() {
 int wmain(int argc, wchar_t *argv[]) {
   if (argc < 2) return 1;
 #ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+  if (wcscmp(argv[1], L"pipe-info-controls") == 0 && argc == 2) {
+    return reportPipeModeControls();
+  }
   if (wcscmp(argv[1], L"claim") == 0 && argc == 3) return claimPipeInstance(argv[2]);
 #endif
   if (wcscmp(argv[1], L"discover") == 0 && argc == 2) return discover();

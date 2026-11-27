@@ -16,6 +16,69 @@ const productionHelper = join(repoRoot, "dist", "windows-configuration-admin-hos
 const testHelper = join(repoRoot, "dist", "windows-configuration-admin-host.test.exe");
 const userProfileRoot = process.env.USERPROFILE;
 const publicRoot = process.env.PUBLIC ?? "C:\\Users\\Public";
+const pipeRejectRemoteClients = 0x00000008;
+
+interface PipeInfoObservation {
+  readonly label: string;
+  readonly succeeded: boolean;
+  readonly flags: number;
+  readonly error: number;
+}
+
+interface ProductionPipeInfoObservation {
+  readonly instance: "production-first" | "production-successor";
+  readonly createMode: number;
+  readonly querySucceeded: boolean;
+  readonly queryFlags: number;
+  readonly queryError: number;
+}
+
+function assertRemoteClientRejectionMode(mode: number): void {
+  if ((mode & pipeRejectRemoteClients) !== pipeRejectRemoteClients) {
+    throw new Error("The production named-pipe mode does not reject remote clients.");
+  }
+}
+
+function parsePipeInfoObservation(line: string): PipeInfoObservation {
+  const [label, status, flagsText, errorText] = line.split("\t");
+  if ((label !== "accept" && label !== "reject") ||
+      (status !== "ok" && status !== "error") ||
+      !/^[0-9]+$/.test(flagsText ?? "") ||
+      !/^[0-9]+$/.test(errorText ?? "")) {
+    throw new Error("The native pipe-mode control returned a malformed observation.");
+  }
+  return {
+    label,
+    succeeded: status === "ok",
+    flags: Number(flagsText),
+    error: Number(errorText)
+  };
+}
+
+function parseProductionPipeModeObservation(line: string): ProductionPipeInfoObservation {
+  const [instance, modeText, status, flagsText, errorText] = line.split("\t");
+  if ((instance !== "production-first" && instance !== "production-successor") ||
+      !/^[0-9]+$/.test(modeText ?? "") ||
+      (status !== "ok" && status !== "error") ||
+      !/^[0-9]+$/.test(flagsText ?? "") ||
+      !/^[0-9]+$/.test(errorText ?? "")) {
+    throw new Error("The production pipe-mode observation is malformed.");
+  }
+  return {
+    instance,
+    createMode: Number(modeText),
+    querySucceeded: status === "ok",
+    queryFlags: Number(flagsText),
+    queryError: Number(errorText)
+  };
+}
+
+test("the remote-rejection mode guard detects a cleared flag", () => {
+  const rejectMode = 0x0000000e;
+  expect(() => assertRemoteClientRejectionMode(rejectMode)).not.toThrow();
+  expect(() => assertRemoteClientRejectionMode(rejectMode & ~pipeRejectRemoteClients))
+    .toThrow("The production named-pipe mode does not reject remote clients.");
+});
 
 const replacementPipeServerSource = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -499,6 +562,73 @@ test("required Windows security fixtures fail instead of being skipped", () => {
 });
 
 describe.skipIf(process.platform !== "win32")("Windows configuration pipe identity enforcement", () => {
+  test("qualifies remote-rejection mode on production-created pipe instances", () => {
+    const output = execFileSync(testHelper, ["pipe-info-controls"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      timeout: 5_000,
+      windowsHide: true
+    });
+    const lines = output.trim().split(/\r?\n/);
+    const controls = lines.slice(0, 2).map(parsePipeInfoObservation);
+    const production = lines.slice(2).map(parseProductionPipeModeObservation);
+    expect(controls).toHaveLength(2);
+    expect(production.map((entry) => entry.instance)).toEqual([
+      "production-first",
+      "production-successor"
+    ]);
+    const acceptControl = controls.find((entry) => entry.label === "accept");
+    const rejectControl = controls.find((entry) => entry.label === "reject");
+    if (!acceptControl || !rejectControl) {
+      throw new Error("The native helper did not return both pipe-mode controls.");
+    }
+
+    for (const entry of production) {
+      expect(() => assertRemoteClientRejectionMode(entry.createMode)).not.toThrow();
+      expect(() => assertRemoteClientRejectionMode(
+        entry.createMode & ~pipeRejectRemoteClients
+      )).toThrow("The production named-pipe mode does not reject remote clients.");
+    }
+    console.info("PIPE_MODE_MUTATION_CHECK=PASS cleared-production-argument-bit-was-rejected");
+    console.info("PIPE_MODE_ARGUMENTS=" + production.map((entry) =>
+      entry.instance + ":" + entry.createMode).join(","));
+    console.info(
+      "GETNAMEDPIPEINFO_CONTROLS accept=" +
+      (acceptControl.succeeded ? acceptControl.flags : "error:" + acceptControl.error) +
+      " reject=" +
+      (rejectControl.succeeded ? rejectControl.flags : "error:" + rejectControl.error)
+    );
+
+    const runtimeObservationQualified =
+      acceptControl.succeeded &&
+      rejectControl.succeeded &&
+      (acceptControl.flags & pipeRejectRemoteClients) === 0 &&
+      (rejectControl.flags & pipeRejectRemoteClients) === pipeRejectRemoteClients &&
+      (acceptControl.flags & ~pipeRejectRemoteClients) ===
+        (rejectControl.flags & ~pipeRejectRemoteClients);
+    if (runtimeObservationQualified) {
+      for (const entry of production) {
+        expect(entry.querySucceeded, "GetNamedPipeInfo error " + entry.queryError).toBe(true);
+        expect(entry.queryFlags & pipeRejectRemoteClients).toBe(pipeRejectRemoteClients);
+        expect(entry.queryFlags & ~pipeRejectRemoteClients)
+          .toBe(rejectControl.flags & ~pipeRejectRemoteClients);
+      }
+      console.info("GETNAMEDPIPEINFO_REMOTE_MODE=QUALIFIED production=" + production.map(
+        (entry) => entry.instance + ":" + entry.queryFlags
+      ).join(","));
+    } else {
+      console.info(
+        "GETNAMEDPIPEINFO_REMOTE_MODE=NOT_QUALIFIED accept=" +
+        (acceptControl.succeeded ? acceptControl.flags : "error:" + acceptControl.error) +
+        " reject=" +
+        (rejectControl.succeeded ? rejectControl.flags : "error:" + rejectControl.error) +
+        " production=" + production.map((entry) => entry.instance + ":" +
+          (entry.querySucceeded ? entry.queryFlags : "error:" + entry.queryError)).join(",") +
+        "; the captured CreateNamedPipeW mode remains the production-call regression evidence"
+      );
+    }
+  });
+
   test("keeps the production pipe namespace owner-controlled while admitted clients drain", async ({ skip }) => {
     const fixtureRoot = await mkdtemp(join(publicRoot, "pipe-namespace-"));
     const fixtureId = randomUUID().replaceAll("-", "");

@@ -1,10 +1,20 @@
 # Windows remote named-pipe qualification
 
-Status: **BLOCKED**. No two-host Windows run has been performed. Local tests and CI do not qualify remote-client rejection.
+Two-host SMB status: **NOT RUN**. That procedure is optional supplementary evidence and does not block the single-host qualification or draft publication.
 
-## 1. Pass criteria
+## Required single-host qualification
 
-Count the remote-rejection check as a pass only when all of these conditions hold:
+Windows CI on Node 20 and 22 is the required qualification. The native test helper creates otherwise equivalent accept-remote and reject-remote controls with matching access mode, pipe type, buffer sizes, timeout, and owner DACL. It also calls the shared production pipe factory to create the first and successor instances, then queries those exact handles with GetNamedPipeInfo. Existing Windows security tests separately exercise the production CLI and server lifecycle.
+
+The test records the exact mode passed by the production factory to CreateNamedPipeW. It requires PIPE_REJECT_REMOTE_CLIENTS on both instances. Clearing the bit from either recorded argument must fail the regression assertion. The Windows test is required on its designated CI jobs and must fail there instead of skipping.
+
+Microsoft documents that CreateNamedPipeW automatically rejects remote clients when this flag is set. The public GetNamedPipeInfo reference lists endpoint and pipe-type flags but does not list the remote-rejection bit. Microsoft's HLK test says GetNamedPipeInfo returns the correct option for this mode. CI treats the runtime observation as qualified only when the paired controls differ by the remote-rejection bit and the production handles match the reject-remote control. If they do not, the test reports NOT_QUALIFIED and retains the exact production-call regression evidence. Production does not use GetNamedPipeInfo for enforcement.
+
+The owner approved single-host CI as the required gate because it checks the documented local pipe-creation contract on the Windows kernel used by CI. A two-host attempt adds a second Windows machine, SID and account coordination, DNS, SMB services, and port 445 availability. Those requirements qualify the end-to-end network path. They add infrastructure cost beyond the approved local creation-mode check, so the two-host procedure remains supplementary.
+
+## 1. Optional two-host pass criteria
+
+When running the supplementary check, count it as a pass only when all of these conditions hold:
 
 1. The client and server are separate existing Windows hosts. The client can resolve the server name and reach TCP port 445.
 2. The positive control connects over the network, exchanges a nonce, and reports the authenticated client SID. That SID must match the server helper's owner SID.
@@ -14,14 +24,14 @@ Count the remote-rejection check as a pass only when all of these conditions hol
 
 Do not infer identity from account names. Local accounts with the same name on two computers may have different SIDs. The positive control checks the SID represented by the remote connection on the server. See Microsoft's [SID guidance](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-identifiers).
 
-## 2. Host and network requirements
+## 2. Optional host and network requirements
 
 1. **Server:** Windows 10 or 11, Node.js 20 or 22, and Visual Studio C++ Build Tools plus the Windows SDK for the installed Node architecture. The client needs no repository checkout.
 2. **Client:** a second Windows 10 or 11 host with PowerShell 7.4 or later and the .NET named-pipe APIs.
 3. **Identity:** use a domain account available on both hosts. Confirm the SID on each host with `whoami /user`. The server-side positive control must report that same SID. If a local account is used, proceed only when the observed server-side SID matches the helper owner SID.
-4. **Network:** DNS must resolve the server, SMB named-pipe traffic must be available over TCP 445, and the server and workstation services must already be running. Do not change firewall rules, services, registry values, or machine-wide settings for this check. If a prerequisite fails, stop and leave qualification blocked.
+4. **Network:** DNS must resolve the server, SMB named-pipe traffic must be available over TCP 445, and the server and workstation services must already be running. Do not change firewall rules, services, registry values, or machine-wide settings for this check. If a prerequisite fails, record the two-host run as NOT RUN or INCONCLUSIVE.
 
-Named-pipe remote connections use the SMB `IPC$` share. The [production helper](../native/windows/configuration-admin-host.cpp) creates its pipe with an owner-SID DACL and `PIPE_REJECT_REMOTE_CLIENTS`; the positive control below uses a test DACL for that same owner SID. Microsoft documents the remote-rejection flag as automatically rejecting remote clients and defines `ERROR_PIPE_LOCAL` as “The pipe is local.” See [CreateNamedPipeW](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew), [named pipes](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes), and [system error codes](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-).
+Named-pipe remote connections use the SMB `IPC$` share. The [production helper](../native/windows/configuration-admin-host.cpp) creates its pipe with an owner-SID DACL and `PIPE_REJECT_REMOTE_CLIENTS`; the positive control below uses a test DACL for that same owner SID. Microsoft documents the flag as automatically rejecting remote clients and defines `ERROR_PIPE_LOCAL` as “The pipe is local.” The [public GetNamedPipeInfo reference](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-getnamedpipeinfo) does not list the remote-rejection bit in its `lpFlags` table. The [HLK test](https://learn.microsoft.com/en-us/windows-hardware/test/hlk/testref/e3bcbd3f-3e9c-484a-a587-3c081cb28f7a) states that it checks whether GetNamedPipeInfo returns the option. See [CreateNamedPipeW](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew), [named pipes](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes), and [system error codes](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-).
 
 ## 3. Build and start an isolated production server
 
@@ -250,4 +260,4 @@ if ($helper) {
 Remove-Item -LiteralPath $fixture -Recurse -Force
 ```
 
-Close the dedicated PowerShell window to discard its temporary environment variables. Do not change machine-wide settings or contact another MCP process. The two-host result remains **BLOCKED** until these steps are run and their output is reviewed.
+Close the dedicated PowerShell window to discard its temporary environment variables. Do not change machine-wide settings or contact another MCP process. Until this optional procedure is run, record its result as **NOT RUN**. A run with missing or mismatched evidence is **INCONCLUSIVE**.
