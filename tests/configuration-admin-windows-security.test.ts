@@ -932,6 +932,11 @@ describe.skipIf(process.platform !== "win32")("Windows configuration pipe identi
         serverPid: ownerRecord.server_pid
       }), "utf8");
 
+      const initialOwnerReload = runCli(builtCli, repoRoot, serverEnv, ownerRecord.server_pid);
+      expect(initialOwnerReload.status, initialOwnerReload.stderr).toBe(0);
+      expect(initialOwnerReload.stdout).toContain("Reloaded configuration");
+      expect(await fetch(`http://127.0.0.1:${serverPort}/health`).then((response) => response.ok)).toBe(true);
+
       runAsWindowsUser(userName, password, launcherPath, fixturePath, stdoutPath, stderrPath);
       const result = JSON.parse(await readFile(stdoutPath, "utf8")) as {
         sid: string;

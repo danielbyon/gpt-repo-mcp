@@ -73,6 +73,11 @@ describe.skipIf(process.platform === "win32")("POSIX configuration IPC identity 
 
       const port = await waitForServer(server, () => serverOutput);
       const record = await waitForDiscoveryRecord(adminDirectory, () => serverOutput);
+      const initialOwnerReload = runCli(builtCli, repoRoot, serverEnv, record.server_pid);
+      expect(initialOwnerReload.status, initialOwnerReload.stderr).toBe(0);
+      expect(initialOwnerReload.stdout).toContain("Reloaded configuration");
+      expect(await fetch(`http://127.0.0.1:${port}/health`).then((response) => response.ok)).toBe(true);
+
       const outsiderScript = String.raw`
 import net from "node:net";
 const [endpoint] = process.argv.slice(1);
