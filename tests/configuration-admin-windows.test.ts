@@ -786,6 +786,7 @@ describe("owner-local Windows configuration IPC", () => {
       const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-shutdown-bound-");
       vi.stubEnv("LOCALAPPDATA", localAppData);
       vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_FAULT", "hold-shutdown");
 
       const sourceIdentity: ConfigurationSourceIdentity = {
         status: "available",

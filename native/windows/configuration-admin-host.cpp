@@ -944,6 +944,9 @@ void signalShutdown(ControlHub &hub) {
 
 void dispatchControlLine(const std::string &line, ControlHub &hub) {
   if (line == "SHUTDOWN") {
+#ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
+    if (wcscmp(testFault(), L"hold-shutdown") == 0) Sleep(INFINITE);
+#endif
     signalShutdown(hub);
     return;
   }
