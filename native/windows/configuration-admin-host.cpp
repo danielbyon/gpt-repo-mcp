@@ -39,7 +39,7 @@ constexpr DWORD kMaximumInputBytes = kMaximumFrameBytes + 4;
 constexpr DWORD kMaximumControlLineBytes = 32'768;
 constexpr DWORD kConnectionTimeoutMs = 2'000;
 constexpr DWORD kProbeTimeoutMs = 2'000;
-constexpr DWORD kReloadAcknowledgmentTimeoutMs = 30'000;
+constexpr DWORD kOperationResponseTimeoutMs = 30'000;
 constexpr DWORD kControlLineTimeoutMs = 2'000;
 #ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
 constexpr size_t kMaximumConnections = 2;
@@ -920,10 +920,11 @@ bool hasJsonStringField(const std::string &json, const char *name, const char *e
   return cursor == json.size() || json[cursor] == ',' || json[cursor] == '}';
 }
 
-bool isReloadRequest(const std::vector<BYTE> &request) {
+bool usesOperationResponseTimeout(const std::vector<BYTE> &request) {
   if (request.size() < 4) return false;
   const std::string json(reinterpret_cast<const char *>(request.data() + 4), request.size() - 4);
-  return hasJsonStringField(json, "operation", "reload");
+  return hasJsonStringField(json, "operation", "reload") ||
+      hasJsonStringField(json, "operation", "status");
 }
 
 std::string nextConnectionId() {
@@ -1095,8 +1096,8 @@ ControlResult handleServerConnection(HANDLE pipe, HANDLE parentProcess, ControlH
   }
 
   std::vector<BYTE> response;
-  const DWORD acknowledgmentTimeout = isReloadRequest(request)
-      ? kReloadAcknowledgmentTimeoutMs : kProbeTimeoutMs;
+  const DWORD acknowledgmentTimeout = usesOperationResponseTimeout(request)
+      ? kOperationResponseTimeoutMs : kProbeTimeoutMs;
   const ULONGLONG acknowledgmentDeadline = GetTickCount64() + acknowledgmentTimeout;
   const ControlResult result = waitForControlResponse(
       parentProcess, clientProcess.get(), hub, connectionId, pending,
