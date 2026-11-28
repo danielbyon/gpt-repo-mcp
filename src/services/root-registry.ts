@@ -25,6 +25,23 @@ export type PreparedRootConfiguration = Readonly<{
   codeIntelligence?: DeepReadonly<NonNullable<RepoReaderConfig["code_intelligence"]>>;
 }>;
 
+export type ConfigurationPreparationCategory = "json" | "configuration" | "repository-filesystem" | "mixed";
+
+/** Carries safe failure categories from the canonical configuration preparation path. */
+export class ConfigurationPreparationError extends Error {
+  readonly issueCodes: readonly string[];
+
+  constructor(
+    readonly category: ConfigurationPreparationCategory,
+    issueCodes: readonly string[],
+    message: string
+  ) {
+    super(message);
+    this.name = "ConfigurationPreparationError";
+    this.issueCodes = Object.freeze([...new Set(issueCodes)]);
+  }
+}
+
 export class RootRegistry {
   private constructor(
     private readonly repos: readonly RepoConfig[],
@@ -40,15 +57,63 @@ export class RootRegistry {
 
   /** Validates one file buffer before building the immutable registry it describes. */
   static async prepareFromBuffer(raw: Uint8Array, configPath: string): Promise<PreparedRootConfiguration> {
-    const validation = await validateConfigDocument(JSON.parse(Buffer.from(raw).toString("utf8")));
+    let document: unknown;
+    try {
+      document = JSON.parse(Buffer.from(raw).toString("utf8"));
+    } catch {
+      throw new ConfigurationPreparationError("json", [], `Invalid repository config at ${configPath}: JSON parsing failed.`);
+    }
+
+    let validation: Awaited<ReturnType<typeof validateConfigDocument>>;
+    try {
+      validation = await validateConfigDocument(document);
+    } catch (error) {
+      const repositoryFilesystemFailure = isFilesystemError(error);
+      throw new ConfigurationPreparationError(
+        repositoryFilesystemFailure ? "repository-filesystem" : "configuration",
+        [repositoryFilesystemFailure ? "REPOSITORY_FILESYSTEM_VALIDATION_FAILED" : "CONFIGURATION_VALIDATION_FAILED"],
+        `Invalid repository config at ${configPath}: ${repositoryFilesystemFailure
+          ? "repository filesystem validation failed."
+          : "configuration validation failed."}`
+      );
+    }
     if (validation.issues.length > 0 || !validation.config) {
       const details = validation.issues.map(({ code, message }) => `${code}: ${message}`).join("; ");
-      throw new Error(`Invalid repository config at ${configPath}: ${details || "no parsed config was returned"}`);
+      const issueCodes = validation.issues.map(({ code }) => code);
+      const hasRepositoryFilesystemIssue = issueCodes.some((code) =>
+        code === "ROOT_MISSING" || code === "ROOT_NOT_DIRECTORY" || code === "NOT_GIT_REPO"
+      );
+      const hasConfigurationIssue = issueCodes.some((code) =>
+        code !== "ROOT_MISSING" && code !== "ROOT_NOT_DIRECTORY" && code !== "NOT_GIT_REPO"
+      ) || issueCodes.length === 0;
+      const category: ConfigurationPreparationCategory = hasRepositoryFilesystemIssue && hasConfigurationIssue
+        ? "mixed"
+        : hasRepositoryFilesystemIssue
+          ? "repository-filesystem"
+          : "configuration";
+      throw new ConfigurationPreparationError(
+        category,
+        issueCodes.length > 0 ? issueCodes : ["CONFIGURATION_VALIDATION_FAILED"],
+        `Invalid repository config at ${configPath}: ${details || "no parsed config was returned"}`
+      );
     }
 
     const parsed = RepoReaderConfigSchema.parse(validation.config);
+    let registry: RootRegistry;
+    try {
+      registry = await RootRegistry.create(parsed);
+    } catch (error) {
+      const repositoryFilesystemFailure = isFilesystemError(error);
+      throw new ConfigurationPreparationError(
+        repositoryFilesystemFailure ? "repository-filesystem" : "configuration",
+        [repositoryFilesystemFailure ? "ROOT_CANONICALIZATION_FAILED" : "CONFIGURATION_PREPARATION_FAILED"],
+        `Invalid repository config at ${configPath}: ${repositoryFilesystemFailure
+          ? "repository filesystem validation failed."
+          : "configuration preparation failed."}`
+      );
+    }
     return Object.freeze({
-      registry: await RootRegistry.create(parsed),
+      registry,
       ...(parsed.code_intelligence
         ? { codeIntelligence: deepFreeze(parsed.code_intelligence) }
         : {})
@@ -98,4 +163,10 @@ function deepFreeze<T>(value: T): DeepReadonly<T> {
     Object.freeze(value);
   }
   return value as DeepReadonly<T>;
+}
+
+function isFilesystemError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return typeof code === "string" && /^(?:EACCES|EIO|EISDIR|ELOOP|EMFILE|ENAMETOOLONG|ENFILE|ENOENT|ENOTDIR|ENOSPC|EPERM|EROFS)$/.test(code);
 }

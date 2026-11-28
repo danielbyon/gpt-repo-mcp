@@ -1,7 +1,8 @@
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { createConnection, type AddressInfo } from "node:net";
+import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -10,8 +11,8 @@ import { expect, test, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { createConfigurationSourceIdentity } from "../src/config/config-source-identity.js";
 import { createConfigurationAdminController } from "../src/runtime/configuration-admin-controller.js";
-import { startPosixConfigurationAdminServer } from "../src/runtime/configuration-admin-posix.js";
-import { encodeAdminFrame, type ConfigurationAdminResponse } from "../src/runtime/configuration-admin-protocol.js";
+import { startConfigurationAdminHost } from "../src/runtime/configuration-admin-host.js";
+import { parseAdminRequest, type ConfigurationAdminResponse } from "../src/runtime/configuration-admin-protocol.js";
 import { createMcpHttpApp } from "../src/runtime/mcp-http-app.js";
 import { ConfigurationRevisionStore, prepareConfigurationCandidate } from "../src/services/configuration-revision-store.js";
 import type { EffectiveHotRevision } from "../src/services/configuration-revision-store.js";
@@ -253,80 +254,92 @@ test("serves the published snapshot after an administrative reload acknowledgeme
   }
 }, 15_000);
 
-test.skipIf(process.platform === "win32")(
-  "serves a published snapshot after its administrative reload acknowledgement is lost",
-  async () => {
+test("production CLI recovers after a published reload response is lost over real IPC", async () => {
   const fixture = await createFixture();
   const publication = deferred<ConfigurationAdminResponse>();
-  const releaseAcknowledgement = deferred<void>();
   let ipcDirectory: string | undefined;
+  let localAppData: string | undefined;
   let httpApp: ReturnType<typeof createMcpHttpApp> | undefined;
   let server: ReturnType<typeof createServer> | undefined;
   let client: Client | undefined;
-  let adminHost: Awaited<ReturnType<typeof startPosixConfigurationAdminServer>> | undefined;
-  let socket: ReturnType<typeof createConnection> | undefined;
+  let adminHost: Awaited<ReturnType<typeof startConfigurationAdminHost>> | undefined;
 
   try {
-    ipcDirectory = await mkdtemp(join("/tmp", "gpt-admin-"));
+    if (process.platform === "win32") {
+      const profile = process.env.USERPROFILE;
+      if (!profile) throw new Error("Windows acceptance tests require USERPROFILE.");
+      localAppData = await mkdtemp(join(profile, "gpt-repo-admin-e2e-"));
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+    } else {
+      ipcDirectory = await mkdtemp(join("/tmp", "gpt-admin-"));
+      await chmod(ipcDirectory, 0o700);
+      vi.stubEnv("GPT_REPO_TEST_BUILT_SERVER", "1");
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_DIRECTORY", ipcDirectory);
+    }
+    const cliPath = join(process.cwd(), "dist", "cli", "connect-gpt.js");
+    await access(cliPath);
     const sourceIdentity = createConfigurationSourceIdentity(fixture.configPath, process.cwd());
     const instanceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     httpApp = createMcpHttpApp({ revisionStore: fixture.store, maxSessions: 4, sessionIdleTtlMs: 60_000 });
+    let helperPid: number | undefined;
     const controller = createConfigurationAdminController({
       serverPid: process.pid,
+      helperPid: () => helperPid,
       instanceId,
       sourceIdentity,
       revisionStore: fixture.store
     });
-    const httpServer = createServer(httpApp.app);
-    server = httpServer;
-    const mcpClient = new Client({ name: "configuration-admin-lost-ack-test", version: "1" });
-    client = mcpClient;
-
-    await chmod(ipcDirectory, 0o700);
-    adminHost = await startPosixConfigurationAdminServer({
-      directory: ipcDirectory,
+    adminHost = await startConfigurationAdminHost({
       serverPid: process.pid,
       instanceId,
-      handle: async (request) => {
+      onHelperPid: (pid) => { helperPid = pid; },
+      handle: async (value) => {
+        const request = parseAdminRequest(value);
         const response = await controller.handle(request);
-        if (response.operation === "reload_result" && response.outcome === "published") {
+        if (request.operation === "reload" && response.operation === "reload_result" && response.outcome === "published") {
           publication.resolve(response);
-          await releaseAcknowledgement.promise;
+          throw new Error("The test host drops the published reload response.");
         }
         return response;
       }
     });
+    const httpServer = createServer(httpApp.app);
+    server = httpServer;
+    const mcpClient = new Client({ name: "configuration-admin-recovery-test", version: "1" });
+    client = mcpClient;
+
     await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
     const address = httpServer.address() as AddressInfo;
     await mcpClient.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`)));
+    const rootsBefore = await callRawTool(mcpClient, "repo_list_roots", {});
+    expect(JSON.stringify(rootsBefore)).toContain("old-root");
 
     await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)]);
     const acceptedBytes = await readFile(fixture.configPath);
-    const request = {
-      protocol_version: 1 as const,
-      request_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-      operation: "reload" as const,
-      expected_server_pid: process.pid,
-      expected_instance_id: instanceId,
-      expected_source_identity: sourceIdentity
-    };
-
-    socket = createConnection(adminHost.record.endpoint);
-    await new Promise<void>((resolve, reject) => {
-      socket!.once("connect", resolve);
-      socket!.once("error", reject);
-    });
-    socket.end(encodeAdminFrame(request));
+    const reloadPromise = runBuiltCli(["--config", fixture.configPath, "config", "reload"], createCliEnvironment(ipcDirectory, localAppData));
     const response = await publication.promise;
-
-    // Closing before the handler returns prevents the published response from reaching this client.
-    socket.destroy();
-    releaseAcknowledgement.resolve();
+    const reloadResult = await reloadPromise;
     expect(response).toMatchObject({
       outcome: "published",
       effective_generation: 2,
       accepted_source_sha256: createHash("sha256").update(acceptedBytes).digest("hex")
     });
+    expect(reloadResult.code).toBe(1);
+    expect(reloadResult.stderr).toContain("Configuration reload outcome is indeterminate");
+    expect(fixture.store.getState()).toMatchObject({
+      acceptedCandidate: { sourceSha256: createHash("sha256").update(acceptedBytes).digest("hex") },
+      effectiveHotRevision: { generation: 2 },
+      lastReloadOutcome: "accepted"
+    });
+
+    const statusResult = await runBuiltCli(["--config", fixture.configPath, "config", "status"], createCliEnvironment(ipcDirectory, localAppData));
+    expect(statusResult.code).toBe(0);
+    expect(statusResult.stdout).toContain(`Accepted candidate: sha256=${createHash("sha256").update(acceptedBytes).digest("hex")}`);
+    expect(statusResult.stdout).toContain("Effective hot revision: generation=2");
+    expect(statusResult.stdout).toContain("Saved file: valid");
+    expect(statusResult.stdout).toContain("matches_accepted=true");
+    expect(statusResult.stdout).toContain("Last reload outcome: accepted");
 
     const rootsResult = await callRawTool(mcpClient, "repo_list_roots", {});
     const roots = rootsResult.structuredContent as { repos: Array<{ root: string }> };
@@ -334,8 +347,6 @@ test.skipIf(process.platform === "win32")(
     expect(rootPaths).toContain(await realpath(fixture.newRoot));
     expect(rootPaths).not.toContain(await realpath(fixture.oldRoot));
   } finally {
-    releaseAcknowledgement.resolve();
-    socket?.destroy();
     await client?.close().catch(() => undefined);
     server?.closeAllConnections();
     try {
@@ -351,15 +362,60 @@ test.skipIf(process.platform === "win32")(
           try {
             if (ipcDirectory) await rm(ipcDirectory, { recursive: true, force: true });
           } finally {
-            await rm(fixture.directory, { recursive: true, force: true });
+            try {
+              if (localAppData) await rm(localAppData, { recursive: true, force: true });
+            } finally {
+              vi.unstubAllEnvs();
+              await rm(fixture.directory, { recursive: true, force: true });
+            }
           }
         }
       }
     }
   }
-  },
-  15_000
-);
+}, 30_000);
+
+function createCliEnvironment(ipcDirectory: string | undefined, localAppData: string | undefined): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GPT_REPO_CONFIG: undefined,
+    REPO_READER_CONFIG: undefined,
+    ...(ipcDirectory ? {
+      GPT_REPO_TEST_BUILT_SERVER: "1",
+      GPT_REPO_ADMIN_TEST_DIRECTORY: ipcDirectory
+    } : {}),
+    ...(localAppData ? {
+      LOCALAPPDATA: localAppData,
+      GPT_REPO_ADMIN_TEST_HELPER: "1"
+    } : {})
+  };
+}
+
+function runBuiltCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+}> {
+  const child = spawn(process.execPath, [join(process.cwd(), "dist", "cli", "connect-gpt.js"), ...args], {
+    cwd: process.cwd(),
+    env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+  child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({
+      code,
+      signal,
+      stdout: Buffer.concat(stdout).toString("utf8"),
+      stderr: Buffer.concat(stderr).toString("utf8")
+    }));
+  });
+}
 
 async function createFixture() {
   const directory = await mkdtemp(join(tmpdir(), "mcp-config-activation-"));

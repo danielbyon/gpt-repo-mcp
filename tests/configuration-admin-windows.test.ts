@@ -87,6 +87,53 @@ const overlappingReloadScenarios: Array<{
 
 describe("owner-local Windows configuration IPC", () => {
   test.skipIf(process.platform !== "win32")(
+    "uses the shared 30-second status budget through the native helper",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-status-deadline-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      let helperPid: number | undefined;
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          onHelperPid: (pid) => { helperPid = pid; },
+          handle: async (value) => {
+            const request = parseAdminRequest(value);
+            await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_250));
+            return statusResponse(request.request_id, sourceIdentity, helperPid);
+          }
+        });
+
+        const response = await requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "34343434-3434-4434-8434-343434343434",
+          operation: "status",
+          expected_server_pid: process.pid,
+          expected_instance_id: instanceId,
+          expected_source_identity: sourceIdentity
+        });
+
+        expect(response).toMatchObject({
+          operation: "status_result",
+          request_id: "34343434-3434-4434-8434-343434343434",
+          helper_pid: host.record.helper_pid
+        });
+      } finally {
+        await cleanupWindowsHost(host, localAppData);
+      }
+    },
+    15_000
+  );
+
+  test.skipIf(process.platform !== "win32")(
     "keeps a confirmed startup publication when the acknowledgment write callback stalls",
     async () => {
       const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-start-ack-delay-");
@@ -248,7 +295,11 @@ describe("owner-local Windows configuration IPC", () => {
         },
         instanceId,
         sourceIdentity,
-        revisionStore: { getState: () => currentState, reloadFromFile }
+        revisionStore: {
+          getState: () => currentState,
+          captureStatus: async () => { throw new Error("Status capture is not used by this reload test."); },
+          reloadFromFile
+        }
       });
       let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
 
@@ -1232,6 +1283,38 @@ function reloadResponse(
     effective_generation: 8,
     accepted_source_sha256: digestCharacter.repeat(64),
     pending_restart: false
+  };
+}
+
+function statusResponse(
+  requestId: string,
+  sourceIdentity: ConfigurationSourceIdentity,
+  helperPid?: number
+): ConfigurationAdminResponse {
+  return {
+    protocol_version: 1,
+    request_id: requestId,
+    server_pid: process.pid,
+    ...(helperPid === undefined ? {} : { helper_pid: helperPid }),
+    instance_id: instanceId,
+    source_identity: sourceIdentity,
+    operation: "status_result",
+    accepted_candidate: {
+      source_sha256: "a".repeat(64),
+      repository_count: 1,
+      restart_fields: []
+    },
+    saved_source: {
+      status: "valid",
+      source_sha256: "a".repeat(64),
+      matches_accepted: true,
+      repository_count: 1,
+      restart_fields: []
+    },
+    active_hot_revision: { generation: 1, repository_count: 1 },
+    initialized_restart_fields: [],
+    pending_restart_fields: [],
+    last_reload_outcome: "not-run"
   };
 }
 

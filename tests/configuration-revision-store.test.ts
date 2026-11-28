@@ -21,12 +21,14 @@ test("tracks exact accepted bytes without advancing an unchanged hot revision", 
     const initial = await prepareConfigurationCandidate(firstBytes, configPath);
     const store = new ConfigurationRevisionStore({ configPath, initial });
     const originalRevision = store.capture();
+    expect(store.getState().lastReloadOutcome).toBe("not-run");
   expect(Object.hasOwn(originalRevision, "registry")).toBe(false);
 
     const formattedBytes = Buffer.from(`${JSON.stringify(document, null, 2)}\n`);
     await writeFile(configPath, formattedBytes);
     const accepted = await store.reloadFromFile();
 
+    expect(accepted.lastReloadOutcome).toBe("accepted");
     expect(accepted.acceptedCandidate?.sourceSha256).toBe(createHash("sha256").update(formattedBytes).digest("hex"));
     expect(accepted.acceptedCandidate?.sourceSha256).not.toBe(initial.sourceSha256);
     expect(accepted.effectiveHotRevision).toBe(originalRevision);
@@ -49,19 +51,157 @@ test("rejects invalid candidates without changing accepted or effective state", 
 
     await writeFile(configPath, "{broken json");
     await expect(store.reloadFromFile()).rejects.toThrow();
-    expect(store.getState()).toBe(before);
+    expect(store.getState()).toMatchObject({ lastReloadOutcome: "rejected" });
+    expect(store.getState().acceptedCandidate).toBe(before.acceptedCandidate);
+    expect(store.getState().effectiveHotRevision).toBe(before.effectiveHotRevision);
 
     await writeFile(configPath, JSON.stringify({ repos: [], limits: {}, extra: true }));
     await expect(store.reloadFromFile()).rejects.toThrow("SCHEMA_INVALID");
-    expect(store.getState()).toBe(before);
+    expect(store.getState()).toMatchObject({ lastReloadOutcome: "rejected" });
+    expect(store.getState().acceptedCandidate).toBe(before.acceptedCandidate);
+    expect(store.getState().effectiveHotRevision).toBe(before.effectiveHotRevision);
 
     await writeFile(configPath, JSON.stringify(repositoryConfig(join(directory, "missing-root"))));
     await expect(store.reloadFromFile()).rejects.toThrow("ROOT_MISSING");
-    expect(store.getState()).toBe(before);
+    expect(store.getState()).toMatchObject({ lastReloadOutcome: "rejected" });
+    expect(store.getState().acceptedCandidate).toBe(before.acceptedCandidate);
+    expect(store.getState().effectiveHotRevision).toBe(before.effectiveHotRevision);
 
     await rm(configPath);
     await expect(store.reloadFromFile()).rejects.toThrow();
-    expect(store.getState()).toBe(before);
+    expect(store.getState()).toMatchObject({ lastReloadOutcome: "rejected" });
+    expect(store.getState().acceptedCandidate).toBe(before.acceptedCandidate);
+    expect(store.getState().effectiveHotRevision).toBe(before.effectiveHotRevision);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("observes saved source failures with safe categories and raw-byte fingerprints", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "configuration-status-observation-"));
+  const root = join(directory, "repo");
+  const configPath = join(directory, "config.json");
+  try {
+    await mkdir(root);
+    const initialBytes = Buffer.from(JSON.stringify(repositoryConfig(root)));
+    await writeFile(configPath, initialBytes);
+    const initial = await prepareConfigurationCandidate(initialBytes, configPath);
+    const store = new ConfigurationRevisionStore({ configPath, initial });
+
+    const matching = await store.captureStatus();
+    expect(matching.savedSource).toMatchObject({
+      status: "valid",
+      sourceSha256: createHash("sha256").update(initialBytes).digest("hex"),
+      matchesAccepted: true,
+      repositoryCount: 1
+    });
+    expect(matching.state.lastReloadOutcome).toBe("not-run");
+
+    const malformedBytes = Buffer.from("{broken json");
+    await writeFile(configPath, malformedBytes);
+    const malformed = await store.captureStatus();
+    expect(malformed.savedSource).toEqual({
+      status: "invalid-json",
+      sourceSha256: createHash("sha256").update(malformedBytes).digest("hex")
+    });
+
+    const invalidConfigurationBytes = Buffer.from(JSON.stringify({ repos: [], extra: true }));
+    await writeFile(configPath, invalidConfigurationBytes);
+    const invalidConfiguration = await store.captureStatus();
+    expect(invalidConfiguration.savedSource).toMatchObject({
+      status: "validation-failed",
+      category: "configuration",
+      sourceSha256: createHash("sha256").update(invalidConfigurationBytes).digest("hex"),
+      issueCodes: ["SCHEMA_INVALID"]
+    });
+
+    const missingRepositoryBytes = Buffer.from(JSON.stringify(repositoryConfig(join(directory, "missing-repo"))));
+    await writeFile(configPath, missingRepositoryBytes);
+    const invalidRepository = await store.captureStatus();
+    expect(invalidRepository.savedSource).toMatchObject({
+      status: "validation-failed",
+      category: "repository-filesystem",
+      sourceSha256: createHash("sha256").update(missingRepositoryBytes).digest("hex"),
+      issueCodes: ["ROOT_MISSING"]
+    });
+
+    await rm(configPath);
+    const missingFile = await store.captureStatus();
+    expect(missingFile.savedSource).toEqual({ status: "read-failed", code: "FILE_NOT_FOUND" });
+    expect(missingFile.state.acceptedCandidate.sourceSha256).toBe(initial.sourceSha256);
+    expect(missingFile.state.effectiveHotRevision.generation).toBe(1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("captures runtime state before a concurrent reload without joining its queue", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "configuration-status-concurrency-"));
+  const rootA = join(directory, "repo-a");
+  const rootB = join(directory, "repo-b");
+  const configPath = join(directory, "config.json");
+  try {
+    await mkdir(rootA);
+    await mkdir(rootB);
+    const initialBytes = Buffer.from(JSON.stringify(repositoryConfig(rootA)));
+    const nextBytes = Buffer.from(JSON.stringify(repositoryConfig(rootB)));
+    await writeFile(configPath, initialBytes);
+    const initial = await prepareConfigurationCandidate(initialBytes, configPath);
+    const statusReadStarted = deferred<void>();
+    const releaseStatusRead = deferred<void>();
+    let reads = 0;
+    const store = new ConfigurationRevisionStore({
+      configPath,
+      initial,
+      readCandidateBytes: async () => {
+        reads += 1;
+        if (reads === 1) {
+          statusReadStarted.resolve();
+          await releaseStatusRead.promise;
+          return nextBytes;
+        }
+        return nextBytes;
+      }
+    });
+
+    const statusPromise = store.captureStatus();
+    await statusReadStarted.promise;
+    const reloadPromise = store.reloadFromFile();
+    const reloaded = await reloadPromise;
+    expect(reloaded.lastReloadOutcome).toBe("accepted");
+    expect(reloaded.effectiveHotRevision.generation).toBe(2);
+
+    releaseStatusRead.resolve();
+    const observed = await statusPromise;
+    expect(observed.state.effectiveHotRevision.generation).toBe(1);
+    expect(observed.state.acceptedCandidate.sourceSha256).toBe(initial.sourceSha256);
+    expect(observed.savedSource).toMatchObject({
+      status: "valid",
+      sourceSha256: createHash("sha256").update(nextBytes).digest("hex"),
+      matchesAccepted: false
+    });
+    expect(reads).toBe(2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("reports intentional no-source mode without reading a file", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "configuration-status-no-source-"));
+  const root = join(directory, "repo");
+  try {
+    await mkdir(root);
+    const initialBytes = Buffer.from(JSON.stringify(repositoryConfig(root)));
+    const initial = await prepareConfigurationCandidate(initialBytes, join(directory, "unused.json"));
+    const readCandidateBytes = async () => {
+      throw new Error("no-source status must not read a configuration file");
+    };
+    const store = new ConfigurationRevisionStore({ initial, readCandidateBytes });
+
+    const observed = await store.captureStatus();
+
+    expect(observed.savedSource).toEqual({ status: "no-source" });
+    expect(observed.state.lastReloadOutcome).toBe("not-run");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

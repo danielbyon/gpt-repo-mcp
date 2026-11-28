@@ -2,7 +2,7 @@ import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { encodeAdminFrame } from "../src/runtime/configuration-admin-protocol.js";
+import { encodeAdminFrame, type ConfigurationAdminResponse } from "../src/runtime/configuration-admin-protocol.js";
 
 const sourceIdentity = {
   status: "available",
@@ -49,6 +49,85 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
       }
     }
   });
+
+  test("completes a correlated status request over the real local socket", async () => {
+    const ipc = await import("../src/runtime/configuration-admin-posix.js");
+    const directory = await createPrivateDirectory();
+    let closeEndpoint: (() => Promise<void>) | undefined;
+
+    try {
+      const endpoint = await ipc.startPosixConfigurationAdminServer({
+        directory,
+        serverPid: process.pid,
+        instanceId,
+        handle: async (value) => statusResponse(value)
+      });
+      closeEndpoint = endpoint.close;
+      const request = {
+        protocol_version: 1,
+        request_id: "99999999-9999-4999-8999-999999999999",
+        operation: "status",
+        expected_server_pid: process.pid,
+        expected_instance_id: instanceId,
+        expected_source_identity: sourceIdentity
+      } as const;
+
+      const response = await ipc.requestPosixConfigurationAdmin(endpoint.record, request);
+
+      expect(response).toMatchObject({ request_id: request.request_id, operation: "status_result" });
+    } finally {
+      await closeEndpoint?.();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("gives status handling one 30-second server deadline", async () => {
+    const ipc = await import("../src/runtime/configuration-admin-posix.js");
+    const directory = await createPrivateDirectory();
+    let closeEndpoint: (() => Promise<void>) | undefined;
+    let socket: ReturnType<typeof createConnection> | undefined;
+    let markHandled: (() => void) | undefined;
+    const handled = new Promise<void>((resolve) => { markHandled = resolve; });
+
+    try {
+      const endpoint = await ipc.startPosixConfigurationAdminServer({
+        directory,
+        serverPid: process.pid,
+        instanceId,
+        handle: async () => {
+          markHandled?.();
+          return await new Promise<never>(() => undefined);
+        }
+      });
+      closeEndpoint = endpoint.close;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      socket = createConnection({ path: endpoint.record.endpoint });
+      const closed = new Promise<void>((resolve) => socket?.once("close", resolve));
+      socket.end(encodeAdminFrame({
+        protocol_version: 1,
+        request_id: "abababab-abab-4bab-8bab-abababababab",
+        operation: "status",
+        expected_server_pid: process.pid,
+        expected_instance_id: instanceId,
+        expected_source_identity: sourceIdentity
+      }));
+      await handled;
+
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(socket.destroyed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_000);
+      const closedAfterDeadline = await Promise.race([
+        closed.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+      ]);
+      expect(closedAfterDeadline).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      socket?.destroy();
+      await closeEndpoint?.();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 4_000);
 
   test("rejects an unsafe discovery directory before creating an endpoint", async () => {
     const ipc = await import("../src/runtime/configuration-admin-posix.js");
@@ -162,6 +241,57 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
     }
   });
 
+  test("uses a 30-second client response budget for status after the probe-length connection phase", async () => {
+    const ipc = await import("../src/runtime/configuration-admin-posix.js");
+    const directory = await createPrivateDirectory();
+    const endpointPath = join(directory, `instance-${instanceId}.sock`);
+    const server = createServer((socket) => socket.on("data", () => undefined));
+    let serverSocket: Socket | undefined;
+    server.on("connection", (socket) => { serverSocket = socket; });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(endpointPath, resolve);
+      });
+      await chmod(endpointPath, 0o600);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const requestPromise = ipc.requestPosixConfigurationAdmin({
+        protocol_version: 1,
+        server_pid: process.pid,
+        instance_id: instanceId,
+        endpoint: endpointPath
+      }, {
+        protocol_version: 1,
+        request_id: "12121212-1212-4212-8212-121212121212",
+        operation: "status",
+        expected_server_pid: process.pid,
+        expected_instance_id: instanceId,
+        expected_source_identity: sourceIdentity
+      });
+      let result: { kind: "resolved" } | { kind: "rejected"; error: unknown } | undefined;
+      void requestPromise.then(
+        () => { result = { kind: "resolved" }; },
+        (error: unknown) => { result = { kind: "rejected", error }; }
+      );
+      await new Promise<void>((resolve) => server.once("connection", () => resolve()));
+
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(result).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(27_900);
+      await Promise.resolve();
+      expect(result).toMatchObject({ kind: "rejected", error: { code: "IPC_TIMEOUT", phase: "pre-dispatch" } });
+    } finally {
+      vi.useRealTimers();
+      serverSocket?.destroy();
+      try {
+        if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  }, 4_000);
+
   test("keeps a post-publication controller failure indeterminate across POSIX IPC", async () => {
     const ipc = await import("../src/runtime/configuration-admin-posix.js");
     const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
@@ -184,7 +314,11 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
       helperPid: () => { throw new Error("helper PID response unavailable"); },
       instanceId,
       sourceIdentity,
-      revisionStore: { getState: () => currentState, reloadFromFile }
+      revisionStore: {
+        getState: () => currentState,
+        captureStatus: async () => { throw new Error("Status capture is not used by this reload test."); },
+        reloadFromFile
+      }
     });
     let closeEndpoint: (() => Promise<void>) | undefined;
 
@@ -573,7 +707,7 @@ async function createPrivateDirectory(): Promise<string> {
   }
 }
 
-function probeResponse(value: unknown) {
+function probeResponse(value: unknown): ConfigurationAdminResponse {
   const requestId = typeof value === "object" && value !== null && "request_id" in value
     ? String(value.request_id)
     : "11111111-1111-4111-8111-111111111111";
@@ -587,5 +721,31 @@ function probeResponse(value: unknown) {
     effective_generation: 2,
     accepted_source_sha256: "a".repeat(64),
     pending_restart: false
-  } as const;
+  };
+}
+
+function statusResponse(value: unknown): ConfigurationAdminResponse {
+  const requestId = typeof value === "object" && value !== null && "request_id" in value
+    ? String(value.request_id)
+    : "11111111-1111-4111-8111-111111111111";
+  return {
+    protocol_version: 1,
+    request_id: requestId,
+    operation: "status_result",
+    server_pid: process.pid,
+    instance_id: instanceId,
+    source_identity: sourceIdentity,
+    accepted_candidate: { source_sha256: "a".repeat(64), repository_count: 1, restart_fields: [] },
+    saved_source: {
+      status: "valid",
+      source_sha256: "a".repeat(64),
+      matches_accepted: true,
+      repository_count: 1,
+      restart_fields: []
+    },
+    active_hot_revision: { generation: 2, repository_count: 1 },
+    initialized_restart_fields: [],
+    pending_restart_fields: [],
+    last_reload_outcome: "not-run"
+  };
 }

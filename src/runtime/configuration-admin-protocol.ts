@@ -38,6 +38,20 @@ const ReloadRequestSchema = z.object({
   expected_source_identity: AvailableSourceIdentitySchema
 }).strict();
 
+const StatusSourceIdentitySchema = z.union([
+  z.object({ status: z.literal("none") }).strict(),
+  AvailableSourceIdentitySchema
+]);
+
+const StatusRequestSchema = z.object({
+  protocol_version: z.literal(CONFIGURATION_ADMIN_PROTOCOL_VERSION),
+  request_id: z.string().uuid(),
+  operation: z.literal("status"),
+  expected_server_pid: z.number().int().positive(),
+  expected_instance_id: z.string().uuid(),
+  expected_source_identity: StatusSourceIdentitySchema
+}).strict();
+
 const ResponseIdentitySchema = z.object({
   protocol_version: z.literal(CONFIGURATION_ADMIN_PROTOCOL_VERSION),
   request_id: z.string().uuid(),
@@ -73,20 +87,73 @@ const ReloadResponseSchema = z.discriminatedUnion("outcome", [
   }).strict()
 ]);
 
-export type ConfigurationAdminRequest = z.infer<typeof ProbeRequestSchema | typeof ReloadRequestSchema>;
-export type ConfigurationAdminResponse = z.infer<typeof StateResponseSchema | typeof ReloadResponseSchema>;
+const StatusFieldNamesSchema = z.array(z.string().min(1).max(64).regex(/^[a-z][a-z0-9_]*$/)).max(32);
+const StatusIssueCodesSchema = z.array(z.string().min(1).max(64).regex(/^[A-Z][A-Z0-9_]*$/)).max(16);
+const StatusHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
+
+const SavedSourceStatusSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("no-source") }).strict(),
+  z.object({
+    status: z.literal("read-failed"),
+    code: z.enum(["FILE_NOT_FOUND", "FILE_READ_FAILED"])
+  }).strict(),
+  z.object({
+    status: z.literal("invalid-json"),
+    source_sha256: StatusHashSchema
+  }).strict(),
+  z.object({
+    status: z.literal("validation-failed"),
+    category: z.enum(["configuration", "repository-filesystem", "mixed"]),
+    source_sha256: StatusHashSchema,
+    issue_codes: StatusIssueCodesSchema,
+    issue_codes_truncated: z.boolean()
+  }).strict(),
+  z.object({
+    status: z.literal("valid"),
+    source_sha256: StatusHashSchema,
+    matches_accepted: z.boolean(),
+    repository_count: z.number().int().nonnegative(),
+    restart_fields: StatusFieldNamesSchema
+  }).strict()
+]);
+
+const StatusResponseSchema = ResponseIdentitySchema.extend({
+  operation: z.literal("status_result"),
+  accepted_candidate: z.object({
+    source_sha256: StatusHashSchema,
+    repository_count: z.number().int().nonnegative(),
+    restart_fields: StatusFieldNamesSchema
+  }).strict(),
+  saved_source: SavedSourceStatusSchema,
+  active_hot_revision: z.object({
+    generation: z.number().int().nonnegative(),
+    repository_count: z.number().int().nonnegative()
+  }).strict(),
+  initialized_restart_fields: StatusFieldNamesSchema,
+  pending_restart_fields: StatusFieldNamesSchema,
+  last_reload_outcome: z.enum(["not-run", "accepted", "rejected"])
+}).strict();
+
+export type ConfigurationAdminRequest = z.infer<
+  typeof ProbeRequestSchema | typeof ReloadRequestSchema | typeof StatusRequestSchema
+>;
+export type ConfigurationAdminResponse = z.infer<
+  typeof StateResponseSchema | typeof ReloadResponseSchema | typeof StatusResponseSchema
+>;
 export type ConfigurationAdminProbeResponse = Extract<ConfigurationAdminResponse, { operation: "probe_result" }>;
 export type ConfigurationAdminReloadRequest = Extract<ConfigurationAdminRequest, { operation: "reload" }>;
 export type ConfigurationAdminReloadResponse = Extract<ConfigurationAdminResponse, { operation: "reload_result" }>;
+export type ConfigurationAdminStatusRequest = Extract<ConfigurationAdminRequest, { operation: "status" }>;
+export type ConfigurationAdminStatusResponse = Extract<ConfigurationAdminResponse, { operation: "status_result" }>;
 
 /** Validates a decoded message before any administrative action is considered. */
 export function parseAdminRequest(value: unknown): ConfigurationAdminRequest {
-  return z.discriminatedUnion("operation", [ProbeRequestSchema, ReloadRequestSchema]).parse(value);
+  return z.discriminatedUnion("operation", [ProbeRequestSchema, ReloadRequestSchema, StatusRequestSchema]).parse(value);
 }
 
 /** Validates response shape and binds it to the request and selected instance. */
 export function parseAdminResponse(value: unknown): ConfigurationAdminResponse {
-  const response = z.discriminatedUnion("operation", [StateResponseSchema, ReloadResponseSchema]).parse(value);
+  const response = z.discriminatedUnion("operation", [StateResponseSchema, ReloadResponseSchema, StatusResponseSchema]).parse(value);
   return response;
 }
 
@@ -110,6 +177,33 @@ export function responseMatchesReloadEndpoint(
     && response.server_pid === identity.serverPid
     && (identity.helperPid === undefined || response.helper_pid === identity.helperPid)
     && response.instance_id === identity.instanceId;
+}
+
+/** Matches a status result to the probed process and its exact configuration source. */
+export function responseMatchesStatusRequest(
+  response: ConfigurationAdminStatusResponse,
+  request: ConfigurationAdminStatusRequest,
+  identity: { serverPid: number; helperPid?: number; instanceId: string; sourceIdentity: ConfigurationSourceIdentity }
+): boolean {
+  return request.expected_server_pid === identity.serverPid
+    && request.expected_instance_id === identity.instanceId
+    && statusSourceIdentityMatches(request.expected_source_identity, identity.sourceIdentity)
+    && response.request_id === request.request_id
+    && response.server_pid === identity.serverPid
+    && (identity.helperPid === undefined || response.helper_pid === identity.helperPid)
+    && response.instance_id === identity.instanceId
+    && statusSourceIdentityMatches(response.source_identity, request.expected_source_identity)
+    && statusSourceIdentityMatches(response.source_identity, identity.sourceIdentity);
+}
+
+function statusSourceIdentityMatches(
+  left: ConfigurationSourceIdentity,
+  right: ConfigurationSourceIdentity
+): boolean {
+  if (left.status === "none" || right.status === "none") {
+    return left.status === "none" && right.status === "none";
+  }
+  return configurationSourcesMatch(left, right);
 }
 
 const FRAME_HEADER_BYTES = 4;

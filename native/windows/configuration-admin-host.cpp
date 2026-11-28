@@ -1526,6 +1526,8 @@ bool verifyPipeOwnerAndHelperBeforeDispatch(
 
 int client(const std::wstring &endpoint, DWORD timeoutMs,
            DWORD expectedHelperPid, ULONGLONG expectedCreationTime) {
+  // The caller supplies one operation budget for reload or status. Keep one
+  // deadline across pipe connection, request write, and response read.
   const ULONGLONG operationDeadline = GetTickCount64() + timeoutMs;
   std::vector<BYTE> request;
   if (!validLocalPipeName(endpoint) ||

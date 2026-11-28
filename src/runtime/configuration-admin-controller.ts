@@ -1,5 +1,6 @@
 import { configurationSourcesMatch, type ConfigurationSourceIdentity } from "../config/config-source-identity.js";
-import type { ConfigurationRevisionState } from "../services/configuration-revision-store.js";
+import { isDeepStrictEqual } from "node:util";
+import type { SavedSourceObservation } from "../services/configuration-revision-store.js";
 import {
   parseAdminRequest,
   parseAdminResponse,
@@ -7,13 +8,34 @@ import {
 } from "./configuration-admin-protocol.js";
 
 type AdminRevisionState = Readonly<{
-  acceptedCandidate: Pick<ConfigurationRevisionState["acceptedCandidate"], "sourceSha256">;
-  effectiveHotRevision: Pick<ConfigurationRevisionState["effectiveHotRevision"], "generation">;
-  pendingRestart?: ConfigurationRevisionState["pendingRestart"];
+  acceptedCandidate: Readonly<{
+    sourceSha256: string;
+    registry?: Readonly<{ list: () => readonly unknown[] }>;
+    restartSettings?: object;
+  }>;
+  initializedRestartSettings?: object;
+  effectiveHotRevision: Readonly<{
+    generation: number;
+    runtimeContext?: Readonly<{ registry?: Readonly<{ list: () => readonly unknown[] }> }>;
+  }>;
+  pendingRestart?: Readonly<{ initialized?: object; accepted?: object }>;
+  lastReloadOutcome?: "not-run" | "accepted" | "rejected";
+}>;
+
+type AdminStatusSnapshot = Readonly<{
+  state: AdminRevisionState & Readonly<{
+    acceptedCandidate: Readonly<{ registry: Readonly<{ list: () => readonly unknown[] }> }>;
+    effectiveHotRevision: Readonly<{
+      runtimeContext: Readonly<{ registry: Readonly<{ list: () => readonly unknown[] }> }>;
+    }>;
+    lastReloadOutcome: "not-run" | "accepted" | "rejected";
+  }>;
+  savedSource: SavedSourceObservation;
 }>;
 
 type AdminRevisionStore = Readonly<{
   getState: () => AdminRevisionState;
+  captureStatus: () => Promise<AdminStatusSnapshot>;
   reloadFromFile: () => Promise<AdminRevisionState>;
 }>;
 
@@ -35,6 +57,37 @@ export function createConfigurationAdminController(options: {
         ...responseIdentity(request.request_id),
         operation: "probe_result",
         ...stateFields(options.revisionStore.getState())
+      });
+    }
+
+    if (request.operation === "status") {
+      if (request.expected_server_pid !== options.serverPid
+        || request.expected_instance_id !== options.instanceId
+        || !statusSourceIdentityMatches(request.expected_source_identity, retainedIdentity)) {
+        throw new Error("The selected server identity no longer matches.");
+      }
+      if (options.isShuttingDown?.()) {
+        throw new Error("The server is shutting down.");
+      }
+
+      const snapshot = await options.revisionStore.captureStatus();
+      const state = snapshot.state;
+      return parseAdminResponse({
+        ...responseIdentity(request.request_id),
+        operation: "status_result",
+        accepted_candidate: {
+          source_sha256: state.acceptedCandidate.sourceSha256,
+          repository_count: state.acceptedCandidate.registry.list().length,
+          restart_fields: settingNames(state.acceptedCandidate.restartSettings)
+        },
+        saved_source: savedSourceFields(snapshot.savedSource),
+        active_hot_revision: {
+          generation: state.effectiveHotRevision.generation,
+          repository_count: state.effectiveHotRevision.runtimeContext.registry.list().length
+        },
+        initialized_restart_fields: settingNames(state.initializedRestartSettings),
+        pending_restart_fields: pendingRestartFieldNames(state),
+        last_reload_outcome: state.lastReloadOutcome
       });
     }
 
@@ -108,4 +161,54 @@ function stateFields(state: AdminRevisionState) {
     accepted_source_sha256: state.acceptedCandidate.sourceSha256,
     pending_restart: state.pendingRestart !== undefined
   };
+}
+
+function statusSourceIdentityMatches(
+  expected: { status: "none" } | Extract<ConfigurationSourceIdentity, { status: "available" }>,
+  actual: ConfigurationSourceIdentity
+): boolean {
+  if (expected.status === "none") return actual.status === "none";
+  return configurationSourcesMatch(expected, actual);
+}
+
+function settingNames(settings: object | undefined): string[] {
+  return Object.keys(settings ?? {}).sort();
+}
+
+function pendingRestartFieldNames(state: AdminRevisionState): string[] {
+  const initialized = state.pendingRestart?.initialized ?? {};
+  const accepted = state.pendingRestart?.accepted ?? {};
+  return [...new Set([...Object.keys(initialized), ...Object.keys(accepted)])]
+    .filter((name) => !isDeepStrictEqual(
+      (initialized as Record<string, unknown>)[name],
+      (accepted as Record<string, unknown>)[name]
+    ))
+    .sort();
+}
+
+function savedSourceFields(observation: SavedSourceObservation) {
+  switch (observation.status) {
+    case "no-source":
+      return { status: observation.status };
+    case "read-failed":
+      return { status: observation.status, code: observation.code };
+    case "invalid-json":
+      return { status: observation.status, source_sha256: observation.sourceSha256 };
+    case "validation-failed":
+      return {
+        status: observation.status,
+        category: observation.category,
+        source_sha256: observation.sourceSha256,
+        issue_codes: observation.issueCodes,
+        issue_codes_truncated: observation.issueCodesTruncated
+      };
+    case "valid":
+      return {
+        status: observation.status,
+        source_sha256: observation.sourceSha256,
+        matches_accepted: observation.matchesAccepted,
+        repository_count: observation.repositoryCount,
+        restart_fields: observation.restartFields
+      };
+  }
 }

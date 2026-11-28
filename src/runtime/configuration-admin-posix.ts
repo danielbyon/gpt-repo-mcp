@@ -20,6 +20,7 @@ import {
 
 const CONNECTION_AND_PROBE_TIMEOUT_MS = 2_000;
 const RELOAD_ACK_TIMEOUT_MS = 30_000;
+const STATUS_RESPONSE_TIMEOUT_MS = RELOAD_ACK_TIMEOUT_MS;
 const SOCKET_MODE = 0o600;
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const DIRECTORY_READ_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
@@ -140,7 +141,7 @@ export async function readPosixConfigurationAdminRecords(
 }
 
 /**
- * The connection and probe share a two-second deadline. A dispatched reload gets 30 seconds for its acknowledgment.
+ * Connection and probe use two seconds. A dispatched reload and a status request each get one 30-second response budget.
  * Reloads are never retried after a write attempt.
  */
 export async function requestPosixConfigurationAdmin(
@@ -166,7 +167,9 @@ export async function requestPosixConfigurationAdmin(
     let settled = false;
     let deadlineAt = performance.now() + CONNECTION_AND_PROBE_TIMEOUT_MS;
     let deadlineTimer: ReturnType<typeof setTimeout>;
-    const phase = (): "pre-dispatch" | "indeterminate" => dispatched ? "indeterminate" : "pre-dispatch";
+    const phase = (): "pre-dispatch" | "indeterminate" => request.operation === "reload" && dispatched
+      ? "indeterminate"
+      : "pre-dispatch";
 
     const clearDeadline = (): void => clearTimeout(deadlineTimer);
 
@@ -196,9 +199,9 @@ export async function requestPosixConfigurationAdmin(
     socket.on("connect", () => {
       if (deadlineExpired()) return;
       try {
-        if (request.operation === "reload") {
-          dispatched = true;
-          armDeadline(RELOAD_ACK_TIMEOUT_MS);
+        if (request.operation === "reload" || request.operation === "status") {
+          if (request.operation === "reload") dispatched = true;
+          armDeadline(request.operation === "reload" ? RELOAD_ACK_TIMEOUT_MS : STATUS_RESPONSE_TIMEOUT_MS);
         }
         socket.end(frame);
       } catch {
@@ -219,7 +222,8 @@ export async function requestPosixConfigurationAdmin(
         const response = parseAdminResponse(decodeAdminFrame(received));
         if (response.request_id !== request.request_id
           || (request.operation === "probe" && response.operation !== "probe_result")
-          || (request.operation === "reload" && response.operation !== "reload_result")) {
+          || (request.operation === "reload" && response.operation !== "reload_result")
+          || (request.operation === "status" && response.operation !== "status_result")) {
           throw new Error("The administrative response does not match its request.");
         }
         settled = true;
@@ -276,7 +280,7 @@ async function serveConnection(
     const request = parseAdminRequest(requestValue);
     const operationDeadline = request.operation === "probe"
       ? frameDeadline
-      : performance.now() + RELOAD_ACK_TIMEOUT_MS;
+      : performance.now() + (request.operation === "reload" ? RELOAD_ACK_TIMEOUT_MS : STATUS_RESPONSE_TIMEOUT_MS);
     const response = parseAdminResponse(await waitForDeadline(handle(request), operationDeadline, socket));
     if (response.request_id !== request.request_id) return;
     await writeFrameBeforeDeadline(socket, encodeAdminFrame(response), operationDeadline);

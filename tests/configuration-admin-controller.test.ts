@@ -166,6 +166,156 @@ describe("configuration admin controller", () => {
     });
   });
 
+  test("returns one coherent status snapshot without publishing or reloading", async () => {
+    const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
+    const statusState = revisionStatusState("a".repeat(64), 4);
+    const captureStatus = vi.fn(async () => ({
+      state: statusState,
+      savedSource: {
+        status: "validation-failed" as const,
+        category: "repository-filesystem" as const,
+        sourceSha256: "b".repeat(64),
+        issueCodes: ["ROOT_MISSING"],
+        issueCodesTruncated: false
+      }
+    }));
+    const reloadFromFile = vi.fn(async () => state("c".repeat(64), 5));
+    const controller = controllerModule.createConfigurationAdminController({
+      serverPid: 51,
+      helperPid: 52,
+      instanceId: "22222222-2222-4222-8222-222222222222",
+      sourceIdentity,
+      revisionStore: {
+        getState: vi.fn(() => statusState),
+        captureStatus,
+        reloadFromFile
+      }
+    });
+
+    const response = await controller.handle(statusRequest());
+
+    expect(response).toMatchObject({
+      operation: "status_result",
+      server_pid: 51,
+      helper_pid: 52,
+      source_identity: sourceIdentity,
+      accepted_candidate: {
+        source_sha256: "a".repeat(64),
+        repository_count: 2,
+        restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"]
+      },
+      saved_source: {
+        status: "validation-failed",
+        category: "repository-filesystem",
+        source_sha256: "b".repeat(64),
+        issue_codes: ["ROOT_MISSING"]
+      },
+      active_hot_revision: { generation: 4, repository_count: 1 },
+      initialized_restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"],
+      pending_restart_fields: ["query_timeout_ms"],
+      last_reload_outcome: "rejected"
+    });
+    expect(captureStatus).toHaveBeenCalledOnce();
+    expect(reloadFromFile).not.toHaveBeenCalled();
+  });
+
+  test("allows status for an intentionally unconfigured server", async () => {
+    const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
+    const noSourceIdentity = { status: "none" } as const;
+    const statusState = revisionStatusState("a".repeat(64), 1);
+    const captureStatus = vi.fn(async () => ({ state: statusState, savedSource: { status: "no-source" as const } }));
+    const controller = controllerModule.createConfigurationAdminController({
+      serverPid: 51,
+      instanceId: "22222222-2222-4222-8222-222222222222",
+      sourceIdentity: noSourceIdentity,
+      revisionStore: {
+        getState: vi.fn(() => statusState),
+        captureStatus,
+        reloadFromFile: vi.fn()
+      }
+    });
+
+    const response = await controller.handle(statusRequest({ expected_source_identity: noSourceIdentity }));
+
+    expect(response).toMatchObject({ operation: "status_result", source_identity: noSourceIdentity, saved_source: { status: "no-source" } });
+    expect(captureStatus).toHaveBeenCalledOnce();
+  });
+
+  test("projects file-read, JSON, and valid saved-source observations without exposing file details", async () => {
+    const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
+    const observations = [
+      { status: "read-failed", code: "FILE_READ_FAILED" },
+      { status: "invalid-json", sourceSha256: "b".repeat(64) },
+      {
+        status: "valid",
+        sourceSha256: "b".repeat(64),
+        matchesAccepted: false,
+        repositoryCount: 3,
+        restartFields: ["provider"]
+      }
+    ] as const;
+
+    for (const savedSource of observations) {
+      const controller = controllerModule.createConfigurationAdminController({
+        serverPid: 51,
+        instanceId: "22222222-2222-4222-8222-222222222222",
+        sourceIdentity,
+        revisionStore: {
+          getState: () => state("a".repeat(64), 2),
+          captureStatus: async () => ({ state: revisionStatusState("a".repeat(64), 2), savedSource }),
+          reloadFromFile: vi.fn()
+        }
+      });
+
+      const response = await controller.handle(statusRequest());
+
+      expect(response.operation).toBe("status_result");
+      if (response.operation === "status_result") {
+        expect(response.saved_source).toMatchObject({ status: savedSource.status });
+        expect(JSON.stringify(response)).not.toContain("private");
+      }
+    }
+  });
+
+  test("does not observe status when the requested source differs from the bound instance", async () => {
+    const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
+    const captureStatus = vi.fn();
+    const controller = controllerModule.createConfigurationAdminController({
+      serverPid: 51,
+      instanceId: "22222222-2222-4222-8222-222222222222",
+      sourceIdentity,
+      revisionStore: {
+        getState: () => state("a".repeat(64), 2),
+        captureStatus,
+        reloadFromFile: vi.fn()
+      }
+    });
+
+    await expect(controller.handle(statusRequest({
+      expected_source_identity: { ...sourceIdentity, path: "/configs/other.json" }
+    }))).rejects.toThrow();
+    expect(captureStatus).not.toHaveBeenCalled();
+  });
+
+  test("does not read saved configuration after status observes server shutdown", async () => {
+    const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
+    const captureStatus = vi.fn();
+    const controller = controllerModule.createConfigurationAdminController({
+      serverPid: 51,
+      instanceId: "22222222-2222-4222-8222-222222222222",
+      sourceIdentity,
+      revisionStore: {
+        getState: () => state("a".repeat(64), 2),
+        captureStatus,
+        reloadFromFile: vi.fn()
+      },
+      isShuttingDown: () => true
+    });
+
+    await expect(controller.handle(statusRequest())).rejects.toThrow("shutting down");
+    expect(captureStatus).not.toHaveBeenCalled();
+  });
+
   test("rejects mutation once shutdown has started", async () => {
     const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
     const reloadFromFile = vi.fn(async () => state("b".repeat(64), 3));
@@ -196,6 +346,43 @@ function reloadRequest(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function statusRequest(overrides: Record<string, unknown> = {}) {
+  return {
+    protocol_version: 1,
+    request_id: "33333333-3333-4333-8333-333333333333",
+    operation: "status",
+    expected_server_pid: 51,
+    expected_instance_id: "22222222-2222-4222-8222-222222222222",
+    expected_source_identity: sourceIdentity,
+    ...overrides
+  };
+}
+
+function revisionStatusState(sourceSha256: string, generation: number) {
+  const initializedSettings = {
+    provider: "codebase_memory",
+    executable: "/usr/bin/node",
+    query_timeout_ms: 3_000,
+    index_timeout_ms: 1_800_000
+  };
+  const acceptedSettings = { ...initializedSettings, query_timeout_ms: 5_000 };
+  const repositories = (count: number) => ({ list: () => Array.from({ length: count }, () => ({ repo_id: "fixture", display_name: "Fixture", root: "/private/repo" })) });
+  return {
+    acceptedCandidate: {
+      sourceSha256,
+      registry: repositories(2),
+      restartSettings: acceptedSettings
+    },
+    initializedRestartSettings: initializedSettings,
+    effectiveHotRevision: {
+      generation,
+      runtimeContext: { registry: repositories(1) }
+    },
+    pendingRestart: { initialized: initializedSettings, accepted: acceptedSettings },
+    lastReloadOutcome: "rejected" as const
+  };
+}
+
 function state(sourceSha256: string, generation: number) {
   return {
     acceptedCandidate: { sourceSha256 },
@@ -210,6 +397,7 @@ function createStore(
 ) {
   return {
     getState: () => typeof initial === "function" ? initial() : initial,
+    captureStatus: async () => { throw new Error("Status capture is not configured for this reload test."); },
     reloadFromFile
   };
 }

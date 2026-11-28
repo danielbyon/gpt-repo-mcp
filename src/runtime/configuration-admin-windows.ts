@@ -22,6 +22,7 @@ const CONNECTION_TIMEOUT_MS = 2_000;
 const PROBE_TIMEOUT_MS = 2_000;
 const CONTROL_WRITE_TIMEOUT_MS = 2_000;
 const RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS = 30_000;
+const STATUS_RESPONSE_TIMEOUT_MS = RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS;
 const SHUTDOWN_TIMEOUT_MS = 2_000;
 const MAX_DISCOVERY_BYTES = 1_048_576;
 const MAX_CONTROL_LINE_BYTES = Math.ceil((MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 4) * 4 / 3) + 16;
@@ -104,7 +105,9 @@ export async function requestWindowsConfigurationAdmin(
   }
 
   const frame = encodeAdminFrame(request);
-  const timeoutMs = request.operation === "probe" ? PROBE_TIMEOUT_MS : RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS;
+  const timeoutMs = request.operation === "probe"
+    ? PROBE_TIMEOUT_MS
+    : request.operation === "reload" ? RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS : STATUS_RESPONSE_TIMEOUT_MS;
   const output = await runHelper(helperPath, [
     "client",
     target.endpoint,
@@ -113,14 +116,18 @@ export async function requestWindowsConfigurationAdmin(
     target.helper_creation_time
   ], frame, timeoutMs,
     MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 64, request.operation === "reload");
+  const isReload = request.operation === "reload";
+  const isStatus = request.operation === "status";
   const markerEnd = output.indexOf(0x0a);
   if (markerEnd < 0) {
     throw ipcError(
       "WINDOWS_HELPER_OUTCOME_UNKNOWN",
       request.operation === "reload" ? "indeterminate" : "pre-dispatch",
-      request.operation === "reload"
+      isReload
         ? "The reload may have run, but the native helper did not report its outcome."
-        : "The native probe did not return a response."
+        : isStatus
+          ? "The native helper did not return a status snapshot before the deadline."
+          : "The native probe did not return a response."
     );
   }
 
@@ -140,18 +147,22 @@ export async function requestWindowsConfigurationAdmin(
     throw ipcError(
       "WINDOWS_PIPE_INDETERMINATE",
       phase,
-      request.operation === "reload"
+      isReload
         ? "The reload may have run, but the native helper could not confirm the response."
-        : "The native helper could not confirm the probe response."
+        : isStatus
+          ? "The native helper could not confirm the status response."
+          : "The native helper could not confirm the probe response."
     );
   }
   if (marker !== "RESPONSE") {
     throw ipcError(
       "WINDOWS_HELPER_OUTCOME_UNKNOWN",
       request.operation === "reload" ? "indeterminate" : "pre-dispatch",
-      request.operation === "reload"
+      isReload
         ? "The reload may have run, but the native helper returned no valid outcome."
-        : "The native probe returned an invalid outcome."
+        : isStatus
+          ? "The native helper returned no valid status outcome."
+          : "The native probe returned an invalid outcome."
     );
   }
 
@@ -159,7 +170,8 @@ export async function requestWindowsConfigurationAdmin(
     const response = parseAdminResponse(decodeAdminFrame(output.subarray(markerEnd + 1)));
     if (response.request_id !== request.request_id
       || (request.operation === "probe" && response.operation !== "probe_result")
-      || (request.operation === "reload" && response.operation !== "reload_result")) {
+      || (request.operation === "reload" && response.operation !== "reload_result")
+      || (request.operation === "status" && response.operation !== "status_result")) {
       throw new Error("Uncorrelated response.");
     }
     return response;
@@ -167,9 +179,11 @@ export async function requestWindowsConfigurationAdmin(
     throw ipcError(
       "WINDOWS_HELPER_BAD_RESPONSE",
       request.operation === "reload" ? "indeterminate" : "pre-dispatch",
-      request.operation === "reload"
+      isReload
         ? "The reload may have run, but its response could not be verified."
-        : "The native probe response could not be verified."
+        : isStatus
+          ? "The native status response could not be verified."
+          : "The native probe response could not be verified."
     );
   }
 }

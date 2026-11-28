@@ -40,6 +40,7 @@
     "list": "node dist/cli/connect-gpt.js list",
     "check:config": "node dist/cli/connect-gpt.js check",
     "config:reload": "node dist/cli/connect-gpt.js config reload",
+    "config:status": "node dist/cli/connect-gpt.js config status",
     "doctor": "npm run build && node dist/cli/connect-gpt.js doctor",
     "build": "tsup src/server.ts --format esm --dts --clean --external typescript && tsup src/cli/connect-gpt.ts --format esm --out-dir dist/cli --external typescript && node scripts/build-windows-process-host.mjs && node scripts/build-windows-configuration-admin-host.mjs",
     "verify:package-archive": "node scripts/verify-windows-package.mjs",
