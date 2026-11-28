@@ -1785,7 +1785,7 @@ int wmain(int argc, wchar_t *argv[]) {
     wchar_t *end = nullptr;
     const unsigned long timeout = wcstoul(argv[3], &end, 10);
     if (end == argv[3] || *end != L'\0' ||
-        (timeout != kProbeTimeoutMs && timeout != kReloadAcknowledgmentTimeoutMs)) return 5;
+      (timeout != kProbeTimeoutMs && timeout != kOperationResponseTimeoutMs)) return 5;
     DWORD expectedHelperPid = 0;
     ULONGLONG expectedCreationTime = 0;
     if (!parsePositivePid(argv[4], expectedHelperPid) ||
