@@ -403,13 +403,14 @@ test("production CLI recovers a lost reload response and reports restart-only st
       expect(observedStatus.stdout).toContain(`Initialized restart fields: ${initializedFields}`);
       expect(observedStatus.stdout.split("\n").find((line) => line.startsWith("Pending restart fields:")))
         .toBe(`Pending restart fields: ${mutation.field}`);
+      const statusWithoutFingerprints = observedStatus.stdout.replace(/sha256=[a-f0-9]{64}/g, "sha256=<fingerprint>");
       for (const value of [
         mutation.value,
         startupSettings.executable,
         String(startupSettings.index_timeout_ms),
         String(startupSettings.query_timeout_ms)
       ]) {
-        expect(observedStatus.stdout).not.toContain(value);
+        expect(statusWithoutFingerprints).not.toContain(value);
       }
       expect(observedStatus.stdout).toContain("Last reload outcome: accepted");
       previousFingerprint = candidateFingerprint;
