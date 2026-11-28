@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { ConfigurationSourceIdentity } from "../src/config/config-source-identity.js";
+import type { ConfigurationRevisionState } from "../src/services/configuration-revision-store.js";
 import { createConfigurationAdminController } from "../src/runtime/configuration-admin-controller.js";
 import {
   readWindowsConfigurationAdminRecords,
@@ -21,11 +22,15 @@ import {
   type ConfigurationAdminResponse
 } from "../src/runtime/configuration-admin-protocol.js";
 
-const delayedStartupAcknowledgment = vi.hoisted(() => ({ delayMs: 0 }));
+const delayedStartupAcknowledgment = vi.hoisted(() => ({
+  delayMs: 0,
+  beforeClientSpawn: undefined as (() => void) | undefined
+}));
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   const spawnWithDelayedAcknowledgment: typeof actual.spawn = ((...args: Parameters<typeof actual.spawn>) => {
+    if (args[1]?.[0] === "client") delayedStartupAcknowledgment.beforeClientSpawn?.();
     const child = actual.spawn(...args);
     const stdin = child.stdin;
     if (!stdin) return child;
@@ -86,6 +91,188 @@ const overlappingReloadScenarios: Array<{
 ];
 
 describe("owner-local Windows configuration IPC", () => {
+  test.skipIf(process.platform !== "win32")(
+    "uses the shared 30-second status budget through the native helper",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-status-deadline-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      let helperPid: number | undefined;
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          onHelperPid: (pid) => { helperPid = pid; },
+          handle: async (value) => {
+            const request = parseAdminRequest(value);
+            await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_250));
+            return statusResponse(request.request_id, sourceIdentity, helperPid);
+          }
+        });
+
+        const response = await requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "34343434-3434-4434-8434-343434343434",
+          operation: "status",
+          expected_server_pid: process.pid,
+          expected_instance_id: instanceId,
+          expected_source_identity: sourceIdentity
+        });
+
+        expect(response).toMatchObject({
+          operation: "status_result",
+          request_id: "34343434-3434-4434-8434-343434343434",
+          helper_pid: host.record.helper_pid
+        });
+      } finally {
+        await cleanupWindowsHost(host, localAppData);
+      }
+    },
+    15_000
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "rejects a status response carrying the probe operation",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-status-operation-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          handle: async (value) => probeResponse(parseAdminRequest(value).request_id, sourceIdentity)
+        });
+
+        await expect(requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "45454545-4545-4545-8454-454545454545",
+          operation: "status",
+          expected_server_pid: process.pid,
+          expected_instance_id: instanceId,
+          expected_source_identity: sourceIdentity
+        })).rejects.toMatchObject({ code: "WINDOWS_HELPER_BAD_RESPONSE" });
+      } finally {
+        await cleanupWindowsHost(host, localAppData);
+      }
+    }
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "does not dispatch status when helper launch consumes the transaction deadline",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-status-launch-deadline-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      let now = 0;
+      const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+      const handle = vi.fn(async (value: unknown) => statusResponse(parseAdminRequest(value).request_id, sourceIdentity));
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({ serverPid: process.pid, instanceId, handle });
+        delayedStartupAcknowledgment.beforeClientSpawn = () => { now = 30_001; };
+
+        let timeoutError: unknown;
+        try {
+          await requestWindowsConfigurationAdmin(host.record, {
+            protocol_version: 1,
+            request_id: "67676767-6767-4676-8676-676767676767",
+            operation: "status",
+            expected_server_pid: process.pid,
+            expected_instance_id: instanceId,
+            expected_source_identity: sourceIdentity
+          });
+        } catch (error) {
+          timeoutError = error;
+        }
+
+        expect(timeoutError).toMatchObject({ code: "WINDOWS_HELPER_TIMEOUT" });
+        expect(handle).not.toHaveBeenCalled();
+      } finally {
+        delayedStartupAcknowledgment.beforeClientSpawn = undefined;
+        clock.mockRestore();
+        await cleanupWindowsHost(host, localAppData);
+      }
+    }
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "times out one status transaction and rejects its late response",
+    async () => {
+      const localAppData = await createIsolatedLocalAppData("gpt-repo-admin-windows-status-timeout-");
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      vi.stubEnv("GPT_REPO_ADMIN_TEST_HELPER", "1");
+      const sourceIdentity: ConfigurationSourceIdentity = {
+        status: "available",
+        platform: "win32",
+        path: resolve(localAppData, "config.json")
+      };
+      const requestStarted = deferred<void>();
+      const handlerFinished = deferred<void>();
+      let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
+
+      try {
+        host = await startWindowsConfigurationAdminHost({
+          serverPid: process.pid,
+          instanceId,
+          handle: async (value): Promise<ConfigurationAdminResponse> => {
+            const request = parseAdminRequest(value);
+            requestStarted.resolve();
+            await new Promise((resolveDelay) => setTimeout(resolveDelay, 30_100));
+            handlerFinished.resolve();
+            return statusResponse(request.request_id, sourceIdentity);
+          }
+        });
+
+        const pendingStatus = requestWindowsConfigurationAdmin(host.record, {
+          protocol_version: 1,
+          request_id: "56565656-5656-4656-8656-565656565656",
+          operation: "status",
+          expected_server_pid: process.pid,
+          expected_instance_id: instanceId,
+          expected_source_identity: sourceIdentity
+        });
+        await requestStarted.promise;
+        let timeoutError: unknown;
+        try {
+          await pendingStatus;
+        } catch (error) {
+          timeoutError = error;
+        }
+        expect(timeoutError).toMatchObject({ code: "WINDOWS_HELPER_TIMEOUT" });
+        expect(timeoutError).toHaveProperty("message", expect.stringContaining("status request"));
+        expect(String(timeoutError)).not.toContain("probe");
+
+        await handlerFinished.promise;
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+        expect(timeoutError).toMatchObject({ code: "WINDOWS_HELPER_TIMEOUT" });
+      } finally {
+        await cleanupWindowsHost(host, localAppData);
+      }
+    },
+    40_000
+  );
+
   test.skipIf(process.platform !== "win32")(
     "keeps a confirmed startup publication when the acknowledgment write callback stalls",
     async () => {
@@ -225,11 +412,11 @@ describe("owner-local Windows configuration IPC", () => {
       const beforeState = {
         acceptedCandidate: { sourceSha256: "a".repeat(64) },
         effectiveHotRevision: { generation: 2 }
-      };
+      } as unknown as ConfigurationRevisionState;
       const publishedState = {
         acceptedCandidate: { sourceSha256: "b".repeat(64) },
         effectiveHotRevision: { generation: 3 }
-      };
+      } as unknown as ConfigurationRevisionState;
       let currentState = beforeState;
       let helperPid: number | undefined;
       let failHelperPidResolution = true;
@@ -248,7 +435,11 @@ describe("owner-local Windows configuration IPC", () => {
         },
         instanceId,
         sourceIdentity,
-        revisionStore: { getState: () => currentState, reloadFromFile }
+        revisionStore: {
+          getState: () => currentState,
+          captureStatus: async () => { throw new Error("Status capture is not used by this reload test."); },
+          reloadFromFile
+        }
       });
       let host: Awaited<ReturnType<typeof startWindowsConfigurationAdminHost>> | undefined;
 
@@ -1232,6 +1423,39 @@ function reloadResponse(
     effective_generation: 8,
     accepted_source_sha256: digestCharacter.repeat(64),
     pending_restart: false
+  };
+}
+
+function statusResponse(
+  requestId: string,
+  sourceIdentity: ConfigurationSourceIdentity,
+  helperPid?: number
+): ConfigurationAdminResponse {
+  return {
+    protocol_version: 1,
+    request_id: requestId,
+    server_pid: process.pid,
+    ...(helperPid === undefined ? {} : { helper_pid: helperPid }),
+    instance_id: instanceId,
+    source_identity: sourceIdentity,
+    operation: "status_result",
+    accepted_candidate: {
+      source_status: "available",
+      source_sha256: "a".repeat(64),
+      repository_count: 1,
+      restart_fields: []
+    },
+    saved_source: {
+      status: "valid",
+      source_sha256: "a".repeat(64),
+      matches_accepted: true,
+      repository_count: 1,
+      restart_fields: []
+    },
+    active_hot_revision: { generation: 1, repository_count: 1 },
+    initialized_restart_fields: [],
+    pending_restart_fields: [],
+    last_reload_outcome: "not-run"
   };
 }
 

@@ -100,6 +100,33 @@ environment variable keeps its existing built-in default and does not read
 `config.local.json`; the reload command will fail the source check for that
 server. Start a file-backed server with the same selected path before reloading.
 
+## Configuration Status
+
+Check the accepted configuration and the state currently used by a running
+server without reloading it:
+
+```bash
+npm run config:status
+npm run config:status -- --instance <PID>
+```
+
+Status reports the accepted configuration fingerprint, the saved file's latest
+read and validation result, the active repository revision, restart-only field
+names, and the last admitted reload outcome. It does not print configuration
+values. If the saved file cannot be read, parsed, or validated, status still
+prints the active runtime state and returns a failure code.
+
+With the default config selection, status can match servers bound to
+`./config.local.json` and servers intentionally started without a config file.
+If several eligible servers are live, use `--instance <PID>`. An explicit
+`--config` path or config environment variable requires an exact source match;
+the PID only narrows the eligible servers. A server whose source cannot be
+compared is not treated as intentionally unconfigured.
+
+Connections and probes use a two-second deadline. Status and reload responses
+have a 30-second deadline. A status timeout means no verified snapshot was
+received; it does not establish that the server stopped.
+
 ## Add A Repository
 
 ```bash

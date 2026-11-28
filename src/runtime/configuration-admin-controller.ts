@@ -1,21 +1,19 @@
 import { configurationSourcesMatch, type ConfigurationSourceIdentity } from "../config/config-source-identity.js";
-import type { ConfigurationRevisionState } from "../services/configuration-revision-store.js";
+import { isDeepStrictEqual } from "node:util";
+import type {
+  ConfigurationRevisionState,
+  ConfigurationRevisionStore,
+  RestartSettings,
+  SavedSourceObservation
+} from "../services/configuration-revision-store.js";
 import {
   parseAdminRequest,
   parseAdminResponse,
   type ConfigurationAdminResponse
 } from "./configuration-admin-protocol.js";
 
-type AdminRevisionState = Readonly<{
-  acceptedCandidate: Pick<ConfigurationRevisionState["acceptedCandidate"], "sourceSha256">;
-  effectiveHotRevision: Pick<ConfigurationRevisionState["effectiveHotRevision"], "generation">;
-  pendingRestart?: ConfigurationRevisionState["pendingRestart"];
-}>;
-
-type AdminRevisionStore = Readonly<{
-  getState: () => AdminRevisionState;
-  reloadFromFile: () => Promise<AdminRevisionState>;
-}>;
+type AdminRevisionState = ConfigurationRevisionState;
+type AdminRevisionStore = Pick<ConfigurationRevisionStore, "getState" | "captureStatus" | "reloadFromFile">;
 
 /** Binds requests to one server process and its selected configuration path. */
 export function createConfigurationAdminController(options: {
@@ -35,6 +33,40 @@ export function createConfigurationAdminController(options: {
         ...responseIdentity(request.request_id),
         operation: "probe_result",
         ...stateFields(options.revisionStore.getState())
+      });
+    }
+
+    if (request.operation === "status") {
+      if (request.expected_server_pid !== options.serverPid
+        || request.expected_instance_id !== options.instanceId
+        || !statusSourceIdentityMatches(request.expected_source_identity, retainedIdentity)) {
+        throw new Error("The selected server identity no longer matches.");
+      }
+      if (options.isShuttingDown?.()) {
+        throw new Error("The server is shutting down.");
+      }
+
+      const snapshot = await options.revisionStore.captureStatus();
+      const state = snapshot.state;
+      return parseAdminResponse({
+        ...responseIdentity(request.request_id),
+        operation: "status_result",
+        accepted_candidate: {
+          source_status: retainedIdentity.status,
+          ...(retainedIdentity.status === "available"
+            ? { source_sha256: state.acceptedCandidate.sourceSha256 }
+            : {}),
+          repository_count: state.acceptedCandidate.registry.list().length,
+          restart_fields: settingNames(state.acceptedCandidate.restartSettings)
+        },
+        saved_source: savedSourceFields(snapshot.savedSource),
+        active_hot_revision: {
+          generation: state.effectiveHotRevision.generation,
+          repository_count: state.effectiveHotRevision.runtimeContext.registry.list().length
+        },
+        initialized_restart_fields: settingNames(state.initializedRestartSettings),
+        pending_restart_fields: pendingRestartFieldNames(state),
+        last_reload_outcome: state.lastReloadOutcome
       });
     }
 
@@ -108,4 +140,55 @@ function stateFields(state: AdminRevisionState) {
     accepted_source_sha256: state.acceptedCandidate.sourceSha256,
     pending_restart: state.pendingRestart !== undefined
   };
+}
+
+function statusSourceIdentityMatches(
+  expected: { status: "none" } | Extract<ConfigurationSourceIdentity, { status: "available" }>,
+  actual: ConfigurationSourceIdentity
+): boolean {
+  if (expected.status === "none") return actual.status === "none";
+  return configurationSourcesMatch(expected, actual);
+}
+
+function settingNames(settings: RestartSettings | undefined): string[] {
+  return Object.keys(settings ?? {}).sort();
+}
+
+function pendingRestartFieldNames(state: AdminRevisionState): string[] {
+  const initialized = state.pendingRestart?.initialized;
+  const accepted = state.pendingRestart?.accepted;
+  const fieldNames = new Set<keyof RestartSettings>([
+    ...Object.keys(initialized ?? {}) as (keyof RestartSettings)[],
+    ...Object.keys(accepted ?? {}) as (keyof RestartSettings)[]
+  ]);
+  return [...fieldNames]
+    .filter((name) => !isDeepStrictEqual(initialized?.[name], accepted?.[name]))
+    .sort();
+}
+
+function savedSourceFields(observation: SavedSourceObservation) {
+  switch (observation.status) {
+    case "no-source":
+      return { status: observation.status };
+    case "read-failed":
+      return { status: observation.status, code: observation.code };
+    case "invalid-json":
+      return { status: observation.status, source_sha256: observation.sourceSha256 };
+    case "validation-failed":
+      return {
+        status: observation.status,
+        category: observation.category,
+        source_sha256: observation.sourceSha256,
+        issue_codes: observation.issueCodes,
+        issue_codes_truncated: observation.issueCodesTruncated
+      };
+    case "valid":
+      return {
+        status: observation.status,
+        source_sha256: observation.sourceSha256,
+        matches_accepted: observation.matchesAccepted,
+        repository_count: observation.repositoryCount,
+        restart_fields: observation.restartFields
+      };
+  }
 }

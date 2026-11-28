@@ -1,9 +1,19 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
+import { isNotFoundError } from "../runtime/fs-helpers.js";
 import type { CodeIntelligenceService } from "./code-intelligence-service.js";
-import { RootRegistry, type DeepReadonly, type PreparedRootConfiguration, type RepoReaderConfig } from "./root-registry.js";
+import {
+  ConfigurationPreparationError,
+  RootRegistry,
+  type DeepReadonly,
+  type PreparedRootConfiguration,
+  type RepoReaderConfig
+} from "./root-registry.js";
 import type { RuntimeContext } from "../runtime/context.js";
+
+const MAX_STATUS_ISSUE_CODES = 16;
+const SAFE_ISSUE_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 export type RestartSettings = DeepReadonly<NonNullable<RepoReaderConfig["code_intelligence"]>>;
 
@@ -28,6 +38,31 @@ export type ConfigurationRevisionState = Readonly<{
   initializedRestartSettings?: RestartSettings;
   effectiveHotRevision: EffectiveHotRevision;
   pendingRestart?: PendingRestart;
+  lastReloadOutcome: "not-run" | "accepted" | "rejected";
+}>;
+
+export type SavedSourceObservation =
+  | Readonly<{ status: "no-source" }>
+  | Readonly<{ status: "read-failed"; code: "FILE_NOT_FOUND" | "FILE_READ_FAILED" }>
+  | Readonly<{ status: "invalid-json"; sourceSha256: string }>
+  | Readonly<{
+      status: "validation-failed";
+      category: "configuration" | "repository-filesystem" | "mixed";
+      sourceSha256: string;
+      issueCodes: readonly string[];
+      issueCodesTruncated: boolean;
+    }>
+  | Readonly<{
+      status: "valid";
+      sourceSha256: string;
+      matchesAccepted: boolean;
+      repositoryCount: number;
+      restartFields: readonly string[];
+    }>;
+
+export type ConfigurationRevisionStatusSnapshot = Readonly<{
+  state: ConfigurationRevisionState;
+  savedSource: SavedSourceObservation;
 }>;
 
 type CandidateReader = (configPath: string) => Promise<Uint8Array>;
@@ -79,7 +114,8 @@ export class ConfigurationRevisionStore {
       acceptedCandidate: initialCandidate,
       initializedRestartSettings: this.initializedRestartSettings,
       effectiveHotRevision,
-      pendingRestart: pendingRestart(this.initializedRestartSettings, initialCandidate.restartSettings)
+      pendingRestart: pendingRestart(this.initializedRestartSettings, initialCandidate.restartSettings),
+      lastReloadOutcome: "not-run"
     });
   }
 
@@ -91,6 +127,13 @@ export class ConfigurationRevisionStore {
     return this.state;
   }
 
+  /** Captures runtime state once, then reads the saved file separately without waiting behind reloads. */
+  async captureStatus(): Promise<ConfigurationRevisionStatusSnapshot> {
+    const state = this.state;
+    const savedSource = await this.observeSavedSource(state);
+    return Object.freeze({ state, savedSource });
+  }
+
   /** Queues the complete read, validation, and publication operation in call order. */
   reloadFromFile(): Promise<ConfigurationRevisionState> {
     const configPath = this.configPath;
@@ -98,7 +141,14 @@ export class ConfigurationRevisionStore {
       return Promise.reject(new Error("Configuration reload is unavailable without a config file."));
     }
 
-    const reload = (): Promise<ConfigurationRevisionState> => this.reloadCandidate(configPath);
+    const reload = async (): Promise<ConfigurationRevisionState> => {
+      try {
+        return await this.reloadCandidate(configPath);
+      } catch (error) {
+        this.state = freezeState({ ...this.state, lastReloadOutcome: "rejected" });
+        throw error;
+      }
+    };
     const operation = this.reloadTail.then(reload, reload);
     this.reloadTail = operation.then(() => undefined, () => undefined);
     return operation;
@@ -121,10 +171,60 @@ export class ConfigurationRevisionStore {
       acceptedCandidate: candidate,
       initializedRestartSettings: this.initializedRestartSettings,
       effectiveHotRevision,
-      pendingRestart: pendingRestart(this.initializedRestartSettings, candidate.restartSettings)
+      pendingRestart: pendingRestart(this.initializedRestartSettings, candidate.restartSettings),
+      lastReloadOutcome: "accepted"
     });
     this.state = next;
     return next;
+  }
+
+  private async observeSavedSource(state: ConfigurationRevisionState): Promise<SavedSourceObservation> {
+    const configPath = this.configPath;
+    if (configPath === undefined) return Object.freeze({ status: "no-source" });
+
+    let bytes: Buffer;
+    try {
+      bytes = Buffer.from(await this.readCandidateBytes(configPath));
+    } catch (error) {
+      return Object.freeze({
+        status: "read-failed",
+        code: isNotFoundError(error) ? "FILE_NOT_FOUND" : "FILE_READ_FAILED"
+      });
+    }
+
+    const sourceSha256 = createHash("sha256").update(bytes).digest("hex");
+    try {
+      const candidate = freezeCandidate(await this.prepareCandidate(bytes, configPath));
+      return Object.freeze({
+        status: "valid",
+        sourceSha256,
+        matchesAccepted: sourceSha256 === state.acceptedCandidate.sourceSha256,
+        repositoryCount: candidate.registry.list().length,
+        restartFields: settingNames(candidate.restartSettings)
+      });
+    } catch (error) {
+      if (error instanceof ConfigurationPreparationError && error.category === "json") {
+        return Object.freeze({ status: "invalid-json", sourceSha256 });
+      }
+
+      const category = error instanceof ConfigurationPreparationError
+        ? error.category === "repository-filesystem" || error.category === "mixed"
+          ? error.category
+          : "configuration"
+        : "configuration";
+      const codes = error instanceof ConfigurationPreparationError
+        ? error.issueCodes
+        : ["CONFIGURATION_PREPARATION_FAILED"];
+      const uniqueCodes = [...new Set(codes.filter((code) => SAFE_ISSUE_CODE_PATTERN.test(code)))];
+      const issueCodes = Object.freeze(uniqueCodes.slice(0, MAX_STATUS_ISSUE_CODES));
+      return Object.freeze({
+        status: "validation-failed",
+        category,
+        sourceSha256,
+        issueCodes,
+        issueCodesTruncated: uniqueCodes.length > issueCodes.length
+      });
+    }
   }
 }
 
@@ -149,6 +249,10 @@ function pendingRestart(
     ...(initialized ? { initialized } : {}),
     ...(accepted ? { accepted } : {})
   });
+}
+
+function settingNames(settings: RestartSettings | undefined): readonly string[] {
+  return Object.freeze(Object.keys(settings ?? {}).sort());
 }
 
 function freezeState(state: ConfigurationRevisionState): ConfigurationRevisionState {

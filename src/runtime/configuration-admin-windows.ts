@@ -22,6 +22,7 @@ const CONNECTION_TIMEOUT_MS = 2_000;
 const PROBE_TIMEOUT_MS = 2_000;
 const CONTROL_WRITE_TIMEOUT_MS = 2_000;
 const RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS = 30_000;
+const STATUS_RESPONSE_TIMEOUT_MS = RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS;
 const SHUTDOWN_TIMEOUT_MS = 2_000;
 const MAX_DISCOVERY_BYTES = 1_048_576;
 const MAX_CONTROL_LINE_BYTES = Math.ceil((MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 4) * 4 / 3) + 16;
@@ -71,7 +72,11 @@ export async function startWindowsConfigurationAdminHost(options: {
 /** Reads Windows discovery records through the helper that validates their ACLs. */
 export async function readWindowsConfigurationAdminRecords(): Promise<ConfigurationAdminDiscoveryRecord[]> {
   const helperPath = await resolveWindowsConfigurationAdminHostPath();
-  const output = await runHelper(helperPath, ["discover"], undefined, CONNECTION_TIMEOUT_MS, MAX_DISCOVERY_BYTES);
+  const output = await runHelper(helperPath, ["discover"], undefined, {
+    timeoutMs: CONNECTION_TIMEOUT_MS,
+    maximumOutputBytes: MAX_DISCOVERY_BYTES,
+    timeoutMessage: "The local administrative helper timed out."
+  });
   let parsed: unknown;
   try {
     parsed = JSON.parse(output.toString("utf8"));
@@ -96,6 +101,9 @@ export async function requestWindowsConfigurationAdmin(
       "The discovered endpoint does not include a verifiable helper process identity."
     );
   }
+  const statusDeadlineAt = request.operation === "status"
+    ? performance.now() + STATUS_RESPONSE_TIMEOUT_MS
+    : undefined;
   let helperPath: string;
   try {
     helperPath = await resolveWindowsConfigurationAdminHostPath();
@@ -104,23 +112,45 @@ export async function requestWindowsConfigurationAdmin(
   }
 
   const frame = encodeAdminFrame(request);
-  const timeoutMs = request.operation === "probe" ? PROBE_TIMEOUT_MS : RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS;
+  const timeoutMs = request.operation === "probe"
+    ? PROBE_TIMEOUT_MS
+    : request.operation === "reload" ? RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS : STATUS_RESPONSE_TIMEOUT_MS;
+  const nativeTimeoutMs = statusDeadlineAt === undefined
+    ? timeoutMs
+    : Math.floor(statusDeadlineAt - performance.now());
+  const timeoutMessage = request.operation === "status"
+    ? "The native status request timed out before a snapshot was returned."
+    : request.operation === "reload"
+      ? "The reload may have run, but the native helper timed out."
+      : "The native probe timed out.";
+  if (nativeTimeoutMs <= 0) {
+    throw ipcError("WINDOWS_HELPER_TIMEOUT", "pre-dispatch", timeoutMessage);
+  }
   const output = await runHelper(helperPath, [
     "client",
     target.endpoint,
-    String(timeoutMs),
+    String(nativeTimeoutMs),
     String(target.helper_pid),
     target.helper_creation_time
-  ], frame, timeoutMs,
-    MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 64, request.operation === "reload");
+  ], frame, {
+    timeoutMs: nativeTimeoutMs,
+    maximumOutputBytes: MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 64,
+    mutation: request.operation === "reload",
+    absoluteDeadlineAt: statusDeadlineAt,
+    timeoutMessage
+  });
+  const isReload = request.operation === "reload";
+  const isStatus = request.operation === "status";
   const markerEnd = output.indexOf(0x0a);
   if (markerEnd < 0) {
     throw ipcError(
       "WINDOWS_HELPER_OUTCOME_UNKNOWN",
       request.operation === "reload" ? "indeterminate" : "pre-dispatch",
-      request.operation === "reload"
+      isReload
         ? "The reload may have run, but the native helper did not report its outcome."
-        : "The native probe did not return a response."
+        : isStatus
+          ? "The native helper did not return a status snapshot before the deadline."
+          : "The native probe did not return a response."
     );
   }
 
@@ -140,18 +170,22 @@ export async function requestWindowsConfigurationAdmin(
     throw ipcError(
       "WINDOWS_PIPE_INDETERMINATE",
       phase,
-      request.operation === "reload"
+      isReload
         ? "The reload may have run, but the native helper could not confirm the response."
-        : "The native helper could not confirm the probe response."
+        : isStatus
+          ? "The native helper could not confirm the status response."
+          : "The native helper could not confirm the probe response."
     );
   }
   if (marker !== "RESPONSE") {
     throw ipcError(
       "WINDOWS_HELPER_OUTCOME_UNKNOWN",
       request.operation === "reload" ? "indeterminate" : "pre-dispatch",
-      request.operation === "reload"
+      isReload
         ? "The reload may have run, but the native helper returned no valid outcome."
-        : "The native probe returned an invalid outcome."
+        : isStatus
+          ? "The native helper returned no valid status outcome."
+          : "The native probe returned an invalid outcome."
     );
   }
 
@@ -159,7 +193,8 @@ export async function requestWindowsConfigurationAdmin(
     const response = parseAdminResponse(decodeAdminFrame(output.subarray(markerEnd + 1)));
     if (response.request_id !== request.request_id
       || (request.operation === "probe" && response.operation !== "probe_result")
-      || (request.operation === "reload" && response.operation !== "reload_result")) {
+      || (request.operation === "reload" && response.operation !== "reload_result")
+      || (request.operation === "status" && response.operation !== "status_result")) {
       throw new Error("Uncorrelated response.");
     }
     return response;
@@ -167,9 +202,11 @@ export async function requestWindowsConfigurationAdmin(
     throw ipcError(
       "WINDOWS_HELPER_BAD_RESPONSE",
       request.operation === "reload" ? "indeterminate" : "pre-dispatch",
-      request.operation === "reload"
+      isReload
         ? "The reload may have run, but its response could not be verified."
-        : "The native probe response could not be verified."
+        : isStatus
+          ? "The native status response could not be verified."
+          : "The native probe response could not be verified."
     );
   }
 }
@@ -474,20 +511,32 @@ class WindowsHostProcess {
   }
 }
 
+type RunHelperOptions = Readonly<{
+  timeoutMs: number;
+  maximumOutputBytes: number;
+  mutation?: boolean;
+  absoluteDeadlineAt?: number;
+  timeoutMessage: string;
+}>;
+
 async function runHelper(
   helperPath: string,
   args: string[],
   input: Uint8Array | undefined,
-  timeoutMs: number,
-  maximumOutputBytes: number,
-  mutation = false
+  options: RunHelperOptions
 ): Promise<Buffer> {
-  const deadline = performance.now() + timeoutMs;
+  const deadline = options.absoluteDeadlineAt ?? performance.now() + options.timeoutMs;
+  const enforcesAbsoluteDeadline = options.absoluteDeadlineAt !== undefined;
+  if (enforcesAbsoluteDeadline && performance.now() >= deadline) {
+    throw ipcError("WINDOWS_HELPER_TIMEOUT", "pre-dispatch", options.timeoutMessage);
+  }
   const child = spawn(helperPath, args, { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
   const chunks: Buffer[] = [];
   let outputLength = 0;
   return await new Promise<Buffer>((resolveOutput, rejectOutput) => {
     let settled = false;
+    // Without a native NOT_DISPATCHED marker, a stream error cannot prove the request was not sent.
+    const processErrorPhase = child.pid !== undefined && options.mutation ? "indeterminate" : "pre-dispatch";
     const fail = (error: Error, terminate = true): void => {
       if (settled) return;
       settled = true;
@@ -497,17 +546,31 @@ async function runHelper(
     };
     const finish = (value: Buffer): void => {
       if (settled) return;
+      if (enforcesAbsoluteDeadline && performance.now() >= deadline) {
+        fail(ipcError(
+          "WINDOWS_HELPER_TIMEOUT",
+          processErrorPhase,
+          options.timeoutMessage
+        ));
+        return;
+      }
       settled = true;
       clearTimeout(timer);
       resolveOutput(value);
     };
-    // Without a native NOT_DISPATCHED marker, a stream error cannot prove the request was not sent.
-    const processErrorPhase = child.pid !== undefined && mutation ? "indeterminate" : "pre-dispatch";
 
     child.stdout.on("data", (chunk: Buffer) => {
       if (settled) return;
+      if (enforcesAbsoluteDeadline && performance.now() >= deadline) {
+        fail(ipcError(
+          "WINDOWS_HELPER_TIMEOUT",
+          processErrorPhase,
+          "The native status request timed out before a snapshot was returned."
+        ));
+        return;
+      }
       outputLength += chunk.byteLength;
-      if (outputLength > maximumOutputBytes) {
+      if (outputLength > options.maximumOutputBytes) {
         fail(ipcError("WINDOWS_HELPER_OUTPUT_TOO_LARGE", processErrorPhase, "The native helper output exceeded its limit."));
         return;
       }
@@ -535,10 +598,18 @@ async function runHelper(
       fail(ipcError(
         "WINDOWS_HELPER_TIMEOUT",
         processErrorPhase,
-        mutation ? "The reload may have run, but the native helper timed out." : "The native probe timed out."
+        options.timeoutMessage
       ));
     }, remaining);
     try {
+      if (enforcesAbsoluteDeadline && performance.now() >= deadline) {
+        fail(ipcError(
+          "WINDOWS_HELPER_TIMEOUT",
+          processErrorPhase,
+          options.timeoutMessage
+        ));
+        return;
+      }
       child.stdin.end(input);
     } catch {
       fail(ipcError("WINDOWS_HELPER_CONTROL_WRITE_FAILED", processErrorPhase, "The native helper control channel could not be written."));

@@ -16,8 +16,11 @@ import {
   writeConfigAtomic
 } from "../config/store.js";
 import { validateConfigDocument } from "../config/validation.js";
-import { reloadConfigurationAdmin } from "../runtime/configuration-admin-client.js";
-import type { ConfigurationAdminReloadResponse } from "../runtime/configuration-admin-protocol.js";
+import { reloadConfigurationAdmin, statusConfigurationAdmin } from "../runtime/configuration-admin-client.js";
+import type {
+  ConfigurationAdminReloadResponse,
+  ConfigurationAdminStatusResponse
+} from "../runtime/configuration-admin-protocol.js";
 import { runDoctor, type DoctorChecks } from "./connect-gpt-doctor.js";
 
 type CliIo = {
@@ -31,6 +34,11 @@ type CliIo = {
     selectedSourceIdentity: ConfigurationSourceIdentity;
     instancePid?: number;
   }) => Promise<ConfigurationAdminReloadResponse>;
+  configurationAdminStatus?: (options: {
+    selectedSourceIdentity: ConfigurationSourceIdentity;
+    allowNoSource: boolean;
+    instancePid?: number;
+  }) => Promise<ConfigurationAdminStatusResponse>;
 };
 
 type AddOptions = {
@@ -50,13 +58,15 @@ const usage = [
   "  gpt-repo add <path> [--mode read|write|ship] [--id <repo_id>] [--name <display_name>] [--allow-non-git] [--config <path>]",
   "  gpt-repo remove <repo_id> [--config <path>]",
   "  gpt-repo config reload [--instance <PID>] [--config <path>]",
+  "  gpt-repo config status [--instance <PID>] [--config <path>]",
   "  gpt-repo check [--config <path>]",
   "",
   "Compatibility:",
-  "  connect-gpt config list|add|remove|check|reload"
+  "  connect-gpt config list|add|remove|check|reload|status"
 ].join("\n");
 
 export async function runConnectGptCli(argv: string[], io: CliIo = defaultIo()): Promise<number> {
+  let adminOperation: "reload" | "status" | undefined;
   try {
     const { args, configOverride } = parseGlobalArgs(argv);
     const configSelection = resolveConfigPathSelection({
@@ -112,13 +122,19 @@ export async function runConnectGptCli(argv: string[], io: CliIo = defaultIo()):
     }
 
     if (args[1] === "reload") {
+      adminOperation = "reload";
       return await handleReload(args.slice(2), configSelection.selected_value, io);
+    }
+
+    if (args[1] === "status") {
+      adminOperation = "status";
+      return await handleStatus(args.slice(2), configSelection, io);
     }
 
     throw new CliError(`Unknown config command "${args[1] ?? ""}".\n${usage}`);
   } catch (error) {
     const message = error instanceof ConfigurationAdminIpcError
-      ? formatConfigurationAdminError(error)
+      ? formatConfigurationAdminError(error, adminOperation)
       : error instanceof CliError
         ? error.message
         : error instanceof Error
@@ -127,6 +143,95 @@ export async function runConnectGptCli(argv: string[], io: CliIo = defaultIo()):
     io.stderr(`Error: ${message}`);
     return 1;
   }
+}
+
+async function handleStatus(
+  args: string[],
+  configSelection: ReturnType<typeof resolveConfigPathSelection>,
+  io: CliIo
+): Promise<number> {
+  let instancePid: number | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg !== "--instance" || instancePid !== undefined) {
+      throw new CliError("Usage: gpt-repo config status [--instance <PID>]");
+    }
+    const rawPid = args[index + 1];
+    if (!rawPid || !/^[1-9][0-9]*$/.test(rawPid)) {
+      throw new CliError("--instance requires a positive server PID.");
+    }
+    instancePid = Number(rawPid);
+    if (!Number.isSafeInteger(instancePid)) {
+      throw new CliError("--instance requires a positive server PID.");
+    }
+    index += 1;
+  }
+
+  const selectedSourceIdentity = createConfigurationSourceIdentity(configSelection.selected_value, io.cwd);
+  if (selectedSourceIdentity.status !== "available") {
+    throw new CliError("The selected configuration path cannot be compared safely; status was not requested.");
+  }
+  const getStatus = io.configurationAdminStatus ?? statusConfigurationAdmin;
+  const response = await getStatus({
+    selectedSourceIdentity,
+    allowNoSource: configSelection.selected_by === "default",
+    ...(instancePid === undefined ? {} : { instancePid })
+  });
+  return printConfigurationStatus(response, io);
+}
+
+function printConfigurationStatus(response: ConfigurationAdminStatusResponse, io: CliIo): number {
+  const acceptedSource = response.accepted_candidate.source_status === "none"
+    ? "source=absent"
+    : `sha256=${response.accepted_candidate.source_sha256}`;
+  io.stdout(`Server PID: ${response.server_pid}`);
+  io.stdout(`Source: ${formatSourceIdentity(response.source_identity)}`);
+  io.stdout(
+    `Accepted candidate: ${acceptedSource} ` +
+    `repositories=${response.accepted_candidate.repository_count} ` +
+    `restart_fields=${formatFieldNames(response.accepted_candidate.restart_fields)}`
+  );
+  io.stdout(`Saved file: ${formatSavedSource(response.saved_source)}`);
+  io.stdout(
+    `Effective hot revision: generation=${response.active_hot_revision.generation} ` +
+    `repositories=${response.active_hot_revision.repository_count}`
+  );
+  io.stdout(`Initialized restart fields: ${formatFieldNames(response.initialized_restart_fields)}`);
+  io.stdout(`Pending restart fields: ${formatFieldNames(response.pending_restart_fields)}`);
+  io.stdout(`Last reload outcome: ${response.last_reload_outcome}`);
+  return response.saved_source.status === "read-failed"
+    || response.saved_source.status === "invalid-json"
+    || response.saved_source.status === "validation-failed"
+    ? 1
+    : 0;
+}
+
+function formatSavedSource(source: ConfigurationAdminStatusResponse["saved_source"]): string {
+  switch (source.status) {
+    case "no-source":
+      return "no configuration file is bound to this instance";
+    case "read-failed":
+      return `read-failed code=${source.code}`;
+    case "invalid-json":
+      return `invalid-json sha256=${source.source_sha256}`;
+    case "validation-failed":
+      return `validation-failed category=${source.category} sha256=${source.source_sha256} ` +
+        `issue_codes=${source.issue_codes.join(",") || "none"}` +
+        `${source.issue_codes_truncated ? ",…" : ""}`;
+    case "valid":
+      return `valid sha256=${source.source_sha256} matches_accepted=${source.matches_accepted} ` +
+        `repositories=${source.repository_count} restart_fields=${formatFieldNames(source.restart_fields)}`;
+  }
+}
+
+function formatSourceIdentity(source: ConfigurationAdminStatusResponse["source_identity"]): string {
+  if (source.status === "none") return "none (intentional no-source instance)";
+  if (source.status === "unavailable") return `unavailable (${source.reason})`;
+  return `${source.platform}:${source.path}`;
+}
+
+function formatFieldNames(names: readonly string[]): string {
+  return names.length === 0 ? "none" : names.join(",");
 }
 
 async function handleList(configPath: string, io: CliIo): Promise<number> {
@@ -303,7 +408,13 @@ function normalizeCommand(args: string[]): { name?: string; args: string[] } {
   return { name: args[0], args: args.slice(1) };
 }
 
-function formatConfigurationAdminError(error: ConfigurationAdminIpcError): string {
+function formatConfigurationAdminError(
+  error: ConfigurationAdminIpcError,
+  operation: "reload" | "status" | undefined
+): string {
+  if (operation === "status") {
+    return `Configuration status could not be verified. ${error.message}`;
+  }
   if (error.phase === "indeterminate") {
     return `Configuration reload outcome is indeterminate. The server may have applied it. ${error.message}`;
   }

@@ -3,7 +3,11 @@ import type { ConfigurationSourceIdentity } from "../src/config/config-source-id
 import type { ConfigurationAdminDiscoveryRecord, ConfigurationAdminProbeResult } from "../src/runtime/configuration-admin-client.js";
 import { ConfigurationAdminIpcError } from "../src/runtime/configuration-admin-error.js";
 import { readConfigurationAdminRecords, sendConfigurationAdminRequest } from "../src/runtime/configuration-admin-host.js";
-import type { ConfigurationAdminRequest, ConfigurationAdminResponse } from "../src/runtime/configuration-admin-protocol.js";
+import {
+  parseAdminResponse,
+  type ConfigurationAdminRequest,
+  type ConfigurationAdminResponse
+} from "../src/runtime/configuration-admin-protocol.js";
 
 vi.mock("../src/runtime/configuration-admin-host.js", () => ({
   readConfigurationAdminRecords: vi.fn(),
@@ -136,6 +140,86 @@ describe("configuration admin target selection", () => {
     })).rejects.toMatchObject({ code: "SOURCE_MISMATCH" });
   });
 
+  test("counts default-path and intentional no-source servers together for ambiguity", async () => {
+    const client = await import("../src/runtime/configuration-admin-client.js");
+
+    await expect(client.selectConfigurationAdminStatusTarget({
+      records: [record(41, "instance-a"), record(42, "no-source")],
+      selectedSourceIdentity: sourceA,
+      allowNoSource: true,
+      probe: async (entry) => probe(entry, entry.server_pid === 41 ? sourceA : { status: "none" })
+    })).rejects.toMatchObject({ code: "AMBIGUOUS_INSTANCE" });
+  });
+
+  test("allows default status to select a sole no-source server and excludes unavailable sources", async () => {
+    const client = await import("../src/runtime/configuration-admin-client.js");
+
+    const selected = await client.selectConfigurationAdminStatusTarget({
+      records: [record(41, "unavailable"), record(42, "no-source")],
+      selectedSourceIdentity: sourceA,
+      allowNoSource: true,
+      probe: async (entry) => probe(entry, entry.server_pid === 41
+        ? { status: "unavailable", reason: "unsupported-path" }
+        : { status: "none" })
+    });
+
+    expect(selected.record.server_pid).toBe(42);
+    expect(selected.probe.source_identity).toEqual({ status: "none" });
+  });
+
+  test("keeps explicit status source matching strict and prevents PID bypass", async () => {
+    const client = await import("../src/runtime/configuration-admin-client.js");
+    const records = [record(41, "no-source")];
+
+    await expect(client.selectConfigurationAdminStatusTarget({
+      records,
+      selectedSourceIdentity: sourceA,
+      allowNoSource: false,
+      probe: async (entry) => probe(entry, { status: "none" })
+    })).rejects.toMatchObject({ code: "NO_MATCHING_INSTANCE" });
+    await expect(client.selectConfigurationAdminStatusTarget({
+      records,
+      selectedSourceIdentity: sourceA,
+      allowNoSource: true,
+      instancePid: 41,
+      probe: async (entry) => probe(entry, { status: "unavailable", reason: "unsupported-path" })
+    })).rejects.toMatchObject({ code: "SOURCE_MISMATCH" });
+  });
+
+  test("rejects unavailable source identities before probing for reload and status", async () => {
+    const client = await import("../src/runtime/configuration-admin-client.js");
+    const probeRequest = vi.fn(async () => probe(record(41, "instance-a"), sourceA));
+    const options = {
+      records: [record(41, "instance-a")],
+      selectedSourceIdentity: { status: "unavailable", reason: "empty-path" } as const,
+      probe: probeRequest
+    };
+
+    await expect(client.selectConfigurationAdminTarget(options))
+      .rejects.toMatchObject({ code: "ADMIN_SOURCE_UNAVAILABLE" });
+    await expect(client.selectConfigurationAdminStatusTarget({ ...options, allowNoSource: true }))
+      .rejects.toMatchObject({ code: "ADMIN_SOURCE_UNAVAILABLE" });
+    expect(probeRequest).not.toHaveBeenCalled();
+  });
+
+  test("does not select a status target when its probe response operation is wrong", async () => {
+    const client = await import("../src/runtime/configuration-admin-client.js");
+    vi.mocked(readConfigurationAdminRecords).mockReset();
+    vi.mocked(readConfigurationAdminRecords).mockResolvedValue([record(41, "instance-a")]);
+    vi.mocked(sendConfigurationAdminRequest).mockReset();
+    vi.mocked(sendConfigurationAdminRequest).mockResolvedValue({
+      ...probe(record(41, "instance-a"), sourceA),
+      operation: "reload_result"
+    } as unknown as ConfigurationAdminResponse);
+
+    await expect(client.statusConfigurationAdmin({
+      selectedSourceIdentity: sourceA,
+      allowNoSource: false
+    })).rejects.toMatchObject({ code: "NO_MATCHING_INSTANCE" });
+    vi.mocked(readConfigurationAdminRecords).mockReset();
+    vi.mocked(sendConfigurationAdminRequest).mockReset();
+  });
+
   test("preserves a pre-dispatch probe error for an explicitly selected PID", async () => {
     const client = await import("../src/runtime/configuration-admin-client.js");
     const denied = new ConfigurationAdminIpcError(
@@ -180,6 +264,52 @@ describe("configuration admin target selection", () => {
       expected_instance_id: target.instance_id,
       expected_source_identity: sourceA
     }));
+  });
+
+  test("sends status bound to the selected no-source instance and validates the response identity", async () => {
+    const client = await import("../src/runtime/configuration-admin-client.js");
+    const target = record(41, "11111111-1111-4111-8111-111111111111");
+    vi.mocked(readConfigurationAdminRecords).mockResolvedValue([target]);
+    vi.mocked(sendConfigurationAdminRequest).mockImplementation(async (entry, request) => {
+      if (request.operation === "probe") return probe(entry, { status: "none" }, request.request_id);
+      if (request.operation !== "status") throw new Error("Expected a status request.");
+      return statusResponse(entry, request, { status: "none" });
+    });
+
+    const response = await client.statusConfigurationAdmin({
+      selectedSourceIdentity: sourceA,
+      allowNoSource: true
+    });
+
+    expect(response).toMatchObject({ operation: "status_result", source_identity: { status: "none" } });
+    expect(response.accepted_candidate).toStrictEqual({
+      source_status: "none",
+      repository_count: 1,
+      restart_fields: ["provider"]
+    });
+    expect(Object.hasOwn(response.accepted_candidate, "source_sha256")).toBe(false);
+    expect(response.saved_source).toStrictEqual({ status: "no-source" });
+    expect(sendConfigurationAdminRequest).toHaveBeenLastCalledWith(target, expect.objectContaining({
+      operation: "status",
+      expected_server_pid: target.server_pid,
+      expected_instance_id: target.instance_id,
+      expected_source_identity: { status: "none" }
+    }));
+  });
+
+  test("rejects an uncorrelated status response without reload-specific uncertainty", async () => {
+    const client = await import("../src/runtime/configuration-admin-client.js");
+    vi.mocked(readConfigurationAdminRecords).mockResolvedValue([record(41, "11111111-1111-4111-8111-111111111111")]);
+    vi.mocked(sendConfigurationAdminRequest).mockImplementation(async (entry, request) => {
+      if (request.operation === "probe") return probe(entry, sourceA, request.request_id);
+      if (request.operation !== "status") throw new Error("Expected a status request.");
+      return { ...statusResponse(entry, request, sourceA), request_id: "99999999-9999-4999-8999-999999999999" };
+    });
+
+    await expect(client.statusConfigurationAdmin({
+      selectedSourceIdentity: sourceA,
+      allowNoSource: false
+    })).rejects.toMatchObject({ code: "IPC_IDENTITY_CHANGED", phase: "pre-dispatch" });
   });
 
   test("rejects an unavailable selected source before discovery", async () => {
@@ -322,4 +452,43 @@ function publishedResponse(
     accepted_source_sha256: "c".repeat(64),
     pending_restart: false
   };
+}
+
+function statusResponse(
+  entry: ConfigurationAdminDiscoveryRecord,
+  request: ConfigurationAdminRequest,
+  sourceIdentity: Extract<ConfigurationSourceIdentity, { status: "available" | "none" }>
+): Extract<ConfigurationAdminResponse, { operation: "status_result" }> {
+  if (request.operation !== "status") throw new Error("Expected status request.");
+  const fingerprint = "a".repeat(64);
+  const response = parseAdminResponse({
+    protocol_version: 1,
+    request_id: request.request_id,
+    server_pid: entry.server_pid,
+    ...(entry.helper_pid === undefined ? {} : { helper_pid: entry.helper_pid }),
+    instance_id: entry.instance_id,
+    source_identity: sourceIdentity,
+    operation: "status_result",
+    accepted_candidate: {
+      source_status: sourceIdentity.status,
+      ...(sourceIdentity.status === "available" ? { source_sha256: fingerprint } : {}),
+      repository_count: 1,
+      restart_fields: ["provider"]
+    },
+    saved_source: sourceIdentity.status === "none"
+      ? { status: "no-source" }
+      : {
+          status: "valid",
+          source_sha256: fingerprint,
+          matches_accepted: true,
+          repository_count: 1,
+          restart_fields: ["provider"]
+        },
+    active_hot_revision: { generation: 2, repository_count: 1 },
+    initialized_restart_fields: ["provider"],
+    pending_restart_fields: [],
+    last_reload_outcome: "not-run"
+  });
+  if (response.operation !== "status_result") throw new Error("Expected a status response.");
+  return response;
 }

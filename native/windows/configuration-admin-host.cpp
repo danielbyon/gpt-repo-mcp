@@ -39,7 +39,7 @@ constexpr DWORD kMaximumInputBytes = kMaximumFrameBytes + 4;
 constexpr DWORD kMaximumControlLineBytes = 32'768;
 constexpr DWORD kConnectionTimeoutMs = 2'000;
 constexpr DWORD kProbeTimeoutMs = 2'000;
-constexpr DWORD kReloadAcknowledgmentTimeoutMs = 30'000;
+constexpr DWORD kOperationResponseTimeoutMs = 30'000;
 constexpr DWORD kControlLineTimeoutMs = 2'000;
 #ifdef GPT_REPO_CONFIGURATION_ADMIN_TESTING
 constexpr size_t kMaximumConnections = 2;
@@ -920,10 +920,28 @@ bool hasJsonStringField(const std::string &json, const char *name, const char *e
   return cursor == json.size() || json[cursor] == ',' || json[cursor] == '}';
 }
 
-bool isReloadRequest(const std::vector<BYTE> &request) {
+bool usesOperationResponseTimeout(const std::vector<BYTE> &request) {
   if (request.size() < 4) return false;
   const std::string json(reinterpret_cast<const char *>(request.data() + 4), request.size() - 4);
-  return hasJsonStringField(json, "operation", "reload");
+  return hasJsonStringField(json, "operation", "reload") ||
+      hasJsonStringField(json, "operation", "status");
+}
+
+bool isStatusRequest(const std::vector<BYTE> &request) {
+  if (request.size() < 4) return false;
+  const std::string json(reinterpret_cast<const char *>(request.data() + 4), request.size() - 4);
+  return hasJsonStringField(json, "operation", "status");
+}
+
+bool validClientTimeout(const std::vector<BYTE> &request, DWORD timeoutMs) {
+  if (request.size() < 4) return false;
+  const std::string json(reinterpret_cast<const char *>(request.data() + 4), request.size() - 4);
+  if (hasJsonStringField(json, "operation", "probe")) return timeoutMs == kProbeTimeoutMs;
+  if (hasJsonStringField(json, "operation", "reload")) return timeoutMs == kOperationResponseTimeoutMs;
+  if (hasJsonStringField(json, "operation", "status")) {
+    return timeoutMs > 0 && timeoutMs <= kOperationResponseTimeoutMs;
+  }
+  return false;
 }
 
 std::string nextConnectionId() {
@@ -1060,6 +1078,7 @@ ControlResult waitForControlResponse(
 
 ControlResult handleServerConnection(HANDLE pipe, HANDLE parentProcess, ControlHub &hub) {
   std::vector<BYTE> request;
+  const ULONGLONG statusDeadline = GetTickCount64() + kOperationResponseTimeoutMs;
   const ULONGLONG requestDeadline = GetTickCount64() + kConnectionTimeoutMs;
   if (!readPipeMessage(pipe, parentProcess, request, requestDeadline)) {
     return WaitForSingleObject(parentProcess, 0) == WAIT_OBJECT_0
@@ -1095,9 +1114,10 @@ ControlResult handleServerConnection(HANDLE pipe, HANDLE parentProcess, ControlH
   }
 
   std::vector<BYTE> response;
-  const DWORD acknowledgmentTimeout = isReloadRequest(request)
-      ? kReloadAcknowledgmentTimeoutMs : kProbeTimeoutMs;
-  const ULONGLONG acknowledgmentDeadline = GetTickCount64() + acknowledgmentTimeout;
+  const DWORD acknowledgmentTimeout = usesOperationResponseTimeout(request)
+      ? kOperationResponseTimeoutMs : kProbeTimeoutMs;
+  const ULONGLONG acknowledgmentDeadline = isStatusRequest(request)
+      ? statusDeadline : GetTickCount64() + acknowledgmentTimeout;
   const ControlResult result = waitForControlResponse(
       parentProcess, clientProcess.get(), hub, connectionId, pending,
       response, acknowledgmentDeadline);
@@ -1526,11 +1546,13 @@ bool verifyPipeOwnerAndHelperBeforeDispatch(
 
 int client(const std::wstring &endpoint, DWORD timeoutMs,
            DWORD expectedHelperPid, ULONGLONG expectedCreationTime) {
+  // The caller supplies one operation budget for reload or status. Keep one
+  // deadline across pipe connection, request write, and response read.
   const ULONGLONG operationDeadline = GetTickCount64() + timeoutMs;
   std::vector<BYTE> request;
   if (!validLocalPipeName(endpoint) ||
       !readAllInput(GetStdHandle(STD_INPUT_HANDLE), kMaximumInputBytes, request) ||
-      !hasValidFrame(request)) {
+      !hasValidFrame(request) || !validClientTimeout(request, timeoutMs)) {
     writeStdout("NOT_DISPATCHED\t0\n");
     return 31;
   }
@@ -1781,8 +1803,8 @@ int wmain(int argc, wchar_t *argv[]) {
   if (wcscmp(argv[1], L"client") == 0 && argc == 6) {
     wchar_t *end = nullptr;
     const unsigned long timeout = wcstoul(argv[3], &end, 10);
-    if (end == argv[3] || *end != L'\0' ||
-        (timeout != kProbeTimeoutMs && timeout != kReloadAcknowledgmentTimeoutMs)) return 5;
+    if (end == argv[3] || *end != L'\0' || timeout == 0 ||
+        timeout > kOperationResponseTimeoutMs) return 5;
     DWORD expectedHelperPid = 0;
     ULONGLONG expectedCreationTime = 0;
     if (!parsePositivePid(argv[4], expectedHelperPid) ||

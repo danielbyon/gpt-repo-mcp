@@ -208,6 +208,7 @@ For the full boundary, threat model, and approval behavior, read
 | `npm run connect:secure` | Start the server with the OpenAI Secure MCP Tunnel |
 | `npm run check:config` | Validate local configuration |
 | `npm run config:reload -- [--instance <PID>]` | Reload the selected configuration in its matching local server |
+| `npm run config:status -- [--instance <PID>]` | Report a matching server's saved and active configuration state without reloading |
 
 ## Documentation
 
