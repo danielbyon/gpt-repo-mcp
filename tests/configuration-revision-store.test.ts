@@ -253,16 +253,52 @@ test("keeps restart-only additions, removals, modifications, and reversions sepa
       sourceIdentity,
       revisionStore: store
     });
-    const status = () => controller.handle({
+    let statusRequestId = "";
+    const status = () => {
+      statusRequestId = randomUUID();
+      return controller.handle({
+        protocol_version: 1,
+        request_id: statusRequestId,
+        operation: "status",
+        expected_server_pid: process.pid,
+        expected_instance_id: instanceId,
+        expected_source_identity: sourceIdentity
+      });
+    };
+    const restartFields = ["executable", "index_timeout_ms", "provider", "query_timeout_ms"];
+    const expectedStatus = (options: {
+      fingerprint: string;
+      acceptedFields?: string[];
+      initializedFields: string[];
+      pendingFields: string[];
+    }) => ({
       protocol_version: 1,
-      request_id: randomUUID(),
-      operation: "status",
-      expected_server_pid: process.pid,
-      expected_instance_id: instanceId,
-      expected_source_identity: sourceIdentity
+      request_id: statusRequestId,
+      server_pid: process.pid,
+      instance_id: instanceId,
+      source_identity: sourceIdentity,
+      operation: "status_result",
+      accepted_candidate: {
+        source_status: "available",
+        source_sha256: options.fingerprint,
+        repository_count: 1,
+        restart_fields: options.acceptedFields ?? restartFields
+      },
+      saved_source: {
+        status: "valid",
+        source_sha256: options.fingerprint,
+        matches_accepted: true,
+        repository_count: 1,
+        restart_fields: options.acceptedFields ?? restartFields
+      },
+      active_hot_revision: { generation: startupRevision.generation, repository_count: 1 },
+      initialized_restart_fields: options.initializedFields,
+      pending_restart_fields: options.pendingFields,
+      last_reload_outcome: "accepted"
     });
 
-    await writeFile(configPath, JSON.stringify(repositoryConfig(root, codeIntelligenceSettings(5_000))));
+    const modifiedBytes = Buffer.from(JSON.stringify(repositoryConfig(root, codeIntelligenceSettings(5_000))));
+    await writeFile(configPath, modifiedBytes);
     const modified = await store.reloadFromFile();
     expect(modified.acceptedCandidate?.restartSettings?.query_timeout_ms).toBe(5_000);
     expect(modified.pendingRestart?.initialized?.query_timeout_ms).toBe(3_000);
@@ -270,27 +306,35 @@ test("keeps restart-only additions, removals, modifications, and reversions sepa
     expect(modified.effectiveHotRevision).toBe(startupRevision);
     expect(modified.effectiveHotRevision.runtimeContext.codeIntelligence).toBe(service);
     const modifiedStatus = await status();
-    expect(modifiedStatus).toMatchObject({
-      accepted_candidate: { source_status: "available", restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"] },
-      initialized_restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"],
-      pending_restart_fields: ["query_timeout_ms"]
-    });
-    expect(JSON.stringify(modifiedStatus)).not.toContain(process.execPath);
-    expect(JSON.stringify(modifiedStatus)).not.toContain("5000");
+    expect(modifiedStatus).toStrictEqual(expectedStatus({
+      fingerprint: createHash("sha256").update(modifiedBytes).digest("hex"),
+      initializedFields: restartFields,
+      pendingFields: ["query_timeout_ms"]
+    }));
 
-    await writeFile(configPath, JSON.stringify(repositoryConfig(root, startupSettings)));
+    const restoredBytes = Buffer.from(JSON.stringify(repositoryConfig(root, startupSettings)));
+    await writeFile(configPath, restoredBytes);
     expect((await store.reloadFromFile()).pendingRestart).toBeUndefined();
-    expect((await status())).toMatchObject({ pending_restart_fields: [] });
+    const restoredStatus = await status();
+    expect(restoredStatus).toStrictEqual(expectedStatus({
+      fingerprint: createHash("sha256").update(restoredBytes).digest("hex"),
+      initializedFields: restartFields,
+      pendingFields: []
+    }));
 
-    await writeFile(configPath, JSON.stringify(repositoryConfig(root)));
+    const removedBytes = Buffer.from(JSON.stringify(repositoryConfig(root)));
+    await writeFile(configPath, removedBytes);
     const removed = await store.reloadFromFile();
     expect(removed.pendingRestart?.initialized?.query_timeout_ms).toBe(3_000);
     expect(removed.pendingRestart?.accepted).toBeUndefined();
     expect(removed.effectiveHotRevision).toBe(startupRevision);
-    expect(await status()).toMatchObject({
-      initialized_restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"],
-      pending_restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"]
-    });
+    const removedStatus = await status();
+    expect(removedStatus).toStrictEqual(expectedStatus({
+      fingerprint: createHash("sha256").update(removedBytes).digest("hex"),
+      acceptedFields: [],
+      initializedFields: restartFields,
+      pendingFields: restartFields
+    }));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -314,36 +358,57 @@ test("keeps restart-only additions, removals, modifications, and reversions sepa
       revisionStore: store
     });
 
-    const addedDocument = repositoryConfig(additionRoot, codeIntelligenceSettings(3_000));
-    await writeFile(additionPath, JSON.stringify(addedDocument));
+    const addedCandidate = configurationWithFingerprintFragment((attempt) => repositoryConfig(
+      additionRoot,
+      {
+        ...codeIntelligenceSettings(3_000),
+        executable: join(additionDirectory, `private-code-indexer-${attempt}`)
+      }
+    ), "3000");
+    expect(addedCandidate.fingerprint).toContain("3000");
+    await writeFile(additionPath, addedCandidate.bytes);
     const added = await store.reloadFromFile();
     expect(added.pendingRestart?.initialized).toBeUndefined();
     expect(added.pendingRestart?.accepted?.query_timeout_ms).toBe(3_000);
     expect(added.effectiveHotRevision).toBe(originalRevision);
     const addedBytes = await readFile(additionPath);
     const addedFingerprint = createHash("sha256").update(addedBytes).digest("hex");
+    expect(addedFingerprint).toBe(addedCandidate.fingerprint);
     expect(addedFingerprint).not.toBe(originalFingerprint);
+    const addedRequestId = randomUUID();
     const addedStatus = await controller.handle({
       protocol_version: 1,
-      request_id: randomUUID(),
+      request_id: addedRequestId,
       operation: "status",
       expected_server_pid: process.pid,
       expected_instance_id: instanceId,
       expected_source_identity: sourceIdentity
     });
-    expect(addedStatus).toMatchObject({
-      active_hot_revision: { generation: originalRevision.generation },
+    expect(addedStatus).toStrictEqual({
+      protocol_version: 1,
+      request_id: addedRequestId,
+      server_pid: process.pid,
+      instance_id: instanceId,
+      source_identity: sourceIdentity,
+      operation: "status_result",
       accepted_candidate: {
         source_status: "available",
         source_sha256: addedFingerprint,
+        repository_count: 1,
         restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"]
       },
+      saved_source: {
+        status: "valid",
+        source_sha256: addedFingerprint,
+        matches_accepted: true,
+        repository_count: 1,
+        restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"]
+      },
+      active_hot_revision: { generation: originalRevision.generation, repository_count: 1 },
       initialized_restart_fields: [],
-      pending_restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"]
+      pending_restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"],
+      last_reload_outcome: "accepted"
     });
-    expect(JSON.stringify(addedStatus)).not.toContain(process.execPath);
-    expect(JSON.stringify(addedStatus)).not.toContain("3000");
-    expect(JSON.stringify(addedStatus)).not.toContain("1800000");
   } finally {
     await rm(additionDirectory, { recursive: true, force: true });
   }
@@ -494,6 +559,18 @@ function codeIntelligenceSettings(queryTimeoutMs: number) {
     query_timeout_ms: queryTimeoutMs,
     index_timeout_ms: 1_800_000
   };
+}
+
+function configurationWithFingerprintFragment(
+  createDocument: (attempt: number) => unknown,
+  fragment: string
+): { bytes: Buffer; fingerprint: string } {
+  for (let attempt = 0; attempt < 100_000; attempt += 1) {
+    const bytes = Buffer.from(JSON.stringify(createDocument(attempt)));
+    const fingerprint = createHash("sha256").update(bytes).digest("hex");
+    if (fingerprint.includes(fragment)) return { bytes, fingerprint };
+  }
+  throw new Error(`No configuration fingerprint contained ${fragment} after 100000 candidates.`);
 }
 
 function deferred<T>() {

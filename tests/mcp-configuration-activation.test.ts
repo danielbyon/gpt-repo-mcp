@@ -287,6 +287,8 @@ test("production CLI recovers a lost reload response and reports restart-only st
     const cliPath = join(process.cwd(), "dist", "cli", "connect-gpt.js");
     await access(cliPath);
     const sourceIdentity = createConfigurationSourceIdentity(fixture.configPath, process.cwd());
+    if (sourceIdentity.status !== "available") throw new Error("The test configuration source must be available.");
+    const sourceLabel = `${sourceIdentity.platform}:${sourceIdentity.path}`;
     const instanceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     httpApp = createMcpHttpApp({ revisionStore: fixture.store, maxSessions: 4, sessionIdleTtlMs: 60_000 });
     let helperPid: number | undefined;
@@ -323,6 +325,28 @@ test("production CLI recovers a lost reload response and reports restart-only st
     await mcpClient.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`)));
     const rootsBefore = await callRawTool(mcpClient, "repo_list_roots", {});
     expect(JSON.stringify(rootsBefore)).toContain("old-root");
+    const expectStatusOutput = (
+      result: Awaited<ReturnType<typeof runBuiltCli>>,
+      values: {
+        fingerprint: string;
+        acceptedFields: string;
+        initializedFields: string;
+        pendingFields: string;
+      }
+    ) => {
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
+      expect(result.stdout.trimEnd().split(/\r?\n/)).toEqual([
+        `Server PID: ${process.pid}`,
+        `Source: ${sourceLabel}`,
+        `Accepted candidate: sha256=${values.fingerprint} repositories=1 restart_fields=${values.acceptedFields}`,
+        `Saved file: valid sha256=${values.fingerprint} matches_accepted=true repositories=1 restart_fields=${values.acceptedFields}`,
+        "Effective hot revision: generation=2 repositories=1",
+        `Initialized restart fields: ${values.initializedFields}`,
+        `Pending restart fields: ${values.pendingFields}`,
+        "Last reload outcome: accepted"
+      ]);
+    };
 
     await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)], startupSettings);
     const acceptedBytes = await readFile(fixture.configPath);
@@ -343,44 +367,67 @@ test("production CLI recovers a lost reload response and reports restart-only st
       lastReloadOutcome: "accepted"
     });
 
+    const rootsAfterIndeterminateReload = await callRawTool(mcpClient, "repo_fetch_file", {
+      repo_id: "fixture",
+      path: "marker.txt"
+    });
+    expect(rootsAfterIndeterminateReload.isError).not.toBe(true);
+    expect(JSON.stringify(rootsAfterIndeterminateReload)).toContain("marker from new root");
+    expect(JSON.stringify(rootsAfterIndeterminateReload)).not.toContain("marker from old root");
+
     const cliEnv = createCliEnvironment(ipcDirectory, localAppData);
     const statusResult = await runBuiltCli([
       "--config", fixture.configPath, "config", "status", "--instance", String(process.pid)
     ], cliEnv);
-    expect(statusResult.code).toBe(0);
-    expect(statusResult.stdout).toContain(`Server PID: ${process.pid}`);
-    expect(statusResult.stdout).toContain(`Accepted candidate: sha256=${createHash("sha256").update(acceptedBytes).digest("hex")}`);
-    expect(statusResult.stdout).toContain("Effective hot revision: generation=2");
-    expect(statusResult.stdout).toContain("Saved file: valid");
-    expect(statusResult.stdout).toContain("matches_accepted=true");
-    expect(statusResult.stdout).toContain("Last reload outcome: accepted");
-
     const initializedFields = "executable,index_timeout_ms,provider,query_timeout_ms";
+    expectStatusOutput(statusResult, {
+      fingerprint: createHash("sha256").update(acceptedBytes).digest("hex"),
+      acceptedFields: initializedFields,
+      initializedFields,
+      pendingFields: "none"
+    });
+
     let previousFingerprint = createHash("sha256").update(acceptedBytes).digest("hex");
     const initializedEffectiveRevision = fixture.store.getState().effectiveHotRevision;
-    const restartMutations = [
+    const executableMutation = candidateWithFingerprintSubstring((attempt) => {
+      const settings = {
+        ...startupSettings,
+        executable: join(fixture.directory, `private-code-indexer-${attempt}`)
+      };
+      return {
+        bytes: serializeCandidate([repository("fixture", fixture.newRoot, false)], settings),
+        value: settings
+      };
+    }, "3000");
+    const restartMutations: Array<{
+      field: string;
+      settings: ReturnType<typeof codeIntelligenceSettings>;
+      expectedFingerprint?: string;
+    }> = [
       {
         field: "executable",
-        settings: { ...startupSettings, executable: join(fixture.directory, "private-code-indexer") },
-        value: join(fixture.directory, "private-code-indexer")
+        settings: executableMutation.value,
+        expectedFingerprint: executableMutation.fingerprint
       },
       {
         field: "index_timeout_ms",
-        settings: { ...startupSettings, index_timeout_ms: 1_799_999 },
-        value: "1799999"
+        settings: { ...startupSettings, index_timeout_ms: 1_799_999 }
       },
       {
         field: "query_timeout_ms",
-        settings: { ...startupSettings, query_timeout_ms: 4_123 },
-        value: "4123"
+        settings: { ...startupSettings, query_timeout_ms: 4_123 }
       }
-    ] as const;
+    ];
 
     for (const mutation of restartMutations) {
       await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)], mutation.settings);
       const candidateBytes = await readFile(fixture.configPath);
       const candidateFingerprint = createHash("sha256").update(candidateBytes).digest("hex");
       expect(candidateFingerprint).not.toBe(previousFingerprint);
+      if (mutation.expectedFingerprint) {
+        expect(candidateFingerprint).toBe(mutation.expectedFingerprint);
+        expect(candidateFingerprint).toContain("3000");
+      }
 
       const reloadStatus = await runBuiltCli([
         "--config", fixture.configPath, "config", "reload"
@@ -396,23 +443,12 @@ test("production CLI recovers a lost reload response and reports restart-only st
       const observedStatus = await runBuiltCli([
         "--config", fixture.configPath, "config", "status", "--instance", String(process.pid)
       ], cliEnv);
-      expect(observedStatus.code).toBe(0);
-      expect(observedStatus.stdout).toContain(`Server PID: ${process.pid}`);
-      expect(observedStatus.stdout).toContain(`Accepted candidate: sha256=${candidateFingerprint}`);
-      expect(observedStatus.stdout).toContain("Effective hot revision: generation=2");
-      expect(observedStatus.stdout).toContain(`Initialized restart fields: ${initializedFields}`);
-      expect(observedStatus.stdout.split("\n").find((line) => line.startsWith("Pending restart fields:")))
-        .toBe(`Pending restart fields: ${mutation.field}`);
-      const statusWithoutFingerprints = observedStatus.stdout.replace(/sha256=[a-f0-9]{64}/g, "sha256=<fingerprint>");
-      for (const value of [
-        mutation.value,
-        startupSettings.executable,
-        String(startupSettings.index_timeout_ms),
-        String(startupSettings.query_timeout_ms)
-      ]) {
-        expect(statusWithoutFingerprints).not.toContain(value);
-      }
-      expect(observedStatus.stdout).toContain("Last reload outcome: accepted");
+      expectStatusOutput(observedStatus, {
+        fingerprint: candidateFingerprint,
+        acceptedFields: initializedFields,
+        initializedFields,
+        pendingFields: mutation.field
+      });
       previousFingerprint = candidateFingerprint;
     }
 
@@ -430,13 +466,12 @@ test("production CLI recovers a lost reload response and reports restart-only st
     const removedSectionStatus = await runBuiltCli([
       "--config", fixture.configPath, "config", "status", "--instance", String(process.pid)
     ], cliEnv);
-    expect(removedSectionStatus.code).toBe(0);
-    expect(removedSectionStatus.stdout).toContain(`Accepted candidate: sha256=${removedSectionFingerprint}`);
-    expect(removedSectionStatus.stdout).toContain(`Initialized restart fields: ${initializedFields}`);
-    expect(removedSectionStatus.stdout).toContain(`Pending restart fields: ${initializedFields}`);
-    expect(removedSectionStatus.stdout).not.toContain(startupSettings.executable);
-    expect(removedSectionStatus.stdout).not.toContain(String(startupSettings.index_timeout_ms));
-    expect(removedSectionStatus.stdout).not.toContain(String(startupSettings.query_timeout_ms));
+    expectStatusOutput(removedSectionStatus, {
+      fingerprint: removedSectionFingerprint,
+      acceptedFields: "none",
+      initializedFields,
+      pendingFields: initializedFields
+    });
 
     await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)], startupSettings);
     const restoredBytes = await readFile(fixture.configPath);
@@ -447,12 +482,12 @@ test("production CLI recovers a lost reload response and reports restart-only st
     const restoredStatus = await runBuiltCli([
       "--config", fixture.configPath, "config", "status", "--instance", String(process.pid)
     ], cliEnv);
-    expect(restoredStatus.code).toBe(0);
-    expect(restoredStatus.stdout).toContain(`Accepted candidate: sha256=${restoredFingerprint}`);
-    expect(restoredStatus.stdout).toContain(`Initialized restart fields: ${initializedFields}`);
-    expect(restoredStatus.stdout).toContain("Pending restart fields: none");
-    expect(restoredStatus.stdout).toContain("Last reload outcome: accepted");
-    expect(restoredStatus.stdout).not.toContain(startupSettings.executable);
+    expectStatusOutput(restoredStatus, {
+      fingerprint: restoredFingerprint,
+      acceptedFields: initializedFields,
+      initializedFields,
+      pendingFields: "none"
+    });
     expect(fixture.store.getState()).toMatchObject({
       acceptedCandidate: { sourceSha256: restoredFingerprint },
       effectiveHotRevision: { generation: 2, runtimeContext: { codeIntelligence: codeIntelligenceService } }
@@ -550,11 +585,10 @@ async function createFixture(options: {
     await writeFile(join(newRoot, "marker.txt"), "marker from new root");
     await mkdir(join(oldRoot, ".chatgpt", "runs", "past"), { recursive: true });
     await writeFile(join(oldRoot, ".chatgpt", "runs", "past", "prompt.md"), "historical delegation artifact");
-    await writeFile(configPath, JSON.stringify({
-      repos: [repository("fixture", oldRoot, true)],
-      limits: {},
-      ...(options.codeIntelligence ? { code_intelligence: options.codeIntelligence } : {})
-    }));
+    await writeFile(configPath, serializeCandidate(
+      [repository("fixture", oldRoot, true)],
+      options.codeIntelligence
+    ));
     const initial = await prepareConfigurationCandidate(await readFile(configPath), configPath);
     const store = new ConfigurationRevisionStore({
       configPath,
@@ -572,11 +606,7 @@ async function createFixture(options: {
         repos: ReturnType<typeof repository>[],
         codeIntelligence?: ReturnType<typeof codeIntelligenceSettings>
       ) {
-        await writeFile(configPath, JSON.stringify({
-          repos,
-          limits: {},
-          ...(codeIntelligence ? { code_intelligence: codeIntelligence } : {})
-        }));
+        await writeFile(configPath, serializeCandidate(repos, codeIntelligence));
       }
     };
   } catch (error) {
@@ -602,6 +632,29 @@ function repository(repoId: string, root: string, writesEnabled: boolean, cleanu
 
 function codeIntelligenceSettings(overrides: Partial<ReturnType<typeof baseCodeIntelligenceSettings>> = {}) {
   return { ...baseCodeIntelligenceSettings(), ...overrides };
+}
+
+function serializeCandidate(
+  repos: ReturnType<typeof repository>[],
+  codeIntelligence?: ReturnType<typeof codeIntelligenceSettings>
+): Buffer {
+  return Buffer.from(JSON.stringify({
+    repos,
+    limits: {},
+    ...(codeIntelligence ? { code_intelligence: codeIntelligence } : {})
+  }));
+}
+
+function candidateWithFingerprintSubstring<T>(
+  createCandidate: (attempt: number) => { bytes: Buffer; value: T },
+  fragment: string
+): { bytes: Buffer; fingerprint: string; value: T } {
+  for (let attempt = 0; attempt < 100_000; attempt += 1) {
+    const candidate = createCandidate(attempt);
+    const fingerprint = createHash("sha256").update(candidate.bytes).digest("hex");
+    if (fingerprint.includes(fragment)) return { ...candidate, fingerprint };
+  }
+  throw new Error(`No configuration fingerprint contained ${fragment} after 100000 candidates.`);
 }
 
 function baseCodeIntelligenceSettings() {

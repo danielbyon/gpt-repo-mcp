@@ -3,7 +3,11 @@ import type { ConfigurationSourceIdentity } from "../src/config/config-source-id
 import type { ConfigurationAdminDiscoveryRecord, ConfigurationAdminProbeResult } from "../src/runtime/configuration-admin-client.js";
 import { ConfigurationAdminIpcError } from "../src/runtime/configuration-admin-error.js";
 import { readConfigurationAdminRecords, sendConfigurationAdminRequest } from "../src/runtime/configuration-admin-host.js";
-import type { ConfigurationAdminRequest, ConfigurationAdminResponse } from "../src/runtime/configuration-admin-protocol.js";
+import {
+  parseAdminResponse,
+  type ConfigurationAdminRequest,
+  type ConfigurationAdminResponse
+} from "../src/runtime/configuration-admin-protocol.js";
 
 vi.mock("../src/runtime/configuration-admin-host.js", () => ({
   readConfigurationAdminRecords: vi.fn(),
@@ -264,7 +268,7 @@ describe("configuration admin target selection", () => {
 
   test("sends status bound to the selected no-source instance and validates the response identity", async () => {
     const client = await import("../src/runtime/configuration-admin-client.js");
-    const target = record(41, "instance-a");
+    const target = record(41, "11111111-1111-4111-8111-111111111111");
     vi.mocked(readConfigurationAdminRecords).mockResolvedValue([target]);
     vi.mocked(sendConfigurationAdminRequest).mockImplementation(async (entry, request) => {
       if (request.operation === "probe") return probe(entry, { status: "none" }, request.request_id);
@@ -278,6 +282,13 @@ describe("configuration admin target selection", () => {
     });
 
     expect(response).toMatchObject({ operation: "status_result", source_identity: { status: "none" } });
+    expect(response.accepted_candidate).toStrictEqual({
+      source_status: "none",
+      repository_count: 1,
+      restart_fields: ["provider"]
+    });
+    expect(Object.hasOwn(response.accepted_candidate, "source_sha256")).toBe(false);
+    expect(response.saved_source).toStrictEqual({ status: "no-source" });
     expect(sendConfigurationAdminRequest).toHaveBeenLastCalledWith(target, expect.objectContaining({
       operation: "status",
       expected_server_pid: target.server_pid,
@@ -288,7 +299,7 @@ describe("configuration admin target selection", () => {
 
   test("rejects an uncorrelated status response without reload-specific uncertainty", async () => {
     const client = await import("../src/runtime/configuration-admin-client.js");
-    vi.mocked(readConfigurationAdminRecords).mockResolvedValue([record(41, "instance-a")]);
+    vi.mocked(readConfigurationAdminRecords).mockResolvedValue([record(41, "11111111-1111-4111-8111-111111111111")]);
     vi.mocked(sendConfigurationAdminRequest).mockImplementation(async (entry, request) => {
       if (request.operation === "probe") return probe(entry, sourceA, request.request_id);
       if (request.operation !== "status") throw new Error("Expected a status request.");
@@ -446,10 +457,11 @@ function publishedResponse(
 function statusResponse(
   entry: ConfigurationAdminDiscoveryRecord,
   request: ConfigurationAdminRequest,
-  sourceIdentity: ConfigurationSourceIdentity
+  sourceIdentity: Extract<ConfigurationSourceIdentity, { status: "available" | "none" }>
 ): Extract<ConfigurationAdminResponse, { operation: "status_result" }> {
   if (request.operation !== "status") throw new Error("Expected status request.");
-  return {
+  const fingerprint = "a".repeat(64);
+  const response = parseAdminResponse({
     protocol_version: 1,
     request_id: request.request_id,
     server_pid: entry.server_pid,
@@ -458,15 +470,25 @@ function statusResponse(
     source_identity: sourceIdentity,
     operation: "status_result",
     accepted_candidate: {
-      source_status: "available",
-      source_sha256: "a".repeat(64),
+      source_status: sourceIdentity.status,
+      ...(sourceIdentity.status === "available" ? { source_sha256: fingerprint } : {}),
       repository_count: 1,
       restart_fields: ["provider"]
     },
-    saved_source: { status: "no-source" },
+    saved_source: sourceIdentity.status === "none"
+      ? { status: "no-source" }
+      : {
+          status: "valid",
+          source_sha256: fingerprint,
+          matches_accepted: true,
+          repository_count: 1,
+          restart_fields: ["provider"]
+        },
     active_hot_revision: { generation: 2, repository_count: 1 },
     initialized_restart_fields: ["provider"],
     pending_restart_fields: [],
     last_reload_outcome: "not-run"
-  };
+  });
+  if (response.operation !== "status_result") throw new Error("Expected a status response.");
+  return response;
 }
