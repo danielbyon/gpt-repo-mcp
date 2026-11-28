@@ -119,11 +119,19 @@ const SavedSourceStatusSchema = z.discriminatedUnion("status", [
 
 const StatusResponseSchema = ResponseIdentitySchema.extend({
   operation: z.literal("status_result"),
-  accepted_candidate: z.object({
-    source_sha256: StatusHashSchema,
-    repository_count: z.number().int().nonnegative(),
-    restart_fields: StatusFieldNamesSchema
-  }).strict(),
+  accepted_candidate: z.discriminatedUnion("source_status", [
+    z.object({
+      source_status: z.literal("available"),
+      source_sha256: StatusHashSchema,
+      repository_count: z.number().int().nonnegative(),
+      restart_fields: StatusFieldNamesSchema
+    }).strict(),
+    z.object({
+      source_status: z.literal("none"),
+      repository_count: z.number().int().nonnegative(),
+      restart_fields: StatusFieldNamesSchema
+    }).strict()
+  ]),
   saved_source: SavedSourceStatusSchema,
   active_hot_revision: z.object({
     generation: z.number().int().nonnegative(),
@@ -154,6 +162,10 @@ export function parseAdminRequest(value: unknown): ConfigurationAdminRequest {
 /** Validates response shape and binds it to the request and selected instance. */
 export function parseAdminResponse(value: unknown): ConfigurationAdminResponse {
   const response = z.discriminatedUnion("operation", [StateResponseSchema, ReloadResponseSchema, StatusResponseSchema]).parse(value);
+  if (response.operation === "status_result"
+    && ((response.source_identity.status === "none") !== (response.accepted_candidate.source_status === "none"))) {
+    throw new Error("The accepted candidate source does not match the selected source identity.");
+  }
   return response;
 }
 

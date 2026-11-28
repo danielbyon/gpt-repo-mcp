@@ -57,10 +57,12 @@ export async function startPosixConfigurationAdminServer(options: {
       socket.destroy();
       return;
     }
+    const acceptedAt = performance.now();
     sockets.add(socket);
     socket.on("error", () => socket.destroy());
-    const frameDeadline = performance.now() + CONNECTION_AND_PROBE_TIMEOUT_MS;
-    void serveConnection(socket, options.handle, frameDeadline).finally(() => sockets.delete(socket));
+    const frameDeadline = acceptedAt + CONNECTION_AND_PROBE_TIMEOUT_MS;
+    const statusDeadline = acceptedAt + STATUS_RESPONSE_TIMEOUT_MS;
+    void serveConnection(socket, options.handle, frameDeadline, statusDeadline).finally(() => sockets.delete(socket));
   });
   server.maxConnections = 32;
   server.on("error", () => undefined);
@@ -141,13 +143,14 @@ export async function readPosixConfigurationAdminRecords(
 }
 
 /**
- * Connection and probe use two seconds. A dispatched reload and a status request each get one 30-second response budget.
- * Reloads are never retried after a write attempt.
+ * Status gets one 30-second budget from the start of the request, with a two-second connection limit. Probe and reload
+ * keep their existing deadlines. Reloads are never retried after a write attempt.
  */
 export async function requestPosixConfigurationAdmin(
   record: ConfigurationAdminDiscoveryRecord,
   value: ConfigurationAdminRequest
 ): Promise<ConfigurationAdminResponse> {
+  const transactionStartedAt = performance.now();
   let dispatched = false;
   let request: ConfigurationAdminRequest;
   let frame: Buffer;
@@ -160,12 +163,18 @@ export async function requestPosixConfigurationAdmin(
   } catch (error) {
     throw asIpcError(error, "IPC_UNAVAILABLE", "pre-dispatch", "The administrative endpoint is unavailable.");
   }
+  const statusDeadlineAt = request.operation === "status"
+    ? transactionStartedAt + STATUS_RESPONSE_TIMEOUT_MS
+    : undefined;
 
   return await new Promise<ConfigurationAdminResponse>((resolveResponse, rejectResponse) => {
     const socket = createConnection({ path: record.endpoint });
     let received = Buffer.alloc(0);
     let settled = false;
-    let deadlineAt = performance.now() + CONNECTION_AND_PROBE_TIMEOUT_MS;
+    let deadlineAt = Math.min(
+      performance.now() + CONNECTION_AND_PROBE_TIMEOUT_MS,
+      statusDeadlineAt ?? Number.POSITIVE_INFINITY
+    );
     let deadlineTimer: ReturnType<typeof setTimeout>;
     const phase = (): "pre-dispatch" | "indeterminate" => request.operation === "reload" && dispatched
       ? "indeterminate"
@@ -173,12 +182,17 @@ export async function requestPosixConfigurationAdmin(
 
     const clearDeadline = (): void => clearTimeout(deadlineTimer);
 
-    const armDeadline = (durationMs: number): void => {
+    const armDeadlineAt = (absoluteDeadline: number): void => {
       clearDeadline();
-      deadlineAt = performance.now() + durationMs;
+      deadlineAt = absoluteDeadline;
+      const remainingMs = Math.max(0, deadlineAt - performance.now());
       deadlineTimer = setTimeout(() => {
         fail("IPC_TIMEOUT", "The administrative endpoint did not respond before the deadline.");
-      }, durationMs);
+      }, remainingMs);
+    };
+
+    const armDeadline = (durationMs: number): void => {
+      armDeadlineAt(performance.now() + durationMs);
     };
 
     const deadlineExpired = (): boolean => {
@@ -195,13 +209,14 @@ export async function requestPosixConfigurationAdmin(
       rejectResponse(new ConfigurationAdminIpcError(code, phase(), message));
     };
 
-    armDeadline(CONNECTION_AND_PROBE_TIMEOUT_MS);
+    armDeadlineAt(deadlineAt);
     socket.on("connect", () => {
       if (deadlineExpired()) return;
       try {
         if (request.operation === "reload" || request.operation === "status") {
           if (request.operation === "reload") dispatched = true;
-          armDeadline(request.operation === "reload" ? RELOAD_ACK_TIMEOUT_MS : STATUS_RESPONSE_TIMEOUT_MS);
+          if (request.operation === "reload") armDeadline(RELOAD_ACK_TIMEOUT_MS);
+          else if (statusDeadlineAt !== undefined) armDeadlineAt(statusDeadlineAt);
         }
         socket.end(frame);
       } catch {
@@ -273,14 +288,17 @@ export async function getPosixConfigurationAdminDirectory(): Promise<string> {
 async function serveConnection(
   socket: Socket,
   handle: (value: unknown) => Promise<ConfigurationAdminResponse>,
-  frameDeadline: number
+  frameDeadline: number,
+  statusDeadline: number
 ): Promise<void> {
   try {
     const requestValue = decodeAdminFrame(await readSocketFrame(socket, frameDeadline));
     const request = parseAdminRequest(requestValue);
     const operationDeadline = request.operation === "probe"
       ? frameDeadline
-      : performance.now() + (request.operation === "reload" ? RELOAD_ACK_TIMEOUT_MS : STATUS_RESPONSE_TIMEOUT_MS);
+      : request.operation === "reload"
+        ? performance.now() + RELOAD_ACK_TIMEOUT_MS
+        : statusDeadline;
     const response = parseAdminResponse(await waitForDeadline(handle(request), operationDeadline, socket));
     if (response.request_id !== request.request_id) return;
     await writeFrameBeforeDeadline(socket, encodeAdminFrame(response), operationDeadline);

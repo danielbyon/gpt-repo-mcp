@@ -222,19 +222,36 @@ describe("config status CLI command", () => {
         sourceIdentity: { status: "none" } as const,
         savedSource: { status: "no-source" } as const,
         exitCode: 0,
-        expected: "Source: none (intentional no-source instance)"
+        expected: "Source: none (intentional no-source instance)",
+        acceptedCandidate: {
+          source_status: "none",
+          repository_count: 2,
+          restart_fields: ["provider"]
+        } as const
       },
       {
         sourceIdentity: { status: "available", platform, path: resolve(cwd, "config.local.json") } as const,
         savedSource: { status: "read-failed", code: "FILE_NOT_FOUND" } as const,
         exitCode: 1,
-        expected: "Saved file: read-failed code=FILE_NOT_FOUND"
+        expected: "Saved file: read-failed code=FILE_NOT_FOUND",
+        acceptedCandidate: {
+          source_status: "available",
+          source_sha256: "a".repeat(64),
+          repository_count: 2,
+          restart_fields: ["provider"]
+        } as const
       },
       {
         sourceIdentity: { status: "available", platform, path: resolve(cwd, "config.local.json") } as const,
         savedSource: { status: "invalid-json", source_sha256: "b".repeat(64) } as const,
         exitCode: 1,
-        expected: `Saved file: invalid-json sha256=${"b".repeat(64)}`
+        expected: `Saved file: invalid-json sha256=${"b".repeat(64)}`,
+        acceptedCandidate: {
+          source_status: "available",
+          source_sha256: "a".repeat(64),
+          repository_count: 2,
+          restart_fields: ["provider"]
+        } as const
       }
     ];
 
@@ -243,7 +260,11 @@ describe("config status CLI command", () => {
       const response = {
         ...statusResponse(),
         source_identity: entry.sourceIdentity,
-        saved_source: entry.savedSource
+        saved_source: entry.savedSource,
+        accepted_candidate: {
+          ...entry.acceptedCandidate,
+          restart_fields: [...entry.acceptedCandidate.restart_fields]
+        }
       };
       const code = await runConnectGptCli(["config", "status"], {
         cwd,
@@ -255,6 +276,10 @@ describe("config status CLI command", () => {
 
       expect(code).toBe(entry.exitCode);
       expect(stdout.join("\n")).toContain(entry.expected);
+      if (entry.sourceIdentity.status === "none") {
+        expect(stdout.join("\n")).toContain("Accepted candidate: source=absent repositories=2 restart_fields=provider");
+        expect(stdout.join("\n")).not.toContain(`sha256=${"a".repeat(64)}`);
+      }
     }
   });
 
@@ -331,6 +356,7 @@ function statusResponse(): ConfigurationAdminStatusResponse {
     },
     operation: "status_result",
     accepted_candidate: {
+      source_status: "available",
       source_sha256: "a".repeat(64),
       repository_count: 2,
       restart_fields: ["provider"]

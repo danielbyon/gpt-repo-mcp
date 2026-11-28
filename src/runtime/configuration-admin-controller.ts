@@ -1,43 +1,19 @@
 import { configurationSourcesMatch, type ConfigurationSourceIdentity } from "../config/config-source-identity.js";
 import { isDeepStrictEqual } from "node:util";
-import type { SavedSourceObservation } from "../services/configuration-revision-store.js";
+import type {
+  ConfigurationRevisionState,
+  ConfigurationRevisionStore,
+  RestartSettings,
+  SavedSourceObservation
+} from "../services/configuration-revision-store.js";
 import {
   parseAdminRequest,
   parseAdminResponse,
   type ConfigurationAdminResponse
 } from "./configuration-admin-protocol.js";
 
-type AdminRevisionState = Readonly<{
-  acceptedCandidate: Readonly<{
-    sourceSha256: string;
-    registry?: Readonly<{ list: () => readonly unknown[] }>;
-    restartSettings?: object;
-  }>;
-  initializedRestartSettings?: object;
-  effectiveHotRevision: Readonly<{
-    generation: number;
-    runtimeContext?: Readonly<{ registry?: Readonly<{ list: () => readonly unknown[] }> }>;
-  }>;
-  pendingRestart?: Readonly<{ initialized?: object; accepted?: object }>;
-  lastReloadOutcome?: "not-run" | "accepted" | "rejected";
-}>;
-
-type AdminStatusSnapshot = Readonly<{
-  state: AdminRevisionState & Readonly<{
-    acceptedCandidate: Readonly<{ registry: Readonly<{ list: () => readonly unknown[] }> }>;
-    effectiveHotRevision: Readonly<{
-      runtimeContext: Readonly<{ registry: Readonly<{ list: () => readonly unknown[] }> }>;
-    }>;
-    lastReloadOutcome: "not-run" | "accepted" | "rejected";
-  }>;
-  savedSource: SavedSourceObservation;
-}>;
-
-type AdminRevisionStore = Readonly<{
-  getState: () => AdminRevisionState;
-  captureStatus: () => Promise<AdminStatusSnapshot>;
-  reloadFromFile: () => Promise<AdminRevisionState>;
-}>;
+type AdminRevisionState = ConfigurationRevisionState;
+type AdminRevisionStore = Pick<ConfigurationRevisionStore, "getState" | "captureStatus" | "reloadFromFile">;
 
 /** Binds requests to one server process and its selected configuration path. */
 export function createConfigurationAdminController(options: {
@@ -76,7 +52,10 @@ export function createConfigurationAdminController(options: {
         ...responseIdentity(request.request_id),
         operation: "status_result",
         accepted_candidate: {
-          source_sha256: state.acceptedCandidate.sourceSha256,
+          source_status: retainedIdentity.status,
+          ...(retainedIdentity.status === "available"
+            ? { source_sha256: state.acceptedCandidate.sourceSha256 }
+            : {}),
           repository_count: state.acceptedCandidate.registry.list().length,
           restart_fields: settingNames(state.acceptedCandidate.restartSettings)
         },
@@ -171,18 +150,19 @@ function statusSourceIdentityMatches(
   return configurationSourcesMatch(expected, actual);
 }
 
-function settingNames(settings: object | undefined): string[] {
+function settingNames(settings: RestartSettings | undefined): string[] {
   return Object.keys(settings ?? {}).sort();
 }
 
 function pendingRestartFieldNames(state: AdminRevisionState): string[] {
-  const initialized = state.pendingRestart?.initialized ?? {};
-  const accepted = state.pendingRestart?.accepted ?? {};
-  return [...new Set([...Object.keys(initialized), ...Object.keys(accepted)])]
-    .filter((name) => !isDeepStrictEqual(
-      (initialized as Record<string, unknown>)[name],
-      (accepted as Record<string, unknown>)[name]
-    ))
+  const initialized = state.pendingRestart?.initialized;
+  const accepted = state.pendingRestart?.accepted;
+  const fieldNames = new Set<keyof RestartSettings>([
+    ...Object.keys(initialized ?? {}) as (keyof RestartSettings)[],
+    ...Object.keys(accepted ?? {}) as (keyof RestartSettings)[]
+  ]);
+  return [...fieldNames]
+    .filter((name) => !isDeepStrictEqual(initialized?.[name], accepted?.[name]))
     .sort();
 }
 

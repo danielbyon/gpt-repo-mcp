@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import type { ConfigurationSourceIdentity } from "../src/config/config-source-identity.js";
+import type { ConfigurationRevisionState } from "../src/services/configuration-revision-store.js";
 
 const sourceIdentity: ConfigurationSourceIdentity = {
   status: "available",
@@ -200,6 +201,7 @@ describe("configuration admin controller", () => {
       helper_pid: 52,
       source_identity: sourceIdentity,
       accepted_candidate: {
+        source_status: "available",
         source_sha256: "a".repeat(64),
         repository_count: 2,
         restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"]
@@ -238,6 +240,11 @@ describe("configuration admin controller", () => {
     const response = await controller.handle(statusRequest({ expected_source_identity: noSourceIdentity }));
 
     expect(response).toMatchObject({ operation: "status_result", source_identity: noSourceIdentity, saved_source: { status: "no-source" } });
+    expect(response).toMatchObject({
+      accepted_candidate: { source_status: "none", repository_count: 2, restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"] }
+    });
+    expect(JSON.stringify(response)).not.toContain("source_sha256");
+    expect(JSON.stringify(response)).not.toContain("a".repeat(64));
     expect(captureStatus).toHaveBeenCalledOnce();
   });
 
@@ -358,7 +365,7 @@ function statusRequest(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function revisionStatusState(sourceSha256: string, generation: number) {
+function revisionStatusState(sourceSha256: string, generation: number): ConfigurationRevisionState {
   const initializedSettings = {
     provider: "codebase_memory",
     executable: "/usr/bin/node",
@@ -380,15 +387,15 @@ function revisionStatusState(sourceSha256: string, generation: number) {
     },
     pendingRestart: { initialized: initializedSettings, accepted: acceptedSettings },
     lastReloadOutcome: "rejected" as const
-  };
+  } as unknown as ConfigurationRevisionState;
 }
 
-function state(sourceSha256: string, generation: number) {
+function state(sourceSha256: string, generation: number): ConfigurationRevisionState {
   return {
     acceptedCandidate: { sourceSha256 },
     effectiveHotRevision: { generation },
     pendingRestart: undefined
-  };
+  } as unknown as ConfigurationRevisionState;
 }
 
 function createStore(

@@ -2,6 +2,7 @@ import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
+import type { ConfigurationRevisionState } from "../src/services/configuration-revision-store.js";
 import { encodeAdminFrame, type ConfigurationAdminResponse } from "../src/runtime/configuration-admin-protocol.js";
 
 const sourceIdentity = {
@@ -80,6 +81,41 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  test("returns a delayed status response after the probe budget", async () => {
+    const ipc = await import("../src/runtime/configuration-admin-posix.js");
+    const directory = await createPrivateDirectory();
+    let closeEndpoint: (() => Promise<void>) | undefined;
+
+    try {
+      const endpoint = await ipc.startPosixConfigurationAdminServer({
+        directory,
+        serverPid: process.pid,
+        instanceId,
+        handle: async (value) => {
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_250));
+          return statusResponse(value);
+        }
+      });
+      closeEndpoint = endpoint.close;
+      const response = await ipc.requestPosixConfigurationAdmin(endpoint.record, {
+        protocol_version: 1,
+        request_id: "abababab-abab-4bab-8bab-abababababab",
+        operation: "status",
+        expected_server_pid: process.pid,
+        expected_instance_id: instanceId,
+        expected_source_identity: sourceIdentity
+      });
+
+      expect(response).toMatchObject({
+        request_id: "abababab-abab-4bab-8bab-abababababab",
+        operation: "status_result"
+      });
+    } finally {
+      await closeEndpoint?.();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 5_000);
 
   test("gives status handling one 30-second server deadline", async () => {
     const ipc = await import("../src/runtime/configuration-admin-posix.js");
@@ -241,13 +277,17 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
     }
   });
 
-  test("uses a 30-second client response budget for status after the probe-length connection phase", async () => {
+  test("uses one absolute 30-second transaction deadline and rejects a late status response", async () => {
     const ipc = await import("../src/runtime/configuration-admin-posix.js");
     const directory = await createPrivateDirectory();
     const endpointPath = join(directory, `instance-${instanceId}.sock`);
-    const server = createServer((socket) => socket.on("data", () => undefined));
+    const server = createServer({ allowHalfOpen: true }, (socket) => {
+      socket.on("data", () => undefined);
+      socket.on("error", () => undefined);
+    });
     let serverSocket: Socket | undefined;
     server.on("connection", (socket) => { serverSocket = socket; });
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -274,15 +314,20 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
         () => { result = { kind: "resolved" }; },
         (error: unknown) => { result = { kind: "rejected", error }; }
       );
+      clock.mockReturnValue(1_500);
       await new Promise<void>((resolve) => server.once("connection", () => resolve()));
 
-      await vi.advanceTimersByTimeAsync(2_100);
+      await vi.advanceTimersByTimeAsync(28_499);
       expect(result).toBeUndefined();
-      await vi.advanceTimersByTimeAsync(27_900);
+      await vi.advanceTimersByTimeAsync(1);
       await Promise.resolve();
+      expect(result).toMatchObject({ kind: "rejected", error: { code: "IPC_TIMEOUT", phase: "pre-dispatch" } });
+      serverSocket?.write(encodeAdminFrame(statusResponse({ request_id: "12121212-1212-4212-8212-121212121212" })));
+      await new Promise<void>((resolve) => setImmediate(resolve));
       expect(result).toMatchObject({ kind: "rejected", error: { code: "IPC_TIMEOUT", phase: "pre-dispatch" } });
     } finally {
       vi.useRealTimers();
+      clock.mockRestore();
       serverSocket?.destroy();
       try {
         if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -292,6 +337,40 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
     }
   }, 4_000);
 
+  test("rejects a status response carrying the probe operation", async () => {
+    const ipc = await import("../src/runtime/configuration-admin-posix.js");
+    const directory = await createPrivateDirectory();
+    const endpointPath = join(directory, `instance-${instanceId}.sock`);
+    const requestId = "34343434-3434-4434-8434-343434343434";
+    const server = createServer((socket) => {
+      socket.on("data", () => socket.end(encodeAdminFrame(probeResponse({ request_id: requestId }))));
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(endpointPath, resolve);
+      });
+      await chmod(endpointPath, 0o600);
+      await expect(ipc.requestPosixConfigurationAdmin({
+        protocol_version: 1,
+        server_pid: process.pid,
+        instance_id: instanceId,
+        endpoint: endpointPath
+      }, {
+        protocol_version: 1,
+        request_id: requestId,
+        operation: "status",
+        expected_server_pid: process.pid,
+        expected_instance_id: instanceId,
+        expected_source_identity: sourceIdentity
+      })).rejects.toMatchObject({ code: "IPC_BAD_RESPONSE" });
+    } finally {
+      if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("keeps a post-publication controller failure indeterminate across POSIX IPC", async () => {
     const ipc = await import("../src/runtime/configuration-admin-posix.js");
     const controllerModule = await import("../src/runtime/configuration-admin-controller.js");
@@ -299,11 +378,11 @@ describe.skipIf(process.platform === "win32")("owner-local POSIX configuration I
     const beforeState = {
       acceptedCandidate: { sourceSha256: "a".repeat(64) },
       effectiveHotRevision: { generation: 2 }
-    };
+    } as unknown as ConfigurationRevisionState;
     const publishedState = {
       acceptedCandidate: { sourceSha256: "b".repeat(64) },
       effectiveHotRevision: { generation: 3 }
-    };
+    } as unknown as ConfigurationRevisionState;
     let currentState = beforeState;
     const reloadFromFile = vi.fn(async () => {
       currentState = publishedState;
@@ -735,7 +814,7 @@ function statusResponse(value: unknown): ConfigurationAdminResponse {
     server_pid: process.pid,
     instance_id: instanceId,
     source_identity: sourceIdentity,
-    accepted_candidate: { source_sha256: "a".repeat(64), repository_count: 1, restart_fields: [] },
+    accepted_candidate: { source_status: "available", source_sha256: "a".repeat(64), repository_count: 1, restart_fields: [] },
     saved_source: {
       status: "valid",
       source_sha256: "a".repeat(64),

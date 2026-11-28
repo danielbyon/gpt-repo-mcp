@@ -181,10 +181,13 @@ async function handleStatus(
 }
 
 function printConfigurationStatus(response: ConfigurationAdminStatusResponse, io: CliIo): number {
+  const acceptedSource = response.accepted_candidate.source_status === "none"
+    ? "source=absent"
+    : `sha256=${response.accepted_candidate.source_sha256}`;
   io.stdout(`Server PID: ${response.server_pid}`);
   io.stdout(`Source: ${formatSourceIdentity(response.source_identity)}`);
   io.stdout(
-    `Accepted candidate: sha256=${response.accepted_candidate.source_sha256} ` +
+    `Accepted candidate: ${acceptedSource} ` +
     `repositories=${response.accepted_candidate.repository_count} ` +
     `restart_fields=${formatFieldNames(response.accepted_candidate.restart_fields)}`
   );

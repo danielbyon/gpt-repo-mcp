@@ -16,6 +16,7 @@ import { parseAdminRequest, type ConfigurationAdminResponse } from "../src/runti
 import { createMcpHttpApp } from "../src/runtime/mcp-http-app.js";
 import { ConfigurationRevisionStore, prepareConfigurationCandidate } from "../src/services/configuration-revision-store.js";
 import type { EffectiveHotRevision } from "../src/services/configuration-revision-store.js";
+import type { CodeIntelligenceService } from "../src/services/code-intelligence-service.js";
 
 const { requireAdmittedRuntimeContextSpy } = vi.hoisted(() => ({
   requireAdmittedRuntimeContextSpy: vi.fn()
@@ -254,8 +255,13 @@ test("serves the published snapshot after an administrative reload acknowledgeme
   }
 }, 15_000);
 
-test("production CLI recovers after a published reload response is lost over real IPC", async () => {
-  const fixture = await createFixture();
+test("production CLI recovers a lost reload response and reports restart-only state over real IPC", async () => {
+  const startupSettings = codeIntelligenceSettings();
+  const codeIntelligenceService = {} as CodeIntelligenceService;
+  const fixture = await createFixture({
+    codeIntelligence: startupSettings,
+    codeIntelligenceService
+  });
   const publication = deferred<ConfigurationAdminResponse>();
   let ipcDirectory: string | undefined;
   let localAppData: string | undefined;
@@ -263,6 +269,7 @@ test("production CLI recovers after a published reload response is lost over rea
   let server: ReturnType<typeof createServer> | undefined;
   let client: Client | undefined;
   let adminHost: Awaited<ReturnType<typeof startConfigurationAdminHost>> | undefined;
+  let dropNextPublishedResponse = true;
 
   try {
     if (process.platform === "win32") {
@@ -297,7 +304,9 @@ test("production CLI recovers after a published reload response is lost over rea
       handle: async (value) => {
         const request = parseAdminRequest(value);
         const response = await controller.handle(request);
-        if (request.operation === "reload" && response.operation === "reload_result" && response.outcome === "published") {
+        if (dropNextPublishedResponse && request.operation === "reload"
+          && response.operation === "reload_result" && response.outcome === "published") {
+          dropNextPublishedResponse = false;
           publication.resolve(response);
           throw new Error("The test host drops the published reload response.");
         }
@@ -315,7 +324,7 @@ test("production CLI recovers after a published reload response is lost over rea
     const rootsBefore = await callRawTool(mcpClient, "repo_list_roots", {});
     expect(JSON.stringify(rootsBefore)).toContain("old-root");
 
-    await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)]);
+    await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)], startupSettings);
     const acceptedBytes = await readFile(fixture.configPath);
     const reloadPromise = runBuiltCli(["--config", fixture.configPath, "config", "reload"], createCliEnvironment(ipcDirectory, localAppData));
     const response = await publication.promise;
@@ -327,19 +336,127 @@ test("production CLI recovers after a published reload response is lost over rea
     });
     expect(reloadResult.code).toBe(1);
     expect(reloadResult.stderr).toContain("Configuration reload outcome is indeterminate");
+    expect(await readFile(fixture.configPath)).toEqual(acceptedBytes);
     expect(fixture.store.getState()).toMatchObject({
       acceptedCandidate: { sourceSha256: createHash("sha256").update(acceptedBytes).digest("hex") },
       effectiveHotRevision: { generation: 2 },
       lastReloadOutcome: "accepted"
     });
 
-    const statusResult = await runBuiltCli(["--config", fixture.configPath, "config", "status"], createCliEnvironment(ipcDirectory, localAppData));
+    const cliEnv = createCliEnvironment(ipcDirectory, localAppData);
+    const statusResult = await runBuiltCli([
+      "--config", fixture.configPath, "config", "status", "--instance", String(process.pid)
+    ], cliEnv);
     expect(statusResult.code).toBe(0);
+    expect(statusResult.stdout).toContain(`Server PID: ${process.pid}`);
     expect(statusResult.stdout).toContain(`Accepted candidate: sha256=${createHash("sha256").update(acceptedBytes).digest("hex")}`);
     expect(statusResult.stdout).toContain("Effective hot revision: generation=2");
     expect(statusResult.stdout).toContain("Saved file: valid");
     expect(statusResult.stdout).toContain("matches_accepted=true");
     expect(statusResult.stdout).toContain("Last reload outcome: accepted");
+
+    const initializedFields = "executable,index_timeout_ms,provider,query_timeout_ms";
+    let previousFingerprint = createHash("sha256").update(acceptedBytes).digest("hex");
+    const initializedEffectiveRevision = fixture.store.getState().effectiveHotRevision;
+    const restartMutations = [
+      {
+        field: "executable",
+        settings: { ...startupSettings, executable: join(fixture.directory, "private-code-indexer") },
+        value: join(fixture.directory, "private-code-indexer")
+      },
+      {
+        field: "index_timeout_ms",
+        settings: { ...startupSettings, index_timeout_ms: 1_799_999 },
+        value: "1799999"
+      },
+      {
+        field: "query_timeout_ms",
+        settings: { ...startupSettings, query_timeout_ms: 4_123 },
+        value: "4123"
+      }
+    ] as const;
+
+    for (const mutation of restartMutations) {
+      await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)], mutation.settings);
+      const candidateBytes = await readFile(fixture.configPath);
+      const candidateFingerprint = createHash("sha256").update(candidateBytes).digest("hex");
+      expect(candidateFingerprint).not.toBe(previousFingerprint);
+
+      const reloadStatus = await runBuiltCli([
+        "--config", fixture.configPath, "config", "reload"
+      ], cliEnv);
+      expect(reloadStatus.code).toBe(0);
+      expect(fixture.store.getState()).toMatchObject({
+        acceptedCandidate: { sourceSha256: candidateFingerprint },
+        effectiveHotRevision: { generation: 2, runtimeContext: { codeIntelligence: codeIntelligenceService } }
+      });
+      expect(fixture.store.getState().effectiveHotRevision).toBe(initializedEffectiveRevision);
+      expect(fixture.store.getState().effectiveHotRevision.runtimeContext.codeIntelligence).toBe(codeIntelligenceService);
+
+      const observedStatus = await runBuiltCli([
+        "--config", fixture.configPath, "config", "status", "--instance", String(process.pid)
+      ], cliEnv);
+      expect(observedStatus.code).toBe(0);
+      expect(observedStatus.stdout).toContain(`Server PID: ${process.pid}`);
+      expect(observedStatus.stdout).toContain(`Accepted candidate: sha256=${candidateFingerprint}`);
+      expect(observedStatus.stdout).toContain("Effective hot revision: generation=2");
+      expect(observedStatus.stdout).toContain(`Initialized restart fields: ${initializedFields}`);
+      expect(observedStatus.stdout.split("\n").find((line) => line.startsWith("Pending restart fields:")))
+        .toBe(`Pending restart fields: ${mutation.field}`);
+      for (const value of [
+        mutation.value,
+        startupSettings.executable,
+        String(startupSettings.index_timeout_ms),
+        String(startupSettings.query_timeout_ms)
+      ]) {
+        expect(observedStatus.stdout).not.toContain(value);
+      }
+      expect(observedStatus.stdout).toContain("Last reload outcome: accepted");
+      previousFingerprint = candidateFingerprint;
+    }
+
+    await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)]);
+    const removedSectionBytes = await readFile(fixture.configPath);
+    const removedSectionFingerprint = createHash("sha256").update(removedSectionBytes).digest("hex");
+    const removalReload = await runBuiltCli(["--config", fixture.configPath, "config", "reload"], cliEnv);
+    expect(removalReload.code).toBe(0);
+    expect(removedSectionFingerprint).not.toBe(previousFingerprint);
+    expect(fixture.store.getState()).toMatchObject({
+      acceptedCandidate: { sourceSha256: removedSectionFingerprint },
+      effectiveHotRevision: { generation: 2, runtimeContext: { codeIntelligence: codeIntelligenceService } }
+    });
+    expect(fixture.store.getState().effectiveHotRevision).toBe(initializedEffectiveRevision);
+    const removedSectionStatus = await runBuiltCli([
+      "--config", fixture.configPath, "config", "status", "--instance", String(process.pid)
+    ], cliEnv);
+    expect(removedSectionStatus.code).toBe(0);
+    expect(removedSectionStatus.stdout).toContain(`Accepted candidate: sha256=${removedSectionFingerprint}`);
+    expect(removedSectionStatus.stdout).toContain(`Initialized restart fields: ${initializedFields}`);
+    expect(removedSectionStatus.stdout).toContain(`Pending restart fields: ${initializedFields}`);
+    expect(removedSectionStatus.stdout).not.toContain(startupSettings.executable);
+    expect(removedSectionStatus.stdout).not.toContain(String(startupSettings.index_timeout_ms));
+    expect(removedSectionStatus.stdout).not.toContain(String(startupSettings.query_timeout_ms));
+
+    await fixture.writeCandidate([repository("fixture", fixture.newRoot, false)], startupSettings);
+    const restoredBytes = await readFile(fixture.configPath);
+    const restoredFingerprint = createHash("sha256").update(restoredBytes).digest("hex");
+    const restorationReload = await runBuiltCli(["--config", fixture.configPath, "config", "reload"], cliEnv);
+    expect(restorationReload.code).toBe(0);
+    expect(restoredFingerprint).not.toBe(removedSectionFingerprint);
+    const restoredStatus = await runBuiltCli([
+      "--config", fixture.configPath, "config", "status", "--instance", String(process.pid)
+    ], cliEnv);
+    expect(restoredStatus.code).toBe(0);
+    expect(restoredStatus.stdout).toContain(`Accepted candidate: sha256=${restoredFingerprint}`);
+    expect(restoredStatus.stdout).toContain(`Initialized restart fields: ${initializedFields}`);
+    expect(restoredStatus.stdout).toContain("Pending restart fields: none");
+    expect(restoredStatus.stdout).toContain("Last reload outcome: accepted");
+    expect(restoredStatus.stdout).not.toContain(startupSettings.executable);
+    expect(fixture.store.getState()).toMatchObject({
+      acceptedCandidate: { sourceSha256: restoredFingerprint },
+      effectiveHotRevision: { generation: 2, runtimeContext: { codeIntelligence: codeIntelligenceService } }
+    });
+    expect(fixture.store.getState().effectiveHotRevision).toBe(initializedEffectiveRevision);
 
     const rootsResult = await callRawTool(mcpClient, "repo_list_roots", {});
     const roots = rootsResult.structuredContent as { repos: Array<{ root: string }> };
@@ -417,7 +534,10 @@ function runBuiltCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
   });
 }
 
-async function createFixture() {
+async function createFixture(options: {
+  codeIntelligence?: ReturnType<typeof codeIntelligenceSettings>;
+  codeIntelligenceService?: CodeIntelligenceService;
+} = {}) {
   const directory = await mkdtemp(join(tmpdir(), "mcp-config-activation-"));
   const oldRoot = join(directory, "old-root");
   const newRoot = join(directory, "new-root");
@@ -429,9 +549,17 @@ async function createFixture() {
     await writeFile(join(newRoot, "marker.txt"), "marker from new root");
     await mkdir(join(oldRoot, ".chatgpt", "runs", "past"), { recursive: true });
     await writeFile(join(oldRoot, ".chatgpt", "runs", "past", "prompt.md"), "historical delegation artifact");
-    await writeFile(configPath, JSON.stringify({ repos: [repository("fixture", oldRoot, true)], limits: {} }));
+    await writeFile(configPath, JSON.stringify({
+      repos: [repository("fixture", oldRoot, true)],
+      limits: {},
+      ...(options.codeIntelligence ? { code_intelligence: options.codeIntelligence } : {})
+    }));
     const initial = await prepareConfigurationCandidate(await readFile(configPath), configPath);
-    const store = new ConfigurationRevisionStore({ configPath, initial });
+    const store = new ConfigurationRevisionStore({
+      configPath,
+      initial,
+      ...(options.codeIntelligenceService ? { codeIntelligence: options.codeIntelligenceService } : {})
+    });
     return {
       directory,
       oldRoot,
@@ -439,8 +567,15 @@ async function createFixture() {
       addedRoot,
       configPath,
       store,
-      async writeCandidate(repos: ReturnType<typeof repository>[]) {
-        await writeFile(configPath, JSON.stringify({ repos, limits: {} }));
+      async writeCandidate(
+        repos: ReturnType<typeof repository>[],
+        codeIntelligence?: ReturnType<typeof codeIntelligenceSettings>
+      ) {
+        await writeFile(configPath, JSON.stringify({
+          repos,
+          limits: {},
+          ...(codeIntelligence ? { code_intelligence: codeIntelligence } : {})
+        }));
       }
     };
   } catch (error) {
@@ -461,6 +596,19 @@ function repository(repoId: string, root: string, writesEnabled: boolean, cleanu
       cleanup_enabled: cleanupEnabled,
       cleanup_allowed_globs: [".chatgpt/tool-tests/**"]
     }
+  };
+}
+
+function codeIntelligenceSettings(overrides: Partial<ReturnType<typeof baseCodeIntelligenceSettings>> = {}) {
+  return { ...baseCodeIntelligenceSettings(), ...overrides };
+}
+
+function baseCodeIntelligenceSettings() {
+  return {
+    provider: "codebase_memory" as const,
+    executable: process.execPath,
+    query_timeout_ms: 3_000,
+    index_timeout_ms: 1_800_000
   };
 }
 

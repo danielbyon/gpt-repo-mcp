@@ -927,6 +927,23 @@ bool usesOperationResponseTimeout(const std::vector<BYTE> &request) {
       hasJsonStringField(json, "operation", "status");
 }
 
+bool isStatusRequest(const std::vector<BYTE> &request) {
+  if (request.size() < 4) return false;
+  const std::string json(reinterpret_cast<const char *>(request.data() + 4), request.size() - 4);
+  return hasJsonStringField(json, "operation", "status");
+}
+
+bool validClientTimeout(const std::vector<BYTE> &request, DWORD timeoutMs) {
+  if (request.size() < 4) return false;
+  const std::string json(reinterpret_cast<const char *>(request.data() + 4), request.size() - 4);
+  if (hasJsonStringField(json, "operation", "probe")) return timeoutMs == kProbeTimeoutMs;
+  if (hasJsonStringField(json, "operation", "reload")) return timeoutMs == kOperationResponseTimeoutMs;
+  if (hasJsonStringField(json, "operation", "status")) {
+    return timeoutMs > 0 && timeoutMs <= kOperationResponseTimeoutMs;
+  }
+  return false;
+}
+
 std::string nextConnectionId() {
   const ULONGLONG sequence = g_connectionSequence.fetch_add(1);
   return std::to_string(GetCurrentProcessId()) + "-" + std::to_string(sequence);
@@ -1061,6 +1078,7 @@ ControlResult waitForControlResponse(
 
 ControlResult handleServerConnection(HANDLE pipe, HANDLE parentProcess, ControlHub &hub) {
   std::vector<BYTE> request;
+  const ULONGLONG statusDeadline = GetTickCount64() + kOperationResponseTimeoutMs;
   const ULONGLONG requestDeadline = GetTickCount64() + kConnectionTimeoutMs;
   if (!readPipeMessage(pipe, parentProcess, request, requestDeadline)) {
     return WaitForSingleObject(parentProcess, 0) == WAIT_OBJECT_0
@@ -1098,7 +1116,8 @@ ControlResult handleServerConnection(HANDLE pipe, HANDLE parentProcess, ControlH
   std::vector<BYTE> response;
   const DWORD acknowledgmentTimeout = usesOperationResponseTimeout(request)
       ? kOperationResponseTimeoutMs : kProbeTimeoutMs;
-  const ULONGLONG acknowledgmentDeadline = GetTickCount64() + acknowledgmentTimeout;
+  const ULONGLONG acknowledgmentDeadline = isStatusRequest(request)
+      ? statusDeadline : GetTickCount64() + acknowledgmentTimeout;
   const ControlResult result = waitForControlResponse(
       parentProcess, clientProcess.get(), hub, connectionId, pending,
       response, acknowledgmentDeadline);
@@ -1533,7 +1552,7 @@ int client(const std::wstring &endpoint, DWORD timeoutMs,
   std::vector<BYTE> request;
   if (!validLocalPipeName(endpoint) ||
       !readAllInput(GetStdHandle(STD_INPUT_HANDLE), kMaximumInputBytes, request) ||
-      !hasValidFrame(request)) {
+      !hasValidFrame(request) || !validClientTimeout(request, timeoutMs)) {
     writeStdout("NOT_DISPATCHED\t0\n");
     return 31;
   }
@@ -1784,8 +1803,8 @@ int wmain(int argc, wchar_t *argv[]) {
   if (wcscmp(argv[1], L"client") == 0 && argc == 6) {
     wchar_t *end = nullptr;
     const unsigned long timeout = wcstoul(argv[3], &end, 10);
-    if (end == argv[3] || *end != L'\0' ||
-      (timeout != kProbeTimeoutMs && timeout != kOperationResponseTimeoutMs)) return 5;
+    if (end == argv[3] || *end != L'\0' || timeout == 0 ||
+        timeout > kOperationResponseTimeoutMs) return 5;
     DWORD expectedHelperPid = 0;
     ULONGLONG expectedCreationTime = 0;
     if (!parsePositivePid(argv[4], expectedHelperPid) ||

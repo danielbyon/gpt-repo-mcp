@@ -127,11 +127,11 @@ export async function statusConfigurationAdmin(options: {
   }
 
   const records = await readConfigurationAdminRecords();
-  const target = await selectTarget({
+  const target = await selectConfigurationAdminStatusTarget({
     records,
+    selectedSourceIdentity: options.selectedSourceIdentity,
+    allowNoSource: options.allowNoSource,
     instancePid: options.instancePid,
-    matchesSource: (identity) => configurationSourcesMatch(options.selectedSourceIdentity, identity)
-      || (options.allowNoSource && identity.status === "none"),
     probe: probeConfigurationAdminRecord
   });
   const expectedSourceIdentity = target.probe.source_identity;

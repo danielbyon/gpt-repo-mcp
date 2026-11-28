@@ -72,7 +72,11 @@ export async function startWindowsConfigurationAdminHost(options: {
 /** Reads Windows discovery records through the helper that validates their ACLs. */
 export async function readWindowsConfigurationAdminRecords(): Promise<ConfigurationAdminDiscoveryRecord[]> {
   const helperPath = await resolveWindowsConfigurationAdminHostPath();
-  const output = await runHelper(helperPath, ["discover"], undefined, CONNECTION_TIMEOUT_MS, MAX_DISCOVERY_BYTES);
+  const output = await runHelper(helperPath, ["discover"], undefined, {
+    timeoutMs: CONNECTION_TIMEOUT_MS,
+    maximumOutputBytes: MAX_DISCOVERY_BYTES,
+    timeoutMessage: "The local administrative helper timed out."
+  });
   let parsed: unknown;
   try {
     parsed = JSON.parse(output.toString("utf8"));
@@ -97,6 +101,9 @@ export async function requestWindowsConfigurationAdmin(
       "The discovered endpoint does not include a verifiable helper process identity."
     );
   }
+  const statusDeadlineAt = request.operation === "status"
+    ? performance.now() + STATUS_RESPONSE_TIMEOUT_MS
+    : undefined;
   let helperPath: string;
   try {
     helperPath = await resolveWindowsConfigurationAdminHostPath();
@@ -108,14 +115,30 @@ export async function requestWindowsConfigurationAdmin(
   const timeoutMs = request.operation === "probe"
     ? PROBE_TIMEOUT_MS
     : request.operation === "reload" ? RELOAD_ACKNOWLEDGMENT_TIMEOUT_MS : STATUS_RESPONSE_TIMEOUT_MS;
+  const nativeTimeoutMs = statusDeadlineAt === undefined
+    ? timeoutMs
+    : Math.floor(statusDeadlineAt - performance.now());
+  const timeoutMessage = request.operation === "status"
+    ? "The native status request timed out before a snapshot was returned."
+    : request.operation === "reload"
+      ? "The reload may have run, but the native helper timed out."
+      : "The native probe timed out.";
+  if (nativeTimeoutMs <= 0) {
+    throw ipcError("WINDOWS_HELPER_TIMEOUT", "pre-dispatch", timeoutMessage);
+  }
   const output = await runHelper(helperPath, [
     "client",
     target.endpoint,
-    String(timeoutMs),
+    String(nativeTimeoutMs),
     String(target.helper_pid),
     target.helper_creation_time
-  ], frame, timeoutMs,
-    MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 64, request.operation === "reload");
+  ], frame, {
+    timeoutMs: nativeTimeoutMs,
+    maximumOutputBytes: MAX_CONFIGURATION_ADMIN_FRAME_BYTES + 64,
+    mutation: request.operation === "reload",
+    absoluteDeadlineAt: statusDeadlineAt,
+    timeoutMessage
+  });
   const isReload = request.operation === "reload";
   const isStatus = request.operation === "status";
   const markerEnd = output.indexOf(0x0a);
@@ -488,20 +511,32 @@ class WindowsHostProcess {
   }
 }
 
+type RunHelperOptions = Readonly<{
+  timeoutMs: number;
+  maximumOutputBytes: number;
+  mutation?: boolean;
+  absoluteDeadlineAt?: number;
+  timeoutMessage: string;
+}>;
+
 async function runHelper(
   helperPath: string,
   args: string[],
   input: Uint8Array | undefined,
-  timeoutMs: number,
-  maximumOutputBytes: number,
-  mutation = false
+  options: RunHelperOptions
 ): Promise<Buffer> {
-  const deadline = performance.now() + timeoutMs;
+  const deadline = options.absoluteDeadlineAt ?? performance.now() + options.timeoutMs;
+  const enforcesAbsoluteDeadline = options.absoluteDeadlineAt !== undefined;
+  if (enforcesAbsoluteDeadline && performance.now() >= deadline) {
+    throw ipcError("WINDOWS_HELPER_TIMEOUT", "pre-dispatch", options.timeoutMessage);
+  }
   const child = spawn(helperPath, args, { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
   const chunks: Buffer[] = [];
   let outputLength = 0;
   return await new Promise<Buffer>((resolveOutput, rejectOutput) => {
     let settled = false;
+    // Without a native NOT_DISPATCHED marker, a stream error cannot prove the request was not sent.
+    const processErrorPhase = child.pid !== undefined && options.mutation ? "indeterminate" : "pre-dispatch";
     const fail = (error: Error, terminate = true): void => {
       if (settled) return;
       settled = true;
@@ -511,17 +546,31 @@ async function runHelper(
     };
     const finish = (value: Buffer): void => {
       if (settled) return;
+      if (enforcesAbsoluteDeadline && performance.now() >= deadline) {
+        fail(ipcError(
+          "WINDOWS_HELPER_TIMEOUT",
+          processErrorPhase,
+          options.timeoutMessage
+        ));
+        return;
+      }
       settled = true;
       clearTimeout(timer);
       resolveOutput(value);
     };
-    // Without a native NOT_DISPATCHED marker, a stream error cannot prove the request was not sent.
-    const processErrorPhase = child.pid !== undefined && mutation ? "indeterminate" : "pre-dispatch";
 
     child.stdout.on("data", (chunk: Buffer) => {
       if (settled) return;
+      if (enforcesAbsoluteDeadline && performance.now() >= deadline) {
+        fail(ipcError(
+          "WINDOWS_HELPER_TIMEOUT",
+          processErrorPhase,
+          "The native status request timed out before a snapshot was returned."
+        ));
+        return;
+      }
       outputLength += chunk.byteLength;
-      if (outputLength > maximumOutputBytes) {
+      if (outputLength > options.maximumOutputBytes) {
         fail(ipcError("WINDOWS_HELPER_OUTPUT_TOO_LARGE", processErrorPhase, "The native helper output exceeded its limit."));
         return;
       }
@@ -549,10 +598,18 @@ async function runHelper(
       fail(ipcError(
         "WINDOWS_HELPER_TIMEOUT",
         processErrorPhase,
-        mutation ? "The reload may have run, but the native helper timed out." : "The native probe timed out."
+        options.timeoutMessage
       ));
     }, remaining);
     try {
+      if (enforcesAbsoluteDeadline && performance.now() >= deadline) {
+        fail(ipcError(
+          "WINDOWS_HELPER_TIMEOUT",
+          processErrorPhase,
+          options.timeoutMessage
+        ));
+        return;
+      }
       child.stdin.end(input);
     } catch {
       fail(ipcError("WINDOWS_HELPER_CONTROL_WRITE_FAILED", processErrorPhase, "The native helper control channel could not be written."));

@@ -458,6 +458,7 @@ function statusResponse(
     source_identity: sourceIdentity,
     operation: "status_result",
     accepted_candidate: {
+      source_status: "available",
       source_sha256: "a".repeat(64),
       repository_count: 1,
       restart_fields: ["provider"]

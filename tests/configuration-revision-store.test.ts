@@ -1,8 +1,10 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { expect, test } from "vitest";
+import { createConfigurationSourceIdentity } from "../src/config/config-source-identity.js";
+import { createConfigurationAdminController } from "../src/runtime/configuration-admin-controller.js";
 import {
   ConfigurationRevisionStore,
   prepareConfigurationCandidate
@@ -243,6 +245,22 @@ test("keeps restart-only additions, removals, modifications, and reversions sepa
     const initial = await prepareConfigurationCandidate(await readFile(configPath), configPath);
     const store = new ConfigurationRevisionStore({ configPath, initial, codeIntelligence: service });
     const startupRevision = store.capture();
+    const instanceId = "88888888-8888-4888-8888-888888888888";
+    const sourceIdentity = createConfigurationSourceIdentity(configPath, process.cwd());
+    const controller = createConfigurationAdminController({
+      serverPid: process.pid,
+      instanceId,
+      sourceIdentity,
+      revisionStore: store
+    });
+    const status = () => controller.handle({
+      protocol_version: 1,
+      request_id: randomUUID(),
+      operation: "status",
+      expected_server_pid: process.pid,
+      expected_instance_id: instanceId,
+      expected_source_identity: sourceIdentity
+    });
 
     await writeFile(configPath, JSON.stringify(repositoryConfig(root, codeIntelligenceSettings(5_000))));
     const modified = await store.reloadFromFile();
@@ -251,15 +269,28 @@ test("keeps restart-only additions, removals, modifications, and reversions sepa
     expect(modified.pendingRestart?.accepted?.query_timeout_ms).toBe(5_000);
     expect(modified.effectiveHotRevision).toBe(startupRevision);
     expect(modified.effectiveHotRevision.runtimeContext.codeIntelligence).toBe(service);
+    const modifiedStatus = await status();
+    expect(modifiedStatus).toMatchObject({
+      accepted_candidate: { source_status: "available", restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"] },
+      initialized_restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"],
+      pending_restart_fields: ["query_timeout_ms"]
+    });
+    expect(JSON.stringify(modifiedStatus)).not.toContain(process.execPath);
+    expect(JSON.stringify(modifiedStatus)).not.toContain("5000");
 
     await writeFile(configPath, JSON.stringify(repositoryConfig(root, startupSettings)));
     expect((await store.reloadFromFile()).pendingRestart).toBeUndefined();
+    expect((await status())).toMatchObject({ pending_restart_fields: [] });
 
     await writeFile(configPath, JSON.stringify(repositoryConfig(root)));
     const removed = await store.reloadFromFile();
     expect(removed.pendingRestart?.initialized?.query_timeout_ms).toBe(3_000);
     expect(removed.pendingRestart?.accepted).toBeUndefined();
     expect(removed.effectiveHotRevision).toBe(startupRevision);
+    expect(await status()).toMatchObject({
+      initialized_restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"],
+      pending_restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"]
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -273,12 +304,46 @@ test("keeps restart-only additions, removals, modifications, and reversions sepa
     const initial = await prepareConfigurationCandidate(await readFile(additionPath), additionPath);
     const store = new ConfigurationRevisionStore({ configPath: additionPath, initial });
     const originalRevision = store.capture();
+    const originalFingerprint = store.getState().acceptedCandidate.sourceSha256;
+    const instanceId = "99999999-9999-4999-8999-999999999999";
+    const sourceIdentity = createConfigurationSourceIdentity(additionPath, process.cwd());
+    const controller = createConfigurationAdminController({
+      serverPid: process.pid,
+      instanceId,
+      sourceIdentity,
+      revisionStore: store
+    });
 
-    await writeFile(additionPath, JSON.stringify(repositoryConfig(additionRoot, codeIntelligenceSettings(3_000))));
+    const addedDocument = repositoryConfig(additionRoot, codeIntelligenceSettings(3_000));
+    await writeFile(additionPath, JSON.stringify(addedDocument));
     const added = await store.reloadFromFile();
     expect(added.pendingRestart?.initialized).toBeUndefined();
     expect(added.pendingRestart?.accepted?.query_timeout_ms).toBe(3_000);
     expect(added.effectiveHotRevision).toBe(originalRevision);
+    const addedBytes = await readFile(additionPath);
+    const addedFingerprint = createHash("sha256").update(addedBytes).digest("hex");
+    expect(addedFingerprint).not.toBe(originalFingerprint);
+    const addedStatus = await controller.handle({
+      protocol_version: 1,
+      request_id: randomUUID(),
+      operation: "status",
+      expected_server_pid: process.pid,
+      expected_instance_id: instanceId,
+      expected_source_identity: sourceIdentity
+    });
+    expect(addedStatus).toMatchObject({
+      active_hot_revision: { generation: originalRevision.generation },
+      accepted_candidate: {
+        source_status: "available",
+        source_sha256: addedFingerprint,
+        restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"]
+      },
+      initialized_restart_fields: [],
+      pending_restart_fields: ["executable", "index_timeout_ms", "provider", "query_timeout_ms"]
+    });
+    expect(JSON.stringify(addedStatus)).not.toContain(process.execPath);
+    expect(JSON.stringify(addedStatus)).not.toContain("3000");
+    expect(JSON.stringify(addedStatus)).not.toContain("1800000");
   } finally {
     await rm(additionDirectory, { recursive: true, force: true });
   }
@@ -363,6 +428,51 @@ test("serializes overlapping reloads before either later read or publication can
     const secondState = await secondReload;
     expect(secondState.acceptedCandidate?.sourceSha256).toBe(createHash("sha256").update(bytesB).digest("hex"));
     expect(secondState.effectiveHotRevision.generation).toBe(firstState.effectiveHotRevision.generation + 1);
+    expect(reads).toBe(2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("records a failed reload before publishing the next queued reload outcome", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "configuration-revision-rejected-fifo-"));
+  const root = join(directory, "repo");
+  const configPath = join(directory, "config.json");
+  const initialBytes = Buffer.from(JSON.stringify(repositoryConfig(root)));
+  const rejectedBytes = Buffer.from("invalid candidate");
+  const acceptedBytes = Buffer.from(JSON.stringify(repositoryConfig(root, undefined, "accepted-after-rejection")));
+  const firstPreparationStarted = deferred<void>();
+  const releaseFirstPreparation = deferred<void>();
+  let reads = 0;
+
+  try {
+    await mkdir(root);
+    await writeFile(configPath, initialBytes);
+    const initial = await prepareConfigurationCandidate(initialBytes, configPath);
+    const store = new ConfigurationRevisionStore({
+      configPath,
+      initial,
+      readCandidateBytes: async () => reads++ === 0 ? rejectedBytes : acceptedBytes,
+      prepareCandidate: async (bytes, path) => {
+        if (Buffer.from(bytes).equals(rejectedBytes)) {
+          firstPreparationStarted.resolve();
+          await releaseFirstPreparation.promise;
+          throw new Error("The first queued candidate is rejected.");
+        }
+        return prepareConfigurationCandidate(bytes, path);
+      }
+    });
+
+    const rejectedReload = store.reloadFromFile();
+    await firstPreparationStarted.promise;
+    const acceptedReload = store.reloadFromFile();
+    releaseFirstPreparation.resolve();
+
+    await expect(rejectedReload).rejects.toThrow("The first queued candidate is rejected.");
+    const acceptedState = await acceptedReload;
+    expect(acceptedState.lastReloadOutcome).toBe("accepted");
+    expect(acceptedState.acceptedCandidate.sourceSha256).toBe(createHash("sha256").update(acceptedBytes).digest("hex"));
+    expect(store.getState()).toBe(acceptedState);
     expect(reads).toBe(2);
   } finally {
     await rm(directory, { recursive: true, force: true });

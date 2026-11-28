@@ -149,6 +149,7 @@ test("parses status requests and results with bounded saved-source diagnostics",
     source_identity: sourceIdentity,
     operation: "status_result",
     accepted_candidate: {
+      source_status: "available",
       source_sha256: "a".repeat(64),
       repository_count: 2,
       restart_fields: ["executable", "provider"]
@@ -202,6 +203,41 @@ test("accepts intentional no-source status identity but rejects unavailable sour
   expect(() => protocol.parseAdminRequest({
     ...request,
     expected_source_identity: { status: "unavailable", reason: "empty-path" }
+  })).toThrow();
+
+  const noSourceResponse = {
+    protocol_version: 1,
+    request_id: request.request_id,
+    server_pid: 42,
+    instance_id: request.expected_instance_id,
+    source_identity: { status: "none" },
+    operation: "status_result",
+    accepted_candidate: {
+      source_status: "none",
+      repository_count: 1,
+      restart_fields: []
+    },
+    saved_source: { status: "no-source" },
+    active_hot_revision: { generation: 1, repository_count: 1 },
+    initialized_restart_fields: [],
+    pending_restart_fields: [],
+    last_reload_outcome: "not-run"
+  } as const;
+
+  expect(protocol.parseAdminResponse(noSourceResponse)).toEqual(noSourceResponse);
+  expect(JSON.stringify(noSourceResponse)).not.toContain("source_sha256");
+  expect(() => protocol.parseAdminResponse({
+    ...noSourceResponse,
+    accepted_candidate: { ...noSourceResponse.accepted_candidate, source_sha256: "a".repeat(64) }
+  })).toThrow();
+  expect(() => protocol.parseAdminResponse({
+    ...noSourceResponse,
+    accepted_candidate: {
+      source_status: "available",
+      source_sha256: "a".repeat(64),
+      repository_count: 1,
+      restart_fields: []
+    }
   })).toThrow();
 });
 });
